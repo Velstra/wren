@@ -204,7 +204,9 @@ tracked but not yet scheduled, grouped by area:
   into it. **TCP-MD5 authentication (RFC 2385) is done too** — a per-neighbour
   `password` installs a `TCP_MD5SIG` key on the connector and the listener, so the
   kernel signs and verifies every segment and an unkeyed peer cannot even complete
-  the handshake. Still open: TCP-AO (RFC 5925), BGPsec (RFC 8205).
+  the handshake. **TCP-AO (RFC 5925) is done too** — a per-neighbour `ao-key` installs
+  an HMAC-SHA-1 key via `TCP_AO_ADD_KEY` (its modern, per-connection-keyed successor),
+  mutually exclusive with `password`. Still open: BGPsec (RFC 8205).
 - **Management:** YANG models, NETCONF, RESTCONF, gNMI.
 
 ## Testing

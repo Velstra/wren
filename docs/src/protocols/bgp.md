@@ -563,6 +563,32 @@ side sets one.
 > TCP-MD5 and GTSM are independent and combine: GTSM cheaply discards far-away
 > packets at the IP layer, while TCP-MD5 authenticates the ones that remain.
 
+## TCP-AO authentication (RFC 5925)
+
+**TCP-AO** is the modern successor to TCP-MD5: instead of a fixed MD5 digest it uses a
+stronger MAC (HMAC-SHA-1) and derives a *per-connection* traffic key from the master
+key and the connection's identifiers, which closes the replay and key-reuse weaknesses
+of TCP-MD5. Configure a shared master key and key id on the neighbour (both peers must
+match):
+
+```toml
+[[bgp.neighbor]]
+address   = "10.0.0.2"
+remote-as = 65002
+ao-key    = "correct horse"   # up to 80 bytes; the peer needs the same key
+ao-key-id = 100               # SendID and RecvID (default 100); the peer must match
+```
+
+Like TCP-MD5 the key must be installed before the handshake, so Wren builds the socket
+by hand and sets it with the `TCP_AO_ADD_KEY` socket option on both the connector and
+the listener; the kernel does the per-segment MAC. The key id is used as both the
+SendID and the RecvID (RFC 5925 §3.1), so a symmetric `ao-key-id` on each side
+interoperates. A mismatched or missing key makes the handshake fail, so the session
+never leaves `Idle`. `ao-key` and `password` are mutually exclusive, and TCP-AO needs a
+kernel with `CONFIG_TCP_AO` (Linux 5.18+). `scripts/bgp-tcp-ao-smoke.sh` exercises it
+live (rootless): two directly-connected eBGP speakers establish with matching keys, and
+fail to establish both when the keys differ and when only one side sets one.
+
 ## Route refresh (RFC 2918)
 
 Without route refresh, re-applying an inbound policy means bouncing the session (a

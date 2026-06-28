@@ -154,6 +154,52 @@ pub struct BgpPeerCfg {
     /// enabled. Installed on the socket before the handshake so the kernel signs and
     /// verifies every segment; the peer must share the same key.
     pub password: Option<String>,
+    /// TCP-AO (RFC 5925) master key for this peer, if AO authentication is enabled.
+    /// Mutually exclusive with [`Self::password`].
+    pub ao_key: Option<String>,
+    /// The TCP-AO key id (SendID and RecvID), meaningful only with [`Self::ao_key`].
+    pub ao_key_id: u8,
+}
+
+impl BgpPeerCfg {
+    /// The transport authentication this peer's session uses (at most one scheme).
+    fn tcp_auth(&self) -> TcpAuth {
+        if let Some(pw) = &self.password {
+            TcpAuth::Md5(pw.clone())
+        } else if let Some(key) = &self.ao_key {
+            TcpAuth::Ao { key: key.clone(), key_id: self.ao_key_id }
+        } else {
+            TcpAuth::None
+        }
+    }
+}
+
+/// The transport-layer authentication a BGP session installs on its TCP socket before
+/// the handshake (so it protects the SYN). At most one scheme is active per peer.
+#[derive(Clone)]
+enum TcpAuth {
+    /// No transport authentication.
+    None,
+    /// TCP-MD5 signature (RFC 2385) with the given password.
+    Md5(String),
+    /// TCP-AO (RFC 5925) with the given master key and key id (SendID == RecvID).
+    Ao { key: String, key_id: u8 },
+}
+
+impl TcpAuth {
+    /// Whether any authentication is configured (so the socket must be hand-built).
+    fn is_enabled(&self) -> bool {
+        !matches!(self, TcpAuth::None)
+    }
+
+    /// Install this scheme's key for `peer` on socket `fd`, before the handshake.
+    fn install(&self, fd: i32, peer: Ipv4Addr) -> std::io::Result<()> {
+        match self {
+            TcpAuth::None => Ok(()),
+            TcpAuth::Md5(pw) => set_tcp_md5(fd, peer, pw),
+            TcpAuth::Ao { key, key_id } => set_tcp_ao(fd, peer, key, *key_id),
+        }
+    }
 }
 
 /// The shared, read-only facts every session task needs.
@@ -558,12 +604,12 @@ pub async fn run(
     let (tx, mut rx) = mpsc::channel::<PeerMsg>(PEER_QUEUE);
 
     // A listener for inbound connections (passive peers, and the peer that wins a
-    // simultaneous-open race). Port 179 needs CAP_NET_BIND_SERVICE. When any peer has
-    // a TCP-MD5 password we build the socket by hand to install each peer's key
-    // (`TCP_MD5SIG`) before listening, so the kernel verifies the signature on their
-    // inbound SYNs; otherwise the ordinary async bind is used unchanged.
-    let bound = if cfg.peers.iter().any(|p| p.password.is_some()) {
-        bind_listener_md5(&cfg.peers)
+    // simultaneous-open race). Port 179 needs CAP_NET_BIND_SERVICE. When any peer is
+    // authenticated (TCP-MD5 or TCP-AO) we build the socket by hand to install each
+    // peer's key before listening, so the kernel verifies their inbound SYNs;
+    // otherwise the ordinary async bind is used unchanged.
+    let bound = if cfg.peers.iter().any(|p| p.tcp_auth().is_enabled()) {
+        bind_listener_authed(&cfg.peers)
     } else {
         TcpListener::bind((Ipv4Addr::UNSPECIFIED, PORT)).await
     };
@@ -589,10 +635,10 @@ pub async fn run(
             peer_type: classify(cfg.local_as, &members, peer.remote_as),
             ttl_security: peer.ttl_security,
         };
-        let password = peer.password.clone();
+        let auth = peer.tcp_auth();
         let local = local.clone();
         let tx = tx.clone();
-        tokio::spawn(async move { connector(info, password, local, tx).await });
+        tokio::spawn(async move { connector(info, auth, local, tx).await });
     }
     // Drop our own sender; the listener and connectors keep theirs, so `rx` stays
     // open for the life of the daemon.
@@ -1247,17 +1293,18 @@ fn should_advertise(communities: &[u32], to_type: PeerType) -> bool {
 /// Actively dial a peer, run the session, and retry on failure.
 async fn connector(
     peer: PeerInfo,
-    password: Option<String>,
+    auth: TcpAuth,
     local: Arc<Local>,
     tx: mpsc::Sender<PeerMsg>,
 ) {
     loop {
-        // A TCP-MD5 peer needs its key installed on the socket before the handshake,
-        // so it gets a hand-built connect; an ordinary peer uses tokio's connect.
+        // An authenticated peer needs its key installed on the socket before the
+        // handshake, so it gets a hand-built connect; an ordinary peer uses tokio's.
         let dial = async {
-            match &password {
-                Some(pw) => connect_md5(peer.addr, pw).await,
-                None => TcpStream::connect((peer.addr, PORT)).await,
+            if auth.is_enabled() {
+                connect_authed(peer.addr, &auth).await
+            } else {
+                TcpStream::connect((peer.addr, PORT)).await
             }
         };
         match timeout(CONNECT_TIMEOUT, dial).await {
@@ -1368,6 +1415,79 @@ fn set_tcp_md5(fd: i32, peer: Ipv4Addr, password: &str) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Linux `struct tcp_ao_add` (the argument to the `TCP_AO_ADD_KEY` setsockopt,
+/// RFC 5925 / `<linux/tcp.h>`). libc does not expose it, so it is mirrored here; the
+/// layout (296 bytes) was verified against the running kernel. `set_flags` packs the
+/// `set_current:1, set_rnext:1` bitfield (low two bits).
+#[repr(C)]
+struct TcpAoAdd {
+    addr: libc::sockaddr_storage,
+    alg_name: [u8; 64],
+    ifindex: i32,
+    set_flags: u32,
+    reserved2: u16,
+    prefix: u8,
+    sndid: u8,
+    rcvid: u8,
+    maclen: u8,
+    keyflags: u8,
+    keylen: u8,
+    reserved3: u32,
+    key: [u8; 80],
+}
+
+/// The `TCP_AO_ADD_KEY` setsockopt name (`<linux/tcp.h>`; not in libc).
+const TCP_AO_ADD_KEY: libc::c_int = 38;
+/// The maximum TCP-AO key length, and the HMAC-SHA-1-96 MAC length (RFC 5926).
+const TCP_AO_MAXKEYLEN: usize = 80;
+const TCP_AO_SHA1_MACLEN: u8 = 12;
+
+/// Install a TCP-AO master key (RFC 5925) for `peer` on socket `fd`, using HMAC-SHA-1
+/// (the RFC 5926 mandatory algorithm) with `key_id` as both the SendID and the RecvID.
+/// Set before the handshake, the kernel then derives per-connection traffic keys and
+/// authenticates every segment to/from that peer; the key becomes the current active
+/// key immediately (`set_current` / `set_rnext`).
+fn set_tcp_ao(fd: i32, peer: Ipv4Addr, key: &str, key_id: u8) -> std::io::Result<()> {
+    let kb = key.as_bytes();
+    if kb.is_empty() || kb.len() > TCP_AO_MAXKEYLEN {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "TCP-AO key must be 1..=80 bytes",
+        ));
+    }
+    let mut ao: TcpAoAdd = unsafe { std::mem::zeroed() };
+    let sin = sockaddr_in_v4(peer, 0);
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            std::ptr::addr_of!(sin) as *const u8,
+            std::ptr::addr_of_mut!(ao.addr) as *mut u8,
+            std::mem::size_of::<libc::sockaddr_in>(),
+        );
+    }
+    let alg = b"hmac(sha1)";
+    ao.alg_name[..alg.len()].copy_from_slice(alg);
+    ao.set_flags = 0b11; // set_current | set_rnext: use this key right away
+    ao.prefix = 32; // a host (/32) match for the peer address
+    ao.sndid = key_id;
+    ao.rcvid = key_id;
+    ao.maclen = TCP_AO_SHA1_MACLEN;
+    ao.keylen = kb.len() as u8;
+    ao.key[..kb.len()].copy_from_slice(kb);
+    let rc = unsafe {
+        libc::setsockopt(
+            fd,
+            libc::IPPROTO_TCP,
+            TCP_AO_ADD_KEY,
+            std::ptr::addr_of!(ao) as *const libc::c_void,
+            std::mem::size_of::<TcpAoAdd>() as libc::socklen_t,
+        )
+    };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 /// Put `fd` into non-blocking mode, so a connect can be driven by tokio's reactor.
 fn set_nonblocking(fd: i32) -> std::io::Result<()> {
     let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
@@ -1380,11 +1500,12 @@ fn set_nonblocking(fd: i32) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Connect to a peer that requires a TCP-MD5 password. tokio's `TcpStream::connect`
-/// hands back an already-connected socket — too late to install the key, which must
-/// cover the SYN — so we build the socket by hand: install the key, start a
-/// non-blocking connect, then drive it to completion through tokio. IPv4 only here.
-async fn connect_md5(peer: Ipv4Addr, password: &str) -> std::io::Result<TcpStream> {
+/// Connect to a peer that requires transport authentication (TCP-MD5 or TCP-AO).
+/// tokio's `TcpStream::connect` hands back an already-connected socket — too late to
+/// install the key, which must cover the SYN — so we build the socket by hand: install
+/// the key, start a non-blocking connect, then drive it to completion through tokio.
+/// IPv4 only here.
+async fn connect_authed(peer: Ipv4Addr, auth: &TcpAuth) -> std::io::Result<TcpStream> {
     use std::os::fd::FromRawFd;
     let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0) };
     if fd < 0 {
@@ -1392,7 +1513,7 @@ async fn connect_md5(peer: Ipv4Addr, password: &str) -> std::io::Result<TcpStrea
     }
     // Until the fd is handed to a std stream below, close it ourselves on any error.
     let prepared = (|| -> std::io::Result<()> {
-        set_tcp_md5(fd, peer, password)?;
+        auth.install(fd, peer)?;
         set_nonblocking(fd)?;
         let sin = sockaddr_in_v4(peer, PORT);
         let rc = unsafe {
@@ -1425,11 +1546,11 @@ async fn connect_md5(peer: Ipv4Addr, password: &str) -> std::io::Result<TcpStrea
     Ok(stream)
 }
 
-/// Bind the BGP listener by hand so each password-protected peer's TCP-MD5 key is
-/// installed (`TCP_MD5SIG`) before `listen`, letting the kernel verify the signature
-/// on that peer's inbound connections. IPv4, port 179 on every address — the same
-/// bind tokio's `TcpListener::bind` does, with the keys added.
-fn bind_listener_md5(peers: &[BgpPeerCfg]) -> std::io::Result<TcpListener> {
+/// Bind the BGP listener by hand so each authenticated peer's key (TCP-MD5 or TCP-AO)
+/// is installed before `listen`, letting the kernel verify that peer's inbound
+/// connections. IPv4, port 179 on every address — the same bind tokio's
+/// `TcpListener::bind` does, with the keys added.
+fn bind_listener_authed(peers: &[BgpPeerCfg]) -> std::io::Result<TcpListener> {
     use std::os::fd::FromRawFd;
     let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0) };
     if fd < 0 {
@@ -1450,9 +1571,7 @@ fn bind_listener_md5(peers: &[BgpPeerCfg]) -> std::io::Result<TcpListener> {
             return Err(std::io::Error::last_os_error());
         }
         for p in peers {
-            if let Some(pw) = &p.password {
-                set_tcp_md5(fd, p.addr, pw)?;
-            }
+            p.tcp_auth().install(fd, p.addr)?;
         }
         let sin = sockaddr_in_v4(Ipv4Addr::UNSPECIFIED, PORT);
         if unsafe {

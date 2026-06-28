@@ -411,8 +411,20 @@ pub struct BgpNeighbor {
     /// segment it sends and rejects any received segment whose signature does not
     /// match — a spoofed packet without the shared key cannot disturb the session. The
     /// peer must be configured with the same password. Up to 80 bytes. Unset disables
-    /// authentication.
+    /// authentication. Mutually exclusive with `ao-key`.
     pub password: Option<String>,
+    /// A TCP-AO (RFC 5925) master key for this peer's session — the modern successor to
+    /// TCP-MD5, with HMAC-SHA-1 and per-connection traffic keys. When set, Wren installs
+    /// the key on the connection (via `TCP_AO_ADD_KEY`) before the handshake; the kernel
+    /// then authenticates every segment with HMAC-SHA-1-96. The peer must share the same
+    /// key and key id. Up to 80 bytes. Mutually exclusive with `password`; requires a
+    /// kernel with `CONFIG_TCP_AO` (Linux 5.18+).
+    #[serde(rename = "ao-key")]
+    pub ao_key: Option<String>,
+    /// The TCP-AO key id, used as both the SendID and the RecvID (RFC 5925 §3.1), so the
+    /// two peers must configure the same value. Defaults to 100. Ignored without `ao-key`.
+    #[serde(rename = "ao-key-id")]
+    pub ao_key_id: Option<u8>,
 }
 
 /// Babel protocol configuration (`[babel]`, RFC 8966).
@@ -784,6 +796,27 @@ mod tests {
         .expect("valid config");
         let bgp = cfg.bgp.expect("bgp present");
         assert_eq!(bgp.neighbor[0].password.as_deref(), Some("s3cr3t"));
+    }
+
+    #[test]
+    fn parses_bgp_tcp_ao() {
+        let cfg = Config::from_toml(
+            r#"
+            router-id = "10.0.0.1"
+            [bgp]
+            enabled = true
+            local-as = 65001
+            [[bgp.neighbor]]
+            address = "10.0.0.2"
+            remote-as = 65002
+            ao-key = "aosecret"
+            ao-key-id = 42
+            "#,
+        )
+        .expect("valid config");
+        let bgp = cfg.bgp.expect("bgp present");
+        assert_eq!(bgp.neighbor[0].ao_key.as_deref(), Some("aosecret"));
+        assert_eq!(bgp.neighbor[0].ao_key_id, Some(42));
     }
 
     #[test]

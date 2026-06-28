@@ -756,6 +756,16 @@ fn build_bgp_config(cfg: &wren_config::Config, bgp: &wren_config::Bgp) -> Result
                 );
             }
         }
+        if let Some(key) = &n.ao_key {
+            if key.is_empty() || key.len() > 80 {
+                anyhow::bail!("bgp neighbor {addr} ao-key must be 1..=80 bytes (TCP-AO, RFC 5925)");
+            }
+        }
+        if n.password.is_some() && n.ao_key.is_some() {
+            anyhow::bail!(
+                "bgp neighbor {addr} cannot use both password (TCP-MD5) and ao-key (TCP-AO)"
+            );
+        }
         peers.push(bgp::BgpPeerCfg {
             addr,
             remote_as: n.remote_as,
@@ -763,6 +773,8 @@ fn build_bgp_config(cfg: &wren_config::Config, bgp: &wren_config::Bgp) -> Result
             rr_client: n.route_reflector_client,
             ttl_security: n.ttl_security,
             password: n.password.clone(),
+            ao_key: n.ao_key.clone(),
+            ao_key_id: n.ao_key_id.unwrap_or(100),
         });
     }
 
