@@ -1,6 +1,8 @@
 [package]
 name = "wren-bgp"
 description = "Wren routing daemon — BGP-4 (RFC 4271): message/path-attribute wire codec and best-path selection."
+keywords = ["routing", "bgp", "networking"]
+categories = ["network-programming"]
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

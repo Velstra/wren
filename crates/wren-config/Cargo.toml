@@ -1,6 +1,8 @@
 [package]
 name = "wren-config"
 description = "Wren routing daemon — TOML configuration model."
+keywords = ["routing", "config", "networking"]
+categories = ["network-programming"]
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

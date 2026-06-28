@@ -1,6 +1,8 @@
 [package]
 name = "wren-babel"
 description = "Babel (RFC 8966): packet/TLV wire codec, route table and feasibility logic."
+keywords = ["routing", "babel", "networking"]
+categories = ["network-programming"]
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

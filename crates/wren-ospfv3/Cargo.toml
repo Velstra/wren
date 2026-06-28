@@ -1,6 +1,8 @@
 [package]
 name = "wren-ospfv3"
 description = "Wren routing daemon — OSPFv3 (RFC 5340): the IPv6 packet/LSA wire codec (link-state database and SPF to follow)."
+keywords = ["routing", "ospfv3", "ipv6", "networking"]
+categories = ["network-programming"]
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

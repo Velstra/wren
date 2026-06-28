@@ -1,6 +1,8 @@
 [package]
 name = "wren-netlink"
 description = "Wren routing daemon — Linux netlink (rtnetlink) FIB backend."
+keywords = ["routing", "netlink", "fib", "linux", "networking"]
+categories = ["network-programming"]
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

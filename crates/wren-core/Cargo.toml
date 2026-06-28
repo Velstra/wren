@@ -1,6 +1,8 @@
 [package]
 name = "wren-core"
 description = "Wren routing daemon — dependency-free control-plane core (RIB, routes, FIB abstraction)."
+keywords = ["routing", "rib", "fib", "networking"]
+categories = ["network-programming"]
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

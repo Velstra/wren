@@ -1,6 +1,8 @@
 [package]
 name = "wren-daemon"
 description = "Wren routing daemon — the binary tying config, RIB and FIB together."
+keywords = ["routing", "bgp", "ospf", "daemon", "networking"]
+categories = ["network-programming", "command-line-utilities"]
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

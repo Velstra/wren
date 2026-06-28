@@ -1,6 +1,8 @@
 [package]
 name = "wren-rip"
 description = "Wren routing daemon — RIPv2 (RFC 2453) message codec and route conversion."
+keywords = ["routing", "rip", "ripng", "networking"]
+categories = ["network-programming"]
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

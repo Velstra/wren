@@ -1,6 +1,8 @@
 [package]
 name = "wren-filter"
 description = "Wren route filters — BIRD-style import/export policy over the core route types."
+keywords = ["routing", "filter", "policy", "networking"]
+categories = ["network-programming"]
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

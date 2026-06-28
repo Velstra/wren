@@ -1,6 +1,8 @@
 [package]
 name = "wren-ospf"
 description = "Wren routing daemon — OSPFv2 (RFC 2328): packet/LSA wire codec, link-state database and SPF."
+keywords = ["routing", "ospf", "ospfv2", "networking"]
+categories = ["network-programming"]
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

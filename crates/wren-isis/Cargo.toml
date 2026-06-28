@@ -1,6 +1,8 @@
 [package]
 name = "wren-isis"
 description = "Wren routing daemon — IS-IS (ISO/IEC 10589, RFC 1195): the PDU/TLV wire codec (database, SPF and runner to follow)."
+keywords = ["routing", "isis", "is-is", "networking"]
+categories = ["network-programming"]
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
