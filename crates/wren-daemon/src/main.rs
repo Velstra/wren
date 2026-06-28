@@ -653,6 +653,7 @@ fn build_bgp_config(cfg: &wren_config::Config, bgp: &wren_config::Bgp) -> Result
             addr,
             remote_as: n.remote_as,
             passive: n.passive,
+            rr_client: n.route_reflector_client,
         });
     }
 
@@ -670,6 +671,14 @@ fn build_bgp_config(cfg: &wren_config::Config, bgp: &wren_config::Bgp) -> Result
                 .with_context(|| format!("bgp next-hop6 {s:?} must be an IPv6 address"))?,
         ),
         None => None,
+    };
+
+    // The route-reflector CLUSTER_ID defaults to the BGP router-id (RFC 4456).
+    let cluster_id: Ipv4Addr = match bgp.cluster_id.as_deref() {
+        Some(s) => s
+            .parse()
+            .with_context(|| format!("bgp cluster-id {s:?} must be an IPv4 dotted quad"))?,
+        None => router_id,
     };
 
     let mut communities = Vec::with_capacity(bgp.community.len());
@@ -690,6 +699,7 @@ fn build_bgp_config(cfg: &wren_config::Config, bgp: &wren_config::Bgp) -> Result
         peers,
         originate,
         next_hop6,
+        cluster_id,
         communities,
         large_communities,
         ext_communities,

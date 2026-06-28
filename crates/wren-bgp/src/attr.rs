@@ -176,6 +176,14 @@ pub enum PathAttribute {
         /// The prefixes being withdrawn.
         withdrawn: Vec<Prefix>,
     },
+    /// ORIGINATOR_ID (type 9, optional non-transitive) — the BGP identifier of the
+    /// router that first introduced the route into the local AS (RFC 4456), set by
+    /// a route reflector for loop avoidance.
+    OriginatorId(Ipv4Addr),
+    /// CLUSTER_LIST (type 10, optional non-transitive) — the sequence of cluster
+    /// ids the route has been reflected through (RFC 4456); each reflector prepends
+    /// its own, and a reflector that finds its id here drops the route.
+    ClusterList(Vec<Ipv4Addr>),
     /// AGGREGATOR (type 7, optional transitive).
     Aggregator {
         /// The AS that formed the aggregate.
@@ -214,6 +222,8 @@ impl PathAttribute {
     const ATOMIC_AGGREGATE: u8 = 6;
     const AGGREGATOR: u8 = 7;
     const COMMUNITIES: u8 = 8;
+    const ORIGINATOR_ID: u8 = 9;
+    const CLUSTER_LIST: u8 = 10;
     const MP_REACH_NLRI: u8 = 14;
     const MP_UNREACH_NLRI: u8 = 15;
     const EXTENDED_COMMUNITIES: u8 = 16;
@@ -235,6 +245,8 @@ impl PathAttribute {
             PathAttribute::ExtendedCommunities(_) => Self::EXTENDED_COMMUNITIES,
             PathAttribute::MpReachNlri { .. } => Self::MP_REACH_NLRI,
             PathAttribute::MpUnreachNlri { .. } => Self::MP_UNREACH_NLRI,
+            PathAttribute::OriginatorId(_) => Self::ORIGINATOR_ID,
+            PathAttribute::ClusterList(_) => Self::CLUSTER_LIST,
             PathAttribute::LargeCommunities(_) => Self::LARGE_COMMUNITIES,
             PathAttribute::As4Path(_) => Self::AS4_PATH,
             PathAttribute::As4Aggregator { .. } => Self::AS4_AGGREGATOR,
@@ -248,7 +260,9 @@ impl PathAttribute {
         match self {
             PathAttribute::MultiExitDisc(_)
             | PathAttribute::MpReachNlri { .. }
-            | PathAttribute::MpUnreachNlri { .. } => FLAG_OPTIONAL,
+            | PathAttribute::MpUnreachNlri { .. }
+            | PathAttribute::OriginatorId(_)
+            | PathAttribute::ClusterList(_) => FLAG_OPTIONAL,
             PathAttribute::Aggregator { .. }
             | PathAttribute::Communities(_)
             | PathAttribute::ExtendedCommunities(_)
@@ -306,6 +320,12 @@ impl PathAttribute {
                 out.push(*safi);
                 for p in withdrawn {
                     encode_prefix_any(out, p);
+                }
+            }
+            PathAttribute::OriginatorId(id) => out.extend_from_slice(&id.octets()),
+            PathAttribute::ClusterList(ids) => {
+                for id in ids {
+                    out.extend_from_slice(&id.octets());
                 }
             }
             PathAttribute::Aggregator { asn, id } => {
@@ -453,6 +473,22 @@ impl PathAttribute {
                 let safi = value[2];
                 let withdrawn = decode_mp_prefixes(&value[3..], afi)?;
                 PathAttribute::MpUnreachNlri { afi, safi, withdrawn }
+            }
+            Self::ORIGINATOR_ID => {
+                if value.len() < 4 {
+                    return None;
+                }
+                PathAttribute::OriginatorId(Ipv4Addr::new(value[0], value[1], value[2], value[3]))
+            }
+            Self::CLUSTER_LIST => {
+                if value.len() % 4 != 0 {
+                    return None;
+                }
+                let ids = value
+                    .chunks_exact(4)
+                    .map(|c| Ipv4Addr::new(c[0], c[1], c[2], c[3]))
+                    .collect();
+                PathAttribute::ClusterList(ids)
             }
             Self::AGGREGATOR => {
                 let (asn, id) = decode_aggregator(value, four_octet)?;
@@ -795,6 +831,26 @@ mod tests {
             safi: SAFI_UNICAST,
             withdrawn: vec![],
         });
+    }
+
+    #[test]
+    fn originator_id_and_cluster_list_roundtrip() {
+        let oid = PathAttribute::OriginatorId(ip([10, 0, 0, 1]));
+        roundtrip(oid.clone());
+        let mut buf = Vec::new();
+        oid.encode(&mut buf, true);
+        assert_eq!(buf[0], FLAG_OPTIONAL); // optional non-transitive
+        assert_eq!(buf[1], 9);
+
+        let cl = PathAttribute::ClusterList(vec![ip([1, 1, 1, 1]), ip([2, 2, 2, 2])]);
+        roundtrip(cl.clone());
+        let mut buf = Vec::new();
+        cl.encode(&mut buf, true);
+        assert_eq!(buf[0], FLAG_OPTIONAL);
+        assert_eq!(buf[1], 10);
+        // An empty cluster list is legal; a non-multiple-of-4 value is rejected.
+        roundtrip(PathAttribute::ClusterList(vec![]));
+        assert!(PathAttribute::decode(&[0x80, 10, 3, 1, 2, 3], true).is_none());
     }
 
     #[test]

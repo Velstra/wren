@@ -388,8 +388,49 @@ rules apply per outgoing peer:
 originates nothing, and C learns it via B with the AS_PATH `65002 65001` and
 installs it `proto bgp`. (IPv4 unicast for now; IPv6 propagation is on the roadmap.)
 
+## Route reflection (RFC 4456)
+
+The iBGP split-horizon rule above means a route learned from one iBGP peer is not
+passed to another — so a full iBGP mesh would otherwise be required. A **route
+reflector** relaxes that: mark an iBGP peer as a **client**, and the reflector
+re-advertises routes between its clients and the rest of the iBGP peers.
+
+```toml
+[bgp]
+enabled    = true
+local-as   = 65010
+cluster-id = "10.0.0.254"   # optional; defaults to the BGP router-id
+[[bgp.neighbor]]
+address                = "10.0.0.1"
+remote-as              = 65010   # iBGP
+route-reflector-client = true
+[[bgp.neighbor]]
+address                = "10.0.0.2"
+remote-as              = 65010
+route-reflector-client = true
+```
+
+The reflection rules (§3.2) the reflector applies are:
+
+- a route from a **client** is reflected to **all** other iBGP peers (clients and
+  non-clients) and to eBGP peers;
+- a route from a **non-client** iBGP peer is reflected to **clients only**;
+- a route from an **eBGP** peer is advertised to everyone, as usual.
+
+When it reflects an iBGP route to an iBGP peer the reflector leaves AS_PATH,
+NEXT_HOP and LOCAL_PREF untouched but stamps two loop-avoidance attributes
+(§7–8): **ORIGINATOR_ID** (the router that first introduced the route into the AS,
+preserved if already present) and **CLUSTER_LIST** (the reflector prepends its
+`cluster-id`). On receipt a speaker drops any route whose ORIGINATOR_ID is its own
+router-id or whose CLUSTER_LIST already names its own cluster id, and a shorter
+CLUSTER_LIST is a best-path tie-break (§9).
+
+`scripts/bgp-route-reflection-smoke.sh` exercises this live (rootless): one AS on a
+shared segment with a reflector and two clients that do not peer with each other —
+one client originates a network and the other learns it only by reflection, then
+installs it `proto bgp`.
+
 ## Not yet implemented
 
-**Route reflection** (RFC 4456, so an iBGP-learned route can reach other iBGP
-peers via a reflector), **connection-collision detection** (§6.8), IPv6 route
-propagation, and confederations. These are tracked in the [Roadmap](../roadmap.md).
+**Connection-collision detection** (§6.8), IPv6 route propagation, and
+confederations. These are tracked in the [Roadmap](../roadmap.md).

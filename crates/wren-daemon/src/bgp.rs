@@ -77,6 +77,9 @@ pub struct BgpConfig {
     /// speaker originates or redistributes (RFC 4760 MP_REACH_NLRI). Required to
     /// advertise any IPv6 route; without it IPv6 prefixes are held but not sent.
     pub next_hop6: Option<Ipv6Addr>,
+    /// This route reflector's CLUSTER_ID (RFC 4456), used when reflecting between
+    /// clients and other iBGP peers. Defaults to the router id.
+    pub cluster_id: Ipv4Addr,
     /// COMMUNITIES (RFC 1997) attached to every originated route.
     pub communities: Vec<u32>,
     /// LARGE_COMMUNITY (RFC 8092) tags attached to every originated route.
@@ -93,6 +96,8 @@ pub struct BgpPeerCfg {
     pub remote_as: u32,
     /// Whether to wait for the peer to connect rather than dialling it.
     pub passive: bool,
+    /// Whether this iBGP peer is a route-reflector client (RFC 4456).
+    pub rr_client: bool,
 }
 
 /// The shared, read-only facts every session task needs.
@@ -102,8 +107,17 @@ struct Local {
     hold_time: u16,
     /// The IPv6 next-hop-self for originated IPv6 NLRI (RFC 4760), if configured.
     next_hop6: Option<Ipv6Addr>,
-    /// peer address → its AS, for matching inbound connections.
-    peers: HashMap<Ipv4Addr, u32>,
+    /// This reflector's CLUSTER_ID (RFC 4456).
+    cluster_id: Ipv4Addr,
+    /// peer address → its properties, for matching inbound connections.
+    peers: HashMap<Ipv4Addr, PeerProps>,
+}
+
+/// A configured peer's properties, looked up by address for inbound connections.
+#[derive(Clone, Copy)]
+struct PeerProps {
+    remote_as: u32,
+    rr_client: bool,
 }
 
 /// One prefix this speaker originates, with the COMMUNITIES to attach. The central
@@ -155,6 +169,8 @@ struct PropRoute {
 struct PeerInfo {
     addr: Ipv4Addr,
     remote_as: u32,
+    /// Whether this iBGP peer is a route-reflector client (RFC 4456).
+    rr_client: bool,
 }
 
 /// A message from a per-peer session task to the central RIB task.
@@ -170,6 +186,8 @@ enum PeerMsg {
         peer_as: u32,
         peer_id: Ipv4Addr,
         from_ebgp: bool,
+        /// Whether the sending peer is a route-reflector client (RFC 4456).
+        from_client: bool,
         update: Update,
     },
 }
@@ -363,7 +381,17 @@ pub async fn run(
         router_id: cfg.router_id,
         hold_time: cfg.hold_time,
         next_hop6: cfg.next_hop6,
-        peers: cfg.peers.iter().map(|p| (p.addr, p.remote_as)).collect(),
+        cluster_id: cfg.cluster_id,
+        peers: cfg
+            .peers
+            .iter()
+            .map(|p| {
+                (
+                    p.addr,
+                    PeerProps { remote_as: p.remote_as, rr_client: p.rr_client },
+                )
+            })
+            .collect(),
     });
 
     let (tx, mut rx) = mpsc::channel::<PeerMsg>(PEER_QUEUE);
@@ -388,6 +416,7 @@ pub async fn run(
         let info = PeerInfo {
             addr: peer.addr,
             remote_as: peer.remote_as,
+            rr_client: peer.rr_client,
         };
         let local = local.clone();
         let tx = tx.clone();
@@ -457,15 +486,23 @@ pub async fn run(
                 peer_as,
                 peer_id,
                 from_ebgp,
+                from_client,
                 update,
             } => {
-                let facts = PeerFacts { addr: peer, as_: peer_as, id: peer_id, from_ebgp };
+                let facts = PeerFacts { addr: peer, as_: peer_as, id: peer_id, from_ebgp, from_client };
                 // Withdrawals: base-NLRI IPv4 (the Withdrawn Routes field) and IPv6
                 // (MP_UNREACH_NLRI, RFC 4760 §4).
                 for w in update.withdrawn.iter().chain(mp_unreach_v6(&update)) {
                     if let Some(ev) = rib.withdraw(peer, *w) {
                         apply_event(ev, &updates, &sessions).await;
                     }
+                }
+                // Route-reflection loop avoidance (RFC 4456 §8): drop reachability
+                // whose ORIGINATOR_ID is ours, or whose CLUSTER_LIST already names
+                // our cluster — withdrawals above are still honoured.
+                if is_reflection_loop(&update, local.router_id, local.cluster_id) {
+                    debug!(peer = %peer, "BGP UPDATE failed reflection loop check; reachability ignored");
+                    continue;
                 }
                 // IPv4 reachability: base NLRI with the IPv4 NEXT_HOP attribute.
                 if !update.nlri.is_empty() {
@@ -615,6 +652,8 @@ struct PeerFacts {
     as_: u32,
     id: Ipv4Addr,
     from_ebgp: bool,
+    /// Whether the sending peer is a route-reflector client (RFC 4456).
+    from_client: bool,
 }
 
 /// Build a [`Path`] from a received UPDATE's attributes with the given `next_hop`
@@ -628,6 +667,8 @@ fn build_path(update: &Update, next_hop: IpAddr, peer: PeerFacts) -> Path {
     let mut communities = Vec::new();
     let mut large_communities = Vec::new();
     let mut ext_communities = Vec::new();
+    let mut originator_id = None;
+    let mut cluster_list = Vec::new();
     for a in &update.attributes {
         match a {
             PathAttribute::Origin(o) => origin = *o,
@@ -638,6 +679,8 @@ fn build_path(update: &Update, next_hop: IpAddr, peer: PeerFacts) -> Path {
             PathAttribute::Communities(c) => communities = c.clone(),
             PathAttribute::LargeCommunities(c) => large_communities = c.clone(),
             PathAttribute::ExtendedCommunities(c) => ext_communities = c.clone(),
+            PathAttribute::OriginatorId(id) => originator_id = Some(*id),
+            PathAttribute::ClusterList(ids) => cluster_list = ids.clone(),
             _ => {}
         }
     }
@@ -657,10 +700,27 @@ fn build_path(update: &Update, next_hop: IpAddr, peer: PeerFacts) -> Path {
         igp_metric: 0,
         peer_id: peer.id,
         peer_addr: peer.addr,
+        from_client: peer.from_client,
+        originator_id,
+        cluster_list,
         communities,
         large_communities,
         ext_communities,
     }
+}
+
+/// Whether a received UPDATE's reachability must be ignored for route-reflection
+/// loop avoidance (RFC 4456 §8): its ORIGINATOR_ID is our own router id, or its
+/// CLUSTER_LIST already contains our CLUSTER_ID.
+fn is_reflection_loop(update: &Update, router_id: Ipv4Addr, cluster_id: Ipv4Addr) -> bool {
+    for a in &update.attributes {
+        match a {
+            PathAttribute::OriginatorId(id) if *id == router_id => return true,
+            PathAttribute::ClusterList(ids) if ids.contains(&cluster_id) => return true,
+            _ => {}
+        }
+    }
+    false
 }
 
 /// The base-NLRI IPv4 NEXT_HOP attribute of an UPDATE, if present.
@@ -701,16 +761,30 @@ fn mp_unreach_v6(update: &Update) -> &[Prefix] {
         .unwrap_or(&[])
 }
 
-/// Whether a learned `path` should be re-advertised to a peer that is `to_ebgp`
-/// and at address `to_peer` (the Adj-RIB-Out decision): never echo a route back to
-/// the peer it came from, never pass an iBGP-learned route to another iBGP peer
-/// (split horizon, absent route reflection), and honour the well-known communities.
-fn should_propagate(path: &Path, to_ebgp: bool, to_peer: Ipv4Addr) -> bool {
+/// Whether a learned `path` should be re-advertised to a peer (the Adj-RIB-Out
+/// decision) that is `to_ebgp`, a route-reflector client `to_rr_client`, at address
+/// `to_peer`. Never echo a route back to where it came from; honour the well-known
+/// communities; and apply the propagation / route-reflection rules (RFC 4456 §3.2):
+///
+/// - a route learned from an **eBGP** peer goes to every peer;
+/// - a route learned from a **client** is reflected to every iBGP and eBGP peer;
+/// - a route learned from a **non-client iBGP** peer goes only to clients (and
+///   eBGP peers) — the iBGP split-horizon rule, which route reflection relaxes
+///   precisely for clients.
+///
+/// With no clients configured this collapses to plain iBGP split horizon.
+fn should_propagate(path: &Path, to_ebgp: bool, to_rr_client: bool, to_peer: Ipv4Addr) -> bool {
     if path.peer_addr == to_peer {
         return false; // don't echo a route back to where we learned it
     }
-    if !path.from_ebgp && !to_ebgp {
-        return false; // iBGP → iBGP is not re-advertised without route reflection
+    let reachable = if path.from_ebgp || path.from_client {
+        true
+    } else {
+        // iBGP non-client learned: only to clients or eBGP peers.
+        to_rr_client || to_ebgp
+    };
+    if !reachable {
+        return false;
     }
     should_advertise(&path.communities, to_ebgp)
 }
@@ -762,13 +836,14 @@ async fn accept_loop(listener: TcpListener, local: Arc<Local>, tx: mpsc::Sender<
                 let IpAddr::V4(ip) = addr.ip() else {
                     continue; // IPv4 transport only here
                 };
-                let Some(&remote_as) = local.peers.get(&ip) else {
+                let Some(&props) = local.peers.get(&ip) else {
                     debug!(peer = %ip, "inbound BGP from unconfigured peer; dropping");
                     continue;
                 };
                 let peer = PeerInfo {
                     addr: ip,
-                    remote_as,
+                    remote_as: props.remote_as,
+                    rr_client: props.rr_client,
                 };
                 let local = local.clone();
                 let tx = tx.clone();
@@ -866,6 +941,7 @@ async fn drive_session(
                                 peer_as: sess.peer.remote_as,
                                 peer_id: sess.peer_id,
                                 from_ebgp: sess.from_ebgp,
+                                from_client: sess.peer.rr_client,
                                 update: u.clone(),
                             }).await;
                         }
@@ -1171,7 +1247,7 @@ impl Session<'_> {
             if !r.prefix.is_ipv4() {
                 continue;
             }
-            if !should_propagate(&r.path, self.from_ebgp, self.peer.addr) {
+            if !should_propagate(&r.path, self.from_ebgp, self.peer.rr_client, self.peer.addr) {
                 continue;
             }
             let attributes = self.propagated_attrs(&r.path);
@@ -1203,6 +1279,17 @@ impl Session<'_> {
             }
             if path.med != 0 {
                 attrs.push(PathAttribute::MultiExitDisc(path.med));
+            }
+            // Route reflection (RFC 4456 §8): when reflecting an iBGP-learned route
+            // to an iBGP peer, stamp ORIGINATOR_ID (the router that introduced it,
+            // preserved if already present) and prepend our CLUSTER_ID to the
+            // CLUSTER_LIST so a later reflector can detect a loop.
+            if !path.from_ebgp {
+                let originator = path.originator_id.unwrap_or(path.peer_id);
+                attrs.push(PathAttribute::OriginatorId(originator));
+                let mut cl = path.cluster_list.clone();
+                cl.insert(0, self.local.cluster_id);
+                attrs.push(PathAttribute::ClusterList(cl));
             }
         }
         if !path.communities.is_empty() {
@@ -1277,6 +1364,9 @@ mod tests {
             igp_metric: 0,
             peer_id: ip([10, 0, 0, 1]),
             peer_addr: ip([10, 0, 0, 1]),
+            from_client: false,
+            originator_id: None,
+            cluster_list: vec![],
             communities: vec![0xFDE9_0064, NO_EXPORT],
             large_communities: vec![(65001, 1, 2)],
             ext_communities: vec![[0x00, 0x02, 0xFD, 0xE9, 0x00, 0x00, 0x00, 0x64]], // rt:65001:100
@@ -1321,6 +1411,9 @@ mod tests {
             igp_metric: 0,
             peer_id: ip(from_peer),
             peer_addr: ip(from_peer),
+            from_client: false,
+            originator_id: None,
+            cluster_list: vec![],
             communities: vec![],
             large_communities: vec![],
             ext_communities: vec![],
@@ -1352,29 +1445,66 @@ mod tests {
     fn propagation_never_echoes_to_the_origin_peer() {
         let path = learned_path(true, [10, 0, 0, 1]);
         // To the very peer it came from: suppressed.
-        assert!(!should_propagate(&path, true, ip([10, 0, 0, 1])));
+        assert!(!should_propagate(&path, true, false, ip([10, 0, 0, 1])));
         // To a different eBGP peer: propagated.
-        assert!(should_propagate(&path, true, ip([10, 0, 0, 2])));
+        assert!(should_propagate(&path, true, false, ip([10, 0, 0, 2])));
     }
 
     #[test]
     fn propagation_applies_ibgp_split_horizon() {
-        // A route learned from an iBGP peer is not passed to another iBGP peer …
+        // A route learned from a non-client iBGP peer is not passed to another
+        // non-client iBGP peer …
         let ibgp = learned_path(false, [10, 0, 0, 1]);
-        assert!(!should_propagate(&ibgp, false, ip([10, 0, 0, 2])));
+        assert!(!should_propagate(&ibgp, false, false, ip([10, 0, 0, 2])));
         // … but is passed on to an eBGP peer.
-        assert!(should_propagate(&ibgp, true, ip([10, 0, 0, 2])));
+        assert!(should_propagate(&ibgp, true, false, ip([10, 0, 0, 2])));
         // A route learned from eBGP goes to both iBGP and eBGP peers.
         let ebgp = learned_path(true, [10, 0, 0, 1]);
-        assert!(should_propagate(&ebgp, false, ip([10, 0, 0, 2])));
-        assert!(should_propagate(&ebgp, true, ip([10, 0, 0, 2])));
+        assert!(should_propagate(&ebgp, false, false, ip([10, 0, 0, 2])));
+        assert!(should_propagate(&ebgp, true, false, ip([10, 0, 0, 2])));
+    }
+
+    #[test]
+    fn route_reflection_relaxes_the_split_horizon_for_clients() {
+        // A route learned from a non-client iBGP peer IS reflected to a client.
+        let from_nonclient = learned_path(false, [10, 0, 0, 1]);
+        assert!(should_propagate(&from_nonclient, false, true, ip([10, 0, 0, 2])));
+
+        // A route learned from a client is reflected to every iBGP peer (client or
+        // not) and to eBGP peers.
+        let mut from_client = learned_path(false, [10, 0, 0, 1]);
+        from_client.from_client = true;
+        assert!(should_propagate(&from_client, false, false, ip([10, 0, 0, 2]))); // non-client iBGP
+        assert!(should_propagate(&from_client, false, true, ip([10, 0, 0, 3]))); // client
+        assert!(should_propagate(&from_client, true, false, ip([10, 0, 0, 4]))); // eBGP
+    }
+
+    #[test]
+    fn reflection_loop_check_drops_own_originator_or_cluster() {
+        let upd = |attrs: Vec<PathAttribute>| Update { withdrawn: vec![], attributes: attrs, nlri: vec![] };
+        let rid = ip([10, 0, 0, 1]);
+        let cid = ip([1, 1, 1, 1]);
+        // Our own ORIGINATOR_ID → loop.
+        assert!(is_reflection_loop(&upd(vec![PathAttribute::OriginatorId(rid)]), rid, cid));
+        // Our CLUSTER_ID in the CLUSTER_LIST → loop.
+        assert!(is_reflection_loop(
+            &upd(vec![PathAttribute::ClusterList(vec![ip([9, 9, 9, 9]), cid])]),
+            rid,
+            cid
+        ));
+        // Neither → fine.
+        assert!(!is_reflection_loop(
+            &upd(vec![PathAttribute::OriginatorId(ip([7, 7, 7, 7]))]),
+            rid,
+            cid
+        ));
     }
 
     #[test]
     fn propagation_honours_no_advertise() {
         let mut path = learned_path(true, [10, 0, 0, 1]);
         path.communities = vec![NO_ADVERTISE];
-        assert!(!should_propagate(&path, true, ip([10, 0, 0, 2])));
+        assert!(!should_propagate(&path, true, false, ip([10, 0, 0, 2])));
     }
 
     #[test]
@@ -1478,6 +1608,9 @@ mod tests {
             igp_metric: 0,
             peer_id: ip([10, 0, 0, 2]),
             peer_addr: ip([10, 0, 0, 2]),
+            from_client: false,
+            originator_id: None,
+            cluster_list: vec![],
             communities: vec![],
             large_communities: vec![],
             ext_communities: vec![],

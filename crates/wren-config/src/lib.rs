@@ -283,6 +283,11 @@ pub struct Bgp {
     /// IPv6 route; typically this router's global address on the peering link.
     #[serde(rename = "next-hop6")]
     pub next_hop6: Option<String>,
+    /// This route reflector's CLUSTER_ID (RFC 4456), as a dotted quad. Defaults to
+    /// the BGP `router-id` when unset; only relevant when any neighbor is a
+    /// `route-reflector-client`.
+    #[serde(rename = "cluster-id")]
+    pub cluster_id: Option<String>,
     /// COMMUNITIES (RFC 1997) attached to every originated route, as `asn:value`
     /// or a well-known name (`no-export`, `no-advertise`, `no-export-subconfed`).
     #[serde(default)]
@@ -320,6 +325,11 @@ pub struct BgpNeighbor {
     /// connection ourselves. Defaults to false (we actively connect).
     #[serde(default)]
     pub passive: bool,
+    /// Whether this (iBGP) peer is a **route-reflector client** (RFC 4456): routes
+    /// learned from it are reflected to all other iBGP peers, and routes from other
+    /// iBGP peers are reflected to it. Ignored for eBGP peers. Defaults to false.
+    #[serde(default, rename = "route-reflector-client")]
+    pub route_reflector_client: bool,
 }
 
 /// Babel protocol configuration (`[babel]`, RFC 8966).

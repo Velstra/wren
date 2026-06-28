@@ -45,6 +45,16 @@ pub struct Path {
     pub peer_id: Ipv4Addr,
     /// The peer's address, the final tie-break.
     pub peer_addr: Ipv4Addr,
+    /// Whether this path was learned from a route-reflector client (RFC 4456). Set
+    /// by the reflector to decide reflection; not part of the comparison.
+    pub from_client: bool,
+    /// ORIGINATOR_ID (RFC 4456) if the route was reflected — the BGP id of the
+    /// router that introduced it into the AS. Used for loop avoidance.
+    pub originator_id: Option<Ipv4Addr>,
+    /// CLUSTER_LIST (RFC 4456) the route carries — the clusters it has passed
+    /// through. Its length is a tie-break (§9); a reflector finding its own id here
+    /// drops the route.
+    pub cluster_list: Vec<Ipv4Addr>,
     /// The COMMUNITIES (RFC 1997) attached to this path — retained for
     /// re-advertisement and policy; not part of the §9.1.2.2 comparison.
     pub communities: Vec<u32>,
@@ -110,11 +120,15 @@ pub fn is_better(a: &Path, b: &Path) -> bool {
     if a.igp_metric != b.igp_metric {
         return a.igp_metric < b.igp_metric;
     }
-    // 7. Lowest peer BGP identifier.
+    // 7. Shortest CLUSTER_LIST (RFC 4456 §9) — fewer reflection hops.
+    if a.cluster_list.len() != b.cluster_list.len() {
+        return a.cluster_list.len() < b.cluster_list.len();
+    }
+    // 8. Lowest peer BGP identifier.
     if a.peer_id != b.peer_id {
         return u32::from(a.peer_id) < u32::from(b.peer_id);
     }
-    // 8. Lowest peer address.
+    // 9. Lowest peer address.
     u32::from(a.peer_addr) < u32::from(b.peer_addr)
 }
 
@@ -153,6 +167,9 @@ mod tests {
             igp_metric: 10,
             peer_id: ip([10, 0, 0, 1]),
             peer_addr: ip([10, 0, 0, 1]),
+            from_client: false,
+            originator_id: None,
+            cluster_list: vec![],
             communities: vec![],
             large_communities: vec![],
             ext_communities: vec![],
@@ -227,6 +244,20 @@ mod tests {
         let lo = Path { peer_id: ip([10, 0, 0, 1]), ..base() };
         let hi = Path { peer_id: ip([10, 0, 0, 9]), ..base() };
         assert!(is_better(&lo, &hi));
+    }
+
+    #[test]
+    fn shorter_cluster_list_breaks_the_tie_before_router_id() {
+        // Everything equal but the CLUSTER_LIST length → fewer reflection hops wins,
+        // even though the longer-list path has the lower peer id.
+        let short = Path { cluster_list: vec![ip([1, 1, 1, 1])], peer_id: ip([10, 0, 0, 9]), ..base() };
+        let long = Path {
+            cluster_list: vec![ip([1, 1, 1, 1]), ip([2, 2, 2, 2])],
+            peer_id: ip([10, 0, 0, 1]),
+            ..base()
+        };
+        assert!(is_better(&short, &long));
+        assert!(!is_better(&long, &short));
     }
 
     #[test]
