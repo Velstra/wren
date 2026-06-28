@@ -1,0 +1,33 @@
+[package]
+name = "wren-daemon"
+description = "Wren routing daemon — the binary tying config, RIB and FIB together."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "wren"
+path = "src/main.rs"
+
+[dependencies]
+wren-core.workspace = true
+wren-config.workspace = true
+wren-rip.workspace = true
+wren-ospf.workspace = true
+wren-ospfv3.workspace = true
+wren-bgp.workspace = true
+wren-babel.workspace = true
+wren-isis.workspace = true
+wren-filter.workspace = true
+wren-netlink.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+# For the RIP runner's multicast UDP sockets (SO_BINDTODEVICE, IP_ADD_MEMBERSHIP,
+# IP_MULTICAST_IF) set directly via setsockopt — same minimal dep as wren-netlink.
+libc = "0.2"
