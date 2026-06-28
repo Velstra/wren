@@ -44,7 +44,9 @@ use wren_bgp::fsm::{Action, BgpFsm, Event, State, CODE_CEASE};
 use wren_bgp::large_community::format_large_community;
 use wren_bgp::message::{Message, Notification, Open, Update};
 use wren_bgp::rib::{BgpRib, RibEvent};
-use wren_bgp::{AFI_IPV6, HEADER_LEN, MARKER, MAX_MESSAGE_LEN, PORT, SAFI_UNICAST, VERSION};
+use wren_bgp::{
+    AFI_IPV4, AFI_IPV6, HEADER_LEN, MARKER, MAX_MESSAGE_LEN, PORT, SAFI_UNICAST, VERSION,
+};
 
 use wren_core::{Prefix, Protocol};
 
@@ -209,6 +211,9 @@ enum SessionCmd {
     /// Lose §6.8 collision detection: close this connection with a Cease, without
     /// reporting Down — the winning connection owns the peer's slot.
     Shutdown,
+    /// Send a ROUTE-REFRESH to the peer (RFC 2918), asking it to re-advertise its
+    /// routes to us — triggered by the operator's `bgp refresh <peer>`.
+    SendRefresh,
 }
 
 /// One learned Loc-RIB route the central task asks a session to propagate. The
@@ -250,6 +255,9 @@ enum PeerMsg {
     /// if `conn_id` is still the current connection (a stale loser's Down is
     /// ignored, so it can't evict the surviving session).
     Down { peer: Ipv4Addr, conn_id: u64 },
+    /// The peer sent a ROUTE-REFRESH (RFC 2918): re-advertise our Adj-RIB-Out to it.
+    /// `conn_id` guards against a stale connection (like [`PeerMsg::Down`]).
+    RefreshRequest { peer: Ipv4Addr, conn_id: u64 },
     /// The peer sent an UPDATE.
     Update {
         peer: Ipv4Addr,
@@ -275,6 +283,9 @@ pub enum BgpQuery {
     Routes,
     /// The configured neighbours and their session state.
     Neighbors,
+    /// Send a ROUTE-REFRESH to this peer (RFC 2918) — `bgp refresh <addr>`. Not a
+    /// read-only query, but answered the same way (with a status line).
+    Refresh(Ipv4Addr),
 }
 
 /// A control-socket query plus the channel to answer it on.
@@ -289,6 +300,9 @@ pub struct BgpQueryRequest {
 struct NeighborState {
     remote_as: u32,
     established: bool,
+    /// How many ROUTE-REFRESH requests this peer has sent us (RFC 2918) — a visible
+    /// signal in `show bgp neighbors` that a refresh was honoured.
+    refreshes_received: u64,
 }
 
 /// A neighbour summary handed to the (pure) renderer.
@@ -300,6 +314,8 @@ pub struct NeighborSummary {
     pub remote_as: u32,
     /// Whether the session is currently Established.
     pub established: bool,
+    /// How many ROUTE-REFRESH requests this peer has sent us (RFC 2918).
+    pub refreshes_received: u64,
 }
 
 /// One prefix in the central task's origination set, with the COMMUNITIES to
@@ -333,6 +349,7 @@ fn neighbor_summaries(neighbors: &BTreeMap<Ipv4Addr, NeighborState>) -> Vec<Neig
             addr: *addr,
             remote_as: n.remote_as,
             established: n.established,
+            refreshes_received: n.refreshes_received,
         })
         .collect()
 }
@@ -382,7 +399,11 @@ pub fn render_bgp_neighbors(neighbors: &[NeighborSummary]) -> String {
     let mut out = String::new();
     for n in neighbors {
         let state = if n.established { "Established" } else { "Idle" };
-        let _ = writeln!(out, "{} AS {} {}", n.addr, n.remote_as, state);
+        let _ = write!(out, "{} AS {} {}", n.addr, n.remote_as, state);
+        if n.refreshes_received > 0 {
+            let _ = write!(out, " refreshes {}", n.refreshes_received);
+        }
+        out.push('\n');
     }
     out
 }
@@ -439,7 +460,12 @@ pub async fn run(
     let mut neighbors: BTreeMap<Ipv4Addr, NeighborState> = cfg
         .peers
         .iter()
-        .map(|p| (p.addr, NeighborState { remote_as: p.remote_as, established: false }))
+        .map(|p| {
+            (
+                p.addr,
+                NeighborState { remote_as: p.remote_as, established: false, refreshes_received: 0 },
+            )
+        })
         .collect();
 
     // The origination set: the configured `network`s up front (each carrying the
@@ -536,6 +562,13 @@ pub async fn run(
                 let resp = match req.query {
                     BgpQuery::Routes => render_bgp_routes(&rib),
                     BgpQuery::Neighbors => render_bgp_neighbors(&neighbor_summaries(&neighbors)),
+                    BgpQuery::Refresh(addr) => match sessions.get(&addr) {
+                        Some(cmd_tx) => {
+                            let _ = cmd_tx.send(SessionCmd::SendRefresh).await;
+                            format!("route refresh sent to {addr}\n")
+                        }
+                        None => format!("no established session to {addr}\n"),
+                    },
                 };
                 let _ = req.respond.send(resp);
                 continue;
@@ -608,6 +641,32 @@ pub async fn run(
                 current_conn.remove(&p);
                 for ev in rib.withdraw_peer(p) {
                     apply_event(ev, &updates, &sessions).await;
+                }
+            }
+            PeerMsg::RefreshRequest { peer: p, conn_id } => {
+                // Honour a peer's ROUTE-REFRESH (RFC 2918) by re-advertising our
+                // Adj-RIB-Out to it — the origination snapshot plus the Loc-RIB best
+                // paths (the session re-applies the propagation rules). Ignore a
+                // request from a superseded connection, like a stale Down.
+                if current_conn.get(&p) != Some(&conn_id) {
+                    continue;
+                }
+                if let Some(n) = neighbors.get_mut(&p) {
+                    n.refreshes_received += 1;
+                }
+                if let Some(cmd_tx) = sessions.get(&p) {
+                    info!(peer = %p, "BGP ROUTE-REFRESH: re-advertising Adj-RIB-Out");
+                    let snapshot = origination_snapshot(&originated);
+                    if !snapshot.is_empty() {
+                        let _ = cmd_tx.send(SessionCmd::Advertise(snapshot)).await;
+                    }
+                    let prop: Vec<PropRoute> = rib
+                        .iter_best()
+                        .map(|(prefix, path)| PropRoute { prefix: *prefix, path: path.clone() })
+                        .collect();
+                    if !prop.is_empty() {
+                        let _ = cmd_tx.send(SessionCmd::Propagate(prop)).await;
+                    }
                 }
             }
             PeerMsg::Update {
@@ -1099,6 +1158,7 @@ async fn drive_session(
         peer_id: peer.addr,
         four_octet: false,
         mp_ipv6: false,
+        peer_route_refresh: false,
         established: false,
         hold_deadline: Instant::now() + FAR,
         ka_deadline: Instant::now() + FAR,
@@ -1136,6 +1196,8 @@ async fn drive_session(
                             sess.four_octet = o.supports_four_octet_as();
                             // Send IPv6 NLRI only if the peer can receive it (RFC 4760).
                             sess.mp_ipv6 = o.supports_multiprotocol(AFI_IPV6, SAFI_UNICAST);
+                            // Send a ROUTE-REFRESH only if the peer can honour it (RFC 2918).
+                            sess.peer_route_refresh = o.supports_route_refresh();
                             sess.neg_hold = sess.local.hold_time.min(o.hold_time);
                             sess.keepalive_int = (sess.neg_hold / 3).max(1);
                             Step::Event(Event::OpenReceived)
@@ -1160,6 +1222,20 @@ async fn drive_session(
                     Message::Notification(n) => {
                         debug!(peer = %sess.peer.addr, code = n.code, subcode = n.subcode, "BGP NOTIFICATION received");
                         Step::Event(Event::NotificationReceived)
+                    }
+                    // ROUTE-REFRESH (RFC 2918): the peer asks us to re-advertise our
+                    // Adj-RIB-Out. Forward the request to the central task, which
+                    // re-pushes the origination snapshot and Loc-RIB to this session.
+                    // It is not an FSM event (the session stays Established).
+                    Message::RouteRefresh { afi, safi } => {
+                        if fsm.is_established() {
+                            debug!(peer = %sess.peer.addr, afi, safi, "BGP ROUTE-REFRESH received");
+                            let _ = sess.tx.send(PeerMsg::RefreshRequest {
+                                peer: sess.peer.addr,
+                                conn_id: sess.conn_id,
+                            }).await;
+                        }
+                        Step::Handled
                     }
                 },
                 Err(e) => {
@@ -1204,6 +1280,22 @@ async fn drive_session(
                     sess.withdraw(&prefixes).await?;
                 }
             }
+            Step::Handled => {}
+            // The central task asks us to send a ROUTE-REFRESH to the peer (the
+            // operator ran `bgp refresh <peer>`). Send it for IPv4 unicast, and for
+            // IPv6 unicast too when that family is negotiated (RFC 2918 §3).
+            Step::Cmd(SessionCmd::SendRefresh) => {
+                if sess.established && sess.peer_route_refresh {
+                    let _ = sess
+                        .send(&Message::RouteRefresh { afi: AFI_IPV4, safi: SAFI_UNICAST })
+                        .await;
+                    if sess.mp_ipv6 {
+                        let _ = sess
+                            .send(&Message::RouteRefresh { afi: AFI_IPV6, safi: SAFI_UNICAST })
+                            .await;
+                    }
+                }
+            }
             Step::Cmd(SessionCmd::Shutdown) => {
                 // Lost §6.8 collision resolution: tell the peer with a Cease
                 // (Connection Collision Resolution) and close, but do NOT report
@@ -1233,6 +1325,8 @@ async fn drive_session(
 enum Step {
     Event(Event),
     Cmd(SessionCmd),
+    /// A message was handled inline with no FSM transition (e.g. ROUTE-REFRESH).
+    Handled,
     ReadFailed,
 }
 
@@ -1272,6 +1366,9 @@ struct Session<'a> {
     /// Whether the peer advertised the IPv6-unicast Multiprotocol capability
     /// (RFC 4760) — only then do we send it IPv6 NLRI in MP_REACH_NLRI.
     mp_ipv6: bool,
+    /// Whether the peer advertised the Route Refresh capability (RFC 2918) — only
+    /// then do we send it a ROUTE-REFRESH (it would not honour one otherwise).
+    peer_route_refresh: bool,
     established: bool,
     hold_deadline: Instant,
     ka_deadline: Instant,
@@ -1735,12 +1832,14 @@ mod tests {
     #[test]
     fn render_neighbors_lists_state() {
         let n = vec![
-            NeighborSummary { addr: ip([10, 0, 0, 2]), remote_as: 65002, established: true },
-            NeighborSummary { addr: ip([10, 0, 0, 3]), remote_as: 4_200_000_000, established: false },
+            NeighborSummary { addr: ip([10, 0, 0, 2]), remote_as: 65002, established: true, refreshes_received: 2 },
+            NeighborSummary { addr: ip([10, 0, 0, 3]), remote_as: 4_200_000_000, established: false, refreshes_received: 0 },
         ];
         let out = render_bgp_neighbors(&n);
-        assert!(out.contains("10.0.0.2 AS 65002 Established"));
+        assert!(out.contains("10.0.0.2 AS 65002 Established refreshes 2"));
         assert!(out.contains("10.0.0.3 AS 4200000000 Idle"));
+        // A peer with no refreshes does not show the counter.
+        assert!(!out.lines().find(|l| l.contains("10.0.0.3")).unwrap().contains("refreshes"));
         assert_eq!(render_bgp_neighbors(&[]), "no bgp neighbors configured\n");
     }
 

@@ -82,6 +82,13 @@ enum Command {
         #[arg(trailing_var_arg = true)]
         args: Vec<String>,
     },
+    /// Run a BGP action on a running wren daemon, e.g. `wren bgp refresh
+    /// 10.0.0.2` to send that peer a ROUTE-REFRESH (RFC 2918).
+    Bgp {
+        /// The action words, e.g. `refresh 10.0.0.2`.
+        #[arg(trailing_var_arg = true)]
+        args: Vec<String>,
+    },
 }
 
 /// The mpsc capacity for protocol → router updates.
@@ -104,6 +111,10 @@ async fn main() -> Result<()> {
     // without standing up the daemon or its logging.
     if let Some(Command::Show { args: words }) = &args.command {
         let command = format!("show {}", words.join(" "));
+        return control::run_client(&args.socket, command.trim()).await;
+    }
+    if let Some(Command::Bgp { args: words }) = &args.command {
+        let command = format!("bgp {}", words.join(" "));
         return control::run_client(&args.socket, command.trim()).await;
     }
 

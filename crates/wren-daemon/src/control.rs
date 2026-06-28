@@ -165,6 +165,7 @@ async fn handle_conn(stream: UnixStream, channels: Channels) -> Result<()> {
         format!(
             "error: unknown command {line:?}\n\
              usage: show routes [protocol] | show bgp [routes|neighbors] | \
+             bgp refresh <peer> | \
              show ospf [neighbors|interfaces] | show ospf3 [neighbors|interfaces] | \
              show isis [neighbors|interfaces] | show babel [neighbors|routes] | \
              show rip | show ripng\n"
@@ -227,24 +228,43 @@ pub fn parse_query(line: &str) -> Option<Query> {
     }
 }
 
-/// Parse a `show bgp [routes|neighbors]` command into a [`BgpQuery`]. A bare
-/// `show bgp` defaults to the routes view. Returns `None` for anything else (so
-/// the caller can fall through to the router queries).
+/// Parse a BGP command into a [`BgpQuery`]. Two forms are accepted: the read-only
+/// `show bgp [routes|neighbors]` (a bare `show bgp` defaults to the routes view),
+/// and the action `bgp refresh <peer>` which sends that peer a ROUTE-REFRESH
+/// (RFC 2918). Returns `None` for anything else (so the caller can fall through to
+/// the other parsers).
 pub fn parse_bgp_query(line: &str) -> Option<BgpQuery> {
     let mut tokens = line.split_whitespace();
-    if tokens.next()? != "show" || tokens.next()? != "bgp" {
-        return None;
+    match tokens.next()? {
+        "show" => {
+            if tokens.next()? != "bgp" {
+                return None;
+            }
+            let query = match tokens.next() {
+                None | Some("routes") | Some("route") => BgpQuery::Routes,
+                Some("neighbors") | Some("neighbours") | Some("summary") => BgpQuery::Neighbors,
+                Some(_) => return None,
+            };
+            // A trailing extra token is a malformed command.
+            if tokens.next().is_some() {
+                return None;
+            }
+            Some(query)
+        }
+        // `bgp refresh <addr>`: the address is required and must parse, then the
+        // command takes no more tokens.
+        "bgp" => {
+            if tokens.next()? != "refresh" {
+                return None;
+            }
+            let addr = tokens.next()?.parse().ok()?;
+            if tokens.next().is_some() {
+                return None;
+            }
+            Some(BgpQuery::Refresh(addr))
+        }
+        _ => None,
     }
-    let query = match tokens.next() {
-        None | Some("routes") | Some("route") => BgpQuery::Routes,
-        Some("neighbors") | Some("neighbours") | Some("summary") => BgpQuery::Neighbors,
-        Some(_) => return None,
-    };
-    // A trailing extra token is a malformed command.
-    if tokens.next().is_some() {
-        return None;
-    }
-    Some(query)
 }
 
 /// Parse a `show ospf [neighbors|interfaces]` command into an [`OspfQuery`]. A
@@ -410,6 +430,20 @@ mod tests {
         assert!(parse_bgp_query("show bgp nonsense").is_none());
         assert!(parse_bgp_query("show bgp routes extra").is_none());
         assert!(parse_bgp_query("").is_none());
+    }
+
+    #[test]
+    fn parse_bgp_query_understands_refresh() {
+        use std::net::Ipv4Addr;
+        assert_eq!(
+            parse_bgp_query("bgp refresh 10.0.0.2"),
+            Some(BgpQuery::Refresh(Ipv4Addr::new(10, 0, 0, 2)))
+        );
+        // A missing, malformed or extra-token address is rejected.
+        assert!(parse_bgp_query("bgp refresh").is_none());
+        assert!(parse_bgp_query("bgp refresh nonsense").is_none());
+        assert!(parse_bgp_query("bgp refresh 10.0.0.2 extra").is_none());
+        assert!(parse_bgp_query("bgp nonsense").is_none());
     }
 
     #[test]

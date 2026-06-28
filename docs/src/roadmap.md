@@ -41,7 +41,10 @@ implemented to its RFC.
   Confederation Identifier prepended, so the confederation is seen as one AS);
   confederation segments are excluded from AS_PATH length, the OPEN presents the
   Member-AS to confederation peers and the Confederation Identifier to external
-  ones, and a route looping back into our Member-AS is dropped
+  ones, and a route looping back into our Member-AS is dropped — and **route
+  refresh** (RFC 2918): the capability is negotiated in the OPEN, a received
+  ROUTE-REFRESH makes us re-advertise our Adj-RIB-Out to that peer, and `wren bgp
+  refresh <peer>` sends one
 - [x] **Babel** (RFC 8966) — loop-avoiding distance-vector over IPv6 (UDP 6696,
   `ff02::1:6`), with the feasibility condition and Hello/IHU link costing
 - [x] **OSPFv3** (RFC 5340) — OSPF for IPv6, end to end. The `wren-ospfv3` library
@@ -134,7 +137,9 @@ implemented to its RFC.
   (destination, metric, gateway, interface). Each query is answered by the task that
   owns the data (the router loop / the per-protocol task), with no shared access —
   the send/await plumbing is one generic helper, so a new `show <proto>` is a parser
-  plus a render branch. More per-protocol detail views and a richer API are to come.
+  plus a render branch. Beyond `show`, `wren bgp refresh <peer>` sends that peer a
+  ROUTE-REFRESH (RFC 2918). More per-protocol detail views and a richer API are to
+  come.
 - [~] **Startup reconciliation** — on boot the kernel backend reads the routing
   table back (`RTM_GETROUTE` dump) and removes routes a previous wren instance
   left behind that the current config no longer programs, so a restart never
@@ -152,7 +157,7 @@ tracked but not yet scheduled, grouped by area:
   refinements (the RFC 5303 p2p three-way TLV, L1↔L2 route leaking), RIFT, EIGRP;
   IGMP/MLD for multicast group membership.
 - **BGP breadth:** unnumbered (RFC 5549), EVPN (RFC 7432), multipath / add-path
-  (RFC 7911), route-refresh (RFC 2918), graceful restart + long-lived GR, BMP
+  (RFC 7911), graceful restart + long-lived GR, BMP
   (RFC 7854), FlowSpec (RFC 8955), RPKI origin validation, RTC (RFC 4684).
 - **Data-plane & overlays:** MPLS, SR-MPLS, SRv6, VXLAN, BFD (RFC 5880),
   MLAG, anycast gateway, dual-stack.

@@ -118,6 +118,8 @@ pub enum MessageType {
     Notification,
     /// Keep the session alive (§4.4).
     Keepalive,
+    /// Ask the peer to re-advertise its Adj-RIB-Out (RFC 2918).
+    RouteRefresh,
 }
 
 impl MessageType {
@@ -128,6 +130,7 @@ impl MessageType {
             2 => MessageType::Update,
             3 => MessageType::Notification,
             4 => MessageType::Keepalive,
+            5 => MessageType::RouteRefresh,
             _ => return None,
         })
     }
@@ -139,6 +142,7 @@ impl MessageType {
             MessageType::Update => 2,
             MessageType::Notification => 3,
             MessageType::Keepalive => 4,
+            MessageType::RouteRefresh => 5,
         }
     }
 }
@@ -226,11 +230,12 @@ mod tests {
             MessageType::Update,
             MessageType::Notification,
             MessageType::Keepalive,
+            MessageType::RouteRefresh,
         ] {
             assert_eq!(MessageType::from_u8(t.as_u8()), Some(t));
         }
         assert_eq!(MessageType::from_u8(0), None);
-        assert_eq!(MessageType::from_u8(5), None);
+        assert_eq!(MessageType::from_u8(6), None);
     }
 
     #[test]

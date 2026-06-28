@@ -14,6 +14,9 @@ pub const OPT_PARAM_CAPABILITIES: u8 = 2;
 /// The Multiprotocol Extensions capability code (RFC 4760 §8).
 pub const CAP_MULTIPROTOCOL: u8 = 1;
 
+/// The Route Refresh capability code (RFC 2918 §3).
+pub const CAP_ROUTE_REFRESH: u8 = 2;
+
 /// The 4-octet AS Number capability code (RFC 6793 §4).
 pub const CAP_FOUR_OCTET_AS: u8 = 65;
 
@@ -28,6 +31,9 @@ pub enum Capability {
         /// The Subsequent Address Family Identifier (e.g. [`crate::SAFI_UNICAST`]).
         safi: u8,
     },
+    /// The Route Refresh capability (code 2, RFC 2918): the speaker can receive a
+    /// ROUTE-REFRESH message and will re-advertise its Adj-RIB-Out. No value.
+    RouteRefresh,
     /// The 4-octet AS Number capability (code 65): the speaker's real AS.
     FourOctetAs(u32),
     /// A capability this implementation does not model, kept verbatim.
@@ -44,6 +50,7 @@ impl Capability {
     pub fn code(&self) -> u8 {
         match self {
             Capability::Multiprotocol { .. } => CAP_MULTIPROTOCOL,
+            Capability::RouteRefresh => CAP_ROUTE_REFRESH,
             Capability::FourOctetAs(_) => CAP_FOUR_OCTET_AS,
             Capability::Unknown { code, .. } => *code,
         }
@@ -59,6 +66,9 @@ impl Capability {
                 out.extend_from_slice(&afi.to_be_bytes());
                 out.push(0);
                 out.push(*safi);
+            }
+            Capability::RouteRefresh => {
+                out.push(0); // no value
             }
             Capability::FourOctetAs(asn) => {
                 out.push(4);
@@ -90,6 +100,7 @@ impl Capability {
                 // value[2] is Reserved.
                 safi: value[3],
             },
+            CAP_ROUTE_REFRESH if value.is_empty() => Capability::RouteRefresh,
             CAP_FOUR_OCTET_AS if value.len() == 4 => {
                 Capability::FourOctetAs(u32::from_be_bytes([value[0], value[1], value[2], value[3]]))
             }
@@ -180,6 +191,17 @@ mod tests {
         assert_eq!(opt[2], CAP_MULTIPROTOCOL);
         assert_eq!(opt[3], 4);
         assert_eq!(&opt[4..8], &[0x00, 0x02, 0x00, 0x01]);
+        assert_eq!(parse_optional_parameters(&opt), caps);
+    }
+
+    #[test]
+    fn route_refresh_capability_roundtrips() {
+        let caps = vec![Capability::RouteRefresh];
+        let opt = encode_optional_parameters(&caps);
+        // type 2 (capabilities param), then [cap 2 (route-refresh), len 0].
+        assert_eq!(opt[0], OPT_PARAM_CAPABILITIES);
+        assert_eq!(opt[2], CAP_ROUTE_REFRESH);
+        assert_eq!(opt[3], 0);
         assert_eq!(parse_optional_parameters(&opt), caps);
     }
 

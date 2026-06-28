@@ -54,6 +54,8 @@ impl Open {
                     afi: crate::AFI_IPV6,
                     safi: crate::SAFI_UNICAST,
                 },
+                // We honour a received ROUTE-REFRESH by re-advertising (RFC 2918).
+                Capability::RouteRefresh,
             ],
         }
     }
@@ -83,6 +85,12 @@ impl Open {
         self.capabilities.iter().any(|c| {
             matches!(c, Capability::Multiprotocol { afi: a, safi: s } if *a == afi && *s == safi)
         })
+    }
+
+    /// Whether this OPEN advertised the Route Refresh capability (RFC 2918 §3) —
+    /// i.e. the peer will honour a ROUTE-REFRESH we send by re-advertising.
+    pub fn supports_route_refresh(&self) -> bool {
+        self.capabilities.iter().any(|c| matches!(c, Capability::RouteRefresh))
     }
 }
 
@@ -120,6 +128,14 @@ pub enum Message {
     Notification(Notification),
     /// A KEEPALIVE message (§4.4) — header only.
     Keepalive,
+    /// A ROUTE-REFRESH message (RFC 2918): ask the peer to re-advertise its
+    /// Adj-RIB-Out for one `(AFI, SAFI)` address family.
+    RouteRefresh {
+        /// The Address Family Identifier (e.g. [`crate::AFI_IPV4`]).
+        afi: u16,
+        /// The Subsequent Address Family Identifier (e.g. [`crate::SAFI_UNICAST`]).
+        safi: u8,
+    },
 }
 
 /// Why a BGP message could not be decoded.
@@ -131,7 +147,7 @@ pub enum DecodeError {
     BadMarker,
     /// The length field disagreed with the buffer, or is out of range.
     BadLength { stated: u16, actual: usize },
-    /// The Type field held a value outside 1–4.
+    /// The Type field held a value outside 1–5.
     BadType(u8),
     /// The OPEN version was not [`VERSION`].
     BadVersion(u8),
@@ -164,6 +180,7 @@ impl Message {
             Message::Update(_) => MessageType::Update,
             Message::Notification(_) => MessageType::Notification,
             Message::Keepalive => MessageType::Keepalive,
+            Message::RouteRefresh { .. } => MessageType::RouteRefresh,
         }
     }
 
@@ -180,6 +197,12 @@ impl Message {
             Message::Update(u) => encode_update(u, &mut out, four_octet),
             Message::Notification(n) => encode_notification(n, &mut out),
             Message::Keepalive => {}
+            // ROUTE-REFRESH body: AFI(2) · Reserved(1) · SAFI(1) (RFC 2918 §3).
+            Message::RouteRefresh { afi, safi } => {
+                out.extend_from_slice(&afi.to_be_bytes());
+                out.push(0);
+                out.push(*safi);
+            }
         }
         let len = out.len() as u16;
         out[16..18].copy_from_slice(&len.to_be_bytes());
@@ -213,6 +236,16 @@ impl Message {
                     return Err(DecodeError::Malformed);
                 }
                 Message::Keepalive
+            }
+            MessageType::RouteRefresh => {
+                if body.len() != 4 {
+                    return Err(DecodeError::Malformed);
+                }
+                Message::RouteRefresh {
+                    afi: u16::from_be_bytes([body[0], body[1]]),
+                    // body[2] is Reserved.
+                    safi: body[3],
+                }
             }
         })
     }
@@ -377,6 +410,28 @@ mod tests {
         let bytes = Message::Keepalive.encode(true);
         assert_eq!(bytes.len(), HEADER_LEN);
         roundtrip(Message::Keepalive);
+    }
+
+    #[test]
+    fn route_refresh_roundtrips() {
+        use crate::{AFI_IPV4, AFI_IPV6, SAFI_UNICAST};
+        // Header (19) + AFI(2) + Reserved(1) + SAFI(1) = 23 octets, type 5.
+        let bytes = Message::RouteRefresh { afi: AFI_IPV4, safi: SAFI_UNICAST }.encode(true);
+        assert_eq!(bytes.len(), HEADER_LEN + 4);
+        assert_eq!(bytes[18], 5); // ROUTE-REFRESH type code
+        roundtrip(Message::RouteRefresh { afi: AFI_IPV4, safi: SAFI_UNICAST });
+        roundtrip(Message::RouteRefresh { afi: AFI_IPV6, safi: SAFI_UNICAST });
+        // A wrong-length body is rejected.
+        let mut short = Message::RouteRefresh { afi: AFI_IPV4, safi: SAFI_UNICAST }.encode(true);
+        short.truncate(HEADER_LEN + 3);
+        short[17] = (HEADER_LEN + 3) as u8;
+        assert!(matches!(Message::decode(&short, true), Err(DecodeError::Malformed)));
+    }
+
+    #[test]
+    fn open_advertises_route_refresh_capability() {
+        let open = Open::new(VERSION, 65001, DEFAULT_HOLD_TIME, ip([10, 0, 0, 1]));
+        assert!(open.supports_route_refresh());
     }
 
     #[test]

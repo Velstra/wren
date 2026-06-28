@@ -471,6 +471,34 @@ connection, so a closing loser can never evict the surviving session.
 both dial and accept converge to a single stable session and exchange routes,
 without the flap an unresolved collision would cause.
 
+## Route refresh (RFC 2918)
+
+Without route refresh, re-applying an inbound policy means bouncing the session (a
+hard clear) — disruptive. The **Route Refresh** capability lets a speaker instead
+ask a peer to **re-send its Adj-RIB-Out**, so the receiver can re-run its import
+policy against a fresh copy of the routes, with no flap.
+
+Wren advertises the capability (code 2) in every OPEN, so a peer may send us a
+ROUTE-REFRESH at any time while Established. On receiving one we re-advertise our
+whole Adj-RIB-Out to that peer — the originated networks plus the Loc-RIB best
+paths, with the usual propagation rules re-applied — and bump a per-neighbour
+counter shown by `show bgp neighbors`. To drive the other direction, ask a peer to
+re-send to us with:
+
+```console
+$ wren bgp refresh 10.0.0.2
+route refresh sent to 10.0.0.2
+```
+
+One ROUTE-REFRESH is sent per negotiated address family (IPv4 unicast, and IPv6
+unicast when the Multiprotocol capability was negotiated). The session stays
+Established throughout — that is the whole point over a hard clear.
+
+`scripts/bgp-route-refresh-smoke.sh` exercises this live (rootless): one peer
+issues `bgp refresh`, the other honours it (its `show bgp neighbors` shows the
+refresh counter rise) and the learned route stays installed across the exchange —
+the session never flaps.
+
 ## Confederations (RFC 5065)
 
 A confederation lets a large AS be split into several smaller **Member-ASes** while
