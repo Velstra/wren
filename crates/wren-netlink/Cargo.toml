@@ -1,0 +1,16 @@
+[package]
+name = "wren-netlink"
+description = "Wren routing daemon — Linux netlink (rtnetlink) FIB backend."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+# The one platform crate that touches the kernel directly. Hand-rolled over a raw
+# AF_NETLINK socket via libc — no async runtime, so it satisfies the synchronous
+# `wren_core::Fib` trait, and no heavy netlink dependency tree.
+[dependencies]
+wren-core.workspace = true
+libc = "0.2"
