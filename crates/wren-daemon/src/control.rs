@@ -109,7 +109,7 @@ async fn handle_conn(stream: UnixStream, channels: Channels) -> Result<()> {
             "error: unknown command {line:?}\n\
              usage: show routes [protocol] | show bgp [routes|neighbors] | \
              show ospf [neighbors|interfaces] | show isis [neighbors|interfaces] | \
-             show babel [neighbors]\n"
+             show babel [neighbors|routes]\n"
         )
     };
 
@@ -256,7 +256,7 @@ pub fn parse_isis_query(line: &str) -> Option<IsisQuery> {
     Some(query)
 }
 
-/// Parse a `show babel [neighbors]` command into a [`BabelQuery`]. A bare
+/// Parse a `show babel [neighbors|routes]` command into a [`BabelQuery`]. A bare
 /// `show babel` defaults to the neighbours view. Returns `None` for anything else.
 pub fn parse_babel_query(line: &str) -> Option<BabelQuery> {
     let mut tokens = line.split_whitespace();
@@ -265,6 +265,7 @@ pub fn parse_babel_query(line: &str) -> Option<BabelQuery> {
     }
     let query = match tokens.next() {
         None | Some("neighbors") | Some("neighbours") => BabelQuery::Neighbors,
+        Some("routes") | Some("route") => BabelQuery::Routes,
         Some(_) => return None,
     };
     // A trailing extra token is a malformed command.
@@ -383,6 +384,7 @@ mod tests {
         assert_eq!(parse_babel_query("show babel"), Some(BabelQuery::Neighbors));
         assert_eq!(parse_babel_query("show babel neighbors"), Some(BabelQuery::Neighbors));
         assert_eq!(parse_babel_query("show babel neighbours"), Some(BabelQuery::Neighbors));
+        assert_eq!(parse_babel_query("show babel routes"), Some(BabelQuery::Routes));
     }
 
     #[test]

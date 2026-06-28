@@ -9,9 +9,11 @@
 # netns-root inside `unshare -Urn`. Per-daemon control sockets live under a temp
 # dir (Unix sockets, not the network).
 #
-# Topology: A <--Babel--> B over a veth. Once Hellos + IHUs have been exchanged,
-# A's neighbour table holds B's link-local with a finite link cost, and
-# `wren show babel neighbors` on A must report it.
+# Topology: A <--Babel--> B over a veth. B redistributes a static into Babel.
+# Once Hellos + IHUs have been exchanged, A's neighbour table holds B's link-local
+# with a finite link cost, and A has learned B's route, so:
+#   * `wren show babel neighbors` on A reports the neighbour;
+#   * `wren show babel routes`    on A reports the learned route.
 #
 # Usage:  bash scripts/babel-show-smoke.sh
 set -euo pipefail
@@ -36,9 +38,13 @@ EOF
 
 cat >"$WORK/b.toml" <<EOF
 router-id = "10.0.0.2"
+[[static]]
+prefix = "2001:db8:99::/64"
+via    = "2001:db8::1"
 [babel]
 enabled = true
 interfaces = ["veth1"]
+redistribute = ["static"]
 EOF
 
 export WREN WORK
@@ -63,11 +69,16 @@ unshare -Urn bash -c '
 
   echo "=== wren show babel neighbors (on A) ==="
   "$WREN" --socket "$WORK/a.sock" show babel neighbors 2>&1 | tee "$WORK/nbr.out" || true
+  echo "=== wren show babel routes (on A) ==="
+  "$WREN" --socket "$WORK/a.sock" show babel routes 2>&1 | tee "$WORK/rt.out" || true
 
   ok=1
   # B is learned by its link-local source address, with a finite (numeric) cost.
   grep -Eq "fe80.* rxcost [0-9]+ cost [0-9]+" "$WORK/nbr.out" \
     || { echo "FAIL: B not shown as a babel neighbour with a finite cost on A"; ok=0; }
+  # A learned B's redistributed route, via B's link-local, with a finite metric.
+  grep -Eq "2001:db8:99::/64 via fe80.* metric [0-9]+" "$WORK/rt.out" \
+    || { echo "FAIL: A did not learn 2001:db8:99::/64 in show babel routes"; ok=0; }
 
   if [[ $ok -ne 1 ]]; then echo "--- A log ---"; cat "$WORK/a.log"; echo "--- B log ---"; cat "$WORK/b.log"; fi
   pkill -f "$WORK/a.sock" 2>/dev/null || true

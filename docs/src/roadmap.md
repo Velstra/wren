@@ -107,8 +107,8 @@ implemented to its RFC.
   ospf [neighbors|interfaces]` renders the OSPF adjacencies (Router ID, address,
   state) and interfaces (area, state, elected DR/BDR), and `wren show isis
   [neighbors|interfaces]` renders the IS-IS adjacencies (System ID, SNPA, per-level
-  state) and circuits (type, level, elected DIS), and `wren show babel neighbors`
-  renders the Babel neighbours and their Hello/IHU link costs. Each query is
+  state) and circuits (type, level, elected DIS), and `wren show babel [neighbors|routes]`
+  renders the Babel neighbours (Hello/IHU link costs) and selected routes. Each query is
   answered by the task that owns the data (the router loop / the BGP / OSPF / IS-IS
   / Babel task), with no shared access. More commands (other per-protocol
   neighbour/interface views) and a richer API are to come.

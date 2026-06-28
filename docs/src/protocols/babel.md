@@ -125,21 +125,25 @@ routers learn and install each other's network:
 
 ## Inspecting it
 
-The daemon answers `wren show babel neighbors` over its
+The daemon answers two Babel `show` commands over its
 [control socket](../configuration.md), rendered by the Babel task itself out of
-its live neighbour table — no shared access, like the other protocols' `show`
-commands:
+its live state — no shared access, like the other protocols' `show` commands:
 
 ```console
 $ wren show babel neighbors
 fe80::ee:ccff:fe22:1182 rxcost 256 cost 256
+
+$ wren show babel routes
+2001:db8:99::/64 via fe80::ee:ccff:fe22:1182 metric 256
 ```
 
-Each line is a neighbour (by its link-local address), the **rxcost** it reported
-to us in its IHU (§3.4.3), and the **cost** we use towards it (`inf` if the link
-is currently unusable). `scripts/babel-show-smoke.sh` exercises it live (rootless):
-two routers exchange Hellos and IHUs, and the query reports the neighbour with a
-finite cost.
+`show babel neighbors` lists each neighbour (by its link-local address), the
+**rxcost** it reported to us in its IHU (§3.4.3), and the **cost** we use towards
+it (`inf` if the link is currently unusable). `show babel routes` lists the
+**selected** routes (the Babel RIB) with their next hop and metric.
+`scripts/babel-show-smoke.sh` exercises both live (rootless): two routers exchange
+Hellos and IHUs, one redistributes a route, and the queries report the neighbour
+and the learned route.
 
 ## Not yet implemented
 

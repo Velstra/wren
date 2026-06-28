@@ -234,6 +234,15 @@ impl RouteTable {
         self.selected.get(prefix).map(|(_, nh, m)| (*nh, *m))
     }
 
+    /// Every prefix with a selected route, as `(prefix, next_hop, metric)`, sorted
+    /// by prefix — for the operational `show babel routes` view.
+    pub fn selected_routes(&self) -> Vec<(Prefix, IpAddr, u16)> {
+        self.selected
+            .iter()
+            .map(|(p, (_, nh, m))| (*p, *nh, *m))
+            .collect()
+    }
+
     /// The number of prefixes with a selected route.
     pub fn len(&self) -> usize {
         self.selected.len()

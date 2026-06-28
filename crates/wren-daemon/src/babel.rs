@@ -140,6 +140,8 @@ struct State {
 pub enum BabelQuery {
     /// The neighbours and their link costs.
     Neighbors,
+    /// The selected routes (the Babel RIB).
+    Routes,
 }
 
 /// A control-socket query plus the channel to answer it on.
@@ -174,6 +176,23 @@ pub fn render_babel_neighbors(neighbors: &[BabelNeighborInfo]) -> String {
             n.cost.to_string()
         };
         let _ = writeln!(out, "{} rxcost {} cost {}", n.addr, n.rxcost, cost);
+    }
+    out
+}
+
+/// Render the Babel selected routes, one per line (à la `show babel route`).
+pub fn render_babel_routes(routes: &[(Prefix, IpAddr, u16)]) -> String {
+    if routes.is_empty() {
+        return "no babel routes\n".to_string();
+    }
+    let mut out = String::new();
+    for (prefix, next_hop, metric) in routes {
+        let m = if *metric == METRIC_INFINITY {
+            "inf".to_string()
+        } else {
+            metric.to_string()
+        };
+        let _ = writeln!(out, "{prefix} via {next_hop} metric {m}");
     }
     out
 }
@@ -312,6 +331,7 @@ pub async fn run(
             Some(req) = queries.recv() => {
                 let answer = match req.query {
                     BabelQuery::Neighbors => render_babel_neighbors(&neighbor_infos(&state.neighbours)),
+                    BabelQuery::Routes => render_babel_routes(&state.table.selected_routes()),
                 };
                 let _ = req.respond.send(answer);
             }
