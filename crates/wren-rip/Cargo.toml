@@ -1,0 +1,14 @@
+[package]
+name = "wren-rip"
+description = "Wren routing daemon — RIPv2 (RFC 2453) message codec and route conversion."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+# Only the core; the wire codec is dependency-free `std`. The async socket loop
+# (a future module) will add tokio behind the daemon, not here.
+[dependencies]
+wren-core.workspace = true
