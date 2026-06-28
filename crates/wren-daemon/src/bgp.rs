@@ -188,6 +188,9 @@ enum PeerMsg {
         from_ebgp: bool,
         /// Whether the sending peer is a route-reflector client (RFC 4456).
         from_client: bool,
+        /// The local interface this session rides, for pinning a received IPv6
+        /// link-local next hop to it (RFC 2545); `None` if it couldn't be resolved.
+        ingress_iface: Option<String>,
         update: Update,
     },
 }
@@ -486,6 +489,7 @@ pub async fn run(
                 peer_id,
                 from_ebgp,
                 from_client,
+                ingress_iface,
                 update,
             } => {
                 let facts = PeerFacts { addr: peer, as_: peer_as, id: peer_id, from_ebgp, from_client };
@@ -507,7 +511,7 @@ pub async fn run(
                 if !update.nlri.is_empty() {
                     match base_next_hop(&update) {
                         Some(nh) => {
-                            let path = build_path(&update, IpAddr::V4(nh), facts);
+                            let path = build_path(&update, IpAddr::V4(nh), None, facts);
                             for p in &update.nlri {
                                 if let Some(ev) = rib.update(peer, *p, path.clone()) {
                                     apply_event(ev, &updates, &sessions).await;
@@ -518,8 +522,10 @@ pub async fn run(
                     }
                 }
                 // IPv6 reachability: MP_REACH_NLRI carries its own next hop (RFC 4760).
-                if let Some((nh6, nlri)) = mp_reach_v6(&update) {
-                    let path = build_path(&update, IpAddr::V6(nh6), facts);
+                // A link-local next hop (RFC 2545) is pinned to the ingress interface.
+                if let Some((nh6, nlri, is_link_local)) = mp_reach_v6(&update) {
+                    let iface = if is_link_local { ingress_iface.clone() } else { None };
+                    let path = build_path(&update, IpAddr::V6(nh6), iface, facts);
                     for p in nlri {
                         if let Some(ev) = rib.update(peer, *p, path.clone()) {
                             apply_event(ev, &updates, &sessions).await;
@@ -651,7 +657,12 @@ struct PeerFacts {
 
 /// Build a [`Path`] from a received UPDATE's attributes with the given `next_hop`
 /// (the base-NLRI IPv4 NEXT_HOP, or the IPv6 next hop pulled from MP_REACH_NLRI).
-fn build_path(update: &Update, next_hop: IpAddr, peer: PeerFacts) -> Path {
+fn build_path(
+    update: &Update,
+    next_hop: IpAddr,
+    next_hop_iface: Option<String>,
+    peer: PeerFacts,
+) -> Path {
     let mut origin = Origin::Incomplete;
     let mut as_path = Vec::new();
     let mut as4_path = None;
@@ -686,6 +697,7 @@ fn build_path(update: &Update, next_hop: IpAddr, peer: PeerFacts) -> Path {
         origin,
         as_path,
         next_hop,
+        next_hop_iface,
         local_pref,
         med,
         from_ebgp: peer.from_ebgp,
@@ -724,17 +736,19 @@ fn base_next_hop(update: &Update) -> Option<Ipv4Addr> {
     })
 }
 
-/// The MP_REACH_NLRI (IPv6 unicast) of an UPDATE: its 16-octet global next hop and
-/// reachable prefixes (RFC 4760 §3 / RFC 2545). A 32-octet next hop carries a
-/// link-local after the global; we use the global for the kernel route.
-fn mp_reach_v6(update: &Update) -> Option<(Ipv6Addr, &[Prefix])> {
+/// The MP_REACH_NLRI (IPv6 unicast) of an UPDATE: the next hop to install, the
+/// reachable prefixes, and whether the next hop is a link-local (RFC 4760 §3 /
+/// RFC 2545 §3). A 32-octet next hop carries the speaker's link-local after the
+/// global; we forward over that link-local (pinned to the ingress interface),
+/// which is what the peer intended on the shared link. Otherwise the global.
+fn mp_reach_v6(update: &Update) -> Option<(Ipv6Addr, &[Prefix], bool)> {
     update.attributes.iter().find_map(|a| match a {
-        PathAttribute::MpReachNlri { afi, next_hop, nlri, .. }
-            if *afi == AFI_IPV6 && next_hop.len() >= 16 =>
-        {
-            let mut g = [0u8; 16];
-            g.copy_from_slice(&next_hop[..16]);
-            Some((Ipv6Addr::from(g), nlri.as_slice()))
+        PathAttribute::MpReachNlri { afi, next_hop, nlri, .. } if *afi == AFI_IPV6 => {
+            let (global, link_local) = wren_bgp::decode_v6_next_hop(next_hop)?;
+            match link_local {
+                Some(ll) => Some((ll, nlri.as_slice(), true)),
+                None => Some((global, nlri.as_slice(), false)),
+            }
         }
         _ => None,
     })
@@ -864,6 +878,8 @@ async fn drive_session(
         IpAddr::V4(a) => a,
         IpAddr::V6(_) => local.router_id,
     };
+    // Resolve the interface facing this peer for RFC 2545 link-local next hops.
+    let link = crate::connected::resolve_link(local_ip);
     let (mut rd, wr) = stream.into_split();
 
     // The central task pushes origination commands (advertise/withdraw) down this
@@ -879,6 +895,7 @@ async fn drive_session(
         cmd_tx,
         from_ebgp: peer.remote_as != local.local_as,
         local_ip,
+        link,
         neg_hold: local.hold_time,
         keepalive_int: (local.hold_time / 3).max(1),
         peer_id: peer.addr,
@@ -935,6 +952,7 @@ async fn drive_session(
                                 peer_id: sess.peer_id,
                                 from_ebgp: sess.from_ebgp,
                                 from_client: sess.peer.rr_client,
+                                ingress_iface: sess.link.as_ref().map(|(n, _)| n.clone()),
                                 update: u.clone(),
                             }).await;
                         }
@@ -1016,6 +1034,11 @@ struct Session<'a> {
     cmd_tx: mpsc::Sender<SessionCmd>,
     from_ebgp: bool,
     local_ip: Ipv4Addr,
+    /// The local interface this session rides and its IPv6 link-local, resolved
+    /// from `local_ip` (RFC 2545): the link-local we advertise as the second
+    /// next-hop address toward a directly-connected peer, and the interface we pin
+    /// a received link-local next hop to. `None` if it couldn't be resolved.
+    link: Option<(String, Ipv6Addr)>,
     neg_hold: u16,
     keepalive_int: u16,
     peer_id: Ipv4Addr,
@@ -1107,6 +1130,20 @@ impl Session<'_> {
         }
     }
 
+    /// Build the MP_REACH next-hop field for an IPv6 advertisement with global next
+    /// hop `global`. When we set next-hop-self (`next_hop_self`) on a directly
+    /// connected link — we resolved a link-local for the egress interface — we
+    /// append it, a 32-octet next hop per RFC 2545 §3, so a peer on the shared
+    /// subnet forwards over our link-local. Otherwise just the 16-octet global.
+    fn v6_next_hop_field(&self, global: Ipv6Addr, next_hop_self: bool) -> Vec<u8> {
+        let link_local = if next_hop_self {
+            self.link.as_ref().map(|(_, ll)| *ll)
+        } else {
+            None
+        };
+        wren_bgp::encode_v6_next_hop(global, link_local)
+    }
+
     /// Advertise originated routes to this peer, building the per-peer attributes
     /// (AS_PATH, next-hop-self, COMMUNITIES, LARGE_COMMUNITY). Routes are grouped by
     /// their full tag set so each UPDATE carries a single COMMUNITIES /
@@ -1181,7 +1218,8 @@ impl Session<'_> {
                         attributes.push(PathAttribute::MpReachNlri {
                             afi: AFI_IPV6,
                             safi: SAFI_UNICAST,
-                            next_hop: nh6.octets().to_vec(),
+                            // We originate, so this is always next-hop-self.
+                            next_hop: self.v6_next_hop_field(nh6, true),
                             nlri: v6,
                         });
                         self.send(&Message::Update(Update {
@@ -1280,7 +1318,9 @@ impl Session<'_> {
                 attributes.push(PathAttribute::MpReachNlri {
                     afi: AFI_IPV6,
                     safi: SAFI_UNICAST,
-                    next_hop: nh6.octets().to_vec(),
+                    // Toward eBGP we set next-hop-self (so append our link-local on a
+                    // shared link); toward iBGP the global next hop is preserved.
+                    next_hop: self.v6_next_hop_field(nh6, self.from_ebgp),
                     nlri: vec![r.prefix],
                 });
                 self.send(&Message::Update(Update {
@@ -1388,6 +1428,7 @@ mod tests {
             origin: Origin::Igp,
             as_path: vec![AsPathSegment::Sequence(vec![65001, 196_618])],
             next_hop: IpAddr::V4(ip([192, 0, 2, 1])),
+            next_hop_iface: None,
             local_pref: 100,
             med: 0,
             from_ebgp: true,
@@ -1435,6 +1476,7 @@ mod tests {
             origin: Origin::Igp,
             as_path: vec![AsPathSegment::Sequence(vec![65001])],
             next_hop: IpAddr::V4(ip(from_peer)),
+            next_hop_iface: None,
             local_pref: 100,
             med: 0,
             from_ebgp,
@@ -1632,6 +1674,7 @@ mod tests {
             origin: Origin::Igp,
             as_path: vec![AsPathSegment::Sequence(vec![65002])],
             next_hop: IpAddr::V6("2001:db8::2".parse().unwrap()),
+            next_hop_iface: None,
             local_pref: 100,
             med: 0,
             from_ebgp: true,

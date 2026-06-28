@@ -16,8 +16,10 @@ implemented to its RFC.
   statics as type-5 LSAs)
 - [x] **BGP-4** (RFC 4271) — IPv4 **and IPv6** unicast (the latter via **MP-BGP**,
   RFC 4760: the Multiprotocol capability negotiated in the OPEN, IPv6 reachability
-  in MP_REACH_NLRI with a next-hop-self and withdrawals in MP_UNREACH_NLRI),
-  eBGP and iBGP, over TCP 179, with
+  in MP_REACH_NLRI with a next-hop-self and withdrawals in MP_UNREACH_NLRI; toward
+  a directly-connected peer the next hop is a 32-octet global+link-local pair
+  (RFC 2545), and a received link-local next hop is installed pinned to its
+  interface), eBGP and iBGP, over TCP 179, with
   **4-octet ASNs** (RFC 6793): the 4-octet AS Number capability is negotiated in
   the OPEN, AS_PATH is 4-octet between capable speakers, and AS4_PATH /
   AS4_AGGREGATOR (+ the §4.2.3 reconstruction) carry the true ASNs through legacy
@@ -72,9 +74,7 @@ implemented to its RFC.
 
 - OSPF: stub / NSSA areas, type-4 ASBR-summaries across areas, explicit type-5
   forwarding-address resolution, authentication
-- BGP: connection-collision detection (§6.8), MP-BGP link-local next hops
-  (RFC 2545 — IPv6 routing over a link-local next hop with interface pinning,
-  beyond the global next hop carried today), confederations
+- BGP: connection-collision detection (§6.8), confederations
 - Babel: ETX costing for lossy links, Route/Seqno-Request handling, prefix
   compression on send, IPv4 routes over the IPv6 transport (`RTA_VIA` next hops),
   source-specific routing

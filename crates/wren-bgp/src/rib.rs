@@ -164,6 +164,7 @@ mod tests {
             origin: Origin::Igp,
             as_path: vec![AsPathSegment::Sequence(vec![65001])],
             next_hop: std::net::IpAddr::V4(ip(peer)),
+            next_hop_iface: None,
             local_pref,
             med: 0,
             from_ebgp: true,

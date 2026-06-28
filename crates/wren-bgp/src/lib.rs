@@ -51,7 +51,10 @@ pub mod ext_community;
 pub mod fsm;
 pub mod large_community;
 pub mod message;
+pub mod nexthop;
 pub mod rib;
+
+pub use nexthop::{decode_v6_next_hop, encode_v6_next_hop};
 
 // ===========================================================================
 // Protocol constants (RFC 4271)

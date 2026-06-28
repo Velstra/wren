@@ -31,6 +31,11 @@ pub struct Path {
     /// The NEXT_HOP to reach the destination — IPv4 (the base-NLRI NEXT_HOP
     /// attribute) or IPv6 (the MP_REACH_NLRI next hop, RFC 4760).
     pub next_hop: IpAddr,
+    /// The interface the next hop must be reached over, when it is an IPv6
+    /// link-local carried in a 32-octet MP_REACH next hop (RFC 2545 §3). A
+    /// link-local is not globally unique, so the kernel route must pin it to the
+    /// interface the route arrived on; `None` for ordinary global next hops.
+    pub next_hop_iface: Option<String>,
     /// The (assigned) LOCAL_PREF — higher is preferred.
     pub local_pref: u32,
     /// The MULTI_EXIT_DISC — lower is preferred, compared only within one peer AS.
@@ -83,12 +88,13 @@ impl Path {
     /// AS_PATH length, so the RIB's own tie-break stays sensible if it ever sees
     /// more than one BGP candidate for a prefix.
     pub fn to_route(&self, prefix: Prefix) -> Route {
-        Route::new(
-            prefix,
-            Protocol::Bgp,
-            vec![NextHop::via(self.next_hop)],
-            self.as_path_len() as u32,
-        )
+        // A link-local next hop (RFC 2545) must be pinned to its interface; an
+        // ordinary global/IPv4 next hop is reached by the usual recursive lookup.
+        let nexthop = match &self.next_hop_iface {
+            Some(dev) => NextHop::via_dev(self.next_hop, dev.clone()),
+            None => NextHop::via(self.next_hop),
+        };
+        Route::new(prefix, Protocol::Bgp, vec![nexthop], self.as_path_len() as u32)
     }
 }
 
@@ -160,6 +166,7 @@ mod tests {
             origin: Origin::Igp,
             as_path: vec![AsPathSegment::Sequence(vec![65001, 65002])],
             next_hop: IpAddr::V4(ip([192, 0, 2, 1])),
+            next_hop_iface: None,
             local_pref: DEFAULT_LOCAL_PREF,
             med: 0,
             from_ebgp: true,
@@ -278,5 +285,21 @@ mod tests {
         assert_eq!(route.protocol, Protocol::Bgp);
         assert_eq!(route.metric, 2); // AS_PATH length
         assert_eq!(route.nexthops, vec![NextHop::via(IpAddr::V4(ip([192, 0, 2, 1])))]);
+    }
+
+    #[test]
+    fn to_route_pins_a_link_local_next_hop_to_its_interface() {
+        // RFC 2545: a link-local next hop is installed via that address pinned to
+        // the interface the route arrived on.
+        let p = Path {
+            next_hop: IpAddr::V6("fe80::1".parse().unwrap()),
+            next_hop_iface: Some("eth0".into()),
+            ..base()
+        };
+        let route = p.to_route("2001:db8:99::/64".parse().unwrap());
+        assert_eq!(
+            route.nexthops,
+            vec![NextHop::via_dev(IpAddr::V6("fe80::1".parse().unwrap()), "eth0")]
+        );
     }
 }

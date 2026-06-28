@@ -146,12 +146,27 @@ remote-as = 65002
 The same `next-hop6` applies to any IPv6 route pulled in by `redistribute` — BGP
 is now dual-stack, so an IPv6 static or IGP route is re-originated over MP-BGP just
 as an IPv4 one is. The peer installs the learned prefix `proto bgp` via the
-advertised next hop. (Wren carries a **global** next hop today; an IPv6 route over a
-**link-local** next hop, which needs RFC 2545 interface pinning, is on the roadmap.)
+advertised next hop.
+
+### Link-local next hops (RFC 2545)
+
+The MP_REACH next hop is normally just the 16-octet **global** address from
+`next-hop6`. When a route is advertised to a **directly-connected** peer (the
+session rides an interface for which Wren has an IPv6 link-local), Wren appends its
+link-local, sending the 32-octet **global + link-local** next hop RFC 2545 §3
+prescribes. The receiver then forwards over the link-local — which is not globally
+unique, so the route is installed **pinned to the interface** it arrived on
+(`via fe80::… dev <iface>`) rather than via the global. This is what lets two
+routers exchange IPv6 routes without configuring global next-hop addresses that are
+reachable end to end. The interface is resolved from the session's local transport
+address; on a peering with no resolvable link-local, the next hop stays global-only.
 
 A self-contained, rootless live test is in `scripts/bgp-mp-ipv6-smoke.sh`: two
 speakers peer over IPv4 on a veth that also carries IPv6 globals, one originates an
 IPv6 network, and the other learns it and installs it into its kernel IPv6 table.
+`scripts/bgp-linklocal-nexthop-smoke.sh` is the RFC 2545 variant: the receiver
+installs the route via the advertiser's `fe80::` link-local pinned to its veth, not
+via the global next hop.
 
 ## Testing it
 
