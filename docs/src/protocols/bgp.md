@@ -45,7 +45,10 @@ Established`, with the ConnectRetry, Hold and Keepalive timers and clean teardow
 - the Hold and Keepalive timers driving the FSM;
 - originated `network`s advertised on reaching Established;
 - received UPDATEs folded into the shared BGP RIB, whose best-path changes are
-  announced into the kernel RIB as `proto bgp`.
+  announced into the kernel RIB as `proto bgp`;
+- learned best paths **propagated** onward to the other peers (transit), prepending
+  our AS toward eBGP with next-hop-self, applying iBGP split horizon — see
+  [Propagation](#propagation-transit).
 
 A central task owns the BGP RIB and serialises every change; each peer's session
 runs in its own task owning its socket and FSM.
@@ -362,8 +365,31 @@ communities, LOCAL_PREF, MED and origin; `show bgp neighbors` (or `summary`) lis
 each configured peer with its AS and session state. `scripts/bgp-show-smoke.sh`
 exercises both live (rootless).
 
+## Propagation (transit)
+
+Beyond originating its own `network`s and redistributed routes, Wren **propagates**
+the routes it learns: whenever a prefix's Loc-RIB best path appears, changes or is
+withdrawn, the change is re-advertised to the other peers (the Adj-RIB-Out), so a
+speaker peering with several neighbours acts as transit between them. The standard
+rules apply per outgoing peer:
+
+- a route is **never echoed back** to the peer it was learned from;
+- toward an **eBGP** peer the local AS is **prepended** to the AS_PATH and the next
+  hop is set to ourselves (next-hop-self);
+- toward an **iBGP** peer the AS_PATH and next hop are left unchanged and LOCAL_PREF
+  (and MED) are carried;
+- a route learned from an **iBGP** peer is **not** re-advertised to another iBGP
+  peer (the iBGP split-horizon rule — relaxing it is what route reflection, on the
+  roadmap, will add);
+- the well-known communities (`no-export`, `no-advertise`) are honoured per peer.
+
+`scripts/bgp-propagate-smoke.sh` exercises this live (rootless): an eBGP chain
+`A (AS 65001) — B (AS 65002) — C (AS 65003)` where A originates a network, B
+originates nothing, and C learns it via B with the AS_PATH `65002 65001` and
+installs it `proto bgp`. (IPv4 unicast for now; IPv6 propagation is on the roadmap.)
+
 ## Not yet implemented
 
-MP-BGP / IPv6 (RFC 4760), extended / large communities, route reflection and
-connection-collision detection (§6.8). These are tracked in the
-[Roadmap](../roadmap.md).
+**Route reflection** (RFC 4456, so an iBGP-learned route can reach other iBGP
+peers via a reflector), **connection-collision detection** (§6.8), IPv6 route
+propagation, and confederations. These are tracked in the [Roadmap](../roadmap.md).

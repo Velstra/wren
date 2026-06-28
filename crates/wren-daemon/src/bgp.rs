@@ -123,13 +123,31 @@ pub struct OriginRoute {
 }
 
 /// A command from the central task to a per-peer session task: advertise or
-/// withdraw originated routes. The session acts on it only once Established.
+/// withdraw originated routes, or propagate learned Loc-RIB routes onward. The
+/// session acts on it only once Established.
 enum SessionCmd {
     /// Advertise these originated routes (a snapshot on session-up, or an
     /// incremental redistribution change afterwards).
     Advertise(Vec<OriginRoute>),
     /// Withdraw these prefixes (a redistributed source went away).
     Withdraw(Vec<Prefix>),
+    /// Re-advertise these learned Loc-RIB best paths to this peer (the Adj-RIB-Out),
+    /// applying the eBGP / iBGP propagation rules. The session decides per route
+    /// whether and how to send it.
+    Propagate(Vec<PropRoute>),
+    /// Withdraw these learned prefixes whose best path disappeared.
+    WithdrawPropagated(Vec<Prefix>),
+}
+
+/// One learned Loc-RIB route the central task asks a session to propagate. The
+/// session builds the per-peer UPDATE from the carried [`Path`] (its AS_PATH,
+/// next hop, communities, and the peer it was learned from).
+#[derive(Clone)]
+struct PropRoute {
+    /// The destination.
+    prefix: Prefix,
+    /// Its selected best path, as learned.
+    path: Path,
 }
 
 /// One peer's identity as a session task sees it.
@@ -411,6 +429,17 @@ pub async fn run(
                 if !snapshot.is_empty() {
                     let _ = cmd_tx.send(SessionCmd::Advertise(snapshot)).await;
                 }
+                // Also push the current Loc-RIB best paths so the new peer learns
+                // the routes we already have (the session applies the propagation
+                // rules — it drops anything it taught us, and iBGP→iBGP routes).
+                let prop: Vec<PropRoute> = rib
+                    .iter_best()
+                    .filter(|(prefix, _)| prefix.is_ipv4())
+                    .map(|(prefix, path)| PropRoute { prefix: *prefix, path: path.clone() })
+                    .collect();
+                if !prop.is_empty() {
+                    let _ = cmd_tx.send(SessionCmd::Propagate(prop)).await;
+                }
                 sessions.insert(p, cmd_tx);
             }
             PeerMsg::Down(p) => {
@@ -420,7 +449,7 @@ pub async fn run(
                 }
                 sessions.remove(&p);
                 for ev in rib.withdraw_peer(p) {
-                    emit(ev, &updates).await;
+                    apply_event(ev, &updates, &sessions).await;
                 }
             }
             PeerMsg::Update {
@@ -435,7 +464,7 @@ pub async fn run(
                 // (MP_UNREACH_NLRI, RFC 4760 §4).
                 for w in update.withdrawn.iter().chain(mp_unreach_v6(&update)) {
                     if let Some(ev) = rib.withdraw(peer, *w) {
-                        emit(ev, &updates).await;
+                        apply_event(ev, &updates, &sessions).await;
                     }
                 }
                 // IPv4 reachability: base NLRI with the IPv4 NEXT_HOP attribute.
@@ -445,7 +474,7 @@ pub async fn run(
                             let path = build_path(&update, IpAddr::V4(nh), facts);
                             for p in &update.nlri {
                                 if let Some(ev) = rib.update(peer, *p, path.clone()) {
-                                    emit(ev, &updates).await;
+                                    apply_event(ev, &updates, &sessions).await;
                                 }
                             }
                         }
@@ -457,7 +486,7 @@ pub async fn run(
                     let path = build_path(&update, IpAddr::V6(nh6), facts);
                     for p in nlri {
                         if let Some(ev) = rib.update(peer, *p, path.clone()) {
-                            emit(ev, &updates).await;
+                            apply_event(ev, &updates, &sessions).await;
                         }
                     }
                 }
@@ -523,6 +552,43 @@ async fn apply_redistribution(
                     let _ = tx.send(SessionCmd::Withdraw(vec![prefix])).await;
                 }
                 debug!(%prefix, "redistribution withdrawn from BGP");
+            }
+        }
+    }
+}
+
+/// Apply a Loc-RIB change: propagate it to the other BGP peers (the Adj-RIB-Out)
+/// and hand it to the central router (the kernel FIB).
+async fn apply_event(
+    ev: RibEvent,
+    updates: &mpsc::Sender<RouteUpdate>,
+    sessions: &HashMap<Ipv4Addr, mpsc::Sender<SessionCmd>>,
+) {
+    propagate(&ev, sessions).await;
+    emit(ev, updates).await;
+}
+
+/// Re-advertise a Loc-RIB change to every established session (the Adj-RIB-Out
+/// fan-out). This broadcasts unconditionally; each session applies the eBGP/iBGP
+/// propagation rules itself, and the session that taught us the route drops it
+/// (split horizon). IPv4 unicast only for now.
+async fn propagate(ev: &RibEvent, sessions: &HashMap<Ipv4Addr, mpsc::Sender<SessionCmd>>) {
+    match ev {
+        RibEvent::Best { prefix, path } => {
+            if !prefix.is_ipv4() {
+                return;
+            }
+            let pr = PropRoute { prefix: *prefix, path: path.clone() };
+            for tx in sessions.values() {
+                let _ = tx.send(SessionCmd::Propagate(vec![pr.clone()])).await;
+            }
+        }
+        RibEvent::Withdrawn(prefix) => {
+            if !prefix.is_ipv4() {
+                return;
+            }
+            for tx in sessions.values() {
+                let _ = tx.send(SessionCmd::WithdrawPropagated(vec![*prefix])).await;
             }
         }
     }
@@ -633,6 +699,29 @@ fn mp_unreach_v6(update: &Update) -> &[Prefix] {
             _ => None,
         })
         .unwrap_or(&[])
+}
+
+/// Whether a learned `path` should be re-advertised to a peer that is `to_ebgp`
+/// and at address `to_peer` (the Adj-RIB-Out decision): never echo a route back to
+/// the peer it came from, never pass an iBGP-learned route to another iBGP peer
+/// (split horizon, absent route reflection), and honour the well-known communities.
+fn should_propagate(path: &Path, to_ebgp: bool, to_peer: Ipv4Addr) -> bool {
+    if path.peer_addr == to_peer {
+        return false; // don't echo a route back to where we learned it
+    }
+    if !path.from_ebgp && !to_ebgp {
+        return false; // iBGP → iBGP is not re-advertised without route reflection
+    }
+    should_advertise(&path.communities, to_ebgp)
+}
+
+/// Prepend `asn` to the front of an AS_PATH (RFC 4271 §5.1.2): grow the leading
+/// AS_SEQUENCE, or start a new one if the path is empty or begins with an AS_SET.
+fn prepend_as(segs: &mut Vec<AsPathSegment>, asn: u32) {
+    match segs.first_mut() {
+        Some(AsPathSegment::Sequence(v)) => v.insert(0, asn),
+        _ => segs.insert(0, AsPathSegment::Sequence(vec![asn])),
+    }
 }
 
 /// Whether a route carrying `communities` may be advertised to a peer, honouring
@@ -815,6 +904,16 @@ async fn drive_session(
                 }
             }
             Step::Cmd(SessionCmd::Withdraw(prefixes)) => {
+                if sess.established {
+                    sess.withdraw(&prefixes).await?;
+                }
+            }
+            Step::Cmd(SessionCmd::Propagate(routes)) => {
+                if sess.established {
+                    sess.propagate_routes(&routes).await?;
+                }
+            }
+            Step::Cmd(SessionCmd::WithdrawPropagated(prefixes)) => {
                 if sess.established {
                     sess.withdraw(&prefixes).await?;
                 }
@@ -1062,6 +1161,62 @@ impl Session<'_> {
         Ok(())
     }
 
+    /// Re-advertise learned Loc-RIB routes to this peer (the Adj-RIB-Out), applying
+    /// the propagation rules: never echo a route back to the peer it came from,
+    /// never pass an iBGP-learned route to another iBGP peer (split horizon, absent
+    /// route reflection), and honour the NO_EXPORT / NO_ADVERTISE communities.
+    /// IPv4 unicast only for now.
+    async fn propagate_routes(&mut self, routes: &[PropRoute]) -> Result<()> {
+        for r in routes {
+            if !r.prefix.is_ipv4() {
+                continue;
+            }
+            if !should_propagate(&r.path, self.from_ebgp, self.peer.addr) {
+                continue;
+            }
+            let attributes = self.propagated_attrs(&r.path);
+            self.send(&Message::Update(Update {
+                withdrawn: vec![],
+                attributes,
+                nlri: vec![r.prefix],
+            }))
+            .await?;
+        }
+        Ok(())
+    }
+
+    /// Build the path attributes for re-advertising a learned `path` to this peer.
+    fn propagated_attrs(&self, path: &Path) -> Vec<PathAttribute> {
+        let mut attrs = vec![PathAttribute::Origin(path.origin)];
+        let mut as_path = path.as_path.clone();
+        if self.from_ebgp {
+            // eBGP: prepend our AS and set the next hop to ourselves.
+            prepend_as(&mut as_path, self.local.local_as);
+            attrs.push(PathAttribute::AsPath(as_path));
+            attrs.push(PathAttribute::NextHop(self.local_ip));
+        } else {
+            // iBGP: AS_PATH unchanged, the next hop preserved, carry LOCAL_PREF / MED.
+            attrs.push(PathAttribute::AsPath(as_path));
+            attrs.push(PathAttribute::LocalPref(path.local_pref));
+            if let IpAddr::V4(nh) = path.next_hop {
+                attrs.push(PathAttribute::NextHop(nh));
+            }
+            if path.med != 0 {
+                attrs.push(PathAttribute::MultiExitDisc(path.med));
+            }
+        }
+        if !path.communities.is_empty() {
+            attrs.push(PathAttribute::Communities(path.communities.clone()));
+        }
+        if !path.large_communities.is_empty() {
+            attrs.push(PathAttribute::LargeCommunities(path.large_communities.clone()));
+        }
+        if !path.ext_communities.is_empty() {
+            attrs.push(PathAttribute::ExtendedCommunities(path.ext_communities.clone()));
+        }
+        attrs
+    }
+
     /// Frame and write one BGP message at the session's negotiated AS width.
     async fn send(&mut self, msg: &Message) -> Result<()> {
         self.wr
@@ -1152,6 +1307,74 @@ mod tests {
         assert!(out.contains("10.0.0.2 AS 65002 Established"));
         assert!(out.contains("10.0.0.3 AS 4200000000 Idle"));
         assert_eq!(render_bgp_neighbors(&[]), "no bgp neighbors configured\n");
+    }
+
+    fn learned_path(from_ebgp: bool, from_peer: [u8; 4]) -> Path {
+        Path {
+            origin: Origin::Igp,
+            as_path: vec![AsPathSegment::Sequence(vec![65001])],
+            next_hop: IpAddr::V4(ip(from_peer)),
+            local_pref: 100,
+            med: 0,
+            from_ebgp,
+            peer_as: 65001,
+            igp_metric: 0,
+            peer_id: ip(from_peer),
+            peer_addr: ip(from_peer),
+            communities: vec![],
+            large_communities: vec![],
+            ext_communities: vec![],
+        }
+    }
+
+    #[test]
+    fn prepend_as_grows_or_starts_a_sequence() {
+        // Grows an existing leading sequence.
+        let mut p = vec![AsPathSegment::Sequence(vec![65001, 65002])];
+        prepend_as(&mut p, 65000);
+        assert_eq!(p, vec![AsPathSegment::Sequence(vec![65000, 65001, 65002])]);
+
+        // Empty path → a fresh sequence.
+        let mut p = vec![];
+        prepend_as(&mut p, 65000);
+        assert_eq!(p, vec![AsPathSegment::Sequence(vec![65000])]);
+
+        // Leading set → a new sequence is inserted in front of it.
+        let mut p = vec![AsPathSegment::Set(vec![10, 11])];
+        prepend_as(&mut p, 65000);
+        assert_eq!(
+            p,
+            vec![AsPathSegment::Sequence(vec![65000]), AsPathSegment::Set(vec![10, 11])]
+        );
+    }
+
+    #[test]
+    fn propagation_never_echoes_to_the_origin_peer() {
+        let path = learned_path(true, [10, 0, 0, 1]);
+        // To the very peer it came from: suppressed.
+        assert!(!should_propagate(&path, true, ip([10, 0, 0, 1])));
+        // To a different eBGP peer: propagated.
+        assert!(should_propagate(&path, true, ip([10, 0, 0, 2])));
+    }
+
+    #[test]
+    fn propagation_applies_ibgp_split_horizon() {
+        // A route learned from an iBGP peer is not passed to another iBGP peer …
+        let ibgp = learned_path(false, [10, 0, 0, 1]);
+        assert!(!should_propagate(&ibgp, false, ip([10, 0, 0, 2])));
+        // … but is passed on to an eBGP peer.
+        assert!(should_propagate(&ibgp, true, ip([10, 0, 0, 2])));
+        // A route learned from eBGP goes to both iBGP and eBGP peers.
+        let ebgp = learned_path(true, [10, 0, 0, 1]);
+        assert!(should_propagate(&ebgp, false, ip([10, 0, 0, 2])));
+        assert!(should_propagate(&ebgp, true, ip([10, 0, 0, 2])));
+    }
+
+    #[test]
+    fn propagation_honours_no_advertise() {
+        let mut path = learned_path(true, [10, 0, 0, 1]);
+        path.communities = vec![NO_ADVERTISE];
+        assert!(!should_propagate(&path, true, ip([10, 0, 0, 2])));
     }
 
     #[test]
