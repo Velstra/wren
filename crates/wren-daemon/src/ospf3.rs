@@ -27,6 +27,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io;
 use std::mem;
+use std::fmt::Write as _;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV6};
 use std::os::raw::c_void;
 use std::os::unix::io::FromRawFd;
@@ -35,7 +36,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use tokio::net::UdpSocket;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tokio::time::MissedTickBehavior;
 use tracing::{debug, info, warn};
 
@@ -227,7 +228,136 @@ struct Ospf {
 }
 
 /// Run OSPFv3 on the configured interfaces, announcing SPF routes to `updates`.
-pub async fn run(cfg: Ospf3Config, updates: mpsc::Sender<RouteUpdate>) -> Result<()> {
+/// A `show ospf3 …` query, answered by the OSPFv3 task itself out of the state it
+/// owns (its interfaces, their neighbours and the DR election) — no shared access,
+/// the IPv6 sibling of `show ospf`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Ospf3Query {
+    /// The neighbours on every interface, with their adjacency state.
+    Neighbors,
+    /// The OSPFv3 interfaces, with their area, state and elected DR/BDR.
+    Interfaces,
+}
+
+/// A control-socket query plus the channel to answer it on.
+pub struct Ospf3QueryRequest {
+    /// What to report.
+    pub query: Ospf3Query,
+    /// Where to send the rendered answer.
+    pub respond: oneshot::Sender<String>,
+}
+
+/// One neighbour, snapshotted for the (pure) renderer. The neighbour address is an
+/// IPv6 link-local (the next hop neighbours route through), unlike OSPFv2.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct Ospf3NeighborInfo {
+    /// The neighbour's Router ID (still a 32-bit dotted quad in OSPFv3).
+    pub router_id: Ipv4Addr,
+    /// The neighbour's link-local interface address.
+    pub addr: Ipv6Addr,
+    /// The adjacency state.
+    pub state: NeighborState,
+    /// The local interface the neighbour is on.
+    pub iface: String,
+}
+
+/// One OSPFv3 interface, snapshotted for the (pure) renderer.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct Ospf3IfaceInfo {
+    /// The interface name.
+    pub name: String,
+    /// The area it belongs to.
+    pub area: Ipv4Addr,
+    /// Our link-local address on the link.
+    pub link_local: Ipv6Addr,
+    /// The interface state.
+    pub state: InterfaceState,
+    /// The elected Designated Router, by Router ID (`0.0.0.0` = none).
+    pub dr: Ipv4Addr,
+    /// The elected Backup Designated Router, by Router ID (`0.0.0.0` = none).
+    pub bdr: Ipv4Addr,
+    /// This router's priority on the interface.
+    pub priority: u8,
+}
+
+/// The short name of a neighbour state, as shown by `show ospf3 neighbors`.
+fn neighbor_state_name(s: NeighborState) -> &'static str {
+    match s {
+        NeighborState::Down => "Down",
+        NeighborState::Attempt => "Attempt",
+        NeighborState::Init => "Init",
+        NeighborState::TwoWay => "2-Way",
+        NeighborState::ExStart => "ExStart",
+        NeighborState::Exchange => "Exchange",
+        NeighborState::Loading => "Loading",
+        NeighborState::Full => "Full",
+    }
+}
+
+/// The short name of an interface state, as shown by `show ospf3 interfaces`.
+fn iface_state_name(s: InterfaceState) -> &'static str {
+    match s {
+        InterfaceState::Down => "Down",
+        InterfaceState::Loopback => "Loopback",
+        InterfaceState::Waiting => "Waiting",
+        InterfaceState::PointToPoint => "PtP",
+        InterfaceState::DrOther => "DROther",
+        InterfaceState::Backup => "Backup",
+        InterfaceState::Dr => "DR",
+    }
+}
+
+/// Render the OSPFv3 neighbours, one per line (à la `show ipv6 ospf6 neighbor`).
+pub fn render_ospf3_neighbors(neighbors: &[Ospf3NeighborInfo]) -> String {
+    if neighbors.is_empty() {
+        return "no ospf3 neighbors\n".to_string();
+    }
+    let mut out = String::new();
+    for n in neighbors {
+        let _ = writeln!(
+            out,
+            "{} via {} dev {} state {}",
+            n.router_id,
+            n.addr,
+            n.iface,
+            neighbor_state_name(n.state),
+        );
+    }
+    out
+}
+
+/// Render the OSPFv3 interfaces, one per line (à la `show ipv6 ospf6 interface`).
+pub fn render_ospf3_interfaces(ifaces: &[Ospf3IfaceInfo]) -> String {
+    if ifaces.is_empty() {
+        return "no ospf3 interfaces\n".to_string();
+    }
+    let mut out = String::new();
+    for i in ifaces {
+        let _ = write!(
+            out,
+            "{} area {} {} state {} pri {}",
+            i.name,
+            i.area,
+            i.link_local,
+            iface_state_name(i.state),
+            i.priority,
+        );
+        if !i.dr.is_unspecified() {
+            let _ = write!(out, " dr {}", i.dr);
+        }
+        if !i.bdr.is_unspecified() {
+            let _ = write!(out, " bdr {}", i.bdr);
+        }
+        out.push('\n');
+    }
+    out
+}
+
+pub async fn run(
+    cfg: Ospf3Config,
+    updates: mpsc::Sender<RouteUpdate>,
+    mut queries: mpsc::Receiver<Ospf3QueryRequest>,
+) -> Result<()> {
     let mut ifaces = Vec::new();
     let mut areas: BTreeMap<Ipv4Addr, Area> = BTreeMap::new();
     for ic in &cfg.interfaces {
@@ -316,9 +446,50 @@ pub async fn run(cfg: Ospf3Config, updates: mpsc::Sender<RouteUpdate>) -> Result
                 ospf.fire_wait_timers(now).await;
                 ospf.retransmit_init_dds().await;
             }
+            Some(req) = queries.recv() => {
+                let resp = match req.query {
+                    Ospf3Query::Neighbors => render_ospf3_neighbors(&ospf.neighbor_infos()),
+                    Ospf3Query::Interfaces => render_ospf3_interfaces(&ospf.iface_infos()),
+                };
+                let _ = req.respond.send(resp);
+            }
         }
     }
     Ok(())
+}
+
+impl Ospf {
+    /// Snapshot every interface's neighbours for `show ospf3 neighbors`.
+    fn neighbor_infos(&self) -> Vec<Ospf3NeighborInfo> {
+        let mut out = Vec::new();
+        for iface in &self.ifaces {
+            for nbr in iface.neighbors.values() {
+                out.push(Ospf3NeighborInfo {
+                    router_id: nbr.fsm.router_id,
+                    addr: nbr.addr,
+                    state: nbr.fsm.state,
+                    iface: iface.name.clone(),
+                });
+            }
+        }
+        out
+    }
+
+    /// Snapshot every interface for `show ospf3 interfaces`.
+    fn iface_infos(&self) -> Vec<Ospf3IfaceInfo> {
+        self.ifaces
+            .iter()
+            .map(|iface| Ospf3IfaceInfo {
+                name: iface.name.clone(),
+                area: iface.area,
+                link_local: iface.link_local,
+                state: iface.fsm.state,
+                dr: iface.fsm.dr,
+                bdr: iface.fsm.bdr,
+                priority: iface.fsm.priority,
+            })
+            .collect()
+    }
 }
 
 impl Ospf {

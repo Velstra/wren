@@ -197,6 +197,9 @@ async fn main() -> Result<()> {
     let (ospf_queries_tx, ospf_queries_rx) = mpsc::channel(QUERY_QUEUE);
     let mut ospf_queries_rx = Some(ospf_queries_rx);
     let ospf_enabled = cfg.ospf.as_ref().is_some_and(|o| o.enabled);
+    let (ospf3_queries_tx, ospf3_queries_rx) = mpsc::channel(QUERY_QUEUE);
+    let mut ospf3_queries_rx = Some(ospf3_queries_rx);
+    let ospf3_enabled = cfg.ospf3.as_ref().is_some_and(|o| o.enabled);
     let (isis_queries_tx, isis_queries_rx) = mpsc::channel(QUERY_QUEUE);
     let mut isis_queries_rx = Some(isis_queries_rx);
     let isis_enabled = cfg.isis.as_ref().is_some_and(|i| i.enabled);
@@ -215,6 +218,7 @@ async fn main() -> Result<()> {
             router: queries_tx.clone(),
             bgp: bgp_enabled.then(|| bgp_queries_tx.clone()),
             ospf: ospf_enabled.then(|| ospf_queries_tx.clone()),
+            ospf3: ospf3_enabled.then(|| ospf3_queries_tx.clone()),
             isis: isis_enabled.then(|| isis_queries_tx.clone()),
             babel: babel_enabled.then(|| babel_queries_tx.clone()),
             rip: rip_enabled.then(|| rip_queries_tx.clone()),
@@ -343,8 +347,9 @@ async fn main() -> Result<()> {
                     warn!("OSPFv3 is enabled but the backend is in-memory — learned routes will not be installed in the kernel");
                 }
                 let tx = updates_tx.clone();
+                let qrx = ospf3_queries_rx.take().expect("ospf3 queries rx taken once");
                 tokio::spawn(async move {
-                    if let Err(e) = ospf3::run(run_cfg, tx).await {
+                    if let Err(e) = ospf3::run(run_cfg, tx, qrx).await {
                         error!(error = %e, "OSPFv3 engine stopped");
                     }
                 });

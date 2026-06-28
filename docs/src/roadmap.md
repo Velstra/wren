@@ -53,7 +53,9 @@ implemented to its RFC.
   link-local next hops from the Link-LSAs, plus the inter-area and AS-external
   stages). The `wren-daemon` runner drives it over a raw IPv6 protocol-89 socket:
   point-to-point and broadcast links, single- and multi-area (inter-area via an
-  ABR) and AS-external (an ASBR redistributing IPv6 statics).
+  ABR) and AS-external (an ASBR redistributing IPv6 statics). The runner is
+  **live-verified**: two routers form a point-to-point adjacency over a veth and
+  reach Full (`scripts/ospf3-show-smoke.sh`).
 - [x] **IS-IS** (ISO/IEC 10589, RFC 1195) — the other major link-state IGP, end to
   end and **live-verified** (two routers form a point-to-point adjacency over a
   veth, exchange LSPs and install each other's routes `proto isis`, exercised by
@@ -122,7 +124,9 @@ implemented to its RFC.
   route`, `wren show bgp [routes|neighbors]` renders the BGP Loc-RIB (with
   AS_PATH, communities, LOCAL_PREF, origin) and neighbour states, `wren show
   ospf [neighbors|interfaces]` renders the OSPF adjacencies (Router ID, address,
-  state) and interfaces (area, state, elected DR/BDR), and `wren show isis
+  state) and interfaces (area, state, elected DR/BDR), `wren show ospf3
+  [neighbors|interfaces]` does the same for OSPFv3 (neighbours by Router ID over
+  their IPv6 link-local, interfaces by area and state), `wren show isis
   [neighbors|interfaces]` renders the IS-IS adjacencies (System ID, SNPA, per-level
   state) and circuits (type, level, elected DIS), `wren show babel [neighbors|routes]`
   renders the Babel neighbours (Hello/IHU link costs) and selected routes, and
@@ -130,8 +134,7 @@ implemented to its RFC.
   (destination, metric, gateway, interface). Each query is answered by the task that
   owns the data (the router loop / the per-protocol task), with no shared access —
   the send/await plumbing is one generic helper, so a new `show <proto>` is a parser
-  plus a render branch. More views (OSPFv3, per-protocol detail) and a richer API
-  are to come.
+  plus a render branch. More per-protocol detail views and a richer API are to come.
 - [~] **Startup reconciliation** — on boot the kernel backend reads the routing
   table back (`RTM_GETROUTE` dump) and removes routes a previous wren instance
   left behind that the current config no longer programs, so a restart never

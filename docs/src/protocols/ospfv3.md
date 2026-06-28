@@ -102,6 +102,31 @@ to the router. It is configured under [`[ospf3]`](../configuration.md), supports
 point-to-point and broadcast links, multiple areas (an ABR originates
 Inter-Area-Prefix-LSAs) and redistributing IPv6 statics (an ASBR).
 
+## Inspecting it
+
+The daemon answers `wren show ospf3 neighbors` and `wren show ospf3 interfaces`
+over its [control socket](../configuration.md), each rendered by the OSPFv3 task
+itself out of the live state it owns — no shared access, the IPv6 sibling of
+`show ospf`:
+
+```console
+$ wren show ospf3 neighbors
+10.0.0.2 via fe80::9867:d6ff:fe29:74a2 dev veth0 state Full
+
+$ wren show ospf3 interfaces
+veth0 area 0.0.0.0 fe80::30:ebff:febc:862f state PtP pri 1
+```
+
+`show ospf3 neighbors` lists every neighbour by its **Router ID** (still a 32-bit
+dotted quad in OSPFv3) reached over its **IPv6 link-local** next hop, with the
+local interface and the adjacency state (`Down` … `Full`). `show ospf3 interfaces`
+lists each interface with its area, our link-local address, the state (`PtP`,
+`DROther`, `Backup`, `DR`, …), this router's priority and, on a multi-access
+network, the elected `dr` / `bdr`. `scripts/ospf3-show-smoke.sh` exercises both
+live (rootless) — and is the first end-to-end live run of the OSPFv3 runner: two
+routers form a point-to-point adjacency over a veth and the queries report it
+reaching Full.
+
 ## Not yet implemented
 
 NSSA (type-7) LSAs, OSPFv3 address families (RFC 5838) and the stub/virtual-link

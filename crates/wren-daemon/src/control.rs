@@ -23,6 +23,7 @@ use crate::babel::{BabelQuery, BabelQueryRequest};
 use crate::bgp::{BgpQuery, BgpQueryRequest};
 use crate::isis::{IsisQuery, IsisQueryRequest};
 use crate::ospf::{OspfQuery, OspfQueryRequest};
+use crate::ospf3::{Ospf3Query, Ospf3QueryRequest};
 use crate::rip::{RipQuery, RipQueryRequest};
 use crate::router::{Query, QueryRequest};
 
@@ -37,6 +38,8 @@ pub struct Channels {
     pub bgp: Option<mpsc::Sender<BgpQueryRequest>>,
     /// To the OSPF task (`show ospf`), if OSPF is running.
     pub ospf: Option<mpsc::Sender<OspfQueryRequest>>,
+    /// To the OSPFv3 task (`show ospf3`), if OSPFv3 is running.
+    pub ospf3: Option<mpsc::Sender<Ospf3QueryRequest>>,
     /// To the IS-IS task (`show isis`), if IS-IS is running.
     pub isis: Option<mpsc::Sender<IsisQueryRequest>>,
     /// To the Babel task (`show babel`), if Babel is running.
@@ -75,6 +78,12 @@ impl OwnedQuery for OspfQueryRequest {
     type Query = OspfQuery;
     fn build(query: OspfQuery, respond: oneshot::Sender<String>) -> Self {
         OspfQueryRequest { query, respond }
+    }
+}
+impl OwnedQuery for Ospf3QueryRequest {
+    type Query = Ospf3Query;
+    fn build(query: Ospf3Query, respond: oneshot::Sender<String>) -> Self {
+        Ospf3QueryRequest { query, respond }
     }
 }
 impl OwnedQuery for IsisQueryRequest {
@@ -138,6 +147,8 @@ async fn handle_conn(stream: UnixStream, channels: Channels) -> Result<()> {
 
     let response = if let Some(query) = parse_bgp_query(line) {
         ask_opt(&channels.bgp, query, "bgp").await
+    } else if let Some(query) = parse_ospf3_query(line) {
+        ask_opt(&channels.ospf3, query, "ospf3").await
     } else if let Some(query) = parse_ospf_query(line) {
         ask_opt(&channels.ospf, query, "ospf").await
     } else if let Some(query) = parse_isis_query(line) {
@@ -154,8 +165,9 @@ async fn handle_conn(stream: UnixStream, channels: Channels) -> Result<()> {
         format!(
             "error: unknown command {line:?}\n\
              usage: show routes [protocol] | show bgp [routes|neighbors] | \
-             show ospf [neighbors|interfaces] | show isis [neighbors|interfaces] | \
-             show babel [neighbors|routes] | show rip | show ripng\n"
+             show ospf [neighbors|interfaces] | show ospf3 [neighbors|interfaces] | \
+             show isis [neighbors|interfaces] | show babel [neighbors|routes] | \
+             show rip | show ripng\n"
         )
     };
 
@@ -246,6 +258,27 @@ pub fn parse_ospf_query(line: &str) -> Option<OspfQuery> {
     let query = match tokens.next() {
         None | Some("neighbors") | Some("neighbours") => OspfQuery::Neighbors,
         Some("interfaces") | Some("interface") | Some("iface") => OspfQuery::Interfaces,
+        Some(_) => return None,
+    };
+    // A trailing extra token is a malformed command.
+    if tokens.next().is_some() {
+        return None;
+    }
+    Some(query)
+}
+
+/// Parse a `show ospf3 [neighbors|interfaces]` command into an [`Ospf3Query`]. A
+/// bare `show ospf3` defaults to the neighbours view. Returns `None` for anything
+/// else (so the caller can fall through; note the keyword is the exact token
+/// `ospf3`, so `show ospf` is not matched here).
+pub fn parse_ospf3_query(line: &str) -> Option<Ospf3Query> {
+    let mut tokens = line.split_whitespace();
+    if tokens.next()? != "show" || tokens.next()? != "ospf3" {
+        return None;
+    }
+    let query = match tokens.next() {
+        None | Some("neighbors") | Some("neighbours") => Ospf3Query::Neighbors,
+        Some("interfaces") | Some("interface") | Some("iface") => Ospf3Query::Interfaces,
         Some(_) => return None,
     };
     // A trailing extra token is a malformed command.
@@ -396,6 +429,28 @@ mod tests {
         assert!(parse_ospf_query("show ospf nonsense").is_none());
         assert!(parse_ospf_query("show ospf neighbors extra").is_none());
         assert!(parse_ospf_query("").is_none());
+    }
+
+    #[test]
+    fn parse_ospf3_query_understands_show_ospf3() {
+        assert_eq!(parse_ospf3_query("show ospf3"), Some(Ospf3Query::Neighbors));
+        assert_eq!(parse_ospf3_query("show ospf3 neighbors"), Some(Ospf3Query::Neighbors));
+        assert_eq!(
+            parse_ospf3_query("show ospf3 interfaces"),
+            Some(Ospf3Query::Interfaces)
+        );
+        assert_eq!(parse_ospf3_query("show ospf3 iface"), Some(Ospf3Query::Interfaces));
+    }
+
+    #[test]
+    fn parse_ospf3_and_ospf_stay_distinct() {
+        // Exact-token keywords: `show ospf3` is not an `ospf` query and vice-versa,
+        // so the dispatcher can try both without collision.
+        assert!(parse_ospf3_query("show ospf").is_none());
+        assert!(parse_ospf_query("show ospf3").is_none());
+        assert!(parse_ospf3_query("show ospf3 nonsense").is_none());
+        assert!(parse_ospf3_query("show ospf3 neighbors extra").is_none());
+        assert!(parse_ospf3_query("").is_none());
     }
 
     #[test]
