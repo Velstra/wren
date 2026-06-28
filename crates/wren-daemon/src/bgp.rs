@@ -38,6 +38,7 @@ use tracing::{debug, info, warn};
 use wren_bgp::attr::{reconstruct_as_path, AsPathSegment, Origin, PathAttribute};
 use wren_bgp::community::format_community;
 use wren_bgp::decision::{Path, DEFAULT_LOCAL_PREF};
+use wren_bgp::ext_community::format_ext_community;
 use wren_bgp::fsm::{Action, BgpFsm, Event, State};
 use wren_bgp::large_community::format_large_community;
 use wren_bgp::message::{Message, Notification, Open, Update};
@@ -76,6 +77,8 @@ pub struct BgpConfig {
     pub communities: Vec<u32>,
     /// LARGE_COMMUNITY (RFC 8092) tags attached to every originated route.
     pub large_communities: Vec<(u32, u32, u32)>,
+    /// EXTENDED_COMMUNITIES (RFC 4360) attached to every originated route.
+    pub ext_communities: Vec<[u8; 8]>,
 }
 
 /// One configured BGP peer.
@@ -109,6 +112,8 @@ pub struct OriginRoute {
     pub communities: Vec<u32>,
     /// LARGE_COMMUNITY (RFC 8092) tags to attach.
     pub large_communities: Vec<(u32, u32, u32)>,
+    /// EXTENDED_COMMUNITIES (RFC 4360) to attach.
+    pub ext_communities: Vec<[u8; 8]>,
 }
 
 /// A command from the central task to a per-peer session task: advertise or
@@ -185,6 +190,7 @@ pub struct NeighborSummary {
 struct OriginEntry {
     communities: Vec<u32>,
     large_communities: Vec<(u32, u32, u32)>,
+    ext_communities: Vec<[u8; 8]>,
     configured: bool,
 }
 
@@ -197,6 +203,7 @@ fn origination_snapshot(originated: &BTreeMap<Prefix, OriginEntry>) -> Vec<Origi
             prefix: *prefix,
             communities: e.communities.clone(),
             large_communities: e.large_communities.clone(),
+            ext_communities: e.ext_communities.clone(),
         })
         .collect()
 }
@@ -234,6 +241,11 @@ pub fn render_bgp_routes(rib: &BgpRib) -> String {
             let comms: Vec<String> =
                 path.large_communities.iter().map(|c| format_large_community(*c)).collect();
             let _ = write!(out, " large-communities {}", comms.join(" "));
+        }
+        if !path.ext_communities.is_empty() {
+            let comms: Vec<String> =
+                path.ext_communities.iter().map(|c| format_ext_community(*c)).collect();
+            let _ = write!(out, " ext-communities {}", comms.join(" "));
         }
         let _ = write!(out, " localpref {}", path.local_pref);
         if path.med != 0 {
@@ -313,6 +325,7 @@ pub async fn run(
                 OriginEntry {
                     communities: cfg.communities.clone(),
                     large_communities: cfg.large_communities.clone(),
+                    ext_communities: cfg.ext_communities.clone(),
                     configured: true,
                 },
             )
@@ -451,12 +464,14 @@ async fn apply_redistribution(
             // Communities set on the route by the export filter ride along.
             let communities = route.communities.clone();
             let large_communities = route.large_communities.clone();
+            let ext_communities = route.ext_communities.clone();
             match originated.get(&prefix) {
                 // A configured `network` is authoritative — never overridden.
                 Some(e) if e.configured => return,
                 // Already redistributed with the same tags: nothing new.
                 Some(e) if e.communities == communities
-                    && e.large_communities == large_communities =>
+                    && e.large_communities == large_communities
+                    && e.ext_communities == ext_communities =>
                 {
                     return
                 }
@@ -467,10 +482,16 @@ async fn apply_redistribution(
                 OriginEntry {
                     communities: communities.clone(),
                     large_communities: large_communities.clone(),
+                    ext_communities: ext_communities.clone(),
                     configured: false,
                 },
             );
-            let adv = vec![OriginRoute { prefix, communities, large_communities }];
+            let adv = vec![OriginRoute {
+                prefix,
+                communities,
+                large_communities,
+                ext_communities,
+            }];
             for tx in sessions.values() {
                 let _ = tx.send(SessionCmd::Advertise(adv.clone())).await;
             }
@@ -519,6 +540,7 @@ fn path_from_update(
     let mut local_pref = DEFAULT_LOCAL_PREF;
     let mut communities = Vec::new();
     let mut large_communities = Vec::new();
+    let mut ext_communities = Vec::new();
     for a in &update.attributes {
         match a {
             PathAttribute::Origin(o) => origin = *o,
@@ -529,6 +551,7 @@ fn path_from_update(
             PathAttribute::LocalPref(lp) => local_pref = *lp,
             PathAttribute::Communities(c) => communities = c.clone(),
             PathAttribute::LargeCommunities(c) => large_communities = c.clone(),
+            PathAttribute::ExtendedCommunities(c) => ext_communities = c.clone(),
             _ => {}
         }
     }
@@ -550,6 +573,7 @@ fn path_from_update(
         peer_addr,
         communities,
         large_communities,
+        ext_communities,
     })
 }
 
@@ -857,17 +881,21 @@ impl Session<'_> {
     /// LARGE_COMMUNITY attribute, and a route whose well-known communities forbid
     /// this peer (RFC 1997) is skipped.
     async fn advertise(&mut self, routes: &[OriginRoute]) -> Result<()> {
-        type TagKey = (Vec<u32>, Vec<(u32, u32, u32)>);
+        type TagKey = (Vec<u32>, Vec<(u32, u32, u32)>, Vec<[u8; 8]>);
         let mut groups: BTreeMap<TagKey, Vec<Prefix>> = BTreeMap::new();
         for r in routes {
             if should_advertise(&r.communities, self.from_ebgp) {
                 groups
-                    .entry((r.communities.clone(), r.large_communities.clone()))
+                    .entry((
+                        r.communities.clone(),
+                        r.large_communities.clone(),
+                        r.ext_communities.clone(),
+                    ))
                     .or_default()
                     .push(r.prefix);
             }
         }
-        for ((communities, large_communities), nlri) in groups {
+        for ((communities, large_communities, ext_communities), nlri) in groups {
             let mut attributes = vec![PathAttribute::Origin(Origin::Igp)];
             if self.from_ebgp {
                 // eBGP: prepend our AS and set the next hop to our peering address.
@@ -892,6 +920,9 @@ impl Session<'_> {
             }
             if !large_communities.is_empty() {
                 attributes.push(PathAttribute::LargeCommunities(large_communities));
+            }
+            if !ext_communities.is_empty() {
+                attributes.push(PathAttribute::ExtendedCommunities(ext_communities));
             }
             let update = Update {
                 withdrawn: vec![],
@@ -978,11 +1009,13 @@ mod tests {
             peer_addr: ip([10, 0, 0, 1]),
             communities: vec![0xFDE9_0064, NO_EXPORT],
             large_communities: vec![(65001, 1, 2)],
+            ext_communities: vec![[0x00, 0x02, 0xFD, 0xE9, 0x00, 0x00, 0x00, 0x64]], // rt:65001:100
         };
         rib.update(ip([10, 0, 0, 1]), "10.0.0.0/8".parse::<Prefix>().unwrap(), path);
         let out = render_bgp_routes(&rib);
         assert!(out.contains("10.0.0.0/8 via 192.0.2.1"));
         assert!(out.contains("large-communities 65001:1:2"));
+        assert!(out.contains("ext-communities rt:65001:100"));
         assert!(out.contains("as-path 65001 196618"));
         assert!(out.contains("communities 65001:100 no-export"));
         assert!(out.contains("localpref 100"));
@@ -1058,7 +1091,12 @@ mod tests {
         let mut originated: BTreeMap<Prefix, OriginEntry> = BTreeMap::new();
         originated.insert(
             p,
-            OriginEntry { communities: vec![], large_communities: vec![], configured: true },
+            OriginEntry {
+                communities: vec![],
+                large_communities: vec![],
+                ext_communities: vec![],
+                configured: true,
+            },
         );
         let (tx, mut rx) = mpsc::channel::<SessionCmd>(16);
         let mut sessions = HashMap::new();

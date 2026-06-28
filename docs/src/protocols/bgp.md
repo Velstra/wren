@@ -226,6 +226,44 @@ action              = "accept"
 peer learns the originated network carrying `65001:1:1` and the redistributed
 prefix carrying `65001:7:7`.
 
+## Extended communities (RFC 4360)
+
+The **extended community** is an 8-octet tag with a structured type — the most
+important being the **Route Target** (`rt`) and **Route Origin** (`ro`) used to
+control route distribution (e.g. in L3VPNs). The administrator field can be a
+2-octet AS, a 4-octet AS (RFC 5668) or an IPv4 address, chosen automatically from
+how you write it:
+
+| Text | Encoding |
+|---|---|
+| `rt:65001:100` | two-octet AS specific |
+| `rt:65536:100` | four-octet AS specific (AS > 65535) |
+| `rt:192.0.2.1:100` | IPv4 address specific |
+| `ro:…` | the same, as a Route Origin |
+
+Wren handles them exactly like the other community kinds, in parallel: received
+extended communities are retained and re-advertised; `[bgp] ext-community`
+attaches a set to every originated network; and a filter's `set-ext-community` /
+`add-ext-community` stamp them **per prefix**. Unrecognised types round-trip on the
+wire and render as a raw `0x…` value.
+
+```toml
+[bgp]
+ext-community = ["rt:65001:100"]      # global: on every originated network
+
+[export]
+bgp = "tag"
+[[filter.rule]]
+prefix            = ["10.99.0.0/24"]
+set-ext-community = ["ro:65001:7"]    # per prefix
+action            = "accept"
+```
+
+`show bgp routes` renders them as `ext-communities rt:65001:100`.
+`scripts/bgp-ext-community-smoke.sh` exercises both paths live (rootless): a peer
+learns the originated network carrying `rt:65001:100` and the redistributed prefix
+carrying `ro:65001:7`.
+
 ## Redistribution
 
 BGP can re-originate routes the rest of the daemon already knows — connected

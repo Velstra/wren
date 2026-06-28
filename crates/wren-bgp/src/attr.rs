@@ -147,6 +147,9 @@ pub enum PathAttribute {
     /// LARGE_COMMUNITY (type 32, optional transitive) — the RFC 8092 12-octet
     /// `(global, local1, local2)` tags.
     LargeCommunities(Vec<(u32, u32, u32)>),
+    /// EXTENDED_COMMUNITIES (type 16, optional transitive) — the RFC 4360 8-octet
+    /// tags (Route Target / Route Origin and friends), kept as raw octets.
+    ExtendedCommunities(Vec<[u8; 8]>),
     /// AGGREGATOR (type 7, optional transitive).
     Aggregator {
         /// The AS that formed the aggregate.
@@ -185,6 +188,7 @@ impl PathAttribute {
     const ATOMIC_AGGREGATE: u8 = 6;
     const AGGREGATOR: u8 = 7;
     const COMMUNITIES: u8 = 8;
+    const EXTENDED_COMMUNITIES: u8 = 16;
     const AS4_PATH: u8 = 17;
     const AS4_AGGREGATOR: u8 = 18;
     const LARGE_COMMUNITIES: u8 = 32;
@@ -200,6 +204,7 @@ impl PathAttribute {
             PathAttribute::AtomicAggregate => Self::ATOMIC_AGGREGATE,
             PathAttribute::Aggregator { .. } => Self::AGGREGATOR,
             PathAttribute::Communities(_) => Self::COMMUNITIES,
+            PathAttribute::ExtendedCommunities(_) => Self::EXTENDED_COMMUNITIES,
             PathAttribute::LargeCommunities(_) => Self::LARGE_COMMUNITIES,
             PathAttribute::As4Path(_) => Self::AS4_PATH,
             PathAttribute::As4Aggregator { .. } => Self::AS4_AGGREGATOR,
@@ -214,6 +219,7 @@ impl PathAttribute {
             PathAttribute::MultiExitDisc(_) => FLAG_OPTIONAL,
             PathAttribute::Aggregator { .. }
             | PathAttribute::Communities(_)
+            | PathAttribute::ExtendedCommunities(_)
             | PathAttribute::LargeCommunities(_)
             | PathAttribute::As4Path(_)
             | PathAttribute::As4Aggregator { .. } => FLAG_OPTIONAL | FLAG_TRANSITIVE,
@@ -246,6 +252,11 @@ impl PathAttribute {
                     out.extend_from_slice(&g.to_be_bytes());
                     out.extend_from_slice(&l1.to_be_bytes());
                     out.extend_from_slice(&l2.to_be_bytes());
+                }
+            }
+            PathAttribute::ExtendedCommunities(comms) => {
+                for c in comms {
+                    out.extend_from_slice(c);
                 }
             }
             PathAttribute::Aggregator { asn, id } => {
@@ -337,6 +348,20 @@ impl PathAttribute {
                     .map(|c| u32::from_be_bytes([c[0], c[1], c[2], c[3]]))
                     .collect();
                 PathAttribute::Communities(comms)
+            }
+            Self::EXTENDED_COMMUNITIES => {
+                if value.len() % 8 != 0 {
+                    return None;
+                }
+                let comms = value
+                    .chunks_exact(8)
+                    .map(|c| {
+                        let mut a = [0u8; 8];
+                        a.copy_from_slice(c);
+                        a
+                    })
+                    .collect();
+                PathAttribute::ExtendedCommunities(comms)
             }
             Self::LARGE_COMMUNITIES => {
                 if value.len() % 12 != 0 {
@@ -607,6 +632,15 @@ mod tests {
             (4_200_000_000, 4_294_967_295, 0),
         ]));
         roundtrip(PathAttribute::LargeCommunities(vec![])); // empty list is legal
+    }
+
+    #[test]
+    fn extended_communities_roundtrip() {
+        roundtrip(PathAttribute::ExtendedCommunities(vec![
+            [0x00, 0x02, 0xFD, 0xE9, 0x00, 0x00, 0x00, 0x64], // rt:65001:100
+            [0x02, 0x03, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01], // ro:65536:1
+        ]));
+        roundtrip(PathAttribute::ExtendedCommunities(vec![])); // empty list is legal
         // Flags are optional-transitive, type 8.
         let mut buf = Vec::new();
         PathAttribute::Communities(vec![1]).encode(&mut buf, true);

@@ -50,6 +50,9 @@ pub struct Path {
     /// The LARGE_COMMUNITY (RFC 8092) tags attached to this path — likewise
     /// retained for re-advertisement and policy, not part of the comparison.
     pub large_communities: Vec<(u32, u32, u32)>,
+    /// The EXTENDED_COMMUNITIES (RFC 4360) attached to this path — likewise
+    /// retained for re-advertisement and policy, not part of the comparison.
+    pub ext_communities: Vec<[u8; 8]>,
 }
 
 impl Path {
@@ -151,6 +154,7 @@ mod tests {
             peer_addr: ip([10, 0, 0, 1]),
             communities: vec![],
             large_communities: vec![],
+            ext_communities: vec![],
         }
     }
 

@@ -228,6 +228,7 @@ fn parse_route(msg: &[u8]) -> Option<Route> {
         source: 0,
         communities: Vec::new(),
         large_communities: Vec::new(),
+        ext_communities: Vec::new(),
     })
 }
 

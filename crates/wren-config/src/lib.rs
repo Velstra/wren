@@ -284,6 +284,10 @@ pub struct Bgp {
     /// `global:local1:local2`.
     #[serde(default, rename = "large-community")]
     pub large_community: Vec<String>,
+    /// EXTENDED_COMMUNITIES (RFC 4360) attached to every originated route, as
+    /// `rt:asn:n` / `ro:asn:n` / `rt:ipv4:n`.
+    #[serde(default, rename = "ext-community")]
+    pub ext_community: Vec<String>,
     /// Protocols whose RIB best-path routes are redistributed into BGP (originated
     /// to peers as they appear and change), e.g. `["connected", "static", "ospf"]`.
     /// Only IPv4 routes are redistributed; an optional `[export] bgp` filter gates
@@ -441,6 +445,14 @@ pub struct FilterRule {
     /// `set-large-community`.
     #[serde(rename = "add-large-community", default)]
     pub add_large_community: Vec<String>,
+    /// Replace the matching route's extended communities with these (`rt:asn:n`,
+    /// `ro:asn:n`, `rt:ipv4:n`, …; RFC 4360). Consumed by BGP origination.
+    #[serde(rename = "set-ext-community")]
+    pub set_ext_community: Option<Vec<String>>,
+    /// Append these extended communities to the matching route, after any
+    /// `set-ext-community`.
+    #[serde(rename = "add-ext-community", default)]
+    pub add_ext_community: Vec<String>,
     /// Whether a matching route is `"accept"`ed or `"reject"`ed.
     pub action: String,
 }
@@ -563,6 +575,8 @@ mod tests {
             add-community = ["65000:200"]
             set-large-community = ["65000:1:2"]
             add-large-community = ["65000:3:4"]
+            set-ext-community = ["rt:65000:100"]
+            add-ext-community = ["ro:65000:1"]
             action = "accept"
             "#,
         )
@@ -578,6 +592,11 @@ mod tests {
             Some(&["65000:1:2".to_string()][..])
         );
         assert_eq!(rule.add_large_community, vec!["65000:3:4".to_string()]);
+        assert_eq!(
+            rule.set_ext_community.as_deref(),
+            Some(&["rt:65000:100".to_string()][..])
+        );
+        assert_eq!(rule.add_ext_community, vec!["ro:65000:1".to_string()]);
     }
 
     #[test]

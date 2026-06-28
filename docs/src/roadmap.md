@@ -19,9 +19,11 @@ implemented to its RFC.
   the OPEN, AS_PATH is 4-octet between capable speakers, and AS4_PATH /
   AS4_AGGREGATOR (+ the §4.2.3 reconstruction) carry the true ASNs through legacy
   2-octet peers — **communities** (RFC 1997): the COMMUNITIES attribute with
-  the well-known `no-export` / `no-advertise` propagation rules; and **large
+  the well-known `no-export` / `no-advertise` propagation rules; **large
   communities** (RFC 8092): the LARGE_COMMUNITY attribute (`global:local1:local2`),
-  attached globally or per-prefix via a filter
+  attached globally or per-prefix via a filter; and **extended communities**
+  (RFC 4360 / RFC 5668): the EXTENDED_COMMUNITIES attribute (Route Target / Route
+  Origin, `rt:`/`ro:`), likewise global or per-prefix
 - [x] **Babel** (RFC 8966) — loop-avoiding distance-vector over IPv6 (UDP 6696,
   `ff02::1:6`), with the feasibility condition and Hello/IHU link costing
 - [x] **OSPFv3** (RFC 5340) — OSPF for IPv6, end to end. The `wren-ospfv3` library
@@ -62,8 +64,7 @@ implemented to its RFC.
 
 - OSPF: stub / NSSA areas, type-4 ASBR-summaries across areas, explicit type-5
   forwarding-address resolution, authentication
-- BGP: MP-BGP (RFC 4760), extended communities (RFC 4360), route reflection,
-  connection-collision detection (§6.8)
+- BGP: MP-BGP (RFC 4760), route reflection, connection-collision detection (§6.8)
 - Babel: ETX costing for lossy links, Route/Seqno-Request handling, prefix
   compression on send, IPv4 routes over the IPv6 transport (`RTA_VIA` next hops),
   source-specific routing

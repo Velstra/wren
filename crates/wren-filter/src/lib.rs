@@ -213,6 +213,12 @@ pub struct Modify {
     /// Append these large communities (deduplicated, order-preserving) after any
     /// `set_large_communities` has been applied.
     pub add_large_communities: Vec<(u32, u32, u32)>,
+    /// Replace the route's extended communities with this set (RFC 4360, raw 8
+    /// octets each).
+    pub set_ext_communities: Option<Vec<[u8; 8]>>,
+    /// Append these extended communities (deduplicated, order-preserving) after
+    /// any `set_ext_communities` has been applied.
+    pub add_ext_communities: Vec<[u8; 8]>,
 }
 
 impl Modify {
@@ -225,6 +231,8 @@ impl Modify {
             && self.add_communities.is_empty()
             && self.set_large_communities.is_none()
             && self.add_large_communities.is_empty()
+            && self.set_ext_communities.is_none()
+            && self.add_ext_communities.is_empty()
     }
 
     /// Apply the changes to `route` in place. `set_metric` is applied before
@@ -254,6 +262,14 @@ impl Modify {
         for c in &self.add_large_communities {
             if !route.large_communities.contains(c) {
                 route.large_communities.push(*c);
+            }
+        }
+        if let Some(set) = &self.set_ext_communities {
+            route.ext_communities = set.clone();
+        }
+        for c in &self.add_ext_communities {
+            if !route.ext_communities.contains(c) {
+                route.ext_communities.push(*c);
             }
         }
     }
@@ -530,6 +546,21 @@ mod tests {
         .apply(&mut r);
         // set replaces, then add appends (deduplicated against the new set).
         assert_eq!(r.large_communities, vec![(65536, 1, 2), (65536, 3, 4)]);
+    }
+
+    #[test]
+    fn modify_sets_and_appends_ext_communities() {
+        let mut r = route("10.0.0.0/24", Protocol::Bgp, 0);
+        let rt = [0x00, 0x02, 0xFD, 0xE9, 0x00, 0x00, 0x00, 0x64]; // rt:65001:100
+        let ro = [0x00, 0x03, 0xFD, 0xE9, 0x00, 0x00, 0x00, 0x01]; // ro:65001:1
+        r.ext_communities = vec![[1; 8]];
+        Modify {
+            set_ext_communities: Some(vec![rt]),
+            add_ext_communities: vec![rt, ro],
+            ..Modify::default()
+        }
+        .apply(&mut r);
+        assert_eq!(r.ext_communities, vec![rt, ro]);
     }
 
     #[test]

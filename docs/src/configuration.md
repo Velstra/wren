@@ -257,6 +257,8 @@ rip = "clean-bgp"
 | `add-community` | list | Append communities to the route, after any `set-community`. |
 | `set-large-community` | list | Replace the route's large communities (`global:local1:local2`, RFC 8092); consumed by BGP origination. |
 | `add-large-community` | list | Append large communities to the route, after any `set-large-community`. |
+| `set-ext-community` | list | Replace the route's extended communities (`rt:asn:n` / `ro:asn:n` / `rt:ipv4:n`, RFC 4360); consumed by BGP origination. |
+| `add-ext-community` | list | Append extended communities to the route, after any `set-ext-community`. |
 | `action` | string | `accept` or `reject` (required). |
 
 **Export filters** reuse the same engine on the way *out* of the RIB. The

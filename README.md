@@ -67,7 +67,7 @@ protocols │  wren-rip   │   │  (ospf…)    │   │  (bgp…)     │   
 | `wren-ospf` | OSPFv2 (RFC 2328) — packet/LSA wire codec, LSDB, SPF and the runner state. | `wren-core` |
 | `wren-ospfv3` | OSPFv3 (RFC 5340) — the IPv6 packet/LSA wire codec, LSDB, state machines, flooding and SPF. The runner is in `wren-daemon`. | `wren-core` |
 | `wren-isis` | IS-IS (ISO/IEC 10589, RFC 1195) — the PDU/TLV wire codec, the link-state database with CSNP/PSNP sync, the adjacency FSM with DIS election, and the §7.2 SPF (dual-stack, L1/L2 hierarchy with the attached-bit default). Driven by an `AF_PACKET` (layer-2) runner in `wren-daemon`. | `wren-core` |
-| `wren-bgp` | BGP-4 (RFC 4271) + 4-octet ASNs (RFC 6793) + communities (RFC 1997) + large communities (RFC 8092) — message/path-attribute wire codec, capability negotiation, decision process, RIBs and session FSM. | `wren-core` |
+| `wren-bgp` | BGP-4 (RFC 4271) + 4-octet ASNs (RFC 6793) + communities (RFC 1997 / 8092 / 4360) — message/path-attribute wire codec, capability negotiation, decision process, RIBs and session FSM. | `wren-core` |
 | `wren-babel` | Babel (RFC 8966) — packet/TLV wire codec, source/route table with the feasibility condition, and the neighbour (Hello/IHU) link-cost table. | `wren-core` |
 | `wren-filter` | BIRD-style route filters — prefix-pattern lists + match/accept/reject/modify rules, applied as per-protocol import policy. | `wren-core` |
 | `wren-config` | TOML configuration model. | `wren-core`, `serde`, `toml` |
@@ -243,8 +243,11 @@ Protocols, each to be implemented to its RFC:
   communities (RFC 8092)** are supported in parallel: the LARGE_COMMUNITY attribute
   (`global:local1:local2`), attached globally via `[bgp] large-community` or
   per-prefix via a filter's `set-large-community` — verified live by
-  `scripts/bgp-large-community-smoke.sh`. Still to come: MP-BGP (RFC 4760),
-  extended communities and route reflection.
+  `scripts/bgp-large-community-smoke.sh`. **Extended communities (RFC 4360 /
+  RFC 5668)** too: the EXTENDED_COMMUNITIES attribute (Route Target / Route Origin,
+  `rt:`/`ro:`), global via `[bgp] ext-community` or per-prefix via
+  `set-ext-community` — verified live by `scripts/bgp-ext-community-smoke.sh`.
+  Still to come: MP-BGP (RFC 4760) and route reflection.
 
 Platform / core:
 

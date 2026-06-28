@@ -324,6 +324,10 @@ pub struct Route {
     /// local2)`). Like [`Route::communities`] — set by filters, read by BGP
     /// origination, ignored by other protocols.
     pub large_communities: Vec<(u32, u32, u32)>,
+    /// Extended route tags (RFC 4360 BGP extended communities, raw 8 octets, e.g.
+    /// a Route Target). Like [`Route::communities`] — set by filters, read by BGP
+    /// origination, ignored by other protocols.
+    pub ext_communities: Vec<[u8; 8]>,
 }
 
 impl Route {
@@ -338,6 +342,7 @@ impl Route {
             source: 0,
             communities: Vec::new(),
             large_communities: Vec::new(),
+            ext_communities: Vec::new(),
         }
     }
 

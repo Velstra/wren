@@ -40,6 +40,7 @@ pub mod attr;
 pub mod capability;
 pub mod community;
 pub mod decision;
+pub mod ext_community;
 pub mod fsm;
 pub mod large_community;
 pub mod message;

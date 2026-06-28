@@ -668,6 +668,7 @@ fn build_bgp_config(cfg: &wren_config::Config, bgp: &wren_config::Bgp) -> Result
     }
     let large_communities = parse_large_communities(&bgp.large_community)
         .context("bgp large-community")?;
+    let ext_communities = parse_ext_communities(&bgp.ext_community).context("bgp ext-community")?;
 
     Ok(bgp::BgpConfig {
         local_as: bgp.local_as,
@@ -677,6 +678,7 @@ fn build_bgp_config(cfg: &wren_config::Config, bgp: &wren_config::Bgp) -> Result
         originate,
         communities,
         large_communities,
+        ext_communities,
     })
 }
 
@@ -827,6 +829,19 @@ fn parse_large_communities(list: &[String]) -> Result<Vec<(u32, u32, u32)>> {
         .collect()
 }
 
+/// Parse a list of extended-community strings (`rt:asn:n`, `ro:asn:n`,
+/// `rt:ipv4:n`, …; RFC 4360) into their raw 8-octet values, for
+/// `[bgp] ext-community` or a filter's `*-ext-community`.
+fn parse_ext_communities(list: &[String]) -> Result<Vec<[u8; 8]>> {
+    list.iter()
+        .map(|c| {
+            wren_bgp::ext_community::parse_ext_community(c).with_context(|| {
+                format!("ext community {c:?} must be rt:/ro: asn:n, an IPv4 form, or 0x<16 hex>")
+            })
+        })
+        .collect()
+}
+
 /// Compile one [`wren_config::FilterDef`] into a [`wren_filter::Filter`].
 fn compile_filter(def: &wren_config::FilterDef) -> Result<Filter> {
     let default = match def.default.as_deref() {
@@ -870,6 +885,11 @@ fn compile_filter(def: &wren_config::FilterDef) -> Result<Filter> {
             Some(list) => Some(parse_large_communities(list)?),
         };
         let add_large_communities = parse_large_communities(&r.add_large_community)?;
+        let set_ext_communities = match &r.set_ext_community {
+            None => None,
+            Some(list) => Some(parse_ext_communities(list)?),
+        };
+        let add_ext_communities = parse_ext_communities(&r.add_ext_community)?;
         let modify = Modify {
             set_metric: r.set_metric,
             add_metric: r.add_metric,
@@ -878,6 +898,8 @@ fn compile_filter(def: &wren_config::FilterDef) -> Result<Filter> {
             add_communities,
             set_large_communities,
             add_large_communities,
+            set_ext_communities,
+            add_ext_communities,
         };
         let action = parse_action(&r.action).map_err(|e| anyhow::anyhow!("rule action {e}"))?;
         rules.push(Rule {
