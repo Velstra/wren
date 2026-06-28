@@ -795,6 +795,44 @@ mod tests {
         assert_eq!(got.nexthops.len(), 2, "both ECMP next-hops installed");
     }
 
+    /// Kernel-acceptance for the BGP-multipath case the daemon actually performs:
+    /// a prefix is first installed as a *single* path, then **replaced** by a
+    /// multipath route whose two next hops sit on **different interfaces** (the
+    /// real eBGP-multipath topology) — `CREATE|REPLACE` over an existing entry,
+    /// gateway-only next hops (ifindex 0), metric 1, `proto bgp`. The fresh-install,
+    /// single-interface ECMP test covers neither the replace transition nor the
+    /// cross-interface gateway resolution. Run it the same way:
+    ///
+    /// ```sh
+    /// unshare -Urn sh -c '
+    ///   ip link add d0 type dummy; ip addr add 192.168.1.1/24 dev d0; ip link set d0 up
+    ///   ip link add d1 type dummy; ip addr add 192.168.2.1/24 dev d1; ip link set d1 up
+    ///   cargo test -p wren-netlink replace_single_path_with_multipath -- --ignored --nocapture'
+    /// ```
+    #[test]
+    #[ignore = "needs CAP_NET_ADMIN + 192.168.{1,2}.0/24 on two ifaces; run under unshare -Urn"]
+    fn replace_single_path_with_multipath_acceptance() {
+        let mut fib = KernelFib::new().expect("open kernel fib");
+        let dst = p("10.123.0.0/16");
+        let single =
+            Route::new(dst, Protocol::Bgp, vec![NextHop::via("192.168.1.2".parse().unwrap())], 1);
+        fib.apply(&FibChange::Install(single)).expect("install the single path");
+        let multi = Route::new(
+            dst,
+            Protocol::Bgp,
+            vec![
+                NextHop::via("192.168.1.2".parse().unwrap()),
+                NextHop::via("192.168.2.2".parse().unwrap()),
+            ],
+            1,
+        );
+        fib.apply(&FibChange::Install(multi.clone()))
+            .expect("kernel accepts replacing the single path with cross-interface multipath");
+        let back = fib.owned_routes().expect("dump routes");
+        let got = back.iter().find(|r| r.prefix == dst).expect("the route is present");
+        assert_eq!(got.nexthops.len(), 2, "both ECMP next-hops installed after the replace");
+    }
+
     #[test]
     fn build_and_parse_multipath_ecmp_route() {
         let route = Route::new(

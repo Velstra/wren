@@ -113,7 +113,11 @@ implemented to its RFC.
   routes, attributed by origin protocol
 - [x] **ECMP / multipath** — routes with several next-hops (as the link-state SPFs
   produce by merging equal-cost paths) are programmed as kernel `RTA_MULTIPATH`
-  routes, so every path is installed, not just the first; weights are carried too
+  routes, so every path is installed, not just the first; weights are carried too.
+  **BGP multipath** feeds the same machinery: with `[bgp] multipath = N` a router
+  installs up to `N` equal-cost BGP paths (identical LOCAL_PREF / AS_PATH / ORIGIN /
+  MED / eBGP-iBGP class / IGP cost) for a prefix as one ECMP route, while still
+  advertising only the single best path onward
 - [~] Import / export **filters** (BIRD-style policy) — the `wren-filter` engine is
   in place (prefix-pattern lists with exact/or-longer/range, protocol and metric
   matches, accept/reject with metric/preference and **community** (`set-community`
@@ -176,8 +180,9 @@ tracked but not yet scheduled, grouped by area:
 - **IGPs & link-state:** OSPFv3 NSSA + address families (RFC 5838), IS-IS
   refinements (the RFC 5303 p2p three-way TLV, L1↔L2 route leaking), RIFT, EIGRP;
   IGMP/MLD for multicast group membership.
-- **BGP breadth:** unnumbered (RFC 5549), EVPN (RFC 7432), multipath / add-path
-  (RFC 7911), long-lived graceful restart (RFC 9494), BMP
+- **BGP breadth:** unnumbered (RFC 5549), EVPN (RFC 7432), add-path (RFC 7911 —
+  advertising several paths per prefix; equal-cost multipath *install* is already
+  done, see Platform & core), long-lived graceful restart (RFC 9494), BMP
   (RFC 7854), FlowSpec (RFC 8955), RPKI origin validation, RTC (RFC 4684).
 - **Data-plane & overlays:** MPLS, SR-MPLS, SRv6, VXLAN, BFD (RFC 5880),
   MLAG, anycast gateway, dual-stack.

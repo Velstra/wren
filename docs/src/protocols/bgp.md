@@ -184,6 +184,42 @@ A self-contained, rootless live test of the 4-octet path (two speakers with ASNs
 above 65535 peering over a veth in throwaway namespaces) is in
 `scripts/bgp-4octet-smoke.sh`.
 
+## Multipath (ECMP)
+
+By default a prefix learned over several BGP sessions is installed via its single
+best path — the rest are kept in the Adj-RIB-In as backups. Setting
+
+```toml
+[bgp]
+multipath = 2          # install up to two equal-cost paths as one ECMP route
+```
+
+makes the router install **up to that many equal-cost paths** for a prefix as a
+single multipath (ECMP) kernel route, balancing forwarding across them. Two paths
+are equal-cost when they tie on every attribute the decision process uses to pick a
+winner: the same LOCAL_PREF, the same **whole** AS_PATH (so they share a
+neighbouring AS and never form an ECMP across unrelated upstreams — the
+conservative default, matching Cisco / FRR without `as-path multipath-relax`), the
+same ORIGIN, MED, eBGP-vs-iBGP class and IGP cost to the next hop. The remaining
+tie-breaks (cluster-list length, peer id/address) still pick a single winner — but
+only for what is **advertised** onward: multipath widens forwarding, not the routes
+re-advertised to peers, so `show bgp routes` continues to show the one best path
+while the kernel route carries every next hop.
+
+This feeds the same `RTA_MULTIPATH` machinery the link-state SPFs use, so the kernel
+route looks like any other ECMP route:
+
+```text
+10.99.0.0/24 proto bgp metric 1
+	nexthop via 10.0.0.1 dev veth_ra weight 1
+	nexthop via 10.1.0.1 dev veth_rb weight 1
+```
+
+`scripts/bgp-multipath-smoke.sh` exercises it live (rootless): two routers in the
+same AS each originate the same prefix to a third over separate eBGP sessions; the
+third installs the single best path without `multipath`, and both next hops as one
+ECMP route with `multipath = 2`.
+
 ## Communities (RFC 1997)
 
 Routes can carry **communities** — 32-bit tags written `asn:value` — in the

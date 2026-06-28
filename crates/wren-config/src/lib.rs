@@ -337,6 +337,12 @@ pub struct Bgp {
     /// them. BGP never redistributes its own routes.
     #[serde(default)]
     pub redistribute: Vec<String>,
+    /// The maximum number of equal-cost paths to install per destination as ECMP
+    /// (BGP multipath). Unset or `1` is classic single-best-path forwarding; a
+    /// higher value installs up to that many paths that tie on the decision
+    /// attributes (same LOCAL_PREF, AS_PATH, ORIGIN, MED, eBGP/iBGP class, IGP cost).
+    #[serde(rename = "multipath")]
+    pub multipath: Option<usize>,
     /// The configured peers.
     #[serde(default)]
     pub neighbor: Vec<BgpNeighbor>,
@@ -753,6 +759,31 @@ mod tests {
         let bgp = cfg.bgp.expect("bgp present");
         assert_eq!(bgp.redistribute, vec!["connected", "static", "ospf"]);
         assert_eq!(cfg.export.unwrap().bgp.as_deref(), Some("to-peers"));
+    }
+
+    #[test]
+    fn parses_bgp_multipath() {
+        let cfg = Config::from_toml(
+            r#"
+            router-id = "10.0.0.1"
+            [bgp]
+            enabled   = true
+            local-as  = 65000
+            multipath = 4
+            [[bgp.neighbor]]
+            address = "10.0.0.2"
+            remote-as = 65001
+            "#,
+        )
+        .expect("valid config");
+        assert_eq!(cfg.bgp.expect("bgp present").multipath, Some(4));
+
+        // Absent → None (classic single-best-path).
+        let cfg = Config::from_toml(
+            "router-id = \"10.0.0.1\"\n[bgp]\nenabled = true\nlocal-as = 65000\n",
+        )
+        .expect("valid config");
+        assert_eq!(cfg.bgp.expect("bgp present").multipath, None);
     }
 
     #[test]

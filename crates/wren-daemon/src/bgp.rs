@@ -104,6 +104,9 @@ pub struct BgpConfig {
     /// The Member-AS numbers of the other sub-ASes in this confederation
     /// (RFC 5065); a peer whose `remote_as` is here is a confed-eBGP peer.
     pub confederation_members: Vec<u32>,
+    /// The maximum number of equal-cost paths to install per destination as ECMP
+    /// (BGP multipath). 1 (the default) is classic single-best-path forwarding.
+    pub max_paths: usize,
 }
 
 /// How a peer relates to this speaker, which drives the AS_PATH manipulation and
@@ -572,7 +575,7 @@ pub async fn run(
     // open for the life of the daemon.
     drop(tx);
 
-    let mut rib = BgpRib::new();
+    let mut rib = BgpRib::with_max_paths(cfg.max_paths);
     loop {
         // The nearest Restart Timer deadline across all restarting peers (RFC 4724);
         // the timer future fires when it elapses, or never if none are pending.
@@ -936,7 +939,7 @@ async fn apply_event(
 /// the session that taught us the route drops it (split horizon).
 async fn propagate(ev: &RibEvent, sessions: &HashMap<Ipv4Addr, mpsc::Sender<SessionCmd>>) {
     match ev {
-        RibEvent::Best { prefix, path } => {
+        RibEvent::Best { prefix, path, .. } => {
             let pr = PropRoute { prefix: *prefix, path: path.clone() };
             for tx in sessions.values() {
                 let _ = tx.send(SessionCmd::Propagate(vec![pr.clone()])).await;
@@ -953,7 +956,9 @@ async fn propagate(ev: &RibEvent, sessions: &HashMap<Ipv4Addr, mpsc::Sender<Sess
 /// Turn a Loc-RIB change into a router update.
 async fn emit(ev: RibEvent, updates: &mpsc::Sender<RouteUpdate>) {
     let upd = match ev {
-        RibEvent::Best { prefix, path } => RouteUpdate::Announce(path.to_route(prefix)),
+        RibEvent::Best { prefix, path, hops } => {
+            RouteUpdate::Announce(path.to_route_multipath(prefix, hops))
+        }
         RibEvent::Withdrawn(prefix) => RouteUpdate::Withdraw {
             prefix,
             protocol: Protocol::Bgp,

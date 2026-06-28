@@ -93,18 +93,47 @@ impl Path {
             .sum()
     }
 
+    /// This path's forwarding next hop as a RIB [`NextHop`]. A link-local next hop
+    /// (RFC 2545) must be pinned to its interface; an ordinary global/IPv4 next hop
+    /// is reached by the usual recursive lookup.
+    pub fn next_hop_entry(&self) -> NextHop {
+        match &self.next_hop_iface {
+            Some(dev) => NextHop::via_dev(self.next_hop, dev.clone()),
+            None => NextHop::via(self.next_hop),
+        }
+    }
+
     /// Turn this path into a RIB route for `prefix`. The metric carries the
     /// AS_PATH length, so the RIB's own tie-break stays sensible if it ever sees
     /// more than one BGP candidate for a prefix.
     pub fn to_route(&self, prefix: Prefix) -> Route {
-        // A link-local next hop (RFC 2545) must be pinned to its interface; an
-        // ordinary global/IPv4 next hop is reached by the usual recursive lookup.
-        let nexthop = match &self.next_hop_iface {
-            Some(dev) => NextHop::via_dev(self.next_hop, dev.clone()),
-            None => NextHop::via(self.next_hop),
-        };
-        Route::new(prefix, Protocol::Bgp, vec![nexthop], self.as_path_len() as u32)
+        Route::new(prefix, Protocol::Bgp, vec![self.next_hop_entry()], self.as_path_len() as u32)
     }
+
+    /// Turn this (best) path into a RIB route for `prefix` carrying several
+    /// equal-cost next hops — the BGP multipath / ECMP case. The attributes are the
+    /// winner's (so re-advertisement is unaffected); only the forwarding next-hop
+    /// set widens. See [`multipath_eligible`].
+    pub fn to_route_multipath(&self, prefix: Prefix, hops: Vec<NextHop>) -> Route {
+        Route::new(prefix, Protocol::Bgp, hops, self.as_path_len() as u32)
+    }
+}
+
+/// Whether `b` ties with the best path `a` closely enough to be installed
+/// alongside it as an equal-cost multipath. The conservative default (matching
+/// Cisco / FRR without `as-path multipath-relax`) requires the §9.1.2.2 attributes
+/// that decide forwarding to be identical: LOCAL_PREF, the **whole** AS_PATH (not
+/// just its length — so the routes share a neighbouring AS and never form an ECMP
+/// across unrelated upstreams), ORIGIN, MED, the eBGP/iBGP class, and the IGP cost
+/// to the next hop. The later tie-breaks (cluster-list length, peer id/address)
+/// only pick a single winner to advertise; they do not make the paths unequal.
+pub fn multipath_eligible(a: &Path, b: &Path) -> bool {
+    a.local_pref == b.local_pref
+        && a.as_path == b.as_path
+        && a.origin == b.origin
+        && a.med == b.med
+        && a.from_ebgp == b.from_ebgp
+        && a.igp_metric == b.igp_metric
 }
 
 /// Whether path `a` is strictly preferred over path `b` (RFC 4271 §9.1.2.2 plus
@@ -325,5 +354,37 @@ mod tests {
             route.nexthops,
             vec![NextHop::via_dev(IpAddr::V6("fe80::1".parse().unwrap()), "eth0")]
         );
+    }
+
+    #[test]
+    fn multipath_eligible_requires_an_identical_decision() {
+        let a = base();
+        // Same AS_PATH content and every forwarding attribute → eligible, even though
+        // the next hop and peer differ (that is the whole point of multipath).
+        let b = Path { next_hop: IpAddr::V4(ip([192, 0, 2, 9])), peer_id: ip([10, 0, 0, 9]), ..base() };
+        assert!(multipath_eligible(&a, &b));
+
+        // A differing AS_PATH (same length, different AS) is NOT eligible by default.
+        let other_as = Path { as_path: vec![AsPathSegment::Sequence(vec![65001, 65009])], ..base() };
+        assert!(!multipath_eligible(&a, &other_as));
+
+        // Differing LOCAL_PREF / ORIGIN / MED / class / IGP cost each disqualify.
+        assert!(!multipath_eligible(&a, &Path { local_pref: 200, ..base() }));
+        assert!(!multipath_eligible(&a, &Path { origin: Origin::Incomplete, ..base() }));
+        assert!(!multipath_eligible(&a, &Path { med: 5, ..base() }));
+        assert!(!multipath_eligible(&a, &Path { from_ebgp: false, ..base() }));
+        assert!(!multipath_eligible(&a, &Path { igp_metric: 99, ..base() }));
+    }
+
+    #[test]
+    fn to_route_multipath_carries_every_next_hop() {
+        let p = base();
+        let hops = vec![
+            NextHop::via(IpAddr::V4(ip([10, 0, 0, 1]))),
+            NextHop::via(IpAddr::V4(ip([10, 1, 0, 1]))),
+        ];
+        let route = p.to_route_multipath("203.0.113.0/24".parse().unwrap(), hops.clone());
+        assert_eq!(route.protocol, Protocol::Bgp);
+        assert_eq!(route.nexthops, hops);
     }
 }

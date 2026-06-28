@@ -761,6 +761,7 @@ fn build_bgp_config(cfg: &wren_config::Config, bgp: &wren_config::Bgp) -> Result
         ext_communities,
         confederation_id: bgp.confederation_id,
         confederation_members: bgp.confederation_members.clone(),
+        max_paths: bgp.multipath.unwrap_or(1).max(1),
     })
 }
 
