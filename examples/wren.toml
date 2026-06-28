@@ -1,0 +1,26 @@
+# Example Wren configuration.
+# See the `wren-config` crate for the full schema.
+
+router-id = "10.0.0.1"
+
+# A default route via an upstream gateway.
+[[static]]
+prefix = "0.0.0.0/0"
+via = "192.0.2.1"
+
+# An on-link route out of an interface, with a non-default metric.
+[[static]]
+prefix = "10.20.0.0/16"
+dev = "eth1"
+metric = 10
+
+# RIP (IPv4, RFC 2453): learns/advertises routes over UDP 520 / 224.0.0.9 on
+# these interfaces and redistributes their connected networks.
+[rip]
+enabled = true
+interfaces = ["enp1s0f0"]
+
+# RIPng (IPv6, RFC 2080): the IPv6 sibling, over UDP 521 / ff02::9.
+[ripng]
+enabled = true
+interfaces = ["enp1s0f0"]
