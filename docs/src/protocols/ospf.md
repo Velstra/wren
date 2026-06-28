@@ -227,6 +227,33 @@ In an NSSA Wren:
 (the ABR) learns it and translates it, and C in the backbone installs the
 translated `10.99.0.0/24` external `proto ospf`.
 
+### Injecting a default into a plain NSSA (RFC 3101 §2.3)
+
+Because a plain NSSA carries no AS-external (type-5) LSAs, its internal routers
+have no path to AS-external destinations — the inter-area (type-3) summaries an ABR
+sends only cover destinations *inside* the AS. To give them one, list the area in
+`nssa-default-areas`, and its ABR originates a **type-7 `0.0.0.0/0` default** into
+it (at `stub-default-cost`) while still carrying the ordinary summaries:
+
+```toml
+[ospf]
+enabled            = true
+interfaces         = ["eth1"]
+area               = "1.0.0.0"
+nssa-areas         = ["1.0.0.0"]
+nssa-default-areas = ["1.0.0.0"]   # this NSSA's ABR also injects a type-7 default
+stub-default-cost  = 5
+```
+
+The default's P-bit is left clear, so — like the default an ASBR-less stub gets —
+the ABR never translates it into a type-5 for the rest of the AS. This differs from
+a **totally-NSSA** only in that the summaries are kept: a totally-NSSA suppresses
+them and relies on the same default for *every* outside destination, whereas a
+default-injecting plain NSSA uses the default purely for the AS-external ones.
+`scripts/ospf-nssa-default-smoke.sh` exercises it live (rootless): the same NSSA is
+run without the option (B has the inter-area summary but no default) and then with
+it (B additionally gets the type-7 default, the summary still present).
+
 ## Totally-stubby and totally-NSSA areas
 
 A **totally-stubby** area is a stub from which the ABR additionally suppresses the
@@ -265,8 +292,7 @@ suppressed).
 
 ## Not yet implemented
 
-NSSA default-route injection for a *plain* (summary-carrying) NSSA, the RFC 3101
-§3.2 translator election (a single ABR translates today), type-4 ASBR-summaries
-reaching an ASBR across areas, explicit type-5 forwarding-address resolution, and
-authentication (Wren uses null authentication today). These are tracked in the
-[Roadmap](../roadmap.md).
+The RFC 3101 §3.2 translator election (a single ABR translates today), type-4
+ASBR-summaries reaching an ASBR across areas, explicit type-5 forwarding-address
+resolution, and authentication (Wren uses null authentication today). These are
+tracked in the [Roadmap](../roadmap.md).

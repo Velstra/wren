@@ -582,8 +582,12 @@ fn build_ospf_config(
     // NSSA areas (RFC 3101) plus the totally-NSSA subset, and mutually exclusive
     // with stubs.
     let totally_nssa_areas = parse_areas(&ospf.totally_nssa_areas, "totally-nssa-area")?;
+    // Plain NSSAs into which the ABR also injects a type-7 default (RFC 3101 §2.3),
+    // keeping their summaries — distinct from the no-summary totally-NSSA set.
+    let nssa_default_areas = parse_areas(&ospf.nssa_default_areas, "nssa-default-area")?;
     let mut nssa_areas = parse_areas(&ospf.nssa_areas, "nssa-area")?;
     nssa_areas.extend(totally_nssa_areas.iter().copied()); // a totally-NSSA area is an NSSA
+    nssa_areas.extend(nssa_default_areas.iter().copied()); // a default-injecting area is an NSSA
     if nssa_areas.contains(&Ipv4Addr::UNSPECIFIED) {
         anyhow::bail!("the backbone area 0.0.0.0 cannot be an NSSA area (RFC 3101)");
     }
@@ -605,6 +609,7 @@ fn build_ospf_config(
         nssa_areas,
         totally_stubby_areas,
         totally_nssa_areas,
+        nssa_default_areas,
     })
 }
 

@@ -232,6 +232,13 @@ pub struct Ospf {
     /// type-7 default route. An area listed here is treated as an NSSA.
     #[serde(default, rename = "totally-nssa-areas")]
     pub totally_nssa_areas: Vec<String>,
+    /// Areas (plain NSSAs) into which the area border router additionally injects a
+    /// type-7 default route (RFC 3101 §2.3), listed by id. Unlike a totally-NSSA the
+    /// area keeps its inter-area (type-3) summaries; the default merely gives the
+    /// area's internal routers a path to AS-external destinations the NSSA never
+    /// carries. An area listed here is treated as an NSSA.
+    #[serde(default, rename = "nssa-default-areas")]
+    pub nssa_default_areas: Vec<String>,
 }
 
 /// One OSPF interface placed in a specific area (`[[ospf.interface]]`).
@@ -952,6 +959,23 @@ mod tests {
         let ospf = cfg.ospf.expect("ospf present");
         assert_eq!(ospf.totally_stubby_areas, vec!["1.0.0.0"]);
         assert_eq!(ospf.totally_nssa_areas, vec!["3.0.0.0"]);
+    }
+
+    #[test]
+    fn parses_ospf_nssa_default_areas() {
+        let cfg = Config::from_toml(
+            r#"
+            router-id = "10.0.0.1"
+            [ospf]
+            enabled = true
+            interfaces = ["eth1"]
+            nssa-areas         = ["1.0.0.0"]
+            nssa-default-areas = ["1.0.0.0"]
+            "#,
+        )
+        .expect("valid config");
+        let ospf = cfg.ospf.expect("ospf present");
+        assert_eq!(ospf.nssa_default_areas, vec!["1.0.0.0"]);
     }
 
     #[test]

@@ -110,6 +110,12 @@ pub struct OspfConfig {
     /// inter-area (type-3) summaries and instead injects a type-7 default route.
     /// Every area here is also in [`Self::nssa_areas`].
     pub totally_nssa_areas: HashSet<Ipv4Addr>,
+    /// Plain NSSAs into which the ABR additionally injects a type-7 default route
+    /// (RFC 3101 §2.3) while still carrying the inter-area (type-3) summaries — unlike
+    /// a totally-NSSA, which suppresses those summaries. Every area here is also in
+    /// [`Self::nssa_areas`]; a totally-NSSA already injects the default, so it need not
+    /// be listed here as well.
+    pub nssa_default_areas: HashSet<Ipv4Addr>,
 }
 
 /// One configured OSPF interface and the area it is in.
@@ -1410,17 +1416,20 @@ impl Ospf {
         self.translate_nssa().await;
     }
 
-    /// Inject a type-7 default route (`0.0.0.0/0`) into each totally-NSSA area as
-    /// its area border router. A totally-NSSA area carries neither AS-external
-    /// (type-5) nor inter-area (type-3) summaries, so its internal routers reach
-    /// every destination outside the area — inter-area and AS-external alike —
-    /// through this default. The P-bit is left clear (`options = 0`) so the ABR does
-    /// **not** translate the default into a type-5 for the rest of the AS. Reached
-    /// only after the `is_abr` guard in [`Ospf::originate_summaries`], so only an ABR
-    /// injects it; the cost is the same `stub_default_cost` a stub default uses.
+    /// Inject a type-7 default route (`0.0.0.0/0`) into each NSSA that wants one, as
+    /// its area border router. Two kinds want it (see [`Ospf::wants_nssa_default`]): a
+    /// **totally-NSSA**, which carries neither AS-external (type-5) nor inter-area
+    /// (type-3) summaries, so its internal routers reach every destination outside the
+    /// area through this default; and a **plain NSSA** listed in `nssa-default-areas`
+    /// (RFC 3101 §2.3), which keeps its summaries but still needs a path to the
+    /// AS-external destinations an NSSA never carries. The injected LSA is identical in
+    /// both cases — the P-bit is left clear (`options = 0`) so the ABR does **not**
+    /// translate the default into a type-5 for the rest of the AS. Reached only after
+    /// the `is_abr` guard in [`Ospf::originate_summaries`], so only an ABR injects it;
+    /// the cost is the same `stub_default_cost` a stub default uses.
     async fn originate_nssa_default(&mut self) {
         let areas: Vec<Ipv4Addr> =
-            self.areas.keys().copied().filter(|a| self.is_totally_nssa(*a)).collect();
+            self.areas.keys().copied().filter(|a| self.wants_nssa_default(*a)).collect();
         for area in areas {
             let lsa = Lsa {
                 header: {
@@ -1757,6 +1766,15 @@ impl Ospf {
     /// Whether `area` is a totally-NSSA area (a "no-summary" NSSA).
     fn is_totally_nssa(&self, area: Ipv4Addr) -> bool {
         self.cfg.totally_nssa_areas.contains(&area)
+    }
+
+    /// Whether an ABR should inject a type-7 default route (`0.0.0.0/0`) into `area` —
+    /// true both for a totally-NSSA (where the default stands in for the suppressed
+    /// summaries and externals) and for a plain NSSA explicitly listed in
+    /// `nssa-default-areas` (RFC 3101 §2.3), which keeps its summaries but still needs
+    /// a path to the AS-external destinations an NSSA never carries.
+    fn wants_nssa_default(&self, area: Ipv4Addr) -> bool {
+        self.is_totally_nssa(area) || self.cfg.nssa_default_areas.contains(&area)
     }
 
     /// Whether an ABR should suppress inter-area (type-3) summaries into `area` —

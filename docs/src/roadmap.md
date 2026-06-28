@@ -105,7 +105,10 @@ implemented to its RFC.
   **The "no-summary" variants are done too**: a `totally-stubby` area also has its
   inter-area (type-3) summaries suppressed by the ABR (only the default remains),
   and a `totally-nssa` area likewise suppresses summaries and has the ABR inject a
-  **type-7 default** (P-bit clear, so it is not translated AS-wide).
+  **type-7 default** (P-bit clear, so it is not translated AS-wide). **A plain NSSA
+  can also opt into a default** via `nssa-default-areas`: the ABR injects the same
+  type-7 `0.0.0.0/0` default but keeps the summaries, giving the area a path to the
+  AS-external destinations an NSSA never carries.
 - Babel: ETX costing for lossy links, Route/Seqno-Request handling, prefix
   compression on send, IPv4 routes over the IPv6 transport (`RTA_VIA` next hops),
   source-specific routing
