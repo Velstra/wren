@@ -203,6 +203,17 @@ pub struct Ospf {
     /// The external metric advertised for redistributed routes. Defaults to 20.
     #[serde(rename = "redistribute-metric")]
     pub redistribute_metric: Option<u32>,
+    /// Areas configured as **stub** areas (RFC 2328 §3.6), listed by id (dotted
+    /// quad, e.g. `["1.0.0.0"]`). A stub area carries no AS-external (type-5) LSAs;
+    /// an area border router injects a default route into it instead. Stub routers
+    /// clear the E-bit in their Hellos and only form adjacencies with neighbours
+    /// that agree the area is a stub.
+    #[serde(default, rename = "stub-areas")]
+    pub stub_areas: Vec<String>,
+    /// The metric an area border router advertises for the default route it injects
+    /// into each stub area (the type-3 `0.0.0.0/0` summary). Defaults to 1.
+    #[serde(rename = "stub-default-cost")]
+    pub stub_default_cost: Option<u32>,
 }
 
 /// One OSPF interface placed in a specific area (`[[ospf.interface]]`).
@@ -841,6 +852,24 @@ mod tests {
         assert_eq!(ospf.redistribute, vec!["connected", "static"]);
         assert_eq!(ospf.redistribute_metric, Some(50));
         assert_eq!(cfg.export.unwrap().ospf.as_deref(), Some("to-area"));
+    }
+
+    #[test]
+    fn parses_ospf_stub_areas() {
+        let cfg = Config::from_toml(
+            r#"
+            router-id = "10.0.0.1"
+            [ospf]
+            enabled = true
+            interfaces = ["eth1"]
+            stub-areas = ["1.0.0.0", "2.0.0.0"]
+            stub-default-cost = 5
+            "#,
+        )
+        .expect("valid config");
+        let ospf = cfg.ospf.expect("ospf present");
+        assert_eq!(ospf.stub_areas, vec!["1.0.0.0", "2.0.0.0"]);
+        assert_eq!(ospf.stub_default_cost, Some(5));
     }
 
     #[test]

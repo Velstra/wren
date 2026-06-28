@@ -155,8 +155,46 @@ multi-access network, the elected `dr` / `bdr`. `scripts/ospf-show-smoke.sh`
 exercises both live (rootless): two routers form a point-to-point adjacency and
 the queries report it reaching Full.
 
+## Stub areas (RFC 2328 §3.6)
+
+A **stub area** keeps the link-state database small by carrying no AS-external
+(type-5) LSAs: routers inside it reach external destinations through a single
+default route the area border router injects, rather than learning every external
+prefix. Mark an area a stub by listing its id:
+
+```toml
+[ospf]
+enabled           = true
+interfaces        = ["eth1"]
+area              = "1.0.0.0"
+stub-areas        = ["1.0.0.0"]   # this area carries no externals
+stub-default-cost = 5             # the metric an ABR gives the injected default
+```
+
+Every router with an interface in the area — the ABR included — must agree it is a
+stub, so `stub-areas` is set on all of them. Concretely Wren then:
+
+- **clears the E-bit** (AS-external-capable) in the Hellos *and* Database
+  Description packets it sends in the area, and refuses to form an adjacency with a
+  neighbour whose E-bit disagrees (§10.5) — so a stub and a non-stub router never
+  partially adjacency-up;
+- **never floods type-5 LSAs** into the area, leaves them out of the Database
+  Description summary there (otherwise a neighbour would request a type-5 that never
+  arrives and hang in `Loading`), and drops any type-5 that still arrives on a stub
+  interface;
+- as an **ABR, injects a default route** — a type-3 `0.0.0.0/0` summary at
+  `stub-default-cost` — into the area. Ordinary inter-area (type-3) summaries are
+  still sent too; this is a plain stub, not a totally-stubby area.
+
+A stub router then installs `0.0.0.0/0` via the ABR and none of the externals.
+`scripts/ospf-stub-area-smoke.sh` exercises this live (rootless): the same topology
+is run with the area normal (the internal router learns the external `10.99.0.0/24`
+and no default) and then as a stub (the external is gone, replaced by a
+`default via` the ABR, with the ordinary inter-area route still present).
+
 ## Not yet implemented
 
-Stub / NSSA areas, type-4 ASBR-summaries reaching an ASBR across areas, explicit
-type-5 forwarding-address resolution, and authentication (Wren uses null
-authentication today). These are tracked in the [Roadmap](../roadmap.md).
+NSSA areas (type-7), totally-stubby areas, type-4 ASBR-summaries reaching an ASBR
+across areas, explicit type-5 forwarding-address resolution, and authentication
+(Wren uses null authentication today). These are tracked in the
+[Roadmap](../roadmap.md).

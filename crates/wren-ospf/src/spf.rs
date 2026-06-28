@@ -889,6 +889,22 @@ mod tests {
     }
 
     #[test]
+    fn default_summary_yields_a_default_route() {
+        // The stub-area mechanism (RFC 2328 §3.6): the ABR injects a 0.0.0.0/0
+        // type-3 summary, which a stub router resolves into a default route via it.
+        let mut db = area_with_abr();
+        db.install(summary_lsa([2, 2, 2, 2], [0, 0, 0, 0], [0, 0, 0, 0], 5));
+        let intra = compute(&db, ip([1, 1, 1, 1]));
+        let inter = inter_area_routes(&db, &intra, ip([1, 1, 1, 1]));
+        let def = inter
+            .iter()
+            .find(|r| r.prefix.to_string() == "0.0.0.0/0")
+            .expect("default route present");
+        assert_eq!(def.cost, 15); // 10 to the ABR + 5 default-cost
+        assert_eq!(def.gateways, vec![ip([10, 0, 12, 2])]);
+    }
+
+    #[test]
     fn inter_area_skips_unreachable_infinity_and_self() {
         let mut db = area_with_abr();
         // A summary from an ABR not on the SPF tree → unreachable, skipped.

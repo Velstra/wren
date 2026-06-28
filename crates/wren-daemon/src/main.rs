@@ -565,6 +565,15 @@ fn build_ospf_config(
     } else {
         Vec::new()
     };
+    // Stub areas (RFC 2328 §3.6): parse each configured area id to a dotted quad.
+    let stub_areas: std::collections::HashSet<Ipv4Addr> = ospf
+        .stub_areas
+        .iter()
+        .map(|a| a.parse().context("ospf stub-area must be a dotted quad, e.g. \"1.0.0.0\""))
+        .collect::<Result<_>>()?;
+    if stub_areas.contains(&Ipv4Addr::UNSPECIFIED) {
+        anyhow::bail!("the backbone area 0.0.0.0 cannot be a stub area (RFC 2328 §3.6)");
+    }
     Ok(ospf::OspfConfig {
         router_id,
         iface_type,
@@ -575,6 +584,8 @@ fn build_ospf_config(
         interfaces,
         redistribute,
         redistribute_metric: ospf.redistribute_metric.unwrap_or(20),
+        stub_areas,
+        stub_default_cost: ospf.stub_default_cost.unwrap_or(1),
     })
 }
 

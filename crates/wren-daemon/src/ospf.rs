@@ -92,6 +92,12 @@ pub struct OspfConfig {
     pub redistribute: Vec<RedistRoute>,
     /// The external (type-2) metric advertised for RIB-redistributed routes.
     pub redistribute_metric: u32,
+    /// Areas configured as stubs (RFC 2328 §3.6): they receive no AS-external
+    /// (type-5) LSAs, and an area border router injects a default route into them.
+    pub stub_areas: HashSet<Ipv4Addr>,
+    /// The metric an ABR advertises for the default route (`0.0.0.0/0`) it injects
+    /// into each stub area.
+    pub stub_default_cost: u32,
 }
 
 /// One configured OSPF interface and the area it is in.
@@ -532,11 +538,16 @@ impl Ospf {
         let self_id = self.cfg.router_id;
         {
             let iface = &self.ifaces[idx];
+            // The neighbour's E-bit must match this area's external capability, or no
+            // adjacency forms (RFC 2328 §10.5): a stub area expects it cleared.
+            let expect_e = !self.cfg.stub_areas.contains(&iface.area);
+            let got_e = hello.options & OPT_E != 0;
             if hello.hello_interval != cfg_hi
                 || hello.dead_interval != cfg_di
                 || hello.network_mask != len_to_mask(iface.mask_len)
+                || got_e != expect_e
             {
-                debug!(neighbor = %nbr_id, "Hello parameters mismatch — ignored");
+                debug!(neighbor = %nbr_id, options = hello.options, "Hello parameters/options mismatch — ignored");
                 return;
             }
         }
@@ -666,6 +677,7 @@ impl Ospf {
     async fn start_dd_exchange(&mut self, idx: usize, nbr_id: Ipv4Addr) {
         let seq = self.alloc_dd_seq();
         let area = self.ifaces[idx].area;
+        let options = self.area_options(area);
         let (sock, dst, bytes) = {
             let iface = &mut self.ifaces[idx];
             let Some(n) = iface.neighbors.get_mut(&nbr_id) else {
@@ -677,7 +689,7 @@ impl Ospf {
             n.request_list.clear();
             let dd = DatabaseDescription {
                 interface_mtu: 1500,
-                options: OPT_E,
+                options,
                 flags: DD_FLAG_INIT | DD_FLAG_MORE | DD_FLAG_MASTER,
                 dd_sequence: seq,
                 lsa_headers: vec![],
@@ -775,6 +787,7 @@ impl Ospf {
     /// Send an Exchange DD: our (area) database summary the first time, empty after.
     async fn send_exchange_dd(&mut self, idx: usize, nbr_id: Ipv4Addr) {
         let area = self.ifaces[idx].area;
+        let options = self.area_options(area);
         let headers = self.db_headers(area);
         let (sock, dst, bytes) = {
             let iface = &mut self.ifaces[idx];
@@ -787,7 +800,7 @@ impl Ospf {
             }
             let dd = DatabaseDescription {
                 interface_mtu: 1500,
-                options: OPT_E,
+                options,
                 flags,
                 dd_sequence: n.dd_seq,
                 lsa_headers: send_headers,
@@ -897,6 +910,11 @@ impl Ospf {
         let mut reflood_ext = Vec::new();
         for lsa in upd.lsas {
             let is_ext = lsa.header.ls_type == LsType::AsExternal;
+            // A stub area carries no AS-external (type-5) LSAs (RFC 2328 §3.6); drop
+            // any that arrive on a stub interface rather than installing or acking.
+            if is_ext && self.is_stub(area) {
+                continue;
+            }
             let on_request_list = self.ifaces[idx]
                 .neighbors
                 .get(&nbr_id)
@@ -1268,6 +1286,15 @@ impl Ospf {
                     *slot = (*slot).min(r.cost);
                 }
             }
+            // Into a stub area (RFC 2328 §3.6) the ABR injects a default route in
+            // place of the AS-external LSAs the area never sees — a type-3 summary
+            // for 0.0.0.0/0 at the configured cost. The ordinary inter-area summaries
+            // are still sent too (this is a plain stub, not a totally-stubby area).
+            if self.is_stub(dest) {
+                if let Ok(default) = Prefix::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0) {
+                    want_routes.insert(default, self.cfg.stub_default_cost);
+                }
+            }
 
             let mut to_flood = Vec::new();
             let mut want_keys = HashSet::new();
@@ -1325,6 +1352,10 @@ impl Ospf {
     /// area except the one at `except`.
     async fn flood_external_except(&self, lsa: &Lsa, except: Ipv4Addr) {
         for iface in &self.ifaces {
+            // Stub areas (RFC 2328 §3.6) never receive AS-external LSAs.
+            if self.is_stub(iface.area) {
+                continue;
+            }
             let bytes = self.packet(
                 iface.area,
                 Body::LinkStateUpdate(LinkStateUpdate {
@@ -1460,7 +1491,7 @@ impl Ospf {
                 if n.fsm.state == NeighborState::ExStart {
                     let dd = DatabaseDescription {
                         interface_mtu: 1500,
-                        options: OPT_E,
+                        options: self.area_options(iface.area),
                         flags: DD_FLAG_INIT | DD_FLAG_MORE | DD_FLAG_MASTER,
                         dd_sequence: n.dd_seq,
                         lsa_headers: vec![],
@@ -1492,7 +1523,9 @@ impl Ospf {
             let hello = Hello {
                 network_mask: len_to_mask(iface.mask_len),
                 hello_interval: self.cfg.hello_interval,
-                options: OPT_E,
+                // The E-bit advertises AS-external capability; it is cleared in a
+                // stub area so two stub routers agree (RFC 2328 §3.6, §9.5).
+                options: self.area_options(iface.area),
                 router_priority: iface.fsm.priority,
                 dead_interval: self.cfg.dead_interval,
                 designated_router: self.router_id_to_addr(iface, iface.fsm.dr),
@@ -1517,6 +1550,23 @@ impl Ospf {
 
     fn iface_index(&self, ifindex: u32) -> Option<usize> {
         self.ifaces.iter().position(|i| i.ifindex == ifindex)
+    }
+
+    /// Whether `area` is configured as a stub area (RFC 2328 §3.6): no AS-external
+    /// LSAs, the E-bit cleared in Hellos, an ABR-injected default route.
+    fn is_stub(&self, area: Ipv4Addr) -> bool {
+        self.cfg.stub_areas.contains(&area)
+    }
+
+    /// The OSPF Options for packets exchanged in `area`: the E-bit (AS-external
+    /// capable) is cleared in a stub area, and it must match across Hellos *and*
+    /// Database Description packets for the adjacency to form (RFC 2328 §3.6).
+    fn area_options(&self, area: Ipv4Addr) -> u8 {
+        if self.is_stub(area) {
+            0
+        } else {
+            OPT_E
+        }
     }
 
     /// Whether this router has interfaces in more than one area.
@@ -1580,12 +1630,15 @@ impl Ospf {
     /// Every LSA header to describe on an adjacency in `area`: the area's own
     /// database plus the AS-wide external (type-5) LSAs.
     fn db_headers(&self, area: Ipv4Addr) -> Vec<LsaHeader> {
-        self.areas[&area]
-            .lsdb
-            .iter()
-            .chain(self.external_lsdb.iter())
-            .map(|l| l.header)
-            .collect()
+        let mut headers: Vec<LsaHeader> =
+            self.areas[&area].lsdb.iter().map(|l| l.header).collect();
+        // A stub area carries no AS-external (type-5) LSAs, so they are left out of
+        // the Database Description too (RFC 2328 §3.6) — otherwise a neighbour would
+        // request a type-5 we will never flood into the stub and stall in Loading.
+        if !self.is_stub(area) {
+            headers.extend(self.external_lsdb.iter().map(|l| l.header));
+        }
+        headers
     }
 
     fn drop_from_request_lists(&mut self, key: &LsaKey) {

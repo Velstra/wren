@@ -93,8 +93,12 @@ implemented to its RFC.
 
 ### Protocol refinements
 
-- OSPF: stub / NSSA areas, type-4 ASBR-summaries across areas, explicit type-5
-  forwarding-address resolution, authentication
+- OSPF: NSSA areas (type-7), totally-stubby areas, type-4 ASBR-summaries across
+  areas, explicit type-5 forwarding-address resolution, authentication. **Stub
+  areas (RFC 2328 §3.6) are done**: an area marked `stub` carries no AS-external
+  (type-5) LSAs — the E-bit is cleared in its Hellos and Database Descriptions so
+  only stub-agreeing neighbours adjacency-up, and an ABR injects a default route
+  (a type-3 `0.0.0.0/0` summary) into it in place of the externals it never sees.
 - Babel: ETX costing for lossy links, Route/Seqno-Request handling, prefix
   compression on send, IPv4 routes over the IPv6 transport (`RTA_VIA` next hops),
   source-specific routing
