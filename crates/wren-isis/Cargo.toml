@@ -1,0 +1,16 @@
+[package]
+name = "wren-isis"
+description = "Wren routing daemon — IS-IS (ISO/IEC 10589, RFC 1195): the PDU/TLV wire codec (database, SPF and runner to follow)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+# Like the other protocol crates, the wire codec and protocol logic are
+# dependency-free `std`. The async data-link socket loop (IS-IS runs directly over
+# layer 2, not IP) will live in wren-daemon behind tokio/libc, keeping this crate
+# pure and unit-testable.
+[dependencies]
+wren-core.workspace = true
