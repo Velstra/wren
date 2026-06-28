@@ -1,0 +1,5 @@
+# Wren is an ordinary stable-Rust project (the eBPF nightly used elsewhere in the
+# velstra ecosystem is not needed here — Wren is a pure control-plane daemon).
+[toolchain]
+channel = "stable"
+components = ["rustfmt", "clippy"]

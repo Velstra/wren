@@ -1,0 +1,48 @@
+# Wren — a routing daemon in Rust.
+#
+# A Cargo workspace, deliberately split so the control-plane *core* (RIB, route
+# types, best-path selection, the FIB abstraction) carries no dependencies and
+# can be embedded directly — e.g. into the Velstra Sentinel appliance — while the
+# daemon, protocols and platform glue layer their dependencies on top.
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2021"
+rust-version = "1.74"
+# The daemon and every crate are GPL-2.0-or-later (like BIRD), EXCEPT the
+# dependency-free `wren-core`, which is Apache-2.0 so it can be embedded
+# anywhere (including the AGPL Velstra Sentinel). `wren-core` overrides this.
+license = "GPL-2.0-or-later"
+repository = "https://github.com/velstra/wren"
+authors = ["The Wren authors"]
+
+[workspace.dependencies]
+# Internal crates.
+wren-core = { path = "crates/wren-core", version = "0.0.1" }
+wren-rip = { path = "crates/wren-rip", version = "0.0.1" }
+wren-ospf = { path = "crates/wren-ospf", version = "0.0.1" }
+wren-ospfv3 = { path = "crates/wren-ospfv3", version = "0.0.1" }
+wren-isis = { path = "crates/wren-isis", version = "0.0.1" }
+wren-bgp = { path = "crates/wren-bgp", version = "0.0.1" }
+wren-babel = { path = "crates/wren-babel", version = "0.0.1" }
+wren-filter = { path = "crates/wren-filter", version = "0.0.1" }
+wren-config = { path = "crates/wren-config", version = "0.0.1" }
+wren-netlink = { path = "crates/wren-netlink", version = "0.0.1" }
+
+# Third-party (used by the daemon/protocols; NOT by wren-core).
+anyhow = "1"
+thiserror = "1"
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+clap = { version = "4", features = ["derive"] }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "macros", "signal", "sync", "io-util"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+panic = "abort"
