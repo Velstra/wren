@@ -146,6 +146,10 @@ pub struct BgpPeerCfg {
     pub passive: bool,
     /// Whether this iBGP peer is a route-reflector client (RFC 4456).
     pub rr_client: bool,
+    /// GTSM (RFC 5082) maximum hop count to this peer, if enabled (1 = directly
+    /// connected). When set the session sends with TTL 255 and rejects received
+    /// packets whose TTL is below `255 − (hops − 1)`.
+    pub ttl_security: Option<u8>,
 }
 
 /// The shared, read-only facts every session task needs.
@@ -178,6 +182,8 @@ struct PeerProps {
     remote_as: u32,
     rr_client: bool,
     peer_type: PeerType,
+    /// GTSM (RFC 5082) max hop count for this peer, applied to inbound connections.
+    ttl_security: Option<u8>,
 }
 
 /// One prefix this speaker originates, with the COMMUNITIES to attach. The central
@@ -244,6 +250,8 @@ struct PeerInfo {
     rr_client: bool,
     /// How this peer relates to us (RFC 5065): iBGP, confed-eBGP or true eBGP.
     peer_type: PeerType,
+    /// GTSM (RFC 5082) max hop count for this peer, if enabled.
+    ttl_security: Option<u8>,
 }
 
 /// A message from a per-peer session task to the central RIB task.
@@ -536,6 +544,7 @@ pub async fn run(
                         remote_as: p.remote_as,
                         rr_client: p.rr_client,
                         peer_type: classify(cfg.local_as, &members, p.remote_as),
+                        ttl_security: p.ttl_security,
                     },
                 )
             })
@@ -566,6 +575,7 @@ pub async fn run(
             remote_as: peer.remote_as,
             rr_client: peer.rr_client,
             peer_type: classify(cfg.local_as, &members, peer.remote_as),
+            ttl_security: peer.ttl_security,
         };
         let local = local.clone();
         let tx = tx.clone();
@@ -1254,6 +1264,7 @@ async fn accept_loop(listener: TcpListener, local: Arc<Local>, tx: mpsc::Sender<
                     remote_as: props.remote_as,
                     rr_client: props.rr_client,
                     peer_type: props.peer_type,
+                    ttl_security: props.ttl_security,
                 };
                 let local = local.clone();
                 let tx = tx.clone();
@@ -1268,6 +1279,27 @@ async fn accept_loop(listener: TcpListener, local: Arc<Local>, tx: mpsc::Sender<
     }
 }
 
+/// Apply the Generalized TTL Security Mechanism (GTSM, RFC 5082) to a peer's TCP
+/// socket: send with IP TTL 255 (`IP_TTL`) and have the kernel reject any received
+/// packet whose TTL is below `255 − (hops − 1)` (`IP_MINTTL`). A directly-connected
+/// eBGP neighbour uses `hops = 1`, so the minimum accepted TTL is 255 — a packet from
+/// an off-path attacker more than one hop away arrives with a decremented TTL and is
+/// dropped by the kernel before it ever reaches the session. Applied to both the
+/// dialled and the accepted connection (via [`drive_session`]). IPv4 transport only
+/// here; a failure is logged but not fatal — GTSM is defence in depth, and a session
+/// without it still works.
+fn apply_gtsm(stream: &TcpStream, hops: u8) {
+    use std::os::fd::AsRawFd;
+    let fd = stream.as_raw_fd();
+    let min_ttl = 255 - (hops.max(1) as i32 - 1);
+    if let Err(e) = crate::rip::setsockopt_int(fd, libc::IPPROTO_IP, libc::IP_TTL, 255) {
+        debug!(error = %e, "GTSM: could not set IP_TTL 255");
+    }
+    if let Err(e) = crate::rip::setsockopt_int(fd, libc::IPPROTO_IP, libc::IP_MINTTL, min_ttl) {
+        debug!(error = %e, "GTSM: could not set IP_MINTTL {min_ttl}");
+    }
+}
+
 /// The per-peer session: the TCP socket is already connected, so the FSM starts at
 /// OpenSent and is driven to Established and back by received messages and timers.
 async fn drive_session(
@@ -1278,6 +1310,12 @@ async fn drive_session(
     inbound: bool,
 ) -> Result<()> {
     stream.set_nodelay(true).ok();
+    // GTSM (RFC 5082): if configured for this peer, send with TTL 255 and reject
+    // packets that arrive with a too-low TTL. Applied here so both the inbound
+    // (accepted) and outbound (dialled) connection get it.
+    if let Some(hops) = peer.ttl_security {
+        apply_gtsm(&stream, hops);
+    }
     let local_ip = match stream.local_addr()?.ip() {
         IpAddr::V4(a) => a,
         IpAddr::V6(_) => local.router_id,

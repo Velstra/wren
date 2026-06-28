@@ -507,6 +507,34 @@ connection, so a closing loser can never evict the surviving session.
 both dial and accept converge to a single stable session and exchange routes,
 without the flap an unresolved collision would cause.
 
+## TTL security (GTSM, RFC 5082)
+
+A BGP session rides on TCP, so an off-path attacker who can spoof the peer's source
+address can try to inject or reset it. The **Generalized TTL Security Mechanism**
+defends a session whose peer is a known, small number of hops away: both ends send
+their packets with the IP TTL set to its maximum (255) and reject any received
+packet whose TTL is below `255 − (hops − 1)`. Because a router decrements the TTL at
+every hop, a packet forged by an attacker more than `hops` away arrives with a TTL
+too low to pass — and the check is essentially free, because the kernel drops the
+packet before BGP ever sees it. Enable it per neighbour with the maximum hop count
+(1 for a directly-connected eBGP peer):
+
+```toml
+[[bgp.neighbor]]
+address      = "10.0.0.2"
+remote-as    = 65002
+ttl-security = 1     # directly connected: send TTL 255, require received TTL 255
+```
+
+Wren sets `IP_TTL` to 255 on the session's socket and `IP_MINTTL` to `255 − (hops − 1)`
+(so `ttl-security = 1` demands a minimum TTL of 255), on both the dialled and the
+accepted connection. Both peers must enable it — each only protects its own receive
+side. `scripts/bgp-ttl-security-smoke.sh` exercises it live (rootless) with two eBGP
+speakers placed **two hops apart** behind a forwarding router: the session comes up
+with GTSM off, fails to establish with `ttl-security = 1` (the once-decremented
+packets fall below the minimum), and comes up again with `ttl-security = 2` — GTSM
+admits a peer at the configured distance and rejects only ones beyond it.
+
 ## Route refresh (RFC 2918)
 
 Without route refresh, re-applying an inbound policy means bouncing the session (a

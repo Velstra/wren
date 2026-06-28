@@ -194,7 +194,10 @@ tracked but not yet scheduled, grouped by area:
   MLAG, anycast gateway, dual-stack.
 - **Forwarding & policy:** VRFs, policy-based routing, route maps, prefix lists,
   route policies, prefix limits, max-AS-path.
-- **Security:** TTL security (GTSM, RFC 5082), TCP-AO (RFC 5925), BGPsec (RFC 8205).
+- **Security:** **TTL security (GTSM, RFC 5082) is done** — a per-neighbour
+  `ttl-security = <hops>` makes a BGP session send with TTL 255 and reject received
+  packets below `255 − (hops − 1)`, so a peer further than `hops` away cannot inject
+  into it. Still open: TCP-AO (RFC 5925), BGPsec (RFC 8205).
 - **Management:** YANG models, NETCONF, RESTCONF, gNMI.
 
 ## Testing

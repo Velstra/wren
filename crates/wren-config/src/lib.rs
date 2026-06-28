@@ -386,6 +386,13 @@ pub struct BgpNeighbor {
     /// iBGP peers are reflected to it. Ignored for eBGP peers. Defaults to false.
     #[serde(default, rename = "route-reflector-client")]
     pub route_reflector_client: bool,
+    /// Enable the Generalized TTL Security Mechanism (GTSM, RFC 5082) for this peer,
+    /// giving the **maximum number of hops** to the peer (1 for a directly-connected
+    /// eBGP neighbour). Wren then sends with IP TTL 255 and rejects any received
+    /// packet whose TTL is below `255 − (hops − 1)`, so an off-path attacker more than
+    /// `hops` away cannot inject into the session. Unset disables GTSM.
+    #[serde(rename = "ttl-security")]
+    pub ttl_security: Option<u8>,
 }
 
 /// Babel protocol configuration (`[babel]`, RFC 8966).
@@ -718,6 +725,26 @@ mod tests {
         assert_eq!(bgp.neighbor[0].remote_as, 65002);
         assert!(!bgp.neighbor[0].passive);
         assert!(bgp.neighbor[1].passive);
+        assert_eq!(bgp.neighbor[0].ttl_security, None);
+    }
+
+    #[test]
+    fn parses_bgp_ttl_security() {
+        let cfg = Config::from_toml(
+            r#"
+            router-id = "10.0.0.1"
+            [bgp]
+            enabled = true
+            local-as = 65001
+            [[bgp.neighbor]]
+            address = "10.0.0.2"
+            remote-as = 65002
+            ttl-security = 1
+            "#,
+        )
+        .expect("valid config");
+        let bgp = cfg.bgp.expect("bgp present");
+        assert_eq!(bgp.neighbor[0].ttl_security, Some(1));
     }
 
     #[test]

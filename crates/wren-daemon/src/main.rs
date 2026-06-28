@@ -715,6 +715,7 @@ fn build_bgp_config(cfg: &wren_config::Config, bgp: &wren_config::Bgp) -> Result
             remote_as: n.remote_as,
             passive: n.passive,
             rr_client: n.route_reflector_client,
+            ttl_security: n.ttl_security,
         });
     }
 
