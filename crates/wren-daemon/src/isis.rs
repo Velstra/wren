@@ -232,6 +232,8 @@ pub enum IsisQuery {
     Neighbors,
     /// The IS-IS interfaces, with their type, level and elected DIS.
     Interfaces,
+    /// The link-state database — every LSP held, per level.
+    Database,
 }
 
 /// A control-socket query plus the channel to answer it on.
@@ -270,6 +272,28 @@ pub struct IsisIfaceInfo {
     pub dis: [Option<(SystemId, u8)>; 2],
     /// Whether this router is the DIS, per level (`[L1, L2]`).
     pub is_dis: [bool; 2],
+}
+
+/// One LSP held in the link-state database, snapshotted for the (pure) renderer.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct IsisLspInfo {
+    /// The level whose database holds this LSP (1 or 2).
+    pub level: u8,
+    /// The LSP's identifier (system-id.pseudonode-fragment).
+    pub lsp_id: LspId,
+    /// The LSP's sequence number (higher is newer).
+    pub seq: u32,
+    /// The LSP's Fletcher checksum.
+    pub checksum: u16,
+    /// Remaining lifetime in seconds (0 == purged/expired).
+    pub lifetime: u16,
+    /// The 4-bit ATT (attached) flags — non-zero on an L1L2 router drawing a
+    /// default route towards the backbone.
+    pub attached: u8,
+    /// The Partition-Repair bit.
+    pub partition: bool,
+    /// The LSP Database Overload bit.
+    pub overload: bool,
 }
 
 /// The short name of an adjacency state, as shown by `show isis neighbors`.
@@ -336,6 +360,27 @@ pub fn render_isis_interfaces(ifaces: &[IsisIfaceInfo]) -> String {
             }
         }
         out.push('\n');
+    }
+    out
+}
+
+/// Render the link-state database, one LSP per line (à la `show isis database`).
+/// The `att/p/ol` column mirrors FRR/Cisco: the Attached, Partition and Overload
+/// bits. The ATT field shows `1` when any of the four attached-metric flags is set.
+pub fn render_isis_database(lsps: &[IsisLspInfo]) -> String {
+    if lsps.is_empty() {
+        return "no isis lsps\n".to_string();
+    }
+    let mut out = String::new();
+    for l in lsps {
+        let att = u8::from(l.attached != 0);
+        let p = u8::from(l.partition);
+        let ol = u8::from(l.overload);
+        let _ = writeln!(
+            out,
+            "level {} lsp {} seq {:#010x} chksum {:#06x} lifetime {} att/p/ol {}/{}/{}",
+            l.level, l.lsp_id, l.seq, l.checksum, l.lifetime, att, p, ol,
+        );
     }
     out
 }
@@ -453,6 +498,7 @@ pub async fn run(
                 let answer = match req.query {
                     IsisQuery::Neighbors => render_isis_neighbors(&isis.neighbor_infos()),
                     IsisQuery::Interfaces => render_isis_interfaces(&isis.iface_infos()),
+                    IsisQuery::Database => render_isis_database(&isis.lsp_infos()),
                 };
                 let _ = req.respond.send(answer);
             }
@@ -498,6 +544,35 @@ impl Isis {
                 is_dis: iface.is_dis,
             })
             .collect()
+    }
+
+    /// Snapshot every LSP in every active level's database, for `show isis
+    /// database`. Ordered by (level, LSP ID) for a stable listing.
+    fn lsp_infos(&self) -> Vec<IsisLspInfo> {
+        let mut out = Vec::new();
+        for level in self.active_levels() {
+            let lidx = match level {
+                IsLevel::L1 => 0,
+                IsLevel::L2 => 1,
+                IsLevel::L1L2 => continue, // active_levels() never yields L1L2
+            };
+            let level_no = lidx as u8 + 1;
+            let mut lsps: Vec<&Lsp> = self.dbs[lidx].iter().collect();
+            lsps.sort_by_key(|lsp| lsp.lsp_id);
+            for lsp in lsps {
+                out.push(IsisLspInfo {
+                    level: level_no,
+                    lsp_id: lsp.lsp_id,
+                    seq: lsp.sequence_number,
+                    checksum: lsp.checksum,
+                    lifetime: lsp.remaining_lifetime,
+                    attached: lsp.attached,
+                    partition: lsp.partition,
+                    overload: lsp.overload,
+                });
+            }
+        }
+        out
     }
 
     /// The levels this router runs.
@@ -1661,5 +1736,26 @@ mod tests {
         assert_eq!(level_mac(IsLevel::L1), ALL_L1_ISS);
         assert_eq!(level_mac(IsLevel::L2), ALL_L2_ISS);
         assert_eq!(level_mac(IsLevel::L1L2), ALL_L1_ISS);
+    }
+
+    #[test]
+    fn render_isis_database_lists_lsps_with_flags() {
+        assert_eq!(render_isis_database(&[]), "no isis lsps\n");
+        let lsp = IsisLspInfo {
+            level: 2,
+            lsp_id: LspId::new(SystemId::new([0, 0, 10, 0, 0, 1]), 0, 0),
+            seq: 3,
+            checksum: 0x1234,
+            lifetime: 1198,
+            attached: 0b0001,
+            partition: false,
+            overload: false,
+        };
+        let out = render_isis_database(&[lsp]);
+        assert_eq!(
+            out,
+            "level 2 lsp 0000.0a00.0001.00-00 seq 0x00000003 chksum 0x1234 \
+             lifetime 1198 att/p/ol 1/0/0\n"
+        );
     }
 }

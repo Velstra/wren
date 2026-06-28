@@ -186,11 +186,11 @@ a point-to-point adjacency over a veth and exchanging LSPs.
 
 ## Inspecting it
 
-The daemon answers two IS-IS `show` commands over its
+The daemon answers three IS-IS `show` commands over its
 [control socket](../configuration.md), each rendered by the IS-IS task itself out
-of the live state it owns (its interfaces, their per-level adjacencies and the DIS
-election) — no shared access, exactly like `show routes`, `show bgp` and `show
-ospf`:
+of the live state it owns (its interfaces, their per-level adjacencies, the DIS
+election and the per-level link-state databases) — no shared access, exactly like
+`show routes`, `show bgp` and `show ospf`:
 
 ```console
 $ wren show isis neighbors
@@ -199,6 +199,12 @@ $ wren show isis neighbors
 
 $ wren show isis interfaces
 veth0 type point-to-point level l1l2
+
+$ wren show isis database          # aliases: db, lsdb
+level 1 lsp 0000.0000.0001.00-00 seq 0x00000003 chksum 0x9f2a lifetime 1198 att/p/ol 0/0/0
+level 1 lsp 0000.0000.0002.00-00 seq 0x00000002 chksum 0x4c1d lifetime 1197 att/p/ol 0/0/0
+level 2 lsp 0000.0000.0001.00-00 seq 0x00000003 chksum 0x7b80 lifetime 1198 att/p/ol 0/0/0
+level 2 lsp 0000.0000.0002.00-00 seq 0x00000002 chksum 0x12e4 lifetime 1197 att/p/ol 0/0/0
 ```
 
 `show isis neighbors` lists every adjacency — one line per neighbour **per level**
@@ -207,9 +213,14 @@ System ID, its SNPA (the MAC on a LAN), the local interface, the level and the
 state (`Down` / `Init` / `Up`). `show isis interfaces` lists each circuit with its
 type (`broadcast` / `point-to-point`), the level(s) it runs and, on a broadcast
 circuit, the elected `dis-l1` / `dis-l2` LAN ID (marked `(self)` when this router
-won the election). `scripts/isis-show-smoke.sh` exercises both live (rootless):
-two routers form a point-to-point L1L2 adjacency and the queries report both levels
-Up.
+won the election). `show isis database` (also `db` / `lsdb`) dumps the link-state
+database — every LSP held, grouped per level and ordered by LSP ID — with each
+LSP's ID (`system-id.pseudonode-fragment`), sequence number, Fletcher checksum,
+remaining lifetime in seconds and the `att/p/ol` flags (Attached / Partition /
+Overload). `scripts/isis-show-smoke.sh` and `scripts/isis-database-smoke.sh`
+exercise these live (rootless): two routers form a point-to-point L1L2 adjacency,
+the queries report both levels Up and both databases hold each router's L1 and L2
+LSPs.
 
 ## Not yet implemented
 

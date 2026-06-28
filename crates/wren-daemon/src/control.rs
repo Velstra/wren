@@ -167,7 +167,7 @@ async fn handle_conn(stream: UnixStream, channels: Channels) -> Result<()> {
              usage: show routes [protocol] | show bgp [routes|neighbors] | \
              bgp refresh <peer> | \
              show ospf [neighbors|interfaces|database] | show ospf3 [neighbors|interfaces] | \
-             show isis [neighbors|interfaces] | show babel [neighbors|routes] | \
+             show isis [neighbors|interfaces|database] | show babel [neighbors|routes] | \
              show rip | show ripng\n"
         )
     };
@@ -309,9 +309,9 @@ pub fn parse_ospf3_query(line: &str) -> Option<Ospf3Query> {
     Some(query)
 }
 
-/// Parse a `show isis [neighbors|interfaces]` command into an [`IsisQuery`]. A
-/// bare `show isis` defaults to the adjacencies view. Returns `None` for anything
-/// else (so the caller can fall through to the other query parsers).
+/// Parse a `show isis [neighbors|interfaces|database]` command into an
+/// [`IsisQuery`]. A bare `show isis` defaults to the adjacencies view. Returns
+/// `None` for anything else (so the caller can fall through to the other parsers).
 pub fn parse_isis_query(line: &str) -> Option<IsisQuery> {
     let mut tokens = line.split_whitespace();
     if tokens.next()? != "show" || tokens.next()? != "isis" {
@@ -322,6 +322,7 @@ pub fn parse_isis_query(line: &str) -> Option<IsisQuery> {
             IsisQuery::Neighbors
         }
         Some("interfaces") | Some("interface") | Some("iface") => IsisQuery::Interfaces,
+        Some("database") | Some("db") | Some("lsdb") => IsisQuery::Database,
         Some(_) => return None,
     };
     // A trailing extra token is a malformed command.
@@ -503,6 +504,12 @@ mod tests {
             parse_isis_query("show isis interfaces"),
             Some(IsisQuery::Interfaces)
         );
+        for alias in ["database", "db", "lsdb"] {
+            assert_eq!(
+                parse_isis_query(&format!("show isis {alias}")),
+                Some(IsisQuery::Database)
+            );
+        }
     }
 
     #[test]

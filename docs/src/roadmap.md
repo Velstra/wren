@@ -162,8 +162,10 @@ implemented to its RFC.
   `wren show ospf3
   [neighbors|interfaces]` does the same for OSPFv3 (neighbours by Router ID over
   their IPv6 link-local, interfaces by area and state), `wren show isis
-  [neighbors|interfaces]` renders the IS-IS adjacencies (System ID, SNPA, per-level
-  state) and circuits (type, level, elected DIS), `wren show babel [neighbors|routes]`
+  [neighbors|interfaces|database]` renders the IS-IS adjacencies (System ID, SNPA,
+  per-level state), circuits (type, level, elected DIS) and the per-level
+  link-state database (every LSP's ID, sequence, checksum, lifetime, att/p/ol
+  flags), `wren show babel [neighbors|routes]`
   renders the Babel neighbours (Hello/IHU link costs) and selected routes, and
   `wren show rip` / `wren show ripng` render the RIPv2 / RIPng distance-vector table
   (destination, metric, gateway, interface). Each query is answered by the task that
