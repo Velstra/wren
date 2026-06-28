@@ -565,21 +565,25 @@ fn build_ospf_config(
     } else {
         Vec::new()
     };
-    // Stub areas (RFC 2328 §3.6): parse each configured area id to a dotted quad.
-    let stub_areas: std::collections::HashSet<Ipv4Addr> = ospf
-        .stub_areas
-        .iter()
-        .map(|a| a.parse().context("ospf stub-area must be a dotted quad, e.g. \"1.0.0.0\""))
-        .collect::<Result<_>>()?;
+    // Parse a list of area ids (dotted quads) into a set.
+    let parse_areas = |list: &[String], what: &str| -> Result<std::collections::HashSet<Ipv4Addr>> {
+        list.iter()
+            .map(|a| a.parse().with_context(|| format!("ospf {what} must be a dotted quad, e.g. \"1.0.0.0\"")))
+            .collect()
+    };
+    // Stub areas (RFC 2328 §3.6), plus the totally-stubby ("no-summary") subset,
+    // which are stubs that additionally suppress inter-area summaries.
+    let totally_stubby_areas = parse_areas(&ospf.totally_stubby_areas, "totally-stubby-area")?;
+    let mut stub_areas = parse_areas(&ospf.stub_areas, "stub-area")?;
+    stub_areas.extend(totally_stubby_areas.iter().copied()); // a totally-stubby area is a stub
     if stub_areas.contains(&Ipv4Addr::UNSPECIFIED) {
         anyhow::bail!("the backbone area 0.0.0.0 cannot be a stub area (RFC 2328 §3.6)");
     }
-    // NSSA areas (RFC 3101): parsed like stub areas, and mutually exclusive with them.
-    let nssa_areas: std::collections::HashSet<Ipv4Addr> = ospf
-        .nssa_areas
-        .iter()
-        .map(|a| a.parse().context("ospf nssa-area must be a dotted quad, e.g. \"1.0.0.0\""))
-        .collect::<Result<_>>()?;
+    // NSSA areas (RFC 3101) plus the totally-NSSA subset, and mutually exclusive
+    // with stubs.
+    let totally_nssa_areas = parse_areas(&ospf.totally_nssa_areas, "totally-nssa-area")?;
+    let mut nssa_areas = parse_areas(&ospf.nssa_areas, "nssa-area")?;
+    nssa_areas.extend(totally_nssa_areas.iter().copied()); // a totally-NSSA area is an NSSA
     if nssa_areas.contains(&Ipv4Addr::UNSPECIFIED) {
         anyhow::bail!("the backbone area 0.0.0.0 cannot be an NSSA area (RFC 3101)");
     }
@@ -599,6 +603,8 @@ fn build_ospf_config(
         stub_areas,
         stub_default_cost: ospf.stub_default_cost.unwrap_or(1),
         nssa_areas,
+        totally_stubby_areas,
+        totally_nssa_areas,
     })
 }
 

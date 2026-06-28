@@ -102,6 +102,14 @@ pub struct OspfConfig {
     /// no AS-external (type-5) LSAs, but an ASBR inside may originate type-7 LSAs,
     /// which the area border router translates to type-5 for the rest of the AS.
     pub nssa_areas: HashSet<Ipv4Addr>,
+    /// Totally-stubby areas (RFC 2328 §3.6 "no-summary" stubs): a stub area into
+    /// which the ABR also suppresses inter-area (type-3) summaries, leaving only the
+    /// injected default. Every area here is also in [`Self::stub_areas`].
+    pub totally_stubby_areas: HashSet<Ipv4Addr>,
+    /// Totally-NSSA areas (NSSA "no-summary"): an NSSA into which the ABR suppresses
+    /// inter-area (type-3) summaries and instead injects a type-7 default route.
+    /// Every area here is also in [`Self::nssa_areas`].
+    pub totally_nssa_areas: HashSet<Ipv4Addr>,
 }
 
 /// One configured OSPF interface and the area it is in.
@@ -1358,10 +1366,18 @@ impl Ospf {
                     *slot = (*slot).min(r.cost);
                 }
             }
+            // Into a totally-stubby / totally-NSSA ("no-summary") area the ABR
+            // suppresses the inter-area type-3 summaries entirely — the injected
+            // default below (a type-3 default for a stub, a type-7 default for an
+            // NSSA) stands in for every destination outside the area.
+            if self.no_summary(dest) {
+                want_routes.clear();
+            }
             // Into a stub area (RFC 2328 §3.6) the ABR injects a default route in
             // place of the AS-external LSAs the area never sees — a type-3 summary
-            // for 0.0.0.0/0 at the configured cost. The ordinary inter-area summaries
-            // are still sent too (this is a plain stub, not a totally-stubby area).
+            // for 0.0.0.0/0 at the configured cost. For a plain stub the ordinary
+            // inter-area summaries are still sent too; a totally-stubby area cleared
+            // them just above, so only this default remains.
             if self.is_stub(dest) {
                 if let Ok(default) = Prefix::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0) {
                     want_routes.insert(default, self.cfg.stub_default_cost);
@@ -1388,8 +1404,41 @@ impl Ospf {
                 self.flood_lsa(dest, lsa).await;
             }
         }
-        // As an ABR, also translate any NSSA type-7 LSAs to type-5 for the AS.
+        // As an ABR, inject the type-7 default into any totally-NSSA area, and
+        // translate any NSSA type-7 LSAs to type-5 for the rest of the AS.
+        self.originate_nssa_default().await;
         self.translate_nssa().await;
+    }
+
+    /// Inject a type-7 default route (`0.0.0.0/0`) into each totally-NSSA area as
+    /// its area border router. A totally-NSSA area carries neither AS-external
+    /// (type-5) nor inter-area (type-3) summaries, so its internal routers reach
+    /// every destination outside the area — inter-area and AS-external alike —
+    /// through this default. The P-bit is left clear (`options = 0`) so the ABR does
+    /// **not** translate the default into a type-5 for the rest of the AS. Reached
+    /// only after the `is_abr` guard in [`Ospf::originate_summaries`], so only an ABR
+    /// injects it; the cost is the same `stub_default_cost` a stub default uses.
+    async fn originate_nssa_default(&mut self) {
+        let areas: Vec<Ipv4Addr> =
+            self.areas.keys().copied().filter(|a| self.is_totally_nssa(*a)).collect();
+        for area in areas {
+            let lsa = Lsa {
+                header: {
+                    let mut h = self.self_header(LsType::Nssa, Ipv4Addr::UNSPECIFIED);
+                    h.options = 0; // P-bit clear: never translate the default AS-wide
+                    h
+                },
+                body: LsaBody::AsExternal(AsExternalLsa {
+                    network_mask: len_to_mask(0),
+                    external_type2: true,
+                    metric: self.cfg.stub_default_cost,
+                    forwarding_address: Ipv4Addr::UNSPECIFIED,
+                    route_tag: 0,
+                }),
+            };
+            let lsa = self.install_originated(area, lsa);
+            self.flood_lsa(area, &lsa).await;
+        }
     }
 
     /// Translate the NSSA type-7 LSAs held in each not-so-stubby area into AS-external
@@ -1698,6 +1747,24 @@ impl Ospf {
     /// Whether `area` is configured as a not-so-stubby area (NSSA, RFC 3101).
     fn is_nssa(&self, area: Ipv4Addr) -> bool {
         self.cfg.nssa_areas.contains(&area)
+    }
+
+    /// Whether `area` is a totally-stubby area (a "no-summary" stub).
+    fn is_totally_stubby(&self, area: Ipv4Addr) -> bool {
+        self.cfg.totally_stubby_areas.contains(&area)
+    }
+
+    /// Whether `area` is a totally-NSSA area (a "no-summary" NSSA).
+    fn is_totally_nssa(&self, area: Ipv4Addr) -> bool {
+        self.cfg.totally_nssa_areas.contains(&area)
+    }
+
+    /// Whether an ABR should suppress inter-area (type-3) summaries into `area` —
+    /// true for both totally-stubby and totally-NSSA "no-summary" areas, whose
+    /// internal routers reach everything outside the area through an injected
+    /// default instead.
+    fn no_summary(&self, area: Ipv4Addr) -> bool {
+        self.is_totally_stubby(area) || self.is_totally_nssa(area)
     }
 
     /// Whether `area` carries no AS-external (type-5) LSAs — true for both stub and

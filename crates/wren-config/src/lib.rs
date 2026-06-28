@@ -220,6 +220,18 @@ pub struct Ospf {
     /// for the rest of the AS. An area may be a stub or an NSSA, not both.
     #[serde(default, rename = "nssa-areas")]
     pub nssa_areas: Vec<String>,
+    /// Areas configured as **totally-stubby** ("no-summary" stub) areas, listed by
+    /// id. Like a stub they carry no AS-external LSAs, and additionally the area
+    /// border router suppresses inter-area (type-3) summaries, leaving only the
+    /// injected default. An area listed here is treated as a stub.
+    #[serde(default, rename = "totally-stubby-areas")]
+    pub totally_stubby_areas: Vec<String>,
+    /// Areas configured as **totally-NSSA** ("no-summary" NSSA) areas, listed by id.
+    /// Like an NSSA they carry no type-5 LSAs and may hold type-7s, and additionally
+    /// the area border router suppresses inter-area (type-3) summaries and injects a
+    /// type-7 default route. An area listed here is treated as an NSSA.
+    #[serde(default, rename = "totally-nssa-areas")]
+    pub totally_nssa_areas: Vec<String>,
 }
 
 /// One OSPF interface placed in a specific area (`[[ospf.interface]]`).
@@ -922,6 +934,24 @@ mod tests {
         )
         .expect("valid config");
         assert_eq!(cfg.ospf.expect("ospf present").nssa_areas, vec!["3.0.0.0"]);
+    }
+
+    #[test]
+    fn parses_ospf_totally_stubby_and_nssa_areas() {
+        let cfg = Config::from_toml(
+            r#"
+            router-id = "10.0.0.1"
+            [ospf]
+            enabled = true
+            interfaces = ["eth1"]
+            totally-stubby-areas = ["1.0.0.0"]
+            totally-nssa-areas   = ["3.0.0.0"]
+            "#,
+        )
+        .expect("valid config");
+        let ospf = cfg.ospf.expect("ospf present");
+        assert_eq!(ospf.totally_stubby_areas, vec!["1.0.0.0"]);
+        assert_eq!(ospf.totally_nssa_areas, vec!["3.0.0.0"]);
     }
 
     #[test]
