@@ -110,3 +110,29 @@ Response is learned and installed into the kernel:
 For RIPng the same applies over IPv6 (link-local `fe80::` source, a learned
 route's link-local next hop pinned to the receiving interface so the kernel can
 install it).
+
+## Inspecting it
+
+The daemon answers `wren show rip` and `wren show ripng` over its
+[control socket](../configuration.md), each rendered by the owning engine out of
+its live distance-vector table — no shared access, like the other protocols'
+`show` commands. RIP keeps no adjacency state, so the only view is the table:
+
+```console
+$ wren show rip
+10.0.0.0/24 dev veth0 metric 1 (connected)
+10.99.0.0/24 metric 1 (redistributed)
+10.5.0.0/16 via 10.0.0.2 dev veth0 metric 2
+
+$ wren show ripng
+2001:db8::/64 dev veth0 metric 1 (connected)
+2001:db8:99::/64 via fe80::486c:d8ff:fed4:dda5 dev veth0 metric 2
+```
+
+Each line is one route: the destination, the gateway (`via …`, omitted for a
+directly-connected or redistributed network), the interface, the metric (or
+`unreachable` for a route in garbage collection), and a `(connected)` /
+`(redistributed)` tag for the routes RIP originates itself.
+`scripts/rip-show-smoke.sh` exercises both live (rootless): two routers exchange
+Responses over a dual-stack veth and the queries report the learned and originated
+routes.

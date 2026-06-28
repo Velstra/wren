@@ -23,11 +23,12 @@ use crate::babel::{BabelQuery, BabelQueryRequest};
 use crate::bgp::{BgpQuery, BgpQueryRequest};
 use crate::isis::{IsisQuery, IsisQueryRequest};
 use crate::ospf::{OspfQuery, OspfQueryRequest};
+use crate::rip::{RipQuery, RipQueryRequest};
 use crate::router::{Query, QueryRequest};
 
-/// The query channels the control socket forwards to. `bgp` / `ospf` / `isis` are
-/// `None` when that protocol is not configured, so `show bgp` / `show ospf` /
-/// `show isis` can report that instead of hanging.
+/// The query channels the control socket forwards to. Every per-protocol channel
+/// is `None` when that protocol is not configured, so `show <proto>` can report
+/// that instead of hanging.
 #[derive(Clone)]
 pub struct Channels {
     /// To the central router loop (`show routes`).
@@ -40,6 +41,59 @@ pub struct Channels {
     pub isis: Option<mpsc::Sender<IsisQueryRequest>>,
     /// To the Babel task (`show babel`), if Babel is running.
     pub babel: Option<mpsc::Sender<BabelQueryRequest>>,
+    /// To the RIP task (`show rip`), if RIPv2 is running.
+    pub rip: Option<mpsc::Sender<RipQueryRequest>>,
+    /// To the RIPng task (`show ripng`), if RIPng is running.
+    pub ripng: Option<mpsc::Sender<RipQueryRequest>>,
+}
+
+/// A per-protocol query channel's request type: it pairs a typed query with the
+/// oneshot the owning task answers on. Implementing this for each protocol's
+/// `*QueryRequest` lets the control socket's send/await/fallback logic live once
+/// in the generic [`ask`] / [`ask_opt`], instead of a near-identical `ask_*` per
+/// protocol.
+trait OwnedQuery: Send + 'static {
+    /// The query enum this request carries.
+    type Query: Send;
+    /// Build the request from a query and the responder the task replies on.
+    fn build(query: Self::Query, respond: oneshot::Sender<String>) -> Self;
+}
+
+impl OwnedQuery for QueryRequest {
+    type Query = Query;
+    fn build(query: Query, respond: oneshot::Sender<String>) -> Self {
+        QueryRequest { query, respond }
+    }
+}
+impl OwnedQuery for BgpQueryRequest {
+    type Query = BgpQuery;
+    fn build(query: BgpQuery, respond: oneshot::Sender<String>) -> Self {
+        BgpQueryRequest { query, respond }
+    }
+}
+impl OwnedQuery for OspfQueryRequest {
+    type Query = OspfQuery;
+    fn build(query: OspfQuery, respond: oneshot::Sender<String>) -> Self {
+        OspfQueryRequest { query, respond }
+    }
+}
+impl OwnedQuery for IsisQueryRequest {
+    type Query = IsisQuery;
+    fn build(query: IsisQuery, respond: oneshot::Sender<String>) -> Self {
+        IsisQueryRequest { query, respond }
+    }
+}
+impl OwnedQuery for BabelQueryRequest {
+    type Query = BabelQuery;
+    fn build(query: BabelQuery, respond: oneshot::Sender<String>) -> Self {
+        BabelQueryRequest { query, respond }
+    }
+}
+impl OwnedQuery for RipQueryRequest {
+    type Query = RipQuery;
+    fn build(query: RipQuery, respond: oneshot::Sender<String>) -> Self {
+        RipQueryRequest { query, respond }
+    }
 }
 
 /// Serve the control socket at `path`, forwarding queries to the owning tasks.
@@ -83,33 +137,25 @@ async fn handle_conn(stream: UnixStream, channels: Channels) -> Result<()> {
     let line = line.trim();
 
     let response = if let Some(query) = parse_bgp_query(line) {
-        match &channels.bgp {
-            Some(bgp) => ask_bgp(bgp, query).await,
-            None => "bgp is not enabled\n".to_string(),
-        }
+        ask_opt(&channels.bgp, query, "bgp").await
     } else if let Some(query) = parse_ospf_query(line) {
-        match &channels.ospf {
-            Some(ospf) => ask_ospf(ospf, query).await,
-            None => "ospf is not enabled\n".to_string(),
-        }
+        ask_opt(&channels.ospf, query, "ospf").await
     } else if let Some(query) = parse_isis_query(line) {
-        match &channels.isis {
-            Some(isis) => ask_isis(isis, query).await,
-            None => "isis is not enabled\n".to_string(),
-        }
+        ask_opt(&channels.isis, query, "isis").await
     } else if let Some(query) = parse_babel_query(line) {
-        match &channels.babel {
-            Some(babel) => ask_babel(babel, query).await,
-            None => "babel is not enabled\n".to_string(),
-        }
+        ask_opt(&channels.babel, query, "babel").await
+    } else if let Some(query) = parse_rip_query(line, "ripng") {
+        ask_opt(&channels.ripng, query, "ripng").await
+    } else if let Some(query) = parse_rip_query(line, "rip") {
+        ask_opt(&channels.rip, query, "rip").await
     } else if let Some(query) = parse_query(line) {
-        ask_router(&channels.router, query).await
+        ask(&channels.router, query, "router").await
     } else {
         format!(
             "error: unknown command {line:?}\n\
              usage: show routes [protocol] | show bgp [routes|neighbors] | \
              show ospf [neighbors|interfaces] | show isis [neighbors|interfaces] | \
-             show babel [neighbors|routes]\n"
+             show babel [neighbors|routes] | show rip | show ripng\n"
         )
     };
 
@@ -121,54 +167,29 @@ async fn handle_conn(stream: UnixStream, channels: Channels) -> Result<()> {
     Ok(())
 }
 
-/// Forward a router query and await its rendered answer.
-async fn ask_router(queries: &mpsc::Sender<QueryRequest>, query: Query) -> String {
+/// Forward a query to the task that owns the state and await its rendered answer.
+/// One generic body for every protocol: build the request, send it, await the
+/// oneshot, and fall back to an `unavailable` message if the task is gone.
+async fn ask<R: OwnedQuery>(queries: &mpsc::Sender<R>, query: R::Query, name: &str) -> String {
     let (tx, rx) = oneshot::channel();
-    if queries.send(QueryRequest { query, respond: tx }).await.is_err() {
-        return "error: router unavailable\n".to_string();
+    if queries.send(R::build(query, tx)).await.is_err() {
+        return format!("error: {name} unavailable\n");
     }
     rx.await
-        .unwrap_or_else(|_| "error: router unavailable\n".to_string())
+        .unwrap_or_else(|_| format!("error: {name} unavailable\n"))
 }
 
-/// Forward a BGP query and await its rendered answer.
-async fn ask_bgp(queries: &mpsc::Sender<BgpQueryRequest>, query: BgpQuery) -> String {
-    let (tx, rx) = oneshot::channel();
-    if queries.send(BgpQueryRequest { query, respond: tx }).await.is_err() {
-        return "error: bgp unavailable\n".to_string();
+/// Like [`ask`], for a protocol whose task may not be running: reply that it is
+/// not enabled rather than hanging on a channel that was never created.
+async fn ask_opt<R: OwnedQuery>(
+    queries: &Option<mpsc::Sender<R>>,
+    query: R::Query,
+    name: &str,
+) -> String {
+    match queries {
+        Some(q) => ask(q, query, name).await,
+        None => format!("{name} is not enabled\n"),
     }
-    rx.await
-        .unwrap_or_else(|_| "error: bgp unavailable\n".to_string())
-}
-
-/// Forward an OSPF query and await its rendered answer.
-async fn ask_ospf(queries: &mpsc::Sender<OspfQueryRequest>, query: OspfQuery) -> String {
-    let (tx, rx) = oneshot::channel();
-    if queries.send(OspfQueryRequest { query, respond: tx }).await.is_err() {
-        return "error: ospf unavailable\n".to_string();
-    }
-    rx.await
-        .unwrap_or_else(|_| "error: ospf unavailable\n".to_string())
-}
-
-/// Forward an IS-IS query and await its rendered answer.
-async fn ask_isis(queries: &mpsc::Sender<IsisQueryRequest>, query: IsisQuery) -> String {
-    let (tx, rx) = oneshot::channel();
-    if queries.send(IsisQueryRequest { query, respond: tx }).await.is_err() {
-        return "error: isis unavailable\n".to_string();
-    }
-    rx.await
-        .unwrap_or_else(|_| "error: isis unavailable\n".to_string())
-}
-
-/// Forward a Babel query and await its rendered answer.
-async fn ask_babel(queries: &mpsc::Sender<BabelQueryRequest>, query: BabelQuery) -> String {
-    let (tx, rx) = oneshot::channel();
-    if queries.send(BabelQueryRequest { query, respond: tx }).await.is_err() {
-        return "error: babel unavailable\n".to_string();
-    }
-    rx.await
-        .unwrap_or_else(|_| "error: babel unavailable\n".to_string())
 }
 
 /// Parse one control command line into a [`Query`]. Returns `None` for anything
@@ -266,6 +287,26 @@ pub fn parse_babel_query(line: &str) -> Option<BabelQuery> {
     let query = match tokens.next() {
         None | Some("neighbors") | Some("neighbours") => BabelQuery::Neighbors,
         Some("routes") | Some("route") => BabelQuery::Routes,
+        Some(_) => return None,
+    };
+    // A trailing extra token is a malformed command.
+    if tokens.next().is_some() {
+        return None;
+    }
+    Some(query)
+}
+
+/// Parse a `show rip` / `show ripng` command into a [`RipQuery`], matching the
+/// given `keyword` (`"rip"` or `"ripng"`). RIP keeps no adjacency state, so the
+/// only view is its routing table; a bare `show rip` (or `show rip routes`) is the
+/// table. Returns `None` for anything else (so the caller can fall through).
+pub fn parse_rip_query(line: &str, keyword: &str) -> Option<RipQuery> {
+    let mut tokens = line.split_whitespace();
+    if tokens.next()? != "show" || tokens.next()? != keyword {
+        return None;
+    }
+    let query = match tokens.next() {
+        None | Some("routes") | Some("route") => RipQuery::Routes,
         Some(_) => return None,
     };
     // A trailing extra token is a malformed command.
@@ -393,5 +434,25 @@ mod tests {
         assert!(parse_babel_query("show babel nonsense").is_none());
         assert!(parse_babel_query("show babel neighbors extra").is_none());
         assert!(parse_babel_query("").is_none());
+    }
+
+    #[test]
+    fn parse_rip_query_understands_show_rip_and_ripng() {
+        assert_eq!(parse_rip_query("show rip", "rip"), Some(RipQuery::Routes));
+        assert_eq!(parse_rip_query("show rip routes", "rip"), Some(RipQuery::Routes));
+        assert_eq!(parse_rip_query("show ripng", "ripng"), Some(RipQuery::Routes));
+        assert_eq!(parse_rip_query("show ripng route", "ripng"), Some(RipQuery::Routes));
+    }
+
+    #[test]
+    fn parse_rip_query_keeps_rip_and_ripng_distinct() {
+        // The keyword match is exact, so `show ripng` is not a `rip` query and
+        // vice-versa — this is what lets the dispatcher try both without collision.
+        assert!(parse_rip_query("show ripng", "rip").is_none());
+        assert!(parse_rip_query("show rip", "ripng").is_none());
+        assert!(parse_rip_query("show bgp", "rip").is_none());
+        assert!(parse_rip_query("show rip nonsense", "rip").is_none());
+        assert!(parse_rip_query("show rip routes extra", "rip").is_none());
+        assert!(parse_rip_query("", "rip").is_none());
     }
 }

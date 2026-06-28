@@ -203,6 +203,12 @@ async fn main() -> Result<()> {
     let (babel_queries_tx, babel_queries_rx) = mpsc::channel(QUERY_QUEUE);
     let mut babel_queries_rx = Some(babel_queries_rx);
     let babel_enabled = cfg.babel.as_ref().is_some_and(|b| b.enabled);
+    let (rip_queries_tx, rip_queries_rx) = mpsc::channel(QUERY_QUEUE);
+    let mut rip_queries_rx = Some(rip_queries_rx);
+    let rip_enabled = cfg.rip.as_ref().is_some_and(|r| r.enabled);
+    let (ripng_queries_tx, ripng_queries_rx) = mpsc::channel(QUERY_QUEUE);
+    let mut ripng_queries_rx = Some(ripng_queries_rx);
+    let ripng_enabled = cfg.ripng.as_ref().is_some_and(|r| r.enabled);
     {
         let socket = args.socket.clone();
         let channels = control::Channels {
@@ -211,6 +217,8 @@ async fn main() -> Result<()> {
             ospf: ospf_enabled.then(|| ospf_queries_tx.clone()),
             isis: isis_enabled.then(|| isis_queries_tx.clone()),
             babel: babel_enabled.then(|| babel_queries_tx.clone()),
+            rip: rip_enabled.then(|| rip_queries_tx.clone()),
+            ripng: ripng_enabled.then(|| ripng_queries_tx.clone()),
         };
         tokio::spawn(async move {
             if let Err(e) = control::serve(socket, channels).await {
@@ -246,8 +254,9 @@ async fn main() -> Result<()> {
         let redistribute_metric = ripcfg.redistribute_metric.unwrap_or(1);
         let interfaces = ripcfg.interfaces.clone();
         let tx = updates_tx.clone();
+        let qrx = rip_queries_rx.take().expect("rip queries rx taken once");
         tokio::spawn(async move {
-            if let Err(e) = rip::run(interfaces, tx, redist_rx, redistribute_metric).await {
+            if let Err(e) = rip::run(interfaces, tx, redist_rx, redistribute_metric, qrx).await {
                 error!(error = %e, "RIP engine stopped");
             }
         });
@@ -280,8 +289,9 @@ async fn main() -> Result<()> {
         let redistribute_metric = ripngcfg.redistribute_metric.unwrap_or(1);
         let interfaces = ripngcfg.interfaces.clone();
         let tx = updates_tx.clone();
+        let qrx = ripng_queries_rx.take().expect("ripng queries rx taken once");
         tokio::spawn(async move {
-            if let Err(e) = ripng::run(interfaces, tx, redist_rx, redistribute_metric).await {
+            if let Err(e) = ripng::run(interfaces, tx, redist_rx, redistribute_metric, qrx).await {
                 error!(error = %e, "RIPng engine stopped");
             }
         });

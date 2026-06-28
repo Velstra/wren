@@ -630,6 +630,42 @@ impl RipTable {
     pub fn is_empty(&self) -> bool {
         self.routes.is_empty()
     }
+
+    /// A read-only snapshot of every route in the table, sorted by prefix, for the
+    /// operational `show rip` / `show ripng` views. Routes still in garbage
+    /// collection (metric 16) are included and reported `unreachable`.
+    pub fn routes(&self) -> Vec<RouteInfo> {
+        self.routes
+            .iter()
+            .map(|(prefix, r)| RouteInfo {
+                prefix: *prefix,
+                metric: r.metric,
+                next_hop: r.next_hop,
+                ifindex: r.ifindex,
+                connected: r.connected,
+                redistributed: r.redistributed,
+            })
+            .collect()
+    }
+}
+
+/// A read-only snapshot of one entry in RIP's table, for the operational `show
+/// rip` / `show ripng` views. The distance-vector engine is address-neutral, so
+/// this serves both RIPv2 (IPv4) and RIPng (IPv6).
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct RouteInfo {
+    /// The destination network.
+    pub prefix: Prefix,
+    /// The metric to reach it through us (1..=15, or 16 = unreachable/garbage).
+    pub metric: u32,
+    /// The gateway we forward through (unspecified for a connected route).
+    pub next_hop: IpAddr,
+    /// The interface the route was learned on (0 for a redistributed route).
+    pub ifindex: u32,
+    /// Whether this is a directly-connected network.
+    pub connected: bool,
+    /// Whether this was redistributed from another protocol via the RIB.
+    pub redistributed: bool,
 }
 
 /// Build the core [`Route`] RIP presents to the RIB for a prefix.

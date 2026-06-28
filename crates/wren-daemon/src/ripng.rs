@@ -26,7 +26,7 @@ use wren_core::{NextHop, Protocol, Route};
 use wren_rip::{ng, Advert, Command, RipEvent, RipTable, UPDATE_SECS};
 
 use crate::connected;
-use crate::rip::{setsockopt_int, setsockopt_struct};
+use crate::rip::{render_rip_routes, setsockopt_int, setsockopt_struct, RipQuery, RipQueryRequest};
 use crate::router::{Redistribution, RouteUpdate};
 
 /// Advance timers / flush triggered updates this often (seconds).
@@ -60,6 +60,7 @@ pub async fn run(
     updates: mpsc::Sender<RouteUpdate>,
     mut redist: mpsc::Receiver<Redistribution>,
     redistribute_metric: u32,
+    mut queries: mpsc::Receiver<RipQueryRequest>,
 ) -> Result<()> {
     let mut ifaces = Vec::with_capacity(interfaces.len());
     for name in &interfaces {
@@ -155,6 +156,14 @@ pub async fn run(
                 let now = start.elapsed().as_secs();
                 apply_redistribution(&mut table, r, redistribute_metric, now);
                 flush_triggered(&mut table, &ifaces).await;
+            }
+            Some(req) = queries.recv() => {
+                let resp = match req.query {
+                    RipQuery::Routes => render_rip_routes(&table.routes(), |idx| {
+                        iface_by_index(&ifaces, idx).map(|i| i.name.clone())
+                    }),
+                };
+                let _ = req.respond.send(resp);
             }
         }
     }

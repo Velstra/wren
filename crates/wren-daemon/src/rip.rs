@@ -20,6 +20,7 @@
 //! minimal-dependency approach as `wren-netlink`.
 
 use std::ffi::CString;
+use std::fmt::Write as _;
 use std::io;
 use std::mem;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
@@ -30,12 +31,14 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use tokio::net::UdpSocket;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tokio::time::MissedTickBehavior;
 use tracing::{debug, info, warn};
 
 use wren_core::{NextHop, Protocol, Route};
-use wren_rip::{Command, Entry, Message, RipEvent, RipTable, MAX_ENTRIES, PORT, UPDATE_SECS};
+use wren_rip::{
+    Command, Entry, Message, RipEvent, RipTable, RouteInfo, MAX_ENTRIES, PORT, UPDATE_SECS,
+};
 
 use crate::connected;
 use crate::router::{Redistribution, RouteUpdate};
@@ -62,6 +65,57 @@ struct Packet {
     data: Vec<u8>,
 }
 
+/// A `show rip` / `show ripng` query, answered by the RIP task itself out of the
+/// [`RipTable`] it owns (no shared access, like the other protocols' `show`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum RipQuery {
+    /// RIP's own routing table (destination, metric, gateway, interface).
+    Routes,
+}
+
+/// A control-socket query plus the channel to answer it on. Shared by RIPv2 and
+/// RIPng — both run the same address-neutral [`RipTable`].
+pub struct RipQueryRequest {
+    /// What to report.
+    pub query: RipQuery,
+    /// Where to send the rendered answer.
+    pub respond: oneshot::Sender<String>,
+}
+
+/// Render RIP's routing table (à la `show ip rip`), one route per line, resolving
+/// each route's interface index to a name via `iface_name`. Shared by RIPv2 and
+/// RIPng, so it formats from the address-neutral [`RouteInfo`].
+pub fn render_rip_routes(
+    routes: &[RouteInfo],
+    iface_name: impl Fn(u32) -> Option<String>,
+) -> String {
+    if routes.is_empty() {
+        return "no rip routes\n".to_string();
+    }
+    let mut out = String::new();
+    for r in routes {
+        let _ = write!(out, "{}", r.prefix);
+        if !r.next_hop.is_unspecified() {
+            let _ = write!(out, " via {}", r.next_hop);
+        }
+        if let Some(name) = iface_name(r.ifindex) {
+            let _ = write!(out, " dev {name}");
+        }
+        if r.metric >= wren_rip::METRIC_INFINITY {
+            out.push_str(" metric unreachable");
+        } else {
+            let _ = write!(out, " metric {}", r.metric);
+        }
+        if r.connected {
+            out.push_str(" (connected)");
+        } else if r.redistributed {
+            out.push_str(" (redistributed)");
+        }
+        out.push('\n');
+    }
+    out
+}
+
 /// Run RIP on `interfaces`, forwarding learned/lost routes to `updates`. Returns
 /// when a socket error tears the runner down; otherwise runs until cancelled.
 ///
@@ -73,6 +127,7 @@ pub async fn run(
     updates: mpsc::Sender<RouteUpdate>,
     mut redist: mpsc::Receiver<Redistribution>,
     redistribute_metric: u32,
+    mut queries: mpsc::Receiver<RipQueryRequest>,
 ) -> Result<()> {
     let mut ifaces = Vec::with_capacity(interfaces.len());
     for name in &interfaces {
@@ -169,6 +224,14 @@ pub async fn run(
                 let now = start.elapsed().as_secs();
                 apply_redistribution(&mut table, r, redistribute_metric, now);
                 flush_triggered(&mut table, &ifaces).await;
+            }
+            Some(req) = queries.recv() => {
+                let resp = match req.query {
+                    RipQuery::Routes => render_rip_routes(&table.routes(), |idx| {
+                        iface_by_index(&ifaces, idx).map(|i| i.name.clone())
+                    }),
+                };
+                let _ = req.respond.send(resp);
             }
         }
     }
