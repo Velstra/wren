@@ -273,9 +273,16 @@ pub struct Bgp {
     /// The Hold Time proposed in OPEN, in seconds. Defaults to 180.
     #[serde(rename = "hold-time")]
     pub hold_time: Option<u16>,
-    /// Networks this speaker originates (advertises) into BGP, as `addr/len`.
+    /// Networks this speaker originates (advertises) into BGP, as `addr/len`. Both
+    /// IPv4 and IPv6 prefixes are accepted; the IPv6 ones are advertised via
+    /// MP_REACH_NLRI (RFC 4760) and need `next-hop6` set.
     #[serde(default)]
     pub network: Vec<String>,
+    /// The IPv6 next hop (next-hop-self) advertised for the IPv6 unicast NLRI this
+    /// speaker originates or redistributes (RFC 4760). Required to advertise any
+    /// IPv6 route; typically this router's global address on the peering link.
+    #[serde(rename = "next-hop6")]
+    pub next_hop6: Option<String>,
     /// COMMUNITIES (RFC 1997) attached to every originated route, as `asn:value`
     /// or a well-known name (`no-export`, `no-advertise`, `no-export-subconfed`).
     #[serde(default)]

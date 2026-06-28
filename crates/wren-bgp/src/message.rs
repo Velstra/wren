@@ -45,7 +45,16 @@ impl Open {
             my_as: as_trans_fit(local_as),
             hold_time,
             identifier,
-            capabilities: vec![Capability::FourOctetAs(local_as)],
+            // Always offer the 4-octet AS capability, and the Multiprotocol
+            // capability for IPv6 unicast (RFC 4760) — wren can carry IPv6 NLRI,
+            // and a peer that cannot will simply not advertise it back.
+            capabilities: vec![
+                Capability::FourOctetAs(local_as),
+                Capability::Multiprotocol {
+                    afi: crate::AFI_IPV6,
+                    safi: crate::SAFI_UNICAST,
+                },
+            ],
         }
     }
 
@@ -388,10 +397,9 @@ mod tests {
 
     #[test]
     fn open_advertises_and_detects_multiprotocol() {
-        use crate::capability::Capability;
         use crate::{AFI_IPV6, SAFI_UNICAST};
-        let mut open = Open::new(VERSION, 65001, DEFAULT_HOLD_TIME, ip([10, 0, 0, 1]));
-        open.capabilities.push(Capability::Multiprotocol { afi: AFI_IPV6, safi: SAFI_UNICAST });
+        // Open::new advertises IPv6-unicast multiprotocol support out of the box.
+        let open = Open::new(VERSION, 65001, DEFAULT_HOLD_TIME, ip([10, 0, 0, 1]));
         assert!(open.supports_multiprotocol(AFI_IPV6, SAFI_UNICAST));
         assert!(!open.supports_multiprotocol(crate::AFI_IPV4, SAFI_UNICAST));
         roundtrip(Message::Open(open));

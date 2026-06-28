@@ -664,6 +664,14 @@ fn build_bgp_config(cfg: &wren_config::Config, bgp: &wren_config::Bgp) -> Result
         );
     }
 
+    let next_hop6 = match bgp.next_hop6.as_deref() {
+        Some(s) => Some(
+            s.parse::<std::net::Ipv6Addr>()
+                .with_context(|| format!("bgp next-hop6 {s:?} must be an IPv6 address"))?,
+        ),
+        None => None,
+    };
+
     let mut communities = Vec::with_capacity(bgp.community.len());
     for c in &bgp.community {
         communities.push(
@@ -681,6 +689,7 @@ fn build_bgp_config(cfg: &wren_config::Config, bgp: &wren_config::Bgp) -> Result
         hold_time,
         peers,
         originate,
+        next_hop6,
         communities,
         large_communities,
         ext_communities,

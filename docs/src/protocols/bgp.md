@@ -112,6 +112,44 @@ The AS_PATH wire width is then per-session:
 > capability (or as root). If the bind fails Wren logs a warning and continues in
 > active-connect-only mode.
 
+## IPv6 unicast — MP-BGP (RFC 4760)
+
+Beyond IPv4, BGP carries **IPv6 unicast** via the multiprotocol extensions. Wren
+always advertises the **Multiprotocol capability** (code 1) for `(AFI IPv6,
+SAFI unicast)` in its OPEN, so a session negotiates IPv6 support automatically;
+toward a peer that does not advertise it back, Wren simply never sends IPv6 NLRI.
+
+IPv6 reachability rides in **MP_REACH_NLRI** (the prefixes plus the next hop) and
+withdrawals in **MP_UNREACH_NLRI**, rather than the base NEXT_HOP / NLRI / Withdrawn
+fields (which stay IPv4). The TCP session itself is unchanged — it still runs over
+the IPv4 transport to the neighbour `address`; only the carried NLRI is IPv6.
+
+To **originate or redistribute** IPv6 routes a speaker must know the next hop to
+advertise for them (next-hop-self), since the base NEXT_HOP attribute is IPv4-only.
+Set it with `next-hop6` — typically this router's own global address on the peering
+link:
+
+```toml
+[bgp]
+enabled   = true
+local-as  = 65001
+network   = ["2001:db8:99::/64"]   # an IPv6 network to originate
+next-hop6 = "2001:db8::1"          # next-hop-self for IPv6 NLRI
+[[bgp.neighbor]]
+address   = "10.0.0.2"             # the session is still IPv4 transport
+remote-as = 65002
+```
+
+The same `next-hop6` applies to any IPv6 route pulled in by `redistribute` — BGP
+is now dual-stack, so an IPv6 static or IGP route is re-originated over MP-BGP just
+as an IPv4 one is. The peer installs the learned prefix `proto bgp` via the
+advertised next hop. (Wren carries a **global** next hop today; an IPv6 route over a
+**link-local** next hop, which needs RFC 2545 interface pinning, is on the roadmap.)
+
+A self-contained, rootless live test is in `scripts/bgp-mp-ipv6-smoke.sh`: two
+speakers peer over IPv4 on a veth that also carries IPv6 globals, one originates an
+IPv6 network, and the other learns it and installs it into its kernel IPv6 table.
+
 ## Testing it
 
 With the configs above on a veth between two namespaces, both speakers reach
@@ -290,7 +328,9 @@ list — the prefix is withdrawn from peers again.
 
 Notes and limits:
 
-- **IPv4 unicast only** here, so non-IPv4 RIB routes are skipped.
+- **Dual-stack**: both IPv4 and IPv6 RIB routes are redistributed. An IPv6 route
+  is re-originated over [MP-BGP](#ipv6-unicast--mp-bgp-rfc-4760) and needs
+  `next-hop6` set, just like a configured IPv6 `network`.
 - **BGP never redistributes its own routes** (that would loop); `bgp` is rejected
   in the `redistribute` list.
 - A configured `network` always wins: redistribution never overrides or withdraws

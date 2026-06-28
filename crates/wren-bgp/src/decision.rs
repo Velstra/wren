@@ -28,8 +28,9 @@ pub struct Path {
     pub origin: Origin,
     /// The AS_PATH segments (its length is the §9.1.2.2 comparison input).
     pub as_path: Vec<AsPathSegment>,
-    /// The NEXT_HOP to reach the destination.
-    pub next_hop: Ipv4Addr,
+    /// The NEXT_HOP to reach the destination — IPv4 (the base-NLRI NEXT_HOP
+    /// attribute) or IPv6 (the MP_REACH_NLRI next hop, RFC 4760).
+    pub next_hop: IpAddr,
     /// The (assigned) LOCAL_PREF — higher is preferred.
     pub local_pref: u32,
     /// The MULTI_EXIT_DISC — lower is preferred, compared only within one peer AS.
@@ -75,7 +76,7 @@ impl Path {
         Route::new(
             prefix,
             Protocol::Bgp,
-            vec![NextHop::via(IpAddr::V4(self.next_hop))],
+            vec![NextHop::via(self.next_hop)],
             self.as_path_len() as u32,
         )
     }
@@ -144,7 +145,7 @@ mod tests {
         Path {
             origin: Origin::Igp,
             as_path: vec![AsPathSegment::Sequence(vec![65001, 65002])],
-            next_hop: ip([192, 0, 2, 1]),
+            next_hop: IpAddr::V4(ip([192, 0, 2, 1])),
             local_pref: DEFAULT_LOCAL_PREF,
             med: 0,
             from_ebgp: true,

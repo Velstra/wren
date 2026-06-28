@@ -23,7 +23,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::fmt::Write as _;
-use std::net::{IpAddr, Ipv4Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -43,7 +43,7 @@ use wren_bgp::fsm::{Action, BgpFsm, Event, State};
 use wren_bgp::large_community::format_large_community;
 use wren_bgp::message::{Message, Notification, Open, Update};
 use wren_bgp::rib::{BgpRib, RibEvent};
-use wren_bgp::{HEADER_LEN, MARKER, MAX_MESSAGE_LEN, PORT, VERSION};
+use wren_bgp::{AFI_IPV6, HEADER_LEN, MARKER, MAX_MESSAGE_LEN, PORT, SAFI_UNICAST, VERSION};
 
 use wren_core::{Prefix, Protocol};
 
@@ -71,8 +71,12 @@ pub struct BgpConfig {
     pub hold_time: u16,
     /// The configured peers.
     pub peers: Vec<BgpPeerCfg>,
-    /// Networks this speaker originates into BGP.
+    /// Networks this speaker originates into BGP (IPv4 and/or IPv6).
     pub originate: Vec<Prefix>,
+    /// The IPv6 next hop advertised (next-hop-self) for the IPv6 unicast NLRI this
+    /// speaker originates or redistributes (RFC 4760 MP_REACH_NLRI). Required to
+    /// advertise any IPv6 route; without it IPv6 prefixes are held but not sent.
+    pub next_hop6: Option<Ipv6Addr>,
     /// COMMUNITIES (RFC 1997) attached to every originated route.
     pub communities: Vec<u32>,
     /// LARGE_COMMUNITY (RFC 8092) tags attached to every originated route.
@@ -96,6 +100,8 @@ struct Local {
     local_as: u32,
     router_id: Ipv4Addr,
     hold_time: u16,
+    /// The IPv6 next-hop-self for originated IPv6 NLRI (RFC 4760), if configured.
+    next_hop6: Option<Ipv6Addr>,
     /// peer address → its AS, for matching inbound connections.
     peers: HashMap<Ipv4Addr, u32>,
 }
@@ -338,6 +344,7 @@ pub async fn run(
         local_as: cfg.local_as,
         router_id: cfg.router_id,
         hold_time: cfg.hold_time,
+        next_hop6: cfg.next_hop6,
         peers: cfg.peers.iter().map(|p| (p.addr, p.remote_as)).collect(),
     });
 
@@ -423,14 +430,19 @@ pub async fn run(
                 from_ebgp,
                 update,
             } => {
-                for w in &update.withdrawn {
+                let facts = PeerFacts { addr: peer, as_: peer_as, id: peer_id, from_ebgp };
+                // Withdrawals: base-NLRI IPv4 (the Withdrawn Routes field) and IPv6
+                // (MP_UNREACH_NLRI, RFC 4760 §4).
+                for w in update.withdrawn.iter().chain(mp_unreach_v6(&update)) {
                     if let Some(ev) = rib.withdraw(peer, *w) {
                         emit(ev, &updates).await;
                     }
                 }
+                // IPv4 reachability: base NLRI with the IPv4 NEXT_HOP attribute.
                 if !update.nlri.is_empty() {
-                    match path_from_update(&update, peer, peer_as, peer_id, from_ebgp) {
-                        Some(path) => {
+                    match base_next_hop(&update) {
+                        Some(nh) => {
+                            let path = build_path(&update, IpAddr::V4(nh), facts);
                             for p in &update.nlri {
                                 if let Some(ev) = rib.update(peer, *p, path.clone()) {
                                     emit(ev, &updates).await;
@@ -440,6 +452,15 @@ pub async fn run(
                         None => warn!(peer = %peer, "UPDATE with NLRI but no NEXT_HOP — ignored"),
                     }
                 }
+                // IPv6 reachability: MP_REACH_NLRI carries its own next hop (RFC 4760).
+                if let Some((nh6, nlri)) = mp_reach_v6(&update) {
+                    let path = build_path(&update, IpAddr::V6(nh6), facts);
+                    for p in nlri {
+                        if let Some(ev) = rib.update(peer, *p, path.clone()) {
+                            emit(ev, &updates).await;
+                        }
+                    }
+                }
             }
         }
     }
@@ -447,9 +468,9 @@ pub async fn run(
 }
 
 /// Fold a redistribution change from the central router into the origination set
-/// and push it to every established session. BGP here is IPv4-unicast only, so
-/// non-IPv4 prefixes are ignored; and a prefix originated by `[bgp] network`
-/// (configured) is never overridden or withdrawn by redistribution.
+/// and push it to every established session. BGP carries both IPv4 and IPv6 unicast
+/// (the IPv6 prefixes ride MP_REACH_NLRI, RFC 4760); a prefix originated by
+/// `[bgp] network` (configured) is never overridden or withdrawn by redistribution.
 async fn apply_redistribution(
     r: Redistribution,
     originated: &mut BTreeMap<Prefix, OriginEntry>,
@@ -458,9 +479,6 @@ async fn apply_redistribution(
     match r {
         Redistribution::Announce(route) => {
             let prefix = route.prefix;
-            if !prefix.is_ipv4() {
-                return; // IPv4 unicast only
-            }
             // Communities set on the route by the export filter ride along.
             let communities = route.communities.clone();
             let large_communities = route.large_communities.clone();
@@ -523,19 +541,22 @@ async fn emit(ev: RibEvent, updates: &mpsc::Sender<RouteUpdate>) {
     let _ = updates.send(upd).await;
 }
 
-/// Build a [`Path`] from a received UPDATE's attributes, or `None` if it lacks the
-/// mandatory NEXT_HOP.
-fn path_from_update(
-    update: &Update,
-    peer_addr: Ipv4Addr,
-    peer_as: u32,
-    peer_id: Ipv4Addr,
+/// The session facts a received UPDATE is tagged with, threaded into every [`Path`]
+/// built from it.
+#[derive(Clone, Copy)]
+struct PeerFacts {
+    addr: Ipv4Addr,
+    as_: u32,
+    id: Ipv4Addr,
     from_ebgp: bool,
-) -> Option<Path> {
+}
+
+/// Build a [`Path`] from a received UPDATE's attributes with the given `next_hop`
+/// (the base-NLRI IPv4 NEXT_HOP, or the IPv6 next hop pulled from MP_REACH_NLRI).
+fn build_path(update: &Update, next_hop: IpAddr, peer: PeerFacts) -> Path {
     let mut origin = Origin::Incomplete;
     let mut as_path = Vec::new();
     let mut as4_path = None;
-    let mut next_hop = None;
     let mut med = 0;
     let mut local_pref = DEFAULT_LOCAL_PREF;
     let mut communities = Vec::new();
@@ -546,7 +567,6 @@ fn path_from_update(
             PathAttribute::Origin(o) => origin = *o,
             PathAttribute::AsPath(segs) => as_path = segs.clone(),
             PathAttribute::As4Path(segs) => as4_path = Some(segs.clone()),
-            PathAttribute::NextHop(nh) => next_hop = Some(*nh),
             PathAttribute::MultiExitDisc(m) => med = *m,
             PathAttribute::LocalPref(lp) => local_pref = *lp,
             PathAttribute::Communities(c) => communities = c.clone(),
@@ -560,21 +580,59 @@ fn path_from_update(
     if let Some(as4) = as4_path {
         as_path = reconstruct_as_path(&as_path, &as4);
     }
-    Some(Path {
+    Path {
         origin,
         as_path,
-        next_hop: next_hop?,
+        next_hop,
         local_pref,
         med,
-        from_ebgp,
-        peer_as,
+        from_ebgp: peer.from_ebgp,
+        peer_as: peer.as_,
         igp_metric: 0,
-        peer_id,
-        peer_addr,
+        peer_id: peer.id,
+        peer_addr: peer.addr,
         communities,
         large_communities,
         ext_communities,
+    }
+}
+
+/// The base-NLRI IPv4 NEXT_HOP attribute of an UPDATE, if present.
+fn base_next_hop(update: &Update) -> Option<Ipv4Addr> {
+    update.attributes.iter().find_map(|a| match a {
+        PathAttribute::NextHop(nh) => Some(*nh),
+        _ => None,
     })
+}
+
+/// The MP_REACH_NLRI (IPv6 unicast) of an UPDATE: its 16-octet global next hop and
+/// reachable prefixes (RFC 4760 §3 / RFC 2545). A 32-octet next hop carries a
+/// link-local after the global; we use the global for the kernel route.
+fn mp_reach_v6(update: &Update) -> Option<(Ipv6Addr, &[Prefix])> {
+    update.attributes.iter().find_map(|a| match a {
+        PathAttribute::MpReachNlri { afi, next_hop, nlri, .. }
+            if *afi == AFI_IPV6 && next_hop.len() >= 16 =>
+        {
+            let mut g = [0u8; 16];
+            g.copy_from_slice(&next_hop[..16]);
+            Some((Ipv6Addr::from(g), nlri.as_slice()))
+        }
+        _ => None,
+    })
+}
+
+/// The MP_UNREACH_NLRI (IPv6 unicast) withdrawals of an UPDATE (RFC 4760 §4).
+fn mp_unreach_v6(update: &Update) -> &[Prefix] {
+    update
+        .attributes
+        .iter()
+        .find_map(|a| match a {
+            PathAttribute::MpUnreachNlri { afi, withdrawn, .. } if *afi == AFI_IPV6 => {
+                Some(withdrawn.as_slice())
+            }
+            _ => None,
+        })
+        .unwrap_or(&[])
 }
 
 /// Whether a route carrying `communities` may be advertised to a peer, honouring
@@ -668,6 +726,7 @@ async fn drive_session(
         keepalive_int: (local.hold_time / 3).max(1),
         peer_id: peer.addr,
         four_octet: false,
+        mp_ipv6: false,
         established: false,
         hold_deadline: Instant::now() + FAR,
         ka_deadline: Instant::now() + FAR,
@@ -703,6 +762,8 @@ async fn drive_session(
                             // 4-octet AS_PATH only when both speakers advertised the
                             // capability (RFC 6793 §4); we always do.
                             sess.four_octet = o.supports_four_octet_as();
+                            // Send IPv6 NLRI only if the peer can receive it (RFC 4760).
+                            sess.mp_ipv6 = o.supports_multiprotocol(AFI_IPV6, SAFI_UNICAST);
                             sess.neg_hold = sess.local.hold_time.min(o.hold_time);
                             sess.keepalive_int = (sess.neg_hold / 3).max(1);
                             Step::Event(Event::OpenReceived)
@@ -793,6 +854,9 @@ struct Session<'a> {
     /// Whether the peer advertised the 4-octet AS capability (RFC 6793) — sets the
     /// AS_PATH wire width for UPDATEs we send and receive.
     four_octet: bool,
+    /// Whether the peer advertised the IPv6-unicast Multiprotocol capability
+    /// (RFC 4760) — only then do we send it IPv6 NLRI in MP_REACH_NLRI.
+    mp_ipv6: bool,
     established: bool,
     hold_deadline: Instant,
     ka_deadline: Instant,
@@ -896,55 +960,106 @@ impl Session<'_> {
             }
         }
         for ((communities, large_communities, ext_communities), nlri) in groups {
-            let mut attributes = vec![PathAttribute::Origin(Origin::Igp)];
+            // The attributes shared by every NLRI in this tag group (everything but
+            // the family-specific next hop). For an IPv6 group the next hop rides in
+            // MP_REACH_NLRI instead of the base NEXT_HOP attribute.
+            let mut base = vec![PathAttribute::Origin(Origin::Igp)];
             if self.from_ebgp {
-                // eBGP: prepend our AS and set the next hop to our peering address.
-                attributes.push(PathAttribute::AsPath(vec![AsPathSegment::Sequence(vec![
+                base.push(PathAttribute::AsPath(vec![AsPathSegment::Sequence(vec![
                     self.local.local_as,
                 ])]));
                 // Toward a legacy 2-octet peer our AS would collapse to AS_TRANS on
                 // the wire; carry the real 4-octet AS in AS4_PATH (RFC 6793).
                 if !self.four_octet && self.local.local_as > u16::MAX as u32 {
-                    attributes.push(PathAttribute::As4Path(vec![AsPathSegment::Sequence(vec![
+                    base.push(PathAttribute::As4Path(vec![AsPathSegment::Sequence(vec![
                         self.local.local_as,
                     ])]));
                 }
             } else {
                 // iBGP: empty AS_PATH, carry LOCAL_PREF.
-                attributes.push(PathAttribute::AsPath(vec![]));
-                attributes.push(PathAttribute::LocalPref(DEFAULT_LOCAL_PREF));
+                base.push(PathAttribute::AsPath(vec![]));
+                base.push(PathAttribute::LocalPref(DEFAULT_LOCAL_PREF));
             }
-            attributes.push(PathAttribute::NextHop(self.local_ip));
             if !communities.is_empty() {
-                attributes.push(PathAttribute::Communities(communities));
+                base.push(PathAttribute::Communities(communities));
             }
             if !large_communities.is_empty() {
-                attributes.push(PathAttribute::LargeCommunities(large_communities));
+                base.push(PathAttribute::LargeCommunities(large_communities));
             }
             if !ext_communities.is_empty() {
-                attributes.push(PathAttribute::ExtendedCommunities(ext_communities));
+                base.push(PathAttribute::ExtendedCommunities(ext_communities));
             }
-            let update = Update {
-                withdrawn: vec![],
-                attributes,
-                nlri,
-            };
-            self.send(&Message::Update(update)).await?;
+
+            let (v4, v6): (Vec<Prefix>, Vec<Prefix>) = nlri.into_iter().partition(|p| p.is_ipv4());
+
+            // IPv4 unicast: base NLRI with the IPv4 NEXT_HOP (next-hop-self).
+            if !v4.is_empty() {
+                let mut attributes = base.clone();
+                attributes.push(PathAttribute::NextHop(self.local_ip));
+                self.send(&Message::Update(Update {
+                    withdrawn: vec![],
+                    attributes,
+                    nlri: v4,
+                }))
+                .await?;
+            }
+
+            // IPv6 unicast: MP_REACH_NLRI, only if the peer negotiated it and we have
+            // a next-hop-self to advertise.
+            if !v6.is_empty() {
+                match (self.mp_ipv6, self.local.next_hop6) {
+                    (true, Some(nh6)) => {
+                        let mut attributes = base;
+                        attributes.push(PathAttribute::MpReachNlri {
+                            afi: AFI_IPV6,
+                            safi: SAFI_UNICAST,
+                            next_hop: nh6.octets().to_vec(),
+                            nlri: v6,
+                        });
+                        self.send(&Message::Update(Update {
+                            withdrawn: vec![],
+                            attributes,
+                            nlri: vec![],
+                        }))
+                        .await?;
+                    }
+                    (false, _) => debug!(peer = %self.peer.addr, "peer has no IPv6 capability; not advertising IPv6 NLRI"),
+                    (true, None) => warn!(peer = %self.peer.addr, "IPv6 routes to advertise but no `[bgp] next-hop6` configured"),
+                }
+            }
         }
         Ok(())
     }
 
-    /// Withdraw originated prefixes from this peer (one UPDATE, no attributes).
+    /// Withdraw originated prefixes from this peer: IPv4 in the base Withdrawn Routes
+    /// field, IPv6 in MP_UNREACH_NLRI (RFC 4760 §4).
     async fn withdraw(&mut self, prefixes: &[Prefix]) -> Result<()> {
         if prefixes.is_empty() {
             return Ok(());
         }
-        let update = Update {
-            withdrawn: prefixes.to_vec(),
-            attributes: vec![],
-            nlri: vec![],
-        };
-        self.send(&Message::Update(update)).await
+        let (v4, v6): (Vec<Prefix>, Vec<Prefix>) =
+            prefixes.iter().copied().partition(|p| p.is_ipv4());
+        if !v4.is_empty() {
+            self.send(&Message::Update(Update {
+                withdrawn: v4,
+                attributes: vec![],
+                nlri: vec![],
+            }))
+            .await?;
+        }
+        if !v6.is_empty() && self.mp_ipv6 {
+            self.send(&Message::Update(Update {
+                withdrawn: vec![],
+                attributes: vec![PathAttribute::MpUnreachNlri {
+                    afi: AFI_IPV6,
+                    safi: SAFI_UNICAST,
+                    withdrawn: v6,
+                }],
+                nlri: vec![],
+            }))
+            .await?;
+        }
+        Ok(())
     }
 
     /// Frame and write one BGP message at the session's negotiated AS width.
@@ -999,7 +1114,7 @@ mod tests {
         let path = Path {
             origin: Origin::Igp,
             as_path: vec![AsPathSegment::Sequence(vec![65001, 196_618])],
-            next_hop: ip([192, 0, 2, 1]),
+            next_hop: IpAddr::V4(ip([192, 0, 2, 1])),
             local_pref: 100,
             med: 0,
             from_ebgp: true,
@@ -1108,10 +1223,48 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ipv6_prefixes_are_not_redistributed_into_bgp() {
+    async fn ipv6_prefixes_are_redistributed_into_bgp() {
+        // MP-BGP (RFC 4760): IPv6 prefixes are now carried, so redistribution
+        // accepts them and pushes an advertise to every session.
         let mut originated: BTreeMap<Prefix, OriginEntry> = BTreeMap::new();
-        let sessions = HashMap::new();
-        apply_redistribution(Redistribution::Announce(static_route("2001:db8::/32")), &mut originated, &sessions).await;
-        assert!(originated.is_empty());
+        let (tx, mut rx) = mpsc::channel::<SessionCmd>(16);
+        let mut sessions = HashMap::new();
+        sessions.insert(ip([10, 0, 0, 2]), tx);
+        let p: Prefix = "2001:db8:99::/64".parse().unwrap();
+
+        apply_redistribution(Redistribution::Announce(static_route("2001:db8:99::/64")), &mut originated, &sessions).await;
+        assert!(originated.contains_key(&p));
+        match rx.try_recv().unwrap() {
+            SessionCmd::Advertise(routes) => assert_eq!(routes[0].prefix, p),
+            _ => panic!("expected advertise"),
+        }
+    }
+
+    #[test]
+    fn advertise_partitions_v4_and_v6_next_hops() {
+        // A path with an IPv6 next hop renders with the v6 address (MP_REACH path).
+        let mut rib = BgpRib::new();
+        let mut path = Path {
+            origin: Origin::Igp,
+            as_path: vec![AsPathSegment::Sequence(vec![65002])],
+            next_hop: IpAddr::V6("2001:db8::2".parse().unwrap()),
+            local_pref: 100,
+            med: 0,
+            from_ebgp: true,
+            peer_as: 65002,
+            igp_metric: 0,
+            peer_id: ip([10, 0, 0, 2]),
+            peer_addr: ip([10, 0, 0, 2]),
+            communities: vec![],
+            large_communities: vec![],
+            ext_communities: vec![],
+        };
+        rib.update(ip([10, 0, 0, 2]), "2001:db8:99::/64".parse::<Prefix>().unwrap(), path.clone());
+        let out = render_bgp_routes(&rib);
+        assert!(out.contains("2001:db8:99::/64 via 2001:db8::2"));
+        // And to_route carries the v6 next hop into the kernel route.
+        path.next_hop = IpAddr::V6("2001:db8::2".parse().unwrap());
+        let route = path.to_route("2001:db8:99::/64".parse().unwrap());
+        assert_eq!(route.nexthops[0], wren_core::NextHop::via(path.next_hop));
     }
 }
