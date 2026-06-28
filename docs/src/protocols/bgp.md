@@ -43,7 +43,8 @@ Established`, with the ConnectRetry, Hold and Keepalive timers and clean teardow
   `remote-as`, the 4-octet AS Number capability (RFC 6793) is detected, and the
   Hold Time becomes the smaller of the two proposals (Keepalive = Hold / 3);
 - the Hold and Keepalive timers driving the FSM;
-- originated `network`s advertised on reaching Established;
+- originated `network`s advertised on reaching Established, optionally summarised by
+  `[[bgp.aggregate]]` covering prefixes (RFC 4271 §9.2.2.2);
 - received UPDATEs folded into the shared BGP RIB, whose best-path changes are
   announced into the kernel RIB as `proto bgp`;
 - learned best paths **propagated** onward to the other peers (transit), prepending
@@ -608,6 +609,44 @@ and **not** sent to any other neighbour. `scripts/bgp-default-originate-smoke.sh
 exercises it live (rootless): a stub peer learns no default without the option, and
 installs `0.0.0.0/0` via the upstream once it is set — while the upstream itself never
 installs the default it merely advertises.
+
+## Address aggregation (RFC 4271 §9.2.2.2)
+
+Instead of advertising many adjacent more-specifics, you can advertise a single covering
+prefix. Each `[[bgp.aggregate]]` declares a covering prefix; Wren advertises it — to
+**every** peer — as soon as at least one strictly-more-specific route in its own
+origination set (configured `network`s and redistributed prefixes) falls inside it. The
+aggregate carries `ATOMIC_AGGREGATE` and `AGGREGATOR` (this router's AS and id; toward a
+legacy 2-octet peer the real 4-octet AS rides in `AS4_AGGREGATOR`, RFC 6793 §3).
+
+```toml
+[bgp]
+local-as = 65001
+network  = ["10.50.1.0/24", "10.50.2.0/24"]   # the contributing more-specifics
+
+[[bgp.aggregate]]
+prefix       = "10.50.0.0/16"   # advertised once a contributor inside it exists
+summary-only = true             # …and suppress the contributing more-specifics
+```
+
+With `summary-only` the contributing more-specifics are withheld from advertisement,
+leaving only the aggregate; without it the aggregate is advertised **alongside** the
+more-specifics. The set is recomputed on every origination change, so an aggregate
+appears when its first contributor arrives and is withdrawn when the last one leaves
+(restoring any suppressed more-specifics).
+
+Two deliberate limitations:
+
+* The aggregate is **advertise-only** — it is never installed in the local FIB (no
+  discard/`Null0` route), and it never aggregates routes **learned from other BGP
+  peers**, only this speaker's own originated/redistributed prefixes.
+* The aggregate carries an empty `AS_PATH` of its own (it originates here); `as-set`
+  summarisation of contributor AS paths is not done.
+
+`scripts/bgp-aggregate-smoke.sh` exercises it live (rootless) across three phases: with
+no aggregate a peer learns only the `/24`s; with the aggregate it learns the `/16`
+**and** the `/24`s (and the originator never installs the `/16` itself); with
+`summary-only` it learns only the `/16`.
 
 ## Maximum-prefix limit (RFC 4486)
 

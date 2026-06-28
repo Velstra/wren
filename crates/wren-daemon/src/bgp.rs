@@ -45,7 +45,7 @@ use wren_bgp::large_community::format_large_community;
 use wren_bgp::message::{Message, Notification, Open, Update};
 use wren_bgp::rib::{BgpRib, RibEvent};
 use wren_bgp::{
-    AFI_IPV4, AFI_IPV6, HEADER_LEN, MARKER, MAX_MESSAGE_LEN, PORT, SAFI_UNICAST, VERSION,
+    AFI_IPV4, AFI_IPV6, AS_TRANS, HEADER_LEN, MARKER, MAX_MESSAGE_LEN, PORT, SAFI_UNICAST, VERSION,
 };
 
 use wren_core::{Prefix, Protocol};
@@ -110,6 +110,24 @@ pub struct BgpConfig {
     /// The maximum number of equal-cost paths to install per destination as ECMP
     /// (BGP multipath). 1 (the default) is classic single-best-path forwarding.
     pub max_paths: usize,
+    /// Address aggregates (RFC 4271 §9.2.2.2): a covering prefix advertised whenever
+    /// a more-specific, locally-originated/redistributed route contributes to it.
+    pub aggregates: Vec<Aggregate>,
+}
+
+/// A configured address aggregate (RFC 4271 §9.2.2.2). The `prefix` is advertised
+/// as a single route — carrying ATOMIC_AGGREGATE and AGGREGATOR — whenever at least
+/// one strictly-more-specific route in this speaker's origination set (configured
+/// `network`s and redistributed prefixes) falls inside it. With `summary_only` the
+/// contributing more-specifics are suppressed from advertisement, leaving only the
+/// aggregate. The aggregate is advertise-only: it is never installed in the local
+/// FIB, and it does not aggregate routes learned from other BGP peers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Aggregate {
+    /// The covering prefix to advertise.
+    pub prefix: Prefix,
+    /// Suppress the contributing more-specifics, advertising only the aggregate.
+    pub summary_only: bool,
 }
 
 /// How a peer relates to this speaker, which drives the AS_PATH manipulation and
@@ -261,6 +279,9 @@ pub struct OriginRoute {
     pub large_communities: Vec<(u32, u32, u32)>,
     /// EXTENDED_COMMUNITIES (RFC 4360) to attach.
     pub ext_communities: Vec<[u8; 8]>,
+    /// This route is an address aggregate (RFC 4271 §9.2.2.2): it is advertised with
+    /// ATOMIC_AGGREGATE and AGGREGATOR set.
+    pub atomic_aggregate: bool,
 }
 
 /// A command from the central task to a per-peer session task: advertise or
@@ -418,18 +439,65 @@ struct OriginEntry {
     configured: bool,
 }
 
-/// A snapshot of the whole origination set as [`OriginRoute`]s, for advertising to
-/// a freshly-established session.
-fn origination_snapshot(originated: &BTreeMap<Prefix, OriginEntry>) -> Vec<OriginRoute> {
-    originated
+/// Whether `aggregate` strictly covers `contributor`: same family, the contributor
+/// falls inside the aggregate, and it is strictly more specific (a longer prefix).
+/// An aggregate never contributes to itself.
+fn covers(aggregate: &Prefix, contributor: &Prefix) -> bool {
+    aggregate.is_ipv4() == contributor.is_ipv4()
+        && contributor.len() > aggregate.len()
+        && aggregate.contains(contributor.addr())
+}
+
+/// The effective set of routes to advertise, keyed by prefix: the origination set
+/// (configured `network`s and redistributed prefixes) transformed by the configured
+/// aggregates (RFC 4271 §9.2.2.2). An aggregate becomes active — added as an
+/// ATOMIC_AGGREGATE/AGGREGATOR route — when at least one originated route is strictly
+/// more specific and falls inside it; `summary_only` then suppresses those
+/// contributors, leaving only the aggregate.
+fn effective_origination(
+    originated: &BTreeMap<Prefix, OriginEntry>,
+    aggregates: &[Aggregate],
+) -> BTreeMap<Prefix, OriginRoute> {
+    let mut out: BTreeMap<Prefix, OriginRoute> = originated
         .iter()
-        .map(|(prefix, e)| OriginRoute {
-            prefix: *prefix,
-            communities: e.communities.clone(),
-            large_communities: e.large_communities.clone(),
-            ext_communities: e.ext_communities.clone(),
+        .map(|(prefix, e)| {
+            (
+                *prefix,
+                OriginRoute {
+                    prefix: *prefix,
+                    communities: e.communities.clone(),
+                    large_communities: e.large_communities.clone(),
+                    ext_communities: e.ext_communities.clone(),
+                    atomic_aggregate: false,
+                },
+            )
         })
-        .collect()
+        .collect();
+    for agg in aggregates {
+        let contributors: Vec<Prefix> =
+            originated.keys().copied().filter(|c| covers(&agg.prefix, c)).collect();
+        if contributors.is_empty() {
+            continue; // no more-specific present: the aggregate is not advertised
+        }
+        if agg.summary_only {
+            for c in &contributors {
+                out.remove(c);
+            }
+        }
+        // The aggregate itself: empty tag set, ATOMIC_AGGREGATE + AGGREGATOR. It
+        // overrides any equal-prefix originated entry (not a contributor anyway).
+        out.insert(
+            agg.prefix,
+            OriginRoute {
+                prefix: agg.prefix,
+                communities: vec![],
+                large_communities: vec![],
+                ext_communities: vec![],
+                atomic_aggregate: true,
+            },
+        );
+    }
+    out
 }
 
 fn neighbor_summaries(neighbors: &BTreeMap<Ipv4Addr, NeighborState>) -> Vec<NeighborSummary> {
@@ -575,6 +643,12 @@ pub async fn run(
             )
         })
         .collect();
+    // Address aggregates (RFC 4271 §9.2.2.2) and the current effective advertised set
+    // (the origination set transformed by the aggregates). `advertised` is the source
+    // of truth for what we hand a session and the baseline incremental redistribution
+    // changes are diffed against.
+    let aggregates = cfg.aggregates.clone();
+    let mut advertised = effective_origination(&originated, &aggregates);
     // Established sessions we can push origination changes to, keyed by peer.
     let mut sessions: HashMap<Ipv4Addr, mpsc::Sender<SessionCmd>> = HashMap::new();
     // Whether each established session's connection was inbound, for §6.8 collision
@@ -714,7 +788,8 @@ pub async fn run(
                 continue;
             }
             Some(r) = redist.recv() => {
-                apply_redistribution(r, &mut originated, &sessions).await;
+                apply_redistribution(r, &mut originated, &aggregates, &mut advertised, &sessions)
+                    .await;
                 continue;
             }
         };
@@ -765,9 +840,9 @@ pub async fn run(
                         gr_helper.remove(&p);
                     }
                 }
-                // Push the current origination snapshot to the new session, then
-                // remember it for future incremental redistribution changes.
-                let snapshot = origination_snapshot(&originated);
+                // Push the current effective advertised set (origination transformed
+                // by the configured aggregates) to the new session.
+                let snapshot: Vec<OriginRoute> = advertised.values().cloned().collect();
                 if !snapshot.is_empty() {
                     let _ = cmd_tx.send(SessionCmd::Advertise(snapshot)).await;
                 }
@@ -791,6 +866,7 @@ pub async fn run(
                             communities: vec![],
                             large_communities: vec![],
                             ext_communities: vec![],
+                            atomic_aggregate: false,
                         };
                         let _ = cmd_tx.send(SessionCmd::Advertise(vec![route])).await;
                     }
@@ -859,7 +935,7 @@ pub async fn run(
                 }
                 if let Some(cmd_tx) = sessions.get(&p) {
                     info!(peer = %p, "BGP ROUTE-REFRESH: re-advertising Adj-RIB-Out");
-                    let snapshot = origination_snapshot(&originated);
+                    let snapshot: Vec<OriginRoute> = advertised.values().cloned().collect();
                     if !snapshot.is_empty() {
                         let _ = cmd_tx.send(SessionCmd::Advertise(snapshot)).await;
                     }
@@ -1009,16 +1085,22 @@ pub async fn run(
     Ok(())
 }
 
-/// Fold a redistribution change from the central router into the origination set
-/// and push it to every established session. BGP carries both IPv4 and IPv6 unicast
-/// (the IPv6 prefixes ride MP_REACH_NLRI, RFC 4760); a prefix originated by
-/// `[bgp] network` (configured) is never overridden or withdrawn by redistribution.
+/// Fold a redistribution change from the central router into the origination set,
+/// recompute the effective advertised set (origination transformed by the configured
+/// aggregates), and push the delta to every established session. BGP carries both
+/// IPv4 and IPv6 unicast (the IPv6 prefixes ride MP_REACH_NLRI, RFC 4760); a prefix
+/// originated by `[bgp] network` (configured) is never overridden or withdrawn by
+/// redistribution.
 async fn apply_redistribution(
     r: Redistribution,
     originated: &mut BTreeMap<Prefix, OriginEntry>,
+    aggregates: &[Aggregate],
+    advertised: &mut BTreeMap<Prefix, OriginRoute>,
     sessions: &HashMap<Ipv4Addr, mpsc::Sender<SessionCmd>>,
 ) {
-    match r {
+    // Fold the change into the raw origination set; bail if nothing changed so an
+    // idempotent re-announce produces no churn.
+    let changed = match r {
         Redistribution::Announce(route) => {
             let prefix = route.prefix;
             // Communities set on the route by the export filter ride along.
@@ -1027,45 +1109,60 @@ async fn apply_redistribution(
             let ext_communities = route.ext_communities.clone();
             match originated.get(&prefix) {
                 // A configured `network` is authoritative — never overridden.
-                Some(e) if e.configured => return,
+                Some(e) if e.configured => false,
                 // Already redistributed with the same tags: nothing new.
-                Some(e) if e.communities == communities
-                    && e.large_communities == large_communities
-                    && e.ext_communities == ext_communities =>
+                Some(e)
+                    if e.communities == communities
+                        && e.large_communities == large_communities
+                        && e.ext_communities == ext_communities =>
                 {
-                    return
+                    false
                 }
-                _ => {}
+                _ => {
+                    originated.insert(
+                        prefix,
+                        OriginEntry {
+                            communities,
+                            large_communities,
+                            ext_communities,
+                            configured: false,
+                        },
+                    );
+                    debug!(%prefix, "redistributed into BGP");
+                    true
+                }
             }
-            originated.insert(
-                prefix,
-                OriginEntry {
-                    communities: communities.clone(),
-                    large_communities: large_communities.clone(),
-                    ext_communities: ext_communities.clone(),
-                    configured: false,
-                },
-            );
-            let adv = vec![OriginRoute {
-                prefix,
-                communities,
-                large_communities,
-                ext_communities,
-            }];
-            for tx in sessions.values() {
-                let _ = tx.send(SessionCmd::Advertise(adv.clone())).await;
-            }
-            debug!(%prefix, "redistributed into BGP");
         }
         Redistribution::Withdraw(prefix) => {
             // Only retract redistributed prefixes; configured networks stay.
             if matches!(originated.get(&prefix), Some(e) if !e.configured) {
                 originated.remove(&prefix);
-                for tx in sessions.values() {
-                    let _ = tx.send(SessionCmd::Withdraw(vec![prefix])).await;
-                }
                 debug!(%prefix, "redistribution withdrawn from BGP");
+                true
+            } else {
+                false
             }
+        }
+    };
+    if !changed {
+        return;
+    }
+    // Recompute the effective advertised set and diff it against the previous one: a
+    // single redistribution change can activate or retire an aggregate and (under
+    // summary-only) suppress or restore its contributors, so push the whole delta —
+    // not just the one prefix — to every established session.
+    let next = effective_origination(originated, aggregates);
+    let withdrawn: Vec<Prefix> =
+        advertised.keys().filter(|p| !next.contains_key(p)).copied().collect();
+    let adv: Vec<OriginRoute> =
+        next.values().filter(|r| advertised.get(&r.prefix) != Some(r)).cloned().collect();
+    *advertised = next;
+    for tx in sessions.values() {
+        if !adv.is_empty() {
+            let _ = tx.send(SessionCmd::Advertise(adv.clone())).await;
+        }
+        if !withdrawn.is_empty() {
+            let _ = tx.send(SessionCmd::Withdraw(withdrawn.clone())).await;
         }
     }
 }
@@ -2130,6 +2227,11 @@ impl Session<'_> {
         type TagKey = (Vec<u32>, Vec<(u32, u32, u32)>, Vec<[u8; 8]>);
         let mut groups: BTreeMap<TagKey, Vec<Prefix>> = BTreeMap::new();
         for r in routes {
+            // Aggregates carry extra attributes (ATOMIC_AGGREGATE/AGGREGATOR) and are
+            // sent individually below, not folded into a tag group.
+            if r.atomic_aggregate {
+                continue;
+            }
             if should_advertise(&r.communities, self.peer_type) {
                 groups
                     .entry((
@@ -2145,34 +2247,7 @@ impl Session<'_> {
             // The attributes shared by every NLRI in this tag group (everything but
             // the family-specific next hop). For an IPv6 group the next hop rides in
             // MP_REACH_NLRI instead of the base NEXT_HOP attribute.
-            let mut base = vec![PathAttribute::Origin(Origin::Igp)];
-            match self.peer_type {
-                PeerType::Ebgp => {
-                    // True eBGP: prepend the externally visible AS (the Confederation
-                    // Identifier if we are in a confederation, else our AS).
-                    let ext = self.local.external_as();
-                    base.push(PathAttribute::AsPath(vec![AsPathSegment::Sequence(vec![ext])]));
-                    // Toward a legacy 2-octet peer our AS would collapse to AS_TRANS
-                    // on the wire; carry the real 4-octet AS in AS4_PATH (RFC 6793).
-                    if !self.four_octet && ext > u16::MAX as u32 {
-                        base.push(PathAttribute::As4Path(vec![AsPathSegment::Sequence(vec![ext])]));
-                    }
-                }
-                PeerType::Confed => {
-                    // Confed-eBGP (RFC 5065 §5.3): prepend our Member-AS to an
-                    // AS_CONFED_SEQUENCE — internal to the confederation — and carry
-                    // LOCAL_PREF, which is honoured across member-AS boundaries.
-                    base.push(PathAttribute::AsPath(vec![AsPathSegment::ConfedSequence(vec![
-                        self.local.local_as,
-                    ])]));
-                    base.push(PathAttribute::LocalPref(DEFAULT_LOCAL_PREF));
-                }
-                PeerType::Ibgp => {
-                    // iBGP: empty AS_PATH, carry LOCAL_PREF.
-                    base.push(PathAttribute::AsPath(vec![]));
-                    base.push(PathAttribute::LocalPref(DEFAULT_LOCAL_PREF));
-                }
-            }
+            let mut base = self.base_path_attrs();
             if !communities.is_empty() {
                 base.push(PathAttribute::Communities(communities));
             }
@@ -2184,42 +2259,115 @@ impl Session<'_> {
             }
 
             let (v4, v6): (Vec<Prefix>, Vec<Prefix>) = nlri.into_iter().partition(|p| p.is_ipv4());
+            self.send_originated_update(base, v4, v6).await?;
+        }
 
-            // IPv4 unicast: base NLRI with the IPv4 NEXT_HOP (next-hop-self).
-            if !v4.is_empty() {
-                let mut attributes = base.clone();
-                attributes.push(PathAttribute::NextHop(self.local_ip));
-                self.send(&Message::Update(Update {
-                    withdrawn: vec![],
-                    attributes,
-                    nlri: v4,
-                }))
-                .await?;
+        // Address aggregates (RFC 4271 §9.2.2.2): each carries ATOMIC_AGGREGATE and
+        // AGGREGATOR (and AS4_AGGREGATOR toward a legacy 2-octet peer, RFC 6793 §3)
+        // and is sent in its own UPDATE.
+        for r in routes.iter().filter(|r| r.atomic_aggregate) {
+            if !should_advertise(&r.communities, self.peer_type) {
+                continue;
             }
+            let mut base = self.base_path_attrs();
+            base.push(PathAttribute::AtomicAggregate);
+            let agg_as = self.local.external_as();
+            if !self.four_octet && agg_as > u16::MAX as u32 {
+                base.push(PathAttribute::Aggregator { asn: AS_TRANS as u32, id: self.local.router_id });
+                base.push(PathAttribute::As4Aggregator { asn: agg_as, id: self.local.router_id });
+            } else {
+                base.push(PathAttribute::Aggregator { asn: agg_as, id: self.local.router_id });
+            }
+            if !r.communities.is_empty() {
+                base.push(PathAttribute::Communities(r.communities.clone()));
+            }
+            if !r.large_communities.is_empty() {
+                base.push(PathAttribute::LargeCommunities(r.large_communities.clone()));
+            }
+            if !r.ext_communities.is_empty() {
+                base.push(PathAttribute::ExtendedCommunities(r.ext_communities.clone()));
+            }
+            let (v4, v6) = if r.prefix.is_ipv4() {
+                (vec![r.prefix], vec![])
+            } else {
+                (vec![], vec![r.prefix])
+            };
+            self.send_originated_update(base, v4, v6).await?;
+        }
+        Ok(())
+    }
 
-            // IPv6 unicast: MP_REACH_NLRI, only if the peer negotiated it and we have
-            // a next-hop-self to advertise.
-            if !v6.is_empty() {
-                match (self.mp_ipv6, self.local.next_hop6) {
-                    (true, Some(nh6)) => {
-                        let mut attributes = base;
-                        attributes.push(PathAttribute::MpReachNlri {
-                            afi: AFI_IPV6,
-                            safi: SAFI_UNICAST,
-                            // We originate, so this is always next-hop-self.
-                            next_hop: self.v6_next_hop_field(nh6, true),
-                            nlri: v6,
-                        });
-                        self.send(&Message::Update(Update {
-                            withdrawn: vec![],
-                            attributes,
-                            nlri: vec![],
-                        }))
-                        .await?;
-                    }
-                    (false, _) => debug!(peer = %self.peer.addr, "peer has no IPv6 capability; not advertising IPv6 NLRI"),
-                    (true, None) => warn!(peer = %self.peer.addr, "IPv6 routes to advertise but no `[bgp] next-hop6` configured"),
+    /// The path attributes shared by every originated UPDATE to this peer (everything
+    /// but the family-specific next hop and any per-route COMMUNITIES): ORIGIN plus
+    /// the peer-type AS_PATH / LOCAL_PREF (RFC 4271 + RFC 5065), and AS4_PATH toward a
+    /// legacy 2-octet peer (RFC 6793).
+    fn base_path_attrs(&self) -> Vec<PathAttribute> {
+        let mut base = vec![PathAttribute::Origin(Origin::Igp)];
+        match self.peer_type {
+            PeerType::Ebgp => {
+                // True eBGP: prepend the externally visible AS (the Confederation
+                // Identifier if we are in a confederation, else our AS).
+                let ext = self.local.external_as();
+                base.push(PathAttribute::AsPath(vec![AsPathSegment::Sequence(vec![ext])]));
+                // Toward a legacy 2-octet peer our AS would collapse to AS_TRANS on the
+                // wire; carry the real 4-octet AS in AS4_PATH (RFC 6793).
+                if !self.four_octet && ext > u16::MAX as u32 {
+                    base.push(PathAttribute::As4Path(vec![AsPathSegment::Sequence(vec![ext])]));
                 }
+            }
+            PeerType::Confed => {
+                // Confed-eBGP (RFC 5065 §5.3): prepend our Member-AS to an
+                // AS_CONFED_SEQUENCE — internal to the confederation — and carry
+                // LOCAL_PREF, which is honoured across member-AS boundaries.
+                base.push(PathAttribute::AsPath(vec![AsPathSegment::ConfedSequence(vec![
+                    self.local.local_as,
+                ])]));
+                base.push(PathAttribute::LocalPref(DEFAULT_LOCAL_PREF));
+            }
+            PeerType::Ibgp => {
+                // iBGP: empty AS_PATH, carry LOCAL_PREF.
+                base.push(PathAttribute::AsPath(vec![]));
+                base.push(PathAttribute::LocalPref(DEFAULT_LOCAL_PREF));
+            }
+        }
+        base
+    }
+
+    /// Send an originated UPDATE carrying `base` attributes: IPv4 NLRI with the IPv4
+    /// NEXT_HOP (next-hop-self), and/or IPv6 NLRI via MP_REACH_NLRI (RFC 4760) — the
+    /// latter only if the peer negotiated IPv6 and a next-hop6 is configured.
+    async fn send_originated_update(
+        &mut self,
+        base: Vec<PathAttribute>,
+        v4: Vec<Prefix>,
+        v6: Vec<Prefix>,
+    ) -> Result<()> {
+        // IPv4 unicast: base NLRI with the IPv4 NEXT_HOP (next-hop-self).
+        if !v4.is_empty() {
+            let mut attributes = base.clone();
+            attributes.push(PathAttribute::NextHop(self.local_ip));
+            self.send(&Message::Update(Update { withdrawn: vec![], attributes, nlri: v4 }))
+                .await?;
+        }
+
+        // IPv6 unicast: MP_REACH_NLRI, only if the peer negotiated it and we have a
+        // next-hop-self to advertise.
+        if !v6.is_empty() {
+            match (self.mp_ipv6, self.local.next_hop6) {
+                (true, Some(nh6)) => {
+                    let mut attributes = base;
+                    attributes.push(PathAttribute::MpReachNlri {
+                        afi: AFI_IPV6,
+                        safi: SAFI_UNICAST,
+                        // We originate, so this is always next-hop-self.
+                        next_hop: self.v6_next_hop_field(nh6, true),
+                        nlri: v6,
+                    });
+                    self.send(&Message::Update(Update { withdrawn: vec![], attributes, nlri: vec![] }))
+                        .await?;
+                }
+                (false, _) => debug!(peer = %self.peer.addr, "peer has no IPv6 capability; not advertising IPv6 NLRI"),
+                (true, None) => warn!(peer = %self.peer.addr, "IPv6 routes to advertise but no `[bgp] next-hop6` configured"),
             }
         }
         Ok(())
@@ -2713,8 +2861,9 @@ mod tests {
         let mut sessions = HashMap::new();
         sessions.insert(ip([10, 0, 0, 2]), tx);
         let p: Prefix = "10.5.0.0/16".parse().unwrap();
+        let mut advertised: BTreeMap<Prefix, OriginRoute> = BTreeMap::new();
 
-        apply_redistribution(Redistribution::Announce(static_route("10.5.0.0/16")), &mut originated, &sessions).await;
+        apply_redistribution(Redistribution::Announce(static_route("10.5.0.0/16")), &mut originated, &[], &mut advertised, &sessions).await;
         assert!(originated.contains_key(&p));
         match rx.try_recv().unwrap() {
             SessionCmd::Advertise(routes) => assert_eq!(routes[0].prefix, p),
@@ -2722,10 +2871,10 @@ mod tests {
         }
 
         // Re-announcing the same prefix is idempotent: no second advertise.
-        apply_redistribution(Redistribution::Announce(static_route("10.5.0.0/16")), &mut originated, &sessions).await;
+        apply_redistribution(Redistribution::Announce(static_route("10.5.0.0/16")), &mut originated, &[], &mut advertised, &sessions).await;
         assert!(rx.try_recv().is_err());
 
-        apply_redistribution(Redistribution::Withdraw(p), &mut originated, &sessions).await;
+        apply_redistribution(Redistribution::Withdraw(p), &mut originated, &[], &mut advertised, &sessions).await;
         assert!(!originated.contains_key(&p));
         assert!(matches!(rx.try_recv().unwrap(), SessionCmd::Withdraw(_)));
     }
@@ -2746,8 +2895,9 @@ mod tests {
         let (tx, mut rx) = mpsc::channel::<SessionCmd>(16);
         let mut sessions = HashMap::new();
         sessions.insert(ip([10, 0, 0, 2]), tx);
+        let mut advertised: BTreeMap<Prefix, OriginRoute> = BTreeMap::new();
 
-        apply_redistribution(Redistribution::Withdraw(p), &mut originated, &sessions).await;
+        apply_redistribution(Redistribution::Withdraw(p), &mut originated, &[], &mut advertised, &sessions).await;
         assert!(originated.contains_key(&p)); // configured: kept
         assert!(rx.try_recv().is_err()); // nothing pushed
     }
@@ -2761,8 +2911,9 @@ mod tests {
         let mut sessions = HashMap::new();
         sessions.insert(ip([10, 0, 0, 2]), tx);
         let p: Prefix = "2001:db8:99::/64".parse().unwrap();
+        let mut advertised: BTreeMap<Prefix, OriginRoute> = BTreeMap::new();
 
-        apply_redistribution(Redistribution::Announce(static_route("2001:db8:99::/64")), &mut originated, &sessions).await;
+        apply_redistribution(Redistribution::Announce(static_route("2001:db8:99::/64")), &mut originated, &[], &mut advertised, &sessions).await;
         assert!(originated.contains_key(&p));
         match rx.try_recv().unwrap() {
             SessionCmd::Advertise(routes) => assert_eq!(routes[0].prefix, p),

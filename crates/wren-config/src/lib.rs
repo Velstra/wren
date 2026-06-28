@@ -375,9 +375,24 @@ pub struct Bgp {
     /// attributes (same LOCAL_PREF, AS_PATH, ORIGIN, MED, eBGP/iBGP class, IGP cost).
     #[serde(rename = "multipath")]
     pub multipath: Option<usize>,
+    /// Address aggregates (RFC 4271 §9.2.2.2): a covering prefix advertised whenever
+    /// a more-specific, locally-originated/redistributed route falls inside it.
+    #[serde(default, rename = "aggregate")]
+    pub aggregate: Vec<BgpAggregate>,
     /// The configured peers.
     #[serde(default)]
     pub neighbor: Vec<BgpNeighbor>,
+}
+
+/// One BGP address aggregate (`[[bgp.aggregate]]`, RFC 4271 §9.2.2.2).
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct BgpAggregate {
+    /// The covering prefix to advertise, as `addr/len`.
+    pub prefix: String,
+    /// Suppress the contributing more-specifics, advertising only the aggregate.
+    #[serde(default, rename = "summary-only")]
+    pub summary_only: bool,
 }
 
 /// One BGP peer (`[[bgp.neighbor]]`).
@@ -865,6 +880,30 @@ mod tests {
         .expect("valid config");
         let bgp = cfg.bgp.expect("bgp present");
         assert!(bgp.neighbor[0].default_originate);
+    }
+
+    #[test]
+    fn parses_bgp_aggregate() {
+        let cfg = Config::from_toml(
+            r#"
+            router-id = "10.0.0.1"
+            [bgp]
+            enabled = true
+            local-as = 65001
+            [[bgp.aggregate]]
+            prefix = "10.0.0.0/16"
+            summary-only = true
+            [[bgp.aggregate]]
+            prefix = "192.168.0.0/16"
+            "#,
+        )
+        .expect("valid config");
+        let bgp = cfg.bgp.expect("bgp present");
+        assert_eq!(bgp.aggregate.len(), 2);
+        assert_eq!(bgp.aggregate[0].prefix, "10.0.0.0/16");
+        assert!(bgp.aggregate[0].summary_only);
+        assert_eq!(bgp.aggregate[1].prefix, "192.168.0.0/16");
+        assert!(!bgp.aggregate[1].summary_only); // defaults to false
     }
 
     #[test]

@@ -194,7 +194,11 @@ tracked but not yet scheduled, grouped by area:
   advertising several paths per prefix; equal-cost multipath *install* is already
   done, see Platform & core), long-lived graceful restart (RFC 9494), BMP
   (RFC 7854), FlowSpec (RFC 8955), RPKI origin validation, RTC (RFC 4684). (Per-peer
-  `default-originate` — advertising `0.0.0.0/0` to a neighbour — is **done**.)
+  `default-originate` — advertising `0.0.0.0/0` to a neighbour — is **done**.
+  **Address aggregation** (RFC 4271 §9.2.2.2) — a `[[bgp.aggregate]]` covering prefix
+  advertised with ATOMIC_AGGREGATE/AGGREGATOR once a more-specific originated route
+  contributes, with optional `summary-only` suppression — is **done** (for locally
+  originated/redistributed contributors; no `as-set`, no learned-route aggregation).)
 - **Data-plane & overlays:** MPLS, SR-MPLS, SRv6, VXLAN, BFD (RFC 5880),
   MLAG, anycast gateway, dual-stack.
 - **Forwarding & policy:** VRFs, policy-based routing, route maps, prefix lists,

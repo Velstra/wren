@@ -788,6 +788,23 @@ fn build_bgp_config(cfg: &wren_config::Config, bgp: &wren_config::Bgp) -> Result
         );
     }
 
+    // Address aggregates (RFC 4271 §9.2.2.2): each `[[bgp.aggregate]]` prefix is
+    // advertised as a summary whenever a more-specific originated route contributes.
+    let mut aggregates = Vec::with_capacity(bgp.aggregate.len());
+    for agg in &bgp.aggregate {
+        let prefix: wren_core::Prefix = agg
+            .prefix
+            .parse()
+            .with_context(|| format!("bgp aggregate {:?} must be addr/len", agg.prefix))?;
+        if prefix.len() >= prefix.max_len() {
+            anyhow::bail!(
+                "bgp aggregate {:?} is a host route and can never have a more-specific contributor",
+                agg.prefix
+            );
+        }
+        aggregates.push(bgp::Aggregate { prefix, summary_only: agg.summary_only });
+    }
+
     let next_hop6 = match bgp.next_hop6.as_deref() {
         Some(s) => Some(
             s.parse::<std::net::Ipv6Addr>()
@@ -835,6 +852,7 @@ fn build_bgp_config(cfg: &wren_config::Config, bgp: &wren_config::Bgp) -> Result
         confederation_id: bgp.confederation_id,
         confederation_members: bgp.confederation_members.clone(),
         max_paths: bgp.multipath.unwrap_or(1).max(1),
+        aggregates,
     })
 }
 
