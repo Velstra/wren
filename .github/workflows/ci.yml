@@ -1,0 +1,44 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# Cancel superseded runs on the same ref.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  test:
+    name: clippy + test (stable)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Clippy (all targets, warnings are errors)
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      # The unit/integration tests are pure and need no privileges. The
+      # convergence smoke scripts under scripts/ need CAP_NET_RAW + network
+      # namespaces and are intentionally NOT run here — they are run manually
+      # via `unshare -Urn` (see the protocol pages in docs/).
+      - name: Test (workspace)
+        run: cargo test --workspace
+
+  # `rustfmt --check` is deliberately omitted: parts of the codebase use
+  # intentional hand-formatting that newer rustfmt would rewrite. Run
+  # `cargo fmt` locally if you want, but it is not a CI gate.
