@@ -43,9 +43,19 @@ read -r -p "Type 'publish' to continue: " ans
 
 for c in "${CRATES[@]}"; do
   echo "=== publishing $c ==="
-  cargo publish -p "$c"
-  # cargo (>=1.66) waits for the new version to land in the index before it
-  # returns, so the next crate's dependency resolves; the sleep is belt-and-braces.
-  sleep 5
+  # Idempotent: a crate already on crates.io at this version is skipped, so the
+  # script can be re-run safely (e.g. after publishing wren-core by hand first).
+  if out=$(cargo publish -p "$c" 2>&1); then
+    echo "$out" | tail -2
+    # cargo (>=1.66) waits for the new version to land in the index before it
+    # returns, so the next crate's dependency resolves; the sleep is belt-and-braces.
+    sleep 5
+  elif echo "$out" | grep -q "already exists"; then
+    echo "already published — skipping."
+  else
+    echo "$out"
+    echo "ERROR publishing $c — aborting."
+    exit 1
+  fi
 done
-echo "all ${#CRATES[@]} crates published."
+echo "done — all ${#CRATES[@]} crates are published."
