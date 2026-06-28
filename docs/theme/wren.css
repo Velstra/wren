@@ -1,0 +1,20 @@
+/* Small cosmetic tweaks for the Wren handbook. */
+
+/* Give wide reference tables room to breathe. */
+.content table {
+    margin: 1rem 0;
+}
+.content table td,
+.content table th {
+    padding: 0.4rem 0.7rem;
+}
+
+/* Status ticks in the introduction table read better centred. */
+.content table td:last-child {
+    white-space: nowrap;
+}
+
+/* A touch more separation around the ASCII architecture diagrams. */
+.content pre > code {
+    line-height: 1.45;
+}
