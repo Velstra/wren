@@ -1,0 +1,15 @@
+[package]
+name = "wren-core"
+description = "Wren routing daemon — dependency-free control-plane core (RIB, routes, FIB abstraction)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+# Apache-2.0 (NOT the workspace GPL default): the core is dependency-free so it
+# can be embedded anywhere, including downstream proprietary or AGPL projects.
+license = "Apache-2.0"
+repository.workspace = true
+authors.workspace = true
+
+# Deliberately NO dependencies: the core is pure `std` so it can be embedded
+# anywhere (e.g. the Velstra Sentinel appliance) without pulling a runtime.
+[dependencies]
