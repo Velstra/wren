@@ -94,7 +94,11 @@ implemented to its RFC.
 ### Protocol refinements
 
 - OSPF: the RFC 3101 §3.2 NSSA translator election, type-4 ASBR-summaries across
-  areas, explicit type-5 forwarding-address resolution, authentication. **Stub areas
+  areas, explicit type-5 forwarding-address resolution. **Authentication (RFC 2328 §D)
+  is done**: `[ospf] auth-type` selects `none`, a `text` simple password (AuType 1), or
+  `md5` keyed-MD5 (AuType 2, in-process digest) — a mismatched key or scheme drops the
+  packet and no adjacency forms (MD5 anti-replay sequencing is the one remaining gap).
+  **Stub areas
   (RFC 2328 §3.6) are done**: an area marked `stub` carries no AS-external (type-5)
   LSAs — the E-bit is cleared in its Hellos and Database Descriptions so only
   stub-agreeing neighbours adjacency-up, and an ABR injects a default route (a type-3

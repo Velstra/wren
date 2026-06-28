@@ -39,6 +39,7 @@ pub mod flood;
 pub mod interface;
 pub mod lsa;
 pub mod lsdb;
+pub mod md5;
 pub mod neighbor;
 pub mod packet;
 pub mod spf;

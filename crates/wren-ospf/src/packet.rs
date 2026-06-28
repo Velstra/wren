@@ -73,6 +73,91 @@ pub struct Header {
     pub area_id: Ipv4Addr,
 }
 
+/// AuType 0 — Null authentication (RFC 2328 §D.3): the 8 auth bytes are zero.
+pub const AU_NULL: u16 = 0;
+/// AuType 1 — simple (cleartext) password authentication.
+pub const AU_SIMPLE: u16 = 1;
+/// AuType 2 — cryptographic (MD5) authentication.
+pub const AU_CRYPTO: u16 = 2;
+/// The length of an MD5 message digest, and of the OSPF cryptographic key field.
+const MD5_LEN: usize = 16;
+
+/// How an OSPF packet is authenticated (RFC 2328 §D). The interface's configured
+/// scheme is supplied to [`Packet::encode_auth`] when sending and to
+/// [`Packet::decode_auth`] when receiving; a packet whose AuType or authentication
+/// data does not match the configured scheme is rejected ([`DecodeError::BadAuth`]).
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum Auth {
+    /// No authentication (the default): any packet is accepted, the auth field is 0.
+    Null,
+    /// Simple password (AuType 1): a cleartext key (≤ 8 bytes) carried verbatim in the
+    /// 64-bit authentication field. Trivially sniffable — it only stops a router that
+    /// is merely misconfigured, not an attacker.
+    Simple(Vec<u8>),
+    /// Cryptographic MD5 (AuType 2): a keyed MD5 digest of the packet is appended after
+    /// the body, and the auth field carries the key id, the digest length and a
+    /// non-decreasing sequence number. An attacker without the key cannot forge a
+    /// packet the digest will accept.
+    Md5 {
+        /// The key identifier (lets a router roll keys without a flag day).
+        key_id: u8,
+        /// The shared secret; padded with zeros (or truncated) to 16 bytes for MD5.
+        key: Vec<u8>,
+        /// The cryptographic sequence number written into the auth field when sending
+        /// (ignored when verifying — anti-replay sequencing is left to the caller).
+        seq: u32,
+    },
+}
+
+impl Auth {
+    /// The on-wire AuType value for this scheme.
+    pub fn au_type(&self) -> u16 {
+        match self {
+            Auth::Null => AU_NULL,
+            Auth::Simple(_) => AU_SIMPLE,
+            Auth::Md5 { .. } => AU_CRYPTO,
+        }
+    }
+
+    /// The 8-byte authentication field to place in the header for this scheme.
+    fn auth_field(&self) -> [u8; 8] {
+        let mut f = [0u8; 8];
+        match self {
+            Auth::Null => {}
+            Auth::Simple(pw) => {
+                let n = pw.len().min(8);
+                f[..n].copy_from_slice(&pw[..n]);
+            }
+            Auth::Md5 { key_id, seq, .. } => {
+                // [0,1] reserved (0); [2] key id; [3] auth-data length; [4..8] seq.
+                f[2] = *key_id;
+                f[3] = MD5_LEN as u8;
+                f[4..8].copy_from_slice(&seq.to_be_bytes());
+            }
+        }
+        f
+    }
+}
+
+/// The OSPF cryptographic key padded with zeros (or truncated) to the 16 bytes MD5
+/// uses (RFC 2328 §D.4.3).
+fn md5_key16(key: &[u8]) -> [u8; 16] {
+    let mut k = [0u8; 16];
+    let n = key.len().min(16);
+    k[..n].copy_from_slice(&key[..n]);
+    k
+}
+
+/// The MD5 authentication digest over an OSPF packet (RFC 2328 §D.4.3): MD5 of the
+/// packet (header through body, with the auth field already filled and the checksum
+/// left zero) concatenated with the 16-byte key.
+fn md5_auth_digest(packet: &[u8], key: &[u8]) -> [u8; 16] {
+    let mut buf = Vec::with_capacity(packet.len() + 16);
+    buf.extend_from_slice(packet);
+    buf.extend_from_slice(&md5_key16(key));
+    crate::md5::md5(&buf)
+}
+
 /// A Hello packet body (§A.3.2): the parameters two routers must agree on to
 /// become neighbours, plus the sender's current view of the link's neighbours
 /// and its elected DR/BDR.
@@ -237,6 +322,9 @@ pub enum DecodeError {
     /// A Link State Update carried an LSA that would not parse (bad length,
     /// truncated, or fewer LSAs than its count claimed).
     BadLsa,
+    /// Authentication failed: the AuType did not match the configured scheme, the
+    /// simple password differed, or the MD5 key id / digest did not verify.
+    BadAuth,
 }
 
 impl std::fmt::Display for DecodeError {
@@ -250,6 +338,7 @@ impl std::fmt::Display for DecodeError {
             }
             DecodeError::BadChecksum => write!(f, "checksum mismatch"),
             DecodeError::BadLsa => write!(f, "malformed LSA in update"),
+            DecodeError::BadAuth => write!(f, "authentication mismatch"),
         }
     }
 }
@@ -266,6 +355,19 @@ fn packet_checksum(pkt: &[u8]) -> u16 {
     scratch.extend_from_slice(&pkt[..16]);
     scratch.extend_from_slice(&pkt[HEADER_LEN..]);
     ip_checksum(&scratch)
+}
+
+/// Verify the OSPF checksum of `buf` (the auth field is excluded from the sum, so this
+/// is independent of the authentication scheme — used for Null and simple-password
+/// auth, where the checksum, not a digest, protects the body).
+fn verify_checksum(buf: &[u8]) -> Result<(), DecodeError> {
+    let mut scratch = buf.to_vec();
+    scratch[12] = 0;
+    scratch[13] = 0;
+    if packet_checksum(&scratch) != u16::from_be_bytes([buf[12], buf[13]]) {
+        return Err(DecodeError::BadChecksum);
+    }
+    Ok(())
 }
 
 impl Packet {
@@ -309,19 +411,29 @@ impl Packet {
         }
     }
 
-    /// Serialize the packet, filling in version, type, length, checksum and a
-    /// Null authentication trailer.
+    /// Serialize the packet with Null authentication. Convenience wrapper over
+    /// [`Packet::encode_auth`].
     pub fn encode(&self) -> Vec<u8> {
+        self.encode_auth(&Auth::Null)
+    }
+
+    /// Serialize the packet, filling in version, type, length, checksum and the
+    /// authentication per `auth` (RFC 2328 §D). For Null and simple-password auth the
+    /// IP checksum is computed (the auth field is excluded from it) and the password,
+    /// if any, written into the auth field. For MD5 the checksum is left zero and a
+    /// keyed digest is appended after the body, with the length field covering only
+    /// the OSPF packet (not the trailing digest).
+    pub fn encode_auth(&self, auth: &Auth) -> Vec<u8> {
         let mut out = Vec::with_capacity(HEADER_LEN + HELLO_FIXED_LEN);
-        // Common header, checksum + auth left zero for now.
+        // Common header; length + checksum patched below, auth field filled now.
         out.push(VERSION);
         out.push(self.body.packet_type().as_u8());
         out.extend_from_slice(&[0, 0]); // length, patched below
         out.extend_from_slice(&self.header.router_id.octets());
         out.extend_from_slice(&self.header.area_id.octets());
-        out.extend_from_slice(&[0, 0]); // checksum, patched below
-        out.extend_from_slice(&[0, 0]); // AuType = 0 (Null)
-        out.extend_from_slice(&[0; 8]); // authentication
+        out.extend_from_slice(&[0, 0]); // checksum, patched (or left zero for MD5)
+        out.extend_from_slice(&auth.au_type().to_be_bytes());
+        out.extend_from_slice(&auth.auth_field());
 
         match &self.body {
             Body::Hello(h) => encode_hello(h, &mut out),
@@ -331,16 +443,36 @@ impl Packet {
             Body::LinkStateAck(a) => encode_lsack(a, &mut out),
         }
 
+        // The length field covers the OSPF packet only (the MD5 digest, if any, is
+        // appended after and counted only in the IP length).
         let len = out.len() as u16;
         out[2..4].copy_from_slice(&len.to_be_bytes());
-        let csum = packet_checksum(&out);
-        out[12..14].copy_from_slice(&csum.to_be_bytes());
+        match auth {
+            Auth::Md5 { key, .. } => {
+                // Checksum stays zero with cryptographic auth; append the digest.
+                let digest = md5_auth_digest(&out, key);
+                out.extend_from_slice(&digest);
+            }
+            Auth::Null | Auth::Simple(_) => {
+                let csum = packet_checksum(&out);
+                out[12..14].copy_from_slice(&csum.to_be_bytes());
+            }
+        }
         out
     }
 
-    /// Parse and validate an OSPF packet from `buf`. Verifies the version, the
-    /// length field and the checksum before dispatching on the type.
+    /// Parse and validate an OSPF packet expecting Null authentication. Convenience
+    /// wrapper over [`Packet::decode_auth`].
     pub fn decode(buf: &[u8]) -> Result<Packet, DecodeError> {
+        Packet::decode_auth(buf, &Auth::Null)
+    }
+
+    /// Parse and validate an OSPF packet from `buf`, authenticating it against `auth`
+    /// (RFC 2328 §D). Verifies the version and length, that the packet's AuType matches
+    /// the configured scheme, and the scheme-specific authentication: the checksum and
+    /// the password for Null/simple, or the appended keyed digest for MD5. Any mismatch
+    /// is rejected.
+    pub fn decode_auth(buf: &[u8], auth: &Auth) -> Result<Packet, DecodeError> {
         if buf.len() < HEADER_LEN {
             return Err(DecodeError::TooShort);
         }
@@ -348,29 +480,57 @@ impl Packet {
             return Err(DecodeError::BadVersion(buf[0]));
         }
         let ptype = PacketType::from_u8(buf[1]).ok_or(DecodeError::UnknownType(buf[1]))?;
-        let stated = u16::from_be_bytes([buf[2], buf[3]]);
-        if stated as usize != buf.len() {
-            return Err(DecodeError::BadLength {
-                stated,
-                actual: buf.len(),
-            });
+        let stated = u16::from_be_bytes([buf[2], buf[3]]) as usize;
+        // The packet's AuType must match the configured scheme (RFC 2328 §D.3).
+        if u16::from_be_bytes([buf[14], buf[15]]) != auth.au_type() {
+            return Err(DecodeError::BadAuth);
         }
-        // Verify the checksum: rebuild with checksum + auth zeroed and compare.
-        let mut scratch = buf.to_vec();
-        scratch[12] = 0;
-        scratch[13] = 0;
-        for b in &mut scratch[16..HEADER_LEN] {
-            *b = 0;
-        }
-        if packet_checksum(&scratch) != u16::from_be_bytes([buf[12], buf[13]]) {
-            return Err(DecodeError::BadChecksum);
+
+        // The OSPF packet occupies `stated` bytes; with MD5 a 16-byte digest follows.
+        let body_end = match auth {
+            Auth::Md5 { .. } => {
+                if stated + MD5_LEN != buf.len() || stated < HEADER_LEN {
+                    return Err(DecodeError::BadLength { stated: stated as u16, actual: buf.len() });
+                }
+                stated
+            }
+            Auth::Null | Auth::Simple(_) => {
+                if stated != buf.len() {
+                    return Err(DecodeError::BadLength { stated: stated as u16, actual: buf.len() });
+                }
+                stated
+            }
+        };
+
+        match auth {
+            Auth::Null => verify_checksum(buf)?,
+            Auth::Simple(pw) => {
+                verify_checksum(buf)?;
+                let mut want = [0u8; 8];
+                let n = pw.len().min(8);
+                want[..n].copy_from_slice(&pw[..n]);
+                if buf[16..24] != want {
+                    return Err(DecodeError::BadAuth);
+                }
+            }
+            Auth::Md5 { key_id, key, .. } => {
+                // The key id must match, and the appended digest must verify over the
+                // packet (with its in-place auth field) concatenated with the key.
+                if buf[18] != *key_id {
+                    return Err(DecodeError::BadAuth);
+                }
+                let digest = md5_auth_digest(&buf[..body_end], key);
+                if buf[body_end..body_end + MD5_LEN] != digest {
+                    return Err(DecodeError::BadAuth);
+                }
+            }
         }
 
         let header = Header {
             router_id: Ipv4Addr::new(buf[4], buf[5], buf[6], buf[7]),
             area_id: Ipv4Addr::new(buf[8], buf[9], buf[10], buf[11]),
         };
-        let body = &buf[HEADER_LEN..];
+        let body = &buf[HEADER_LEN..body_end];
         let body = match ptype {
             PacketType::Hello => Body::Hello(decode_hello(body)?),
             PacketType::DatabaseDescription => Body::DatabaseDescription(decode_dd(body)?),
@@ -795,6 +955,41 @@ mod tests {
         let bytes = pkt.encode();
         assert_eq!(bytes.len(), HEADER_LEN + 2 * LSA_HEADER_LEN);
         assert_eq!(Packet::decode(&bytes).unwrap(), pkt);
+    }
+
+    #[test]
+    fn simple_password_auth_roundtrips_and_rejects_a_wrong_key() {
+        let auth = Auth::Simple(b"opensesame".to_vec()); // > 8 bytes: truncated to 8
+        let bytes = sample_hello().encode_auth(&auth);
+        assert_eq!(u16::from_be_bytes([bytes[14], bytes[15]]), AU_SIMPLE);
+        // Correct key decodes; the auth field carries the (truncated) password.
+        assert_eq!(Packet::decode_auth(&bytes, &auth).unwrap(), sample_hello());
+        // A different key is rejected, and so is Null against a type-1 packet.
+        assert_eq!(
+            Packet::decode_auth(&bytes, &Auth::Simple(b"other".to_vec())),
+            Err(DecodeError::BadAuth)
+        );
+        assert_eq!(Packet::decode_auth(&bytes, &Auth::Null), Err(DecodeError::BadAuth));
+    }
+
+    #[test]
+    fn md5_auth_appends_a_digest_and_rejects_tampering() {
+        let auth = Auth::Md5 { key_id: 7, key: b"sharedsecret".to_vec(), seq: 0x0102_0304 };
+        let mut bytes = sample_hello().encode_auth(&auth);
+        assert_eq!(u16::from_be_bytes([bytes[14], bytes[15]]), AU_CRYPTO);
+        // The 16-byte digest is appended beyond the OSPF length field.
+        let stated = u16::from_be_bytes([bytes[2], bytes[3]]) as usize;
+        assert_eq!(bytes.len(), stated + 16);
+        assert_eq!(bytes[18], 7); // key id in the auth field
+        // The right key verifies.
+        assert_eq!(Packet::decode_auth(&bytes, &auth).unwrap(), sample_hello());
+        // A wrong key id, a wrong key, and a flipped body byte are all rejected.
+        let wrong_id = Auth::Md5 { key_id: 8, key: b"sharedsecret".to_vec(), seq: 0 };
+        assert_eq!(Packet::decode_auth(&bytes, &wrong_id), Err(DecodeError::BadAuth));
+        let wrong_key = Auth::Md5 { key_id: 7, key: b"different".to_vec(), seq: 0 };
+        assert_eq!(Packet::decode_auth(&bytes, &wrong_key), Err(DecodeError::BadAuth));
+        bytes[HEADER_LEN] ^= 0xff;
+        assert_eq!(Packet::decode_auth(&bytes, &auth), Err(DecodeError::BadAuth));
     }
 
     #[test]

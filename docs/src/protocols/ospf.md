@@ -290,9 +290,45 @@ A-(area 0.0.0.1)-B topology is run with the area a plain stub (B learns the defa
 default remains), then totally-NSSA (B gets a type-7 default and the summary stays
 suppressed).
 
+## Authentication (RFC 2328 §D)
+
+Every OSPF packet carries a 16-bit AuType and a 64-bit authentication field, so a
+link can require its routers to prove a shared secret before they form an adjacency.
+Wren supports all three schemes, configured once under `[ospf]` and applied to every
+interface (the routers on a link must agree):
+
+```toml
+[ospf]
+enabled    = true
+interfaces = ["eth1"]
+auth-type  = "md5"        # "none" (default), "text", or "md5"
+auth-key   = "s3cr3t"     # ≤ 8 bytes for text, ≤ 16 bytes for md5
+auth-key-id = 1           # md5 only; lets keys be rolled (default 1)
+```
+
+- **`none`** (AuType 0) — no authentication; the auth field is zero. The default.
+- **`text`** (AuType 1) — a **simple password**: the cleartext key (up to 8 bytes) is
+  placed in the auth field of every packet and compared on receipt. It only stops a
+  *misconfigured* neighbour — anyone who can see the link can read the password.
+- **`md5`** (AuType 2) — **cryptographic authentication**: a keyed MD5 digest of the
+  packet and the secret is appended after the body, and the auth field carries the key
+  id and a sequence number. The checksum is left zero (the digest replaces it). An
+  attacker without the key cannot forge a packet the digest will accept, so this is the
+  one to use on an untrusted link. (MD5 is computed in-process by a small, dependency-
+  free implementation; the cryptographic sequence number is sent but anti-replay
+  sequencing is not yet enforced on receipt.)
+
+A packet whose AuType or authentication data does not match the configured scheme is
+dropped, so it never reaches the neighbour state machine — a mismatched key simply
+means the adjacency never forms. `scripts/ospf-auth-smoke.sh` exercises this live
+(rootless): two point-to-point routers reach `Full` with matching MD5 keys, fail to
+form an adjacency when the keys differ, and reach `Full` again with a matching simple
+password.
+
 ## Not yet implemented
 
 The RFC 3101 §3.2 translator election (a single ABR translates today), type-4
 ASBR-summaries reaching an ASBR across areas, explicit type-5 forwarding-address
-resolution, and authentication (Wren uses null authentication today). These are
-tracked in the [Roadmap](../roadmap.md).
+resolution, and MD5 cryptographic-authentication anti-replay (the sequence number is
+sent but not yet checked on receipt). These are tracked in the
+[Roadmap](../roadmap.md).

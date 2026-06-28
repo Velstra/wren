@@ -239,6 +239,19 @@ pub struct Ospf {
     /// carries. An area listed here is treated as an NSSA.
     #[serde(default, rename = "nssa-default-areas")]
     pub nssa_default_areas: Vec<String>,
+    /// Packet authentication scheme (RFC 2328 §D), applied to every OSPF interface:
+    /// `"none"` (the default), `"text"` for a simple cleartext password, or `"md5"`
+    /// for a cryptographic keyed-MD5 digest. The peers on a link must agree.
+    #[serde(rename = "auth-type")]
+    pub auth_type: Option<String>,
+    /// The shared authentication key — the cleartext password (≤ 8 bytes) for
+    /// `auth-type = "text"`, or the secret (≤ 16 bytes) for `auth-type = "md5"`.
+    #[serde(rename = "auth-key")]
+    pub auth_key: Option<String>,
+    /// The MD5 key identifier (`auth-type = "md5"` only), letting keys be rolled.
+    /// Defaults to 1.
+    #[serde(rename = "auth-key-id")]
+    pub auth_key_id: Option<u8>,
 }
 
 /// One OSPF interface placed in a specific area (`[[ospf.interface]]`).
@@ -1012,6 +1025,26 @@ mod tests {
         let ospf = cfg.ospf.expect("ospf present");
         assert_eq!(ospf.totally_stubby_areas, vec!["1.0.0.0"]);
         assert_eq!(ospf.totally_nssa_areas, vec!["3.0.0.0"]);
+    }
+
+    #[test]
+    fn parses_ospf_authentication() {
+        let cfg = Config::from_toml(
+            r#"
+            router-id = "10.0.0.1"
+            [ospf]
+            enabled = true
+            interfaces = ["eth1"]
+            auth-type = "md5"
+            auth-key = "secret"
+            auth-key-id = 3
+            "#,
+        )
+        .expect("valid config");
+        let ospf = cfg.ospf.expect("ospf present");
+        assert_eq!(ospf.auth_type.as_deref(), Some("md5"));
+        assert_eq!(ospf.auth_key.as_deref(), Some("secret"));
+        assert_eq!(ospf.auth_key_id, Some(3));
     }
 
     #[test]

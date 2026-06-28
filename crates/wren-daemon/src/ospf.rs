@@ -48,8 +48,8 @@ use wren_ospf::neighbor::{
     Neighbor, NeighborAction, NeighborContext, NeighborEvent, NeighborState,
 };
 use wren_ospf::packet::{
-    Body, DatabaseDescription, Header, Hello, LinkStateAck, LinkStateRequest, LinkStateUpdate,
-    LsRequest, Packet, DD_FLAG_INIT, DD_FLAG_MASTER, DD_FLAG_MORE,
+    Auth, Body, DatabaseDescription, Header, Hello, LinkStateAck, LinkStateRequest,
+    LinkStateUpdate, LsRequest, Packet, DD_FLAG_INIT, DD_FLAG_MASTER, DD_FLAG_MORE,
 };
 use wren_ospf::spf::{self, SpfRoute};
 use wren_ospf::{
@@ -116,6 +116,10 @@ pub struct OspfConfig {
     /// [`Self::nssa_areas`]; a totally-NSSA already injects the default, so it need not
     /// be listed here as well.
     pub nssa_default_areas: HashSet<Ipv4Addr>,
+    /// The packet authentication scheme (RFC 2328 §D) applied to every interface. For
+    /// MD5 the carried sequence number is a template (0); the runner stamps an
+    /// increasing value on each sent packet via [`Ospf::send_auth`].
+    pub auth: Auth,
 }
 
 /// One configured OSPF interface and the area it is in.
@@ -524,7 +528,7 @@ impl Ospf {
         let Some(ospf) = strip_ip_header(&pkt.data) else {
             return;
         };
-        let packet = match Packet::decode(ospf) {
+        let packet = match Packet::decode_auth(ospf, &self.cfg.auth) {
             Ok(p) => p,
             Err(e) => {
                 debug!(src = %pkt.src, error = %e, "ignoring malformed OSPF packet");
@@ -1736,7 +1740,7 @@ impl Ospf {
                 router_id: self.cfg.router_id,
                 area_id: iface.area,
             };
-            let bytes = Packet::hello(header, hello).encode();
+            let bytes = Packet::hello(header, hello).encode_auth(&self.send_auth());
             send(&iface.sock, ALL_SPF_ROUTERS, &bytes).await;
         }
     }
@@ -1891,7 +1895,25 @@ impl Ospf {
             router_id: self.cfg.router_id,
             area_id: area,
         };
-        Packet { header, body }.encode()
+        Packet { header, body }.encode_auth(&self.send_auth())
+    }
+
+    /// The authentication to stamp on an outgoing packet. Null and simple-password
+    /// auth are used verbatim; for MD5 the configured key is reused but the sequence
+    /// number is set to the current wall-clock seconds, which is non-decreasing across
+    /// the session (RFC 2328 §D.3 requires a monotonic sequence per packet).
+    fn send_auth(&self) -> Auth {
+        match &self.cfg.auth {
+            Auth::Md5 { key_id, key, .. } => Auth::Md5 {
+                key_id: *key_id,
+                key: key.clone(),
+                seq: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs() as u32)
+                    .unwrap_or(0),
+            },
+            other => other.clone(),
+        }
     }
 
     fn dd_packet(&self, area: Ipv4Addr, dd: DatabaseDescription) -> Vec<u8> {

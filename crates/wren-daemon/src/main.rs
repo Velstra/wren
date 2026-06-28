@@ -594,6 +594,7 @@ fn build_ospf_config(
     if let Some(a) = nssa_areas.intersection(&stub_areas).next() {
         anyhow::bail!("area {a} cannot be both a stub and an NSSA area");
     }
+    let auth = build_ospf_auth(ospf)?;
     Ok(ospf::OspfConfig {
         router_id,
         iface_type,
@@ -610,7 +611,45 @@ fn build_ospf_config(
         totally_stubby_areas,
         totally_nssa_areas,
         nssa_default_areas,
+        auth,
     })
+}
+
+/// Build the OSPF packet authentication (RFC 2328 §D) from the `[ospf]` `auth-*`
+/// fields: `"none"` (the default), `"text"` for a simple cleartext password (≤ 8
+/// bytes), or `"md5"` for keyed-MD5 (key ≤ 16 bytes, key id defaulting to 1).
+fn build_ospf_auth(ospf: &wren_config::Ospf) -> Result<wren_ospf::packet::Auth> {
+    use wren_ospf::packet::Auth;
+    match ospf.auth_type.as_deref() {
+        None | Some("none") => Ok(Auth::Null),
+        Some("text") => {
+            let key = ospf
+                .auth_key
+                .as_deref()
+                .filter(|k| !k.is_empty())
+                .context("ospf auth-type \"text\" requires a non-empty auth-key")?;
+            if key.len() > 8 {
+                anyhow::bail!("ospf simple-password auth-key must be at most 8 bytes (RFC 2328 §D)");
+            }
+            Ok(Auth::Simple(key.as_bytes().to_vec()))
+        }
+        Some("md5") => {
+            let key = ospf
+                .auth_key
+                .as_deref()
+                .filter(|k| !k.is_empty())
+                .context("ospf auth-type \"md5\" requires a non-empty auth-key")?;
+            if key.len() > 16 {
+                anyhow::bail!("ospf md5 auth-key must be at most 16 bytes (RFC 2328 §D)");
+            }
+            Ok(Auth::Md5 {
+                key_id: ospf.auth_key_id.unwrap_or(1),
+                key: key.as_bytes().to_vec(),
+                seq: 0,
+            })
+        }
+        Some(other) => anyhow::bail!("unknown ospf auth-type {other:?} (want none, text or md5)"),
+    }
 }
 
 /// Resolve the textual `[ospf3]` config into the runner's [`ospf3::Ospf3Config`],
