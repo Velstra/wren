@@ -25,6 +25,9 @@ pub enum LsType {
     SummaryAsbr,
     /// Type 5 — a route external to the AS, originated by an ASBR.
     AsExternal,
+    /// Type 7 — an external route within a not-so-stubby area (RFC 3101). Same body
+    /// as a type-5, but area-scoped; an ABR translates it to type-5 for the AS.
+    Nssa,
 }
 
 impl LsType {
@@ -36,6 +39,7 @@ impl LsType {
             3 => LsType::SummaryNetwork,
             4 => LsType::SummaryAsbr,
             5 => LsType::AsExternal,
+            7 => LsType::Nssa,
             _ => return None,
         })
     }
@@ -48,6 +52,7 @@ impl LsType {
             LsType::SummaryNetwork => 3,
             LsType::SummaryAsbr => 4,
             LsType::AsExternal => 5,
+            LsType::Nssa => 7,
         }
     }
 }
@@ -364,7 +369,10 @@ impl Lsa {
             LsType::SummaryNetwork | LsType::SummaryAsbr => {
                 LsaBody::Summary(decode_summary(body_bytes)?)
             }
-            LsType::AsExternal => LsaBody::AsExternal(decode_external(body_bytes)?),
+            // A type-7 NSSA-external uses the very same body as a type-5 (RFC 3101).
+            LsType::AsExternal | LsType::Nssa => {
+                LsaBody::AsExternal(decode_external(body_bytes)?)
+            }
         };
         Some((Lsa { header, body }, len))
     }
@@ -710,5 +718,27 @@ mod tests {
             }),
         );
         assert_lsa_roundtrips(&l);
+    }
+
+    #[test]
+    fn nssa_type7_lsa_roundtrips_with_the_external_body() {
+        // A type-7 NSSA-external carries the same body as a type-5, but its header
+        // LS type is 7 — the decoder must preserve that (RFC 3101).
+        let l = lsa(
+            LsType::Nssa,
+            [10, 99, 0, 0],
+            LsaBody::AsExternal(AsExternalLsa {
+                network_mask: Ipv4Addr::new(255, 255, 255, 0),
+                external_type2: true,
+                metric: 20,
+                forwarding_address: Ipv4Addr::UNSPECIFIED,
+                route_tag: 0,
+            }),
+        );
+        assert_lsa_roundtrips(&l);
+        let (decoded, _) = Lsa::decode(&l.encode()).unwrap();
+        assert_eq!(decoded.header.ls_type, LsType::Nssa);
+        assert_eq!(decoded.header.ls_type.as_u8(), 7);
+        assert!(matches!(decoded.body, LsaBody::AsExternal(_)));
     }
 }

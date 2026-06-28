@@ -168,8 +168,29 @@ pub fn inter_area_routes(lsdb: &Lsdb, intra: &SpfResult, self_id: Ipv4Addr) -> V
 /// skipped. As with [`inter_area_routes`], the caller lets more-preferred
 /// (intra/inter-area) routes win.
 pub fn external_routes(lsdb: &Lsdb, intra: &SpfResult, self_id: Ipv4Addr) -> Vec<SpfRoute> {
+    external_routes_of_type(lsdb, intra, self_id, LsType::AsExternal)
+}
+
+/// The NSSA-external routes (RFC 3101): exactly like [`external_routes`], but
+/// reading the area-scoped type-7 LSAs from an NSSA area's own database. A router
+/// inside an NSSA reaches the area's external destinations this way; the area
+/// border router additionally translates the type-7s to type-5 for the rest of the
+/// AS (done in the runner).
+pub fn nssa_routes(lsdb: &Lsdb, intra: &SpfResult, self_id: Ipv4Addr) -> Vec<SpfRoute> {
+    external_routes_of_type(lsdb, intra, self_id, LsType::Nssa)
+}
+
+/// Shared body of [`external_routes`] / [`nssa_routes`]: type-5 and type-7 carry
+/// the same external body and use the same cost rules, differing only in the LS
+/// type read and (for type-7) the database scope.
+fn external_routes_of_type(
+    lsdb: &Lsdb,
+    intra: &SpfResult,
+    self_id: Ipv4Addr,
+    ls_type: LsType,
+) -> Vec<SpfRoute> {
     let mut by_prefix: BTreeMap<Prefix, SpfRoute> = BTreeMap::new();
-    for lsa in lsdb.iter_type(LsType::AsExternal) {
+    for lsa in lsdb.iter_type(ls_type) {
         let LsaBody::AsExternal(ext) = &lsa.body else {
             continue;
         };
@@ -531,6 +552,28 @@ mod tests {
             body: LsaBody::AsExternal(AsExternalLsa {
                 network_mask: ip(mask),
                 external_type2: e2,
+                metric,
+                forwarding_address: Ipv4Addr::UNSPECIFIED,
+                route_tag: 0,
+            }),
+        }
+    }
+
+    fn nssa_lsa(asbr: [u8; 4], net: [u8; 4], mask: [u8; 4], metric: u32) -> Lsa {
+        Lsa {
+            header: LsaHeader {
+                ls_age: 1,
+                options: crate::OPT_NP,
+                ls_type: LsType::Nssa,
+                link_state_id: ip(net),
+                advertising_router: ip(asbr),
+                ls_seq: INITIAL_SEQUENCE_NUMBER,
+                ls_checksum: 0,
+                length: 0,
+            },
+            body: LsaBody::AsExternal(AsExternalLsa {
+                network_mask: ip(mask),
+                external_type2: true,
                 metric,
                 forwarding_address: Ipv4Addr::UNSPECIFIED,
                 route_tag: 0,
@@ -951,6 +994,24 @@ mod tests {
         // E2: cost is the advertised metric, independent of the cost to the ASBR.
         assert_eq!(r.cost, 20);
         assert_eq!(r.gateways, vec![ip([10, 0, 12, 2])]);
+    }
+
+    #[test]
+    fn nssa_type7_route_is_computed_like_an_external() {
+        // R2 is the in-area NSSA ASBR; its type-7 lives in the AREA database.
+        let mut db = area_with_asbr();
+        db.install(nssa_lsa([2, 2, 2, 2], [10, 99, 0, 0], [255, 255, 255, 0], 20));
+        let intra = compute(&db, ip([1, 1, 1, 1]));
+        let routes = nssa_routes(&db, &intra, ip([1, 1, 1, 1]));
+        let r = routes
+            .iter()
+            .find(|r| r.prefix.to_string() == "10.99.0.0/24")
+            .expect("nssa route present");
+        assert_eq!(r.cost, 20); // E2 metric alone
+        assert_eq!(r.gateways, vec![ip([10, 0, 12, 2])]); // via the ASBR
+        // The originating ASBR derives no route from its own type-7.
+        let self_routes = nssa_routes(&db, &compute(&db, ip([2, 2, 2, 2])), ip([2, 2, 2, 2]));
+        assert!(self_routes.iter().all(|r| r.prefix.to_string() != "10.99.0.0/24"));
     }
 
     #[test]

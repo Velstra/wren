@@ -192,9 +192,45 @@ is run with the area normal (the internal router learns the external `10.99.0.0/
 and no default) and then as a stub (the external is gone, replaced by a
 `default via` the ABR, with the ordinary inter-area route still present).
 
+## NSSA areas (RFC 3101)
+
+A **not-so-stubby area** (NSSA) is a stub-like area that can still contain its own
+ASBR. Like a stub it carries no AS-external (type-5) LSAs, but an ASBR inside it
+originates **type-7** LSAs (same body as a type-5, but area-scoped), and the area
+border router **translates** them into type-5 LSAs flooded into the rest of the AS.
+This lets an edge area redistribute a few external routes without importing the
+whole AS's external table. Mark an area an NSSA by listing its id:
+
+```toml
+[ospf]
+enabled      = true
+interfaces   = ["eth1"]
+area         = "1.0.0.0"
+nssa-areas   = ["1.0.0.0"]    # an area is either stub or nssa, not both
+redistribute = ["static"]     # an ASBR here originates type-7, not type-5
+```
+
+In an NSSA Wren:
+
+- sets the **N-bit** (and clears the E-bit) in the Hellos and Database Descriptions
+  it sends there, and only forms an adjacency with a neighbour whose N-bit agrees;
+- as an **ASBR inside the NSSA**, originates each redistributed destination as a
+  **type-7** LSA into the area (not a type-5), with a `0.0.0.0` forwarding address
+  (forward via the originator);
+- computes routes to the area's type-7 destinations like AS-externals;
+- as the **ABR**, **translates** every type-7 in the area into a type-5 LSA
+  (re-originated under its own Router ID) and floods it AS-wide, so routers in the
+  backbone and other areas learn the route as an ordinary external.
+
+`scripts/ospf-nssa-smoke.sh` exercises this live (rootless) with three routers —
+`B ──(NSSA)── A ──(backbone)── C`: B redistributes `10.99.0.0/24` as a type-7, A
+(the ABR) learns it and translates it, and C in the backbone installs the
+translated `10.99.0.0/24` external `proto ospf`.
+
 ## Not yet implemented
 
-NSSA areas (type-7), totally-stubby areas, type-4 ASBR-summaries reaching an ASBR
+Totally-stubby areas, NSSA default-route injection and the RFC 3101 §3.2 translator
+election (a single ABR translates today), type-4 ASBR-summaries reaching an ASBR
 across areas, explicit type-5 forwarding-address resolution, and authentication
 (Wren uses null authentication today). These are tracked in the
 [Roadmap](../roadmap.md).

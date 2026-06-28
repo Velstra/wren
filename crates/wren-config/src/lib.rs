@@ -214,6 +214,12 @@ pub struct Ospf {
     /// into each stub area (the type-3 `0.0.0.0/0` summary). Defaults to 1.
     #[serde(rename = "stub-default-cost")]
     pub stub_default_cost: Option<u32>,
+    /// Areas configured as **not-so-stubby** areas (NSSA, RFC 3101), listed by id.
+    /// Like a stub an NSSA carries no AS-external (type-5) LSAs, but an ASBR inside
+    /// it may originate type-7 LSAs that the area border router translates to type-5
+    /// for the rest of the AS. An area may be a stub or an NSSA, not both.
+    #[serde(default, rename = "nssa-areas")]
+    pub nssa_areas: Vec<String>,
 }
 
 /// One OSPF interface placed in a specific area (`[[ospf.interface]]`).
@@ -870,6 +876,21 @@ mod tests {
         let ospf = cfg.ospf.expect("ospf present");
         assert_eq!(ospf.stub_areas, vec!["1.0.0.0", "2.0.0.0"]);
         assert_eq!(ospf.stub_default_cost, Some(5));
+    }
+
+    #[test]
+    fn parses_ospf_nssa_areas() {
+        let cfg = Config::from_toml(
+            r#"
+            router-id = "10.0.0.1"
+            [ospf]
+            enabled = true
+            interfaces = ["eth1"]
+            nssa-areas = ["3.0.0.0"]
+            "#,
+        )
+        .expect("valid config");
+        assert_eq!(cfg.ospf.expect("ospf present").nssa_areas, vec!["3.0.0.0"]);
     }
 
     #[test]

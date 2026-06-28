@@ -53,7 +53,7 @@ use wren_ospf::packet::{
 };
 use wren_ospf::spf::{self, SpfRoute};
 use wren_ospf::{
-    ALL_D_ROUTERS, ALL_SPF_ROUTERS, INITIAL_SEQUENCE_NUMBER, IP_PROTOCOL, MAX_AGE, OPT_E,
+    ALL_D_ROUTERS, ALL_SPF_ROUTERS, INITIAL_SEQUENCE_NUMBER, IP_PROTOCOL, MAX_AGE, OPT_E, OPT_NP,
 };
 
 use crate::rip::{setsockopt_int, setsockopt_struct};
@@ -98,6 +98,10 @@ pub struct OspfConfig {
     /// The metric an ABR advertises for the default route (`0.0.0.0/0`) it injects
     /// into each stub area.
     pub stub_default_cost: u32,
+    /// Areas configured as not-so-stubby (NSSA, RFC 3101): like a stub they carry
+    /// no AS-external (type-5) LSAs, but an ASBR inside may originate type-7 LSAs,
+    /// which the area border router translates to type-5 for the rest of the AS.
+    pub nssa_areas: HashSet<Ipv4Addr>,
 }
 
 /// One configured OSPF interface and the area it is in.
@@ -175,6 +179,9 @@ struct Area {
     originated_networks: HashSet<LsaKey>,
     /// The Summary-LSAs we currently originate into this area (as an ABR).
     originated_summaries: HashSet<LsaKey>,
+    /// The NSSA type-7 LSAs we currently originate into this area (as an ASBR in an
+    /// NSSA, RFC 3101).
+    originated_nssa: HashSet<LsaKey>,
 }
 
 impl Area {
@@ -183,6 +190,7 @@ impl Area {
             lsdb: Lsdb::new(),
             originated_networks: HashSet::new(),
             originated_summaries: HashSet::new(),
+            originated_nssa: HashSet::new(),
         }
     }
 }
@@ -209,6 +217,10 @@ struct Ospf {
     externals: BTreeMap<Prefix, u32>,
     /// The AS-external LSAs we currently originate (for flush bookkeeping).
     originated_externals: HashSet<LsaKey>,
+    /// The AS-external (type-5) LSAs we currently originate by translating NSSA
+    /// type-7 LSAs as an ABR (RFC 3101 §3.2) — tracked apart from
+    /// `originated_externals` so the two flush independently.
+    originated_translated: HashSet<LsaKey>,
     /// The next sequence number to use for each LSA we originate, keyed by
     /// `(area, LSA identity)` — the same LSA key recurs across areas.
     lsa_seqs: HashMap<(Ipv4Addr, LsaKey), i32>,
@@ -406,6 +418,7 @@ pub async fn run(
         external_lsdb: Lsdb::new(),
         externals,
         originated_externals: HashSet::new(),
+        originated_translated: HashSet::new(),
         lsa_seqs: HashMap::new(),
         next_dd_seq: 0x0100_0000,
         announced: HashSet::new(),
@@ -538,14 +551,15 @@ impl Ospf {
         let self_id = self.cfg.router_id;
         {
             let iface = &self.ifaces[idx];
-            // The neighbour's E-bit must match this area's external capability, or no
-            // adjacency forms (RFC 2328 §10.5): a stub area expects it cleared.
-            let expect_e = !self.cfg.stub_areas.contains(&iface.area);
-            let got_e = hello.options & OPT_E != 0;
+            // The neighbour's E-bit (AS-external) and N-bit (NSSA) must match this
+            // area's type, or no adjacency forms (RFC 2328 §10.5, RFC 3101): a stub
+            // expects both cleared, an NSSA expects the N-bit, a normal area the E-bit.
+            let want_opts = self.area_options(iface.area) & (OPT_E | OPT_NP);
+            let got_opts = hello.options & (OPT_E | OPT_NP);
             if hello.hello_interval != cfg_hi
                 || hello.dead_interval != cfg_di
                 || hello.network_mask != len_to_mask(iface.mask_len)
-                || got_e != expect_e
+                || got_opts != want_opts
             {
                 debug!(neighbor = %nbr_id, options = hello.options, "Hello parameters/options mismatch — ignored");
                 return;
@@ -910,9 +924,9 @@ impl Ospf {
         let mut reflood_ext = Vec::new();
         for lsa in upd.lsas {
             let is_ext = lsa.header.ls_type == LsType::AsExternal;
-            // A stub area carries no AS-external (type-5) LSAs (RFC 2328 §3.6); drop
-            // any that arrive on a stub interface rather than installing or acking.
-            if is_ext && self.is_stub(area) {
+            // Stub and NSSA areas carry no AS-external (type-5) LSAs; drop any that
+            // arrive on such an interface rather than installing or acking it.
+            if is_ext && self.no_externals(area) {
                 continue;
             }
             let on_request_list = self.ifaces[idx]
@@ -1100,6 +1114,64 @@ impl Ospf {
         self.originated_externals = want;
         for lsa in &to_flood {
             self.flood_external_except(lsa, Ipv4Addr::UNSPECIFIED).await;
+        }
+        // The same destinations are also originated as NSSA type-7 LSAs into any
+        // NSSA area we are attached to (RFC 3101 §2).
+        self.originate_nssa().await;
+    }
+
+    /// Originate this ASBR's external destinations as NSSA type-7 LSAs into each
+    /// not-so-stubby area it is attached to (RFC 3101 §2). The body is identical to
+    /// a type-5; the area border router translates it to type-5 for the rest of the
+    /// AS. The forwarding address is left `0.0.0.0` (forward via the originator),
+    /// matching what the SPF resolves.
+    async fn originate_nssa(&mut self) {
+        let nssa_areas: Vec<Ipv4Addr> =
+            self.areas.keys().copied().filter(|a| self.is_nssa(*a)).collect();
+        for area in nssa_areas {
+            let mut to_flood = Vec::new();
+            let mut want = HashSet::new();
+            let externals: Vec<(Prefix, u32)> =
+                self.externals.iter().map(|(p, m)| (*p, *m)).collect();
+            for (prefix, metric) in externals {
+                let net = match prefix.addr() {
+                    IpAddr::V4(a) => a,
+                    IpAddr::V6(_) => continue,
+                };
+                let mut lsa = Lsa {
+                    header: {
+                        let mut h = self.self_header(LsType::Nssa, net);
+                        h.options = OPT_NP; // the N/P-bit marks a type-7 (RFC 3101)
+                        h
+                    },
+                    body: LsaBody::AsExternal(AsExternalLsa {
+                        network_mask: len_to_mask(prefix.len()),
+                        external_type2: true,
+                        metric,
+                        forwarding_address: Ipv4Addr::UNSPECIFIED,
+                        route_tag: 0,
+                    }),
+                };
+                let key = lsa.key();
+                lsa.header.ls_seq = self.next_seq(area, key);
+                self.areas.get_mut(&area).unwrap().lsdb.install(lsa.clone());
+                want.insert(key);
+                to_flood.push(lsa);
+            }
+            // Flush type-7 LSAs we no longer originate (age them out in the area).
+            let prev = self.areas[&area].originated_nssa.clone();
+            for key in prev.difference(&want) {
+                if let Some(mut lsa) = self.areas[&area].lsdb.get(key).cloned() {
+                    lsa.header.ls_age = MAX_AGE;
+                    lsa.header.ls_seq = self.next_seq(area, *key);
+                    self.areas.get_mut(&area).unwrap().lsdb.install(lsa.clone());
+                    to_flood.push(lsa);
+                }
+            }
+            self.areas.get_mut(&area).unwrap().originated_nssa = want;
+            for lsa in &to_flood {
+                self.flood_lsa(area, lsa).await;
+            }
         }
     }
 
@@ -1316,6 +1388,61 @@ impl Ospf {
                 self.flood_lsa(dest, lsa).await;
             }
         }
+        // As an ABR, also translate any NSSA type-7 LSAs to type-5 for the AS.
+        self.translate_nssa().await;
+    }
+
+    /// Translate the NSSA type-7 LSAs held in each not-so-stubby area into AS-external
+    /// type-5 LSAs and flood them into the rest of the AS (RFC 3101 §3.2). Only an
+    /// ABR translates (this is reached only after the `is_abr` guard in
+    /// [`Ospf::originate_summaries`]). The single-ABR case here translates every
+    /// reachable, non-self type-7 — the §3.2 translator election (highest Router ID,
+    /// P-bit gating) is a refinement left for later. The forwarding address is
+    /// carried through unchanged (`0.0.0.0` ⇒ forward via us, the translator).
+    async fn translate_nssa(&mut self) {
+        let nssa_areas: Vec<Ipv4Addr> =
+            self.areas.keys().copied().filter(|a| self.is_nssa(*a)).collect();
+        let mut to_flood = Vec::new();
+        let mut want = HashSet::new();
+        for area in &nssa_areas {
+            let sevens: Vec<Lsa> = self.areas[area]
+                .lsdb
+                .iter_type(LsType::Nssa)
+                .filter(|l| {
+                    l.header.advertising_router != self.cfg.router_id
+                        && l.header.ls_age < MAX_AGE
+                })
+                .cloned()
+                .collect();
+            for seven in sevens {
+                let LsaBody::AsExternal(ext) = seven.body else {
+                    continue;
+                };
+                let mut lsa = Lsa {
+                    header: self.self_header(LsType::AsExternal, seven.header.link_state_id),
+                    body: LsaBody::AsExternal(ext),
+                };
+                let key = lsa.key();
+                lsa.header.ls_seq = self.next_seq(AS_SCOPE, key);
+                self.external_lsdb.install(lsa.clone());
+                want.insert(key);
+                to_flood.push(lsa);
+            }
+        }
+        // Flush translations we no longer originate (age them out AS-wide).
+        let prev = self.originated_translated.clone();
+        for key in prev.difference(&want) {
+            if let Some(mut lsa) = self.external_lsdb.get(key).cloned() {
+                lsa.header.ls_age = MAX_AGE;
+                lsa.header.ls_seq = self.next_seq(AS_SCOPE, *key);
+                self.external_lsdb.install(lsa.clone());
+                to_flood.push(lsa);
+            }
+        }
+        self.originated_translated = want;
+        for lsa in &to_flood {
+            self.flood_external_except(lsa, Ipv4Addr::UNSPECIFIED).await;
+        }
     }
 
     /// On reaching Full: re-originate our LSAs, flood them and re-run SPF.
@@ -1352,8 +1479,8 @@ impl Ospf {
     /// area except the one at `except`.
     async fn flood_external_except(&self, lsa: &Lsa, except: Ipv4Addr) {
         for iface in &self.ifaces {
-            // Stub areas (RFC 2328 §3.6) never receive AS-external LSAs.
-            if self.is_stub(iface.area) {
+            // Stub and NSSA areas never receive AS-external (type-5) LSAs.
+            if self.no_externals(iface.area) {
                 continue;
             }
             let bytes = self.packet(
@@ -1432,6 +1559,16 @@ impl Ospf {
         // already covered by an intra- or inter-area route.
         for r in spf::external_routes(&self.external_lsdb, &merged, self.cfg.router_id) {
             chosen.entry(r.prefix).or_insert(r);
+        }
+        // NSSA type-7 externals (RFC 3101): the type-7 LSAs in each NSSA area's own
+        // database, computed like AS-externals. A router inside an NSSA reaches its
+        // externals this way without the type-5s the area never receives.
+        for area in &areas {
+            if self.is_nssa(*area) {
+                for r in spf::nssa_routes(&self.areas[area].lsdb, &merged, self.cfg.router_id) {
+                    chosen.entry(r.prefix).or_insert(r);
+                }
+            }
         }
 
         let new_prefixes: HashSet<Prefix> = chosen.keys().copied().collect();
@@ -1558,11 +1695,25 @@ impl Ospf {
         self.cfg.stub_areas.contains(&area)
     }
 
+    /// Whether `area` is configured as a not-so-stubby area (NSSA, RFC 3101).
+    fn is_nssa(&self, area: Ipv4Addr) -> bool {
+        self.cfg.nssa_areas.contains(&area)
+    }
+
+    /// Whether `area` carries no AS-external (type-5) LSAs — true for both stub and
+    /// NSSA areas, which differ only in that an NSSA also carries type-7.
+    fn no_externals(&self, area: Ipv4Addr) -> bool {
+        self.is_stub(area) || self.is_nssa(area)
+    }
+
     /// The OSPF Options for packets exchanged in `area`: the E-bit (AS-external
-    /// capable) is cleared in a stub area, and it must match across Hellos *and*
-    /// Database Description packets for the adjacency to form (RFC 2328 §3.6).
+    /// capable) is set only in a normal area, and the N-bit (NSSA-capable) only in
+    /// an NSSA. The relevant bits must match across Hellos *and* Database
+    /// Description packets for an adjacency to form (RFC 2328 §3.6, RFC 3101).
     fn area_options(&self, area: Ipv4Addr) -> u8 {
-        if self.is_stub(area) {
+        if self.is_nssa(area) {
+            OPT_NP
+        } else if self.is_stub(area) {
             0
         } else {
             OPT_E
@@ -1632,10 +1783,11 @@ impl Ospf {
     fn db_headers(&self, area: Ipv4Addr) -> Vec<LsaHeader> {
         let mut headers: Vec<LsaHeader> =
             self.areas[&area].lsdb.iter().map(|l| l.header).collect();
-        // A stub area carries no AS-external (type-5) LSAs, so they are left out of
-        // the Database Description too (RFC 2328 §3.6) — otherwise a neighbour would
-        // request a type-5 we will never flood into the stub and stall in Loading.
-        if !self.is_stub(area) {
+        // Stub and NSSA areas carry no AS-external (type-5) LSAs, so they are left
+        // out of the Database Description too — otherwise a neighbour would request
+        // a type-5 we will never flood into the area and stall in Loading. (A type-7
+        // LSA lives in the area lsdb above, so an NSSA still summarises those.)
+        if !self.no_externals(area) {
             headers.extend(self.external_lsdb.iter().map(|l| l.header));
         }
         headers

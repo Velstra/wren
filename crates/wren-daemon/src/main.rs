@@ -574,6 +574,18 @@ fn build_ospf_config(
     if stub_areas.contains(&Ipv4Addr::UNSPECIFIED) {
         anyhow::bail!("the backbone area 0.0.0.0 cannot be a stub area (RFC 2328 §3.6)");
     }
+    // NSSA areas (RFC 3101): parsed like stub areas, and mutually exclusive with them.
+    let nssa_areas: std::collections::HashSet<Ipv4Addr> = ospf
+        .nssa_areas
+        .iter()
+        .map(|a| a.parse().context("ospf nssa-area must be a dotted quad, e.g. \"1.0.0.0\""))
+        .collect::<Result<_>>()?;
+    if nssa_areas.contains(&Ipv4Addr::UNSPECIFIED) {
+        anyhow::bail!("the backbone area 0.0.0.0 cannot be an NSSA area (RFC 3101)");
+    }
+    if let Some(a) = nssa_areas.intersection(&stub_areas).next() {
+        anyhow::bail!("area {a} cannot be both a stub and an NSSA area");
+    }
     Ok(ospf::OspfConfig {
         router_id,
         iface_type,
@@ -586,6 +598,7 @@ fn build_ospf_config(
         redistribute_metric: ospf.redistribute_metric.unwrap_or(20),
         stub_areas,
         stub_default_cost: ospf.stub_default_cost.unwrap_or(1),
+        nssa_areas,
     })
 }
 
