@@ -450,7 +450,27 @@ shared segment with a reflector and two clients that do not peer with each other
 one client originates a network and the other learns it only by reflection, then
 installs it `proto bgp`.
 
+## Connection-collision detection (RFC 4271 §6.8)
+
+When two BGP speakers both actively dial *and* accept, they can open two TCP
+connections to each other at once (a simultaneous open). §6.8 resolves this so
+exactly one survives: the connection opened by the speaker with the **higher BGP
+Identifier** is kept, and the other is closed with a Cease NOTIFICATION
+(subcode 7, *Connection Collision Resolution*). Both ends reach the same verdict,
+so they agree on which connection to keep.
+
+Wren tags each connection as inbound (accepted) or outbound (dialled) and gives it
+a unique id. When a second connection to a peer reaches Established, the central
+task keeps the one matching the §6.8 rule — from our side that is the inbound
+connection when our identifier is the lower of the two — and tells the loser to
+Cease. Because both connections share the peer's address, the loser's eventual
+*Down* carries its connection id and is ignored unless it is still the current
+connection, so a closing loser can never evict the surviving session.
+
+`scripts/bgp-collision-smoke.sh` exercises this live (rootless): two speakers that
+both dial and accept converge to a single stable session and exchange routes,
+without the flap an unresolved collision would cause.
+
 ## Not yet implemented
 
-**Connection-collision detection** (§6.8) and confederations. These are tracked in
-the [Roadmap](../roadmap.md).
+Confederations (RFC 5065), tracked in the [Roadmap](../roadmap.md).

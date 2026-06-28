@@ -24,6 +24,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::fmt::Write as _;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -39,7 +40,7 @@ use wren_bgp::attr::{reconstruct_as_path, AsPathSegment, Origin, PathAttribute};
 use wren_bgp::community::format_community;
 use wren_bgp::decision::{Path, DEFAULT_LOCAL_PREF};
 use wren_bgp::ext_community::format_ext_community;
-use wren_bgp::fsm::{Action, BgpFsm, Event, State};
+use wren_bgp::fsm::{Action, BgpFsm, Event, State, CODE_CEASE};
 use wren_bgp::large_community::format_large_community;
 use wren_bgp::message::{Message, Notification, Open, Update};
 use wren_bgp::rib::{BgpRib, RibEvent};
@@ -56,6 +57,14 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const CONNECT_RETRY: Duration = Duration::from_secs(5);
 /// A far-future deadline used to mean "this timer is disabled".
 const FAR: Duration = Duration::from_secs(86_400);
+/// Cease NOTIFICATION subcode 7, "Connection Collision Resolution" (RFC 4486 §4) —
+/// sent to the connection that loses §6.8 collision detection.
+const CEASE_COLLISION: u8 = 7;
+
+/// A process-wide monotonic source of per-connection ids. Two connections to the
+/// same peer (a simultaneous open) share a peer address but get distinct ids, so
+/// the central task can tell the surviving session's events from a stale loser's.
+static NEXT_CONN_ID: AtomicU64 = AtomicU64::new(1);
 /// Bound on the central task's inbound event queue.
 const PEER_QUEUE: usize = 256;
 /// Bound on the central→session origination command queue.
@@ -151,6 +160,9 @@ enum SessionCmd {
     Propagate(Vec<PropRoute>),
     /// Withdraw these learned prefixes whose best path disappeared.
     WithdrawPropagated(Vec<Prefix>),
+    /// Lose §6.8 collision detection: close this connection with a Cease, without
+    /// reporting Down — the winning connection owns the peer's slot.
+    Shutdown,
 }
 
 /// One learned Loc-RIB route the central task asks a session to propagate. The
@@ -176,10 +188,20 @@ struct PeerInfo {
 /// A message from a per-peer session task to the central RIB task.
 enum PeerMsg {
     /// The session reached Established, handing the central task the channel on
-    /// which to push originated routes to advertise to this peer.
-    Established(Ipv4Addr, mpsc::Sender<SessionCmd>),
-    /// The session left Established / went down — flush the peer's routes.
-    Down(Ipv4Addr),
+    /// which to push originated routes to advertise to this peer. Carries the
+    /// peer's BGP Identifier and whether this connection was inbound (accepted) or
+    /// outbound (dialled), for §6.8 connection-collision detection.
+    Established {
+        peer: Ipv4Addr,
+        peer_id: Ipv4Addr,
+        inbound: bool,
+        conn_id: u64,
+        cmd_tx: mpsc::Sender<SessionCmd>,
+    },
+    /// The session left Established / went down — flush the peer's routes, but only
+    /// if `conn_id` is still the current connection (a stale loser's Down is
+    /// ignored, so it can't evict the surviving session).
+    Down { peer: Ipv4Addr, conn_id: u64 },
     /// The peer sent an UPDATE.
     Update {
         peer: Ipv4Addr,
@@ -378,6 +400,12 @@ pub async fn run(
         .collect();
     // Established sessions we can push origination changes to, keyed by peer.
     let mut sessions: HashMap<Ipv4Addr, mpsc::Sender<SessionCmd>> = HashMap::new();
+    // Whether each established session's connection was inbound, for §6.8 collision
+    // detection (which of two racing connections to keep).
+    let mut est_inbound: HashMap<Ipv4Addr, bool> = HashMap::new();
+    // The id of the current connection per peer, so a stale loser connection's Down
+    // (e.g. after it was Ceased) can't evict the surviving session.
+    let mut current_conn: HashMap<Ipv4Addr, u64> = HashMap::new();
 
     let local = Arc::new(Local {
         local_as: cfg.local_as,
@@ -450,11 +478,33 @@ pub async fn run(
             }
         };
         match msg {
-            PeerMsg::Established(p, cmd_tx) => {
+            PeerMsg::Established { peer: p, peer_id, inbound, conn_id, cmd_tx } => {
+                // §6.8 connection-collision detection: if a session already exists
+                // for this peer, two connections raced to Established. Keep the one
+                // opened by the speaker with the higher BGP Identifier (RFC 4271
+                // §6.8) and shut the other down with a Cease, so exactly one
+                // survives — without churning the peer's state.
+                if sessions.contains_key(&p) {
+                    let keep_inbound = collision_keeps_inbound(local.router_id, peer_id);
+                    let existing_inbound = est_inbound.get(&p).copied().unwrap_or(false);
+                    let new_wins = inbound == keep_inbound && existing_inbound != keep_inbound;
+                    if new_wins {
+                        debug!(peer = %p, "BGP collision: new connection wins, dropping the old");
+                        if let Some(old) = sessions.get(&p) {
+                            let _ = old.send(SessionCmd::Shutdown).await;
+                        }
+                    } else {
+                        debug!(peer = %p, "BGP collision: keeping the existing connection");
+                        let _ = cmd_tx.send(SessionCmd::Shutdown).await;
+                        continue;
+                    }
+                }
                 info!(peer = %p, "BGP session established");
                 if let Some(n) = neighbors.get_mut(&p) {
                     n.established = true;
                 }
+                est_inbound.insert(p, inbound);
+                current_conn.insert(p, conn_id);
                 // Push the current origination snapshot to the new session, then
                 // remember it for future incremental redistribution changes.
                 let snapshot = origination_snapshot(&originated);
@@ -473,12 +523,21 @@ pub async fn run(
                 }
                 sessions.insert(p, cmd_tx);
             }
-            PeerMsg::Down(p) => {
+            PeerMsg::Down { peer: p, conn_id } => {
+                // Ignore a Down from a connection that is no longer the current one
+                // (a loser of §6.8 collision resolution closing after a Cease) — it
+                // must not evict the surviving session or withdraw its routes.
+                if current_conn.get(&p) != Some(&conn_id) {
+                    debug!(peer = %p, "ignoring Down from a superseded connection");
+                    continue;
+                }
                 info!(peer = %p, "BGP session down");
                 if let Some(n) = neighbors.get_mut(&p) {
                     n.established = false;
                 }
                 sessions.remove(&p);
+                est_inbound.remove(&p);
+                current_conn.remove(&p);
                 for ev in rib.withdraw_peer(p) {
                     apply_event(ev, &updates, &sessions).await;
                 }
@@ -714,6 +773,15 @@ fn build_path(
     }
 }
 
+/// RFC 4271 §6.8: when two connections to a peer race to Established, keep the one
+/// opened by the speaker with the higher BGP Identifier. From our side that means
+/// keeping the **inbound** (peer-initiated) connection when our identifier is the
+/// lower of the two; otherwise we keep our own **outbound** connection. Equal
+/// identifiers are a misconfiguration; we then keep the outbound arbitrarily.
+fn collision_keeps_inbound(local_id: Ipv4Addr, peer_id: Ipv4Addr) -> bool {
+    u32::from(local_id) < u32::from(peer_id)
+}
+
 /// Whether a received UPDATE's reachability must be ignored for route-reflection
 /// loop avoidance (RFC 4456 §8): its ORIGINATOR_ID is our own router id, or its
 /// CLUSTER_LIST already contains our CLUSTER_ID.
@@ -824,7 +892,7 @@ async fn connector(peer: PeerInfo, local: Arc<Local>, tx: mpsc::Sender<PeerMsg>)
     loop {
         match timeout(CONNECT_TIMEOUT, TcpStream::connect((peer.addr, PORT))).await {
             Ok(Ok(stream)) => {
-                if let Err(e) = drive_session(stream, peer, &local, &tx).await {
+                if let Err(e) = drive_session(stream, peer, &local, &tx, false).await {
                     debug!(peer = %peer.addr, error = %e, "BGP session ended");
                 }
             }
@@ -855,7 +923,7 @@ async fn accept_loop(listener: TcpListener, local: Arc<Local>, tx: mpsc::Sender<
                 let local = local.clone();
                 let tx = tx.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = drive_session(stream, peer, &local, &tx).await {
+                    if let Err(e) = drive_session(stream, peer, &local, &tx, true).await {
                         debug!(peer = %ip, error = %e, "BGP inbound session ended");
                     }
                 });
@@ -872,6 +940,7 @@ async fn drive_session(
     peer: PeerInfo,
     local: &Local,
     tx: &mpsc::Sender<PeerMsg>,
+    inbound: bool,
 ) -> Result<()> {
     stream.set_nodelay(true).ok();
     let local_ip = match stream.local_addr()?.ip() {
@@ -896,6 +965,8 @@ async fn drive_session(
         from_ebgp: peer.remote_as != local.local_as,
         local_ip,
         link,
+        inbound,
+        conn_id: NEXT_CONN_ID.fetch_add(1, Ordering::Relaxed),
         neg_hold: local.hold_time,
         keepalive_int: (local.hold_time / 3).max(1),
         peer_id: peer.addr,
@@ -1005,6 +1076,20 @@ async fn drive_session(
                     sess.withdraw(&prefixes).await?;
                 }
             }
+            Step::Cmd(SessionCmd::Shutdown) => {
+                // Lost §6.8 collision resolution: tell the peer with a Cease
+                // (Connection Collision Resolution) and close, but do NOT report
+                // Down — the winning connection owns this peer's slot in the
+                // central task, and a Down would evict it.
+                let _ = sess
+                    .send(&Message::Notification(Notification {
+                        code: CODE_CEASE,
+                        subcode: CEASE_COLLISION,
+                        data: vec![],
+                    }))
+                    .await;
+                return Ok(());
+            }
             Step::ReadFailed => {
                 let acts = fsm.handle(Event::TcpConnectionFails);
                 let _ = sess.apply(&acts).await;
@@ -1039,6 +1124,12 @@ struct Session<'a> {
     /// next-hop address toward a directly-connected peer, and the interface we pin
     /// a received link-local next hop to. `None` if it couldn't be resolved.
     link: Option<(String, Ipv6Addr)>,
+    /// Whether this connection was accepted (inbound) vs dialled (outbound), for
+    /// §6.8 collision detection.
+    inbound: bool,
+    /// This connection's unique id, so the central task can distinguish the
+    /// surviving session's Established/Down from a stale loser's.
+    conn_id: u64,
     neg_hold: u16,
     keepalive_int: u16,
     peer_id: Ipv4Addr,
@@ -1093,12 +1184,21 @@ impl Session<'_> {
                     // current origination snapshot, which we advertise on receipt.
                     let _ = self
                         .tx
-                        .send(PeerMsg::Established(self.peer.addr, self.cmd_tx.clone()))
+                        .send(PeerMsg::Established {
+                            peer: self.peer.addr,
+                            peer_id: self.peer_id,
+                            inbound: self.inbound,
+                            conn_id: self.conn_id,
+                            cmd_tx: self.cmd_tx.clone(),
+                        })
                         .await;
                 }
                 Action::SessionDown => {
                     if self.established {
-                        let _ = self.tx.send(PeerMsg::Down(self.peer.addr)).await;
+                        let _ = self
+                            .tx
+                            .send(PeerMsg::Down { peer: self.peer.addr, conn_id: self.conn_id })
+                            .await;
                         self.established = false;
                     }
                 }
@@ -1491,6 +1591,16 @@ mod tests {
             large_communities: vec![],
             ext_communities: vec![],
         }
+    }
+
+    #[test]
+    fn collision_keeps_the_higher_identifier_connection() {
+        // We have the lower id -> keep the inbound (peer-initiated) connection.
+        assert!(collision_keeps_inbound(ip([10, 0, 0, 1]), ip([10, 0, 0, 2])));
+        // We have the higher id -> keep our own outbound connection.
+        assert!(!collision_keeps_inbound(ip([10, 0, 0, 2]), ip([10, 0, 0, 1])));
+        // Equal ids (a misconfiguration) -> keep the outbound.
+        assert!(!collision_keeps_inbound(ip([10, 0, 0, 1]), ip([10, 0, 0, 1])));
     }
 
     #[test]
