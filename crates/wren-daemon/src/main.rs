@@ -776,6 +776,7 @@ fn build_bgp_config(cfg: &wren_config::Config, bgp: &wren_config::Bgp) -> Result
             ao_key: n.ao_key.clone(),
             ao_key_id: n.ao_key_id.unwrap_or(100),
             max_prefix: n.max_prefix.filter(|&m| m > 0),
+            default_originate: n.default_originate,
         });
     }
 

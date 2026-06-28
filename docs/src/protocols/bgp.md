@@ -589,6 +589,26 @@ kernel with `CONFIG_TCP_AO` (Linux 5.18+). `scripts/bgp-tcp-ao-smoke.sh` exercis
 live (rootless): two directly-connected eBGP speakers establish with matching keys, and
 fail to establish both when the keys differ and when only one side sets one.
 
+## Default-originate
+
+On the upstream edge toward a stub customer it is common to hand the customer a single
+default route rather than the whole table. Set `default-originate` on the neighbour and
+Wren advertises `0.0.0.0/0` to it **unconditionally** — whether or not Wren itself has a
+default — with this router as the next hop:
+
+```toml
+[[bgp.neighbor]]
+address          = "10.0.0.2"
+remote-as        = 65002
+default-originate = true     # advertise 0.0.0.0/0 to this peer
+```
+
+The default is advertised only to that peer; it is **not** installed in the local FIB
+and **not** sent to any other neighbour. `scripts/bgp-default-originate-smoke.sh`
+exercises it live (rootless): a stub peer learns no default without the option, and
+installs `0.0.0.0/0` via the upstream once it is set — while the upstream itself never
+installs the default it merely advertises.
+
 ## Maximum-prefix limit (RFC 4486)
 
 A misconfigured or hostile peer can flood the RIB by advertising far more routes than

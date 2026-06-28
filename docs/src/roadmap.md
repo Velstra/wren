@@ -193,7 +193,8 @@ tracked but not yet scheduled, grouped by area:
 - **BGP breadth:** unnumbered (RFC 5549), EVPN (RFC 7432), add-path (RFC 7911 —
   advertising several paths per prefix; equal-cost multipath *install* is already
   done, see Platform & core), long-lived graceful restart (RFC 9494), BMP
-  (RFC 7854), FlowSpec (RFC 8955), RPKI origin validation, RTC (RFC 4684).
+  (RFC 7854), FlowSpec (RFC 8955), RPKI origin validation, RTC (RFC 4684). (Per-peer
+  `default-originate` — advertising `0.0.0.0/0` to a neighbour — is **done**.)
 - **Data-plane & overlays:** MPLS, SR-MPLS, SRv6, VXLAN, BFD (RFC 5880),
   MLAG, anycast gateway, dual-stack.
 - **Forwarding & policy:** VRFs, policy-based routing, route maps, prefix lists,

@@ -430,6 +430,11 @@ pub struct BgpNeighbor {
     /// Prefixes Reached" and keeps it down. Unset (or 0) means no limit.
     #[serde(rename = "max-prefix")]
     pub max_prefix: Option<u32>,
+    /// Advertise a default route (`0.0.0.0/0`) to this peer unconditionally — regardless
+    /// of whether Wren itself has a default — with this router as the next hop. Common on
+    /// the upstream edge toward a stub customer. Defaults to false.
+    #[serde(default, rename = "default-originate")]
+    pub default_originate: bool,
 }
 
 /// Babel protocol configuration (`[babel]`, RFC 8966).
@@ -841,6 +846,25 @@ mod tests {
         .expect("valid config");
         let bgp = cfg.bgp.expect("bgp present");
         assert_eq!(bgp.neighbor[0].max_prefix, Some(1000));
+    }
+
+    #[test]
+    fn parses_bgp_default_originate() {
+        let cfg = Config::from_toml(
+            r#"
+            router-id = "10.0.0.1"
+            [bgp]
+            enabled = true
+            local-as = 65001
+            [[bgp.neighbor]]
+            address = "10.0.0.2"
+            remote-as = 65002
+            default-originate = true
+            "#,
+        )
+        .expect("valid config");
+        let bgp = cfg.bgp.expect("bgp present");
+        assert!(bgp.neighbor[0].default_originate);
     }
 
     #[test]

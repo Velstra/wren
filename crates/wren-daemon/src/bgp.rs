@@ -165,6 +165,9 @@ pub struct BgpPeerCfg {
     /// The maximum number of prefixes to accept from this peer before tearing the
     /// session down with a Cease (RFC 4486 §4). `None` means no limit.
     pub max_prefix: Option<u32>,
+    /// Advertise a default route (`0.0.0.0/0`) to this peer unconditionally, with this
+    /// router as the next hop (and without installing it locally).
+    pub default_originate: bool,
 }
 
 impl BgpPeerCfg {
@@ -591,6 +594,9 @@ pub async fn run(
     // down and kept down — any reconnection is shut down again and their UPDATEs are
     // ignored — until the daemon is reconfigured (no auto-restart timer yet).
     let mut damped: HashSet<Ipv4Addr> = HashSet::new();
+    // Peers to which we advertise a default route (`0.0.0.0/0`) on Established.
+    let default_originate: HashSet<Ipv4Addr> =
+        cfg.peers.iter().filter(|p| p.default_originate).map(|p| p.addr).collect();
 
     let members = cfg.confederation_members.clone();
     let local = Arc::new(Local {
@@ -774,6 +780,20 @@ pub async fn run(
                     .collect();
                 if !prop.is_empty() {
                     let _ = cmd_tx.send(SessionCmd::Propagate(prop)).await;
+                }
+                // default-originate: advertise 0.0.0.0/0 to this peer unconditionally
+                // (next-hop-self), without installing it locally or sending it to any
+                // other peer.
+                if default_originate.contains(&p) {
+                    if let Ok(default) = Prefix::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0) {
+                        let route = OriginRoute {
+                            prefix: default,
+                            communities: vec![],
+                            large_communities: vec![],
+                            ext_communities: vec![],
+                        };
+                        let _ = cmd_tx.send(SessionCmd::Advertise(vec![route])).await;
+                    }
                 }
                 // Initial advertisement done: send the End-of-RIB marker so a helper
                 // on the peer's side knows our re-advertisement is complete (RFC 4724
