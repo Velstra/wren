@@ -455,6 +455,12 @@ pub struct BgpNeighbor {
     /// the route; accept admits it, with any set-metric (→MED), set-preference
     /// (→LOCAL_PREF) or set-community modifications applied. Unset accepts everything.
     pub import: Option<String>,
+    /// Outbound route policy: the name of a `[[filter]]` applied to every route this
+    /// router advertises to this neighbour (an export route-map) — both originated and
+    /// propagated transit routes. Reject suppresses the advertisement; accept sends it
+    /// with any set-community (and, for transit routes, set-metric/set-preference)
+    /// modifications applied. Unset advertises everything.
+    pub export: Option<String>,
 }
 
 /// Babel protocol configuration (`[babel]`, RFC 8966).
@@ -928,6 +934,25 @@ mod tests {
         .expect("valid config");
         let bgp = cfg.bgp.expect("bgp present");
         assert_eq!(bgp.neighbor[0].import.as_deref(), Some("from-peer"));
+    }
+
+    #[test]
+    fn parses_bgp_neighbor_export() {
+        let cfg = Config::from_toml(
+            r#"
+            router-id = "10.0.0.1"
+            [bgp]
+            enabled = true
+            local-as = 65001
+            [[bgp.neighbor]]
+            address = "10.0.0.2"
+            remote-as = 65002
+            export = "to-peer"
+            "#,
+        )
+        .expect("valid config");
+        let bgp = cfg.bgp.expect("bgp present");
+        assert_eq!(bgp.neighbor[0].export.as_deref(), Some("to-peer"));
     }
 
     #[test]

@@ -648,11 +648,14 @@ no aggregate a peer learns only the `/24`s; with the aggregate it learns the `/1
 **and** the `/24`s (and the originator never installs the `/16` itself); with
 `summary-only` it learns only the `/16`.
 
-## Inbound route policy — per-neighbour import filters
+## Route policy — per-neighbour import / export filters
 
-A neighbour can carry an `import =` that names a [`[[filter]]`](../configuration.md)
-applied to **every route received from that peer** before it enters the RIB — the
-inbound half of a route-map. Reject drops the route; accept admits it, with the filter's modifications
+A neighbour can carry an `import =` and/or an `export =` that name
+[`[[filter]]`](../configuration.md) blocks — the inbound and outbound halves of a
+route-map. `import` is applied to **every route received from the peer** before it
+enters the RIB; `export` is applied to **every route advertised to the peer** (both
+originated/aggregate routes and propagated transit routes) as it leaves. Reject
+drops/suppresses the route; accept admits/sends it, with the filter's modifications
 folded back into the path:
 
 | Filter field | BGP attribute it maps to |
@@ -678,19 +681,25 @@ action         = "accept"
 [[bgp.neighbor]]
 address   = "10.0.0.1"
 remote-as = 65001
-import    = "from-upstream"   # apply it to routes learned from this neighbour
+import    = "from-upstream"   # routes learned from this neighbour
+export    = "to-upstream"     # routes advertised to this neighbour
 ```
 
-A prefix that was accepted before but is rejected on a later re-advertisement is
-withdrawn from the RIB, so the policy is honoured incrementally. The filter is the same
-engine used by `[import]` and the redistribution `[export]` filters, operating on a
-`Route` view of the received path (prefix, MED-as-metric, LOCAL_PREF-as-preference,
-communities).
+On **import**, a prefix that was accepted before but is rejected on a later
+re-advertisement is withdrawn from the RIB, so the policy is honoured incrementally. On
+**export**, the modifications follow the usual attribute rules — a set-community is sent
+to every peer type, while set-preference (LOCAL_PREF) and set-metric (MED) are carried
+only to iBGP and confed-eBGP peers (LOCAL_PREF and MED are not sent across a true eBGP
+edge). An originated route carries no MED or LOCAL_PREF of its own, so an export filter
+on it only decides the prefix and rewrites communities.
 
-Only the **inbound** direction is filtered today; per-neighbour **outbound** (export)
-policy is not yet wired. `scripts/bgp-import-filter-smoke.sh` exercises it live
-(rootless): without the filter a peer learns both `/24`s unchanged; with it one `/24` is
-rejected and the other arrives with `localpref 200` and community `65002:777`.
+The filter is the same engine used by `[import]` and the redistribution `[export]`
+filters, operating on a `Route` view of the path (prefix, MED-as-metric,
+LOCAL_PREF-as-preference, communities). Two live (rootless) checks:
+`scripts/bgp-import-filter-smoke.sh` rejects/re-tags routes a peer sends us, and
+`scripts/bgp-export-filter-smoke.sh` rejects/re-tags routes a transit router passes to
+its iBGP peer (one `/24` suppressed, the other arriving with `localpref 200` and a
+community).
 
 ## Maximum-prefix limit (RFC 4486)
 

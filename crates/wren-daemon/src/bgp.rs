@@ -192,6 +192,12 @@ pub struct BgpPeerCfg {
     /// accept admits it, with any set-metric (→MED), set-preference (→LOCAL_PREF) or
     /// set-community modifications applied. `None` accepts everything unchanged.
     pub import: Option<Filter>,
+    /// Outbound route policy (RFC-style export route-map): a filter applied to every
+    /// route advertised to this peer — both originated/aggregate routes and propagated
+    /// transit routes. Reject suppresses the advertisement; accept sends it with any
+    /// set-community (and, for a propagated route, set-metric→MED / set-preference→
+    /// LOCAL_PREF) modifications applied. `None` advertises everything unchanged.
+    pub export: Option<Filter>,
 }
 
 impl BgpPeerCfg {
@@ -249,6 +255,9 @@ struct Local {
     confed_id: Option<u32>,
     /// peer address → its properties, for matching inbound connections.
     peers: HashMap<Ipv4Addr, PeerProps>,
+    /// peer address → its outbound export filter (RFC-style export route-map), applied
+    /// to every route this speaker advertises to that peer. Absent means advertise all.
+    exports: HashMap<Ipv4Addr, Filter>,
 }
 
 impl Local {
@@ -705,6 +714,11 @@ pub async fn run(
                     },
                 )
             })
+            .collect(),
+        exports: cfg
+            .peers
+            .iter()
+            .filter_map(|p| p.export.clone().map(|f| (p.addr, f)))
             .collect(),
     });
 
@@ -1199,11 +1213,12 @@ fn path_to_route(prefix: Prefix, path: &Path) -> Route {
     route
 }
 
-/// Run a received path through this peer's inbound import filter (if any). Returns the
-/// path to install — possibly with set-metric (→MED), set-preference (→LOCAL_PREF) and
-/// set-community modifications folded back in — or `None` if the filter rejected it.
-fn apply_import(import: Option<&Filter>, prefix: Prefix, path: &Path) -> Option<Path> {
-    let Some(filter) = import else {
+/// Run a path through a route filter (this peer's inbound import or outbound export
+/// route-map). Returns the path to use — possibly with set-metric (→MED),
+/// set-preference (→LOCAL_PREF) and set-community modifications folded back in — or
+/// `None` if the filter rejected it. `None` filter is an unconditional pass-through.
+fn filter_path(filter: Option<&Filter>, prefix: Prefix, path: &Path) -> Option<Path> {
+    let Some(filter) = filter else {
         return Some(path.clone());
     };
     let modified = filter.apply(&path_to_route(prefix, path)).accepted()?;
@@ -1214,6 +1229,28 @@ fn apply_import(import: Option<&Filter>, prefix: Prefix, path: &Path) -> Option<
     out.large_communities = modified.large_communities;
     out.ext_communities = modified.ext_communities;
     Some(out)
+}
+
+/// Run an originated/aggregate route through this peer's outbound export filter. An
+/// [`OriginRoute`] carries no MED or LOCAL_PREF of its own (the per-peer AS_PATH /
+/// LOCAL_PREF are added at advertise time), so only the prefix decision and the
+/// community modifications apply. `None` filter is an unconditional pass-through.
+fn filter_origin(filter: Option<&Filter>, r: &OriginRoute) -> Option<OriginRoute> {
+    let Some(filter) = filter else {
+        return Some(r.clone());
+    };
+    let mut route = Route::new(r.prefix, Protocol::Bgp, vec![], 0);
+    route.communities = r.communities.clone();
+    route.large_communities = r.large_communities.clone();
+    route.ext_communities = r.ext_communities.clone();
+    let modified = filter.apply(&route).accepted()?;
+    Some(OriginRoute {
+        prefix: r.prefix,
+        communities: modified.communities,
+        large_communities: modified.large_communities,
+        ext_communities: modified.ext_communities,
+        atomic_aggregate: r.atomic_aggregate,
+    })
 }
 
 /// Install one received prefix into the RIB after the peer's inbound import filter: a
@@ -1229,7 +1266,7 @@ async fn import_and_install(
     updates: &mpsc::Sender<RouteUpdate>,
     sessions: &HashMap<Ipv4Addr, mpsc::Sender<SessionCmd>>,
 ) {
-    let ev = match apply_import(import, prefix, path) {
+    let ev = match filter_path(import, prefix, path) {
         Some(p) => rib.update(peer, prefix, p),
         None => rib.withdraw(peer, prefix),
     };
@@ -1888,6 +1925,7 @@ async fn drive_session(
         wr,
         local,
         peer,
+        export: local.exports.get(&peer.addr).cloned(),
         tx,
         cmd_tx,
         peer_type: peer.peer_type,
@@ -2126,6 +2164,9 @@ struct Session<'a> {
     wr: OwnedWriteHalf,
     local: &'a Local,
     peer: PeerInfo,
+    /// This peer's outbound export filter (RFC-style export route-map), applied to
+    /// every route advertised to it. `None` advertises everything unchanged.
+    export: Option<Filter>,
     tx: &'a mpsc::Sender<PeerMsg>,
     /// Handed to the central task on Established so it can push origination
     /// commands (advertise/withdraw) back to this session.
@@ -2284,6 +2325,11 @@ impl Session<'_> {
     /// LARGE_COMMUNITY attribute, and a route whose well-known communities forbid
     /// this peer (RFC 1997) is skipped.
     async fn advertise(&mut self, routes: &[OriginRoute]) -> Result<()> {
+        // Per-neighbour outbound export policy: drop or re-tag originated routes before
+        // they are grouped into UPDATEs.
+        let routes: Vec<OriginRoute> =
+            routes.iter().filter_map(|r| filter_origin(self.export.as_ref(), r)).collect();
+        let routes = &routes[..];
         type TagKey = (Vec<u32>, Vec<(u32, u32, u32)>, Vec<[u8; 8]>);
         let mut groups: BTreeMap<TagKey, Vec<Prefix>> = BTreeMap::new();
         for r in routes {
@@ -2474,13 +2520,18 @@ impl Session<'_> {
             if !should_propagate(&r.path, self.peer_type, self.peer.rr_client, self.peer.addr) {
                 continue;
             }
-            let mut attributes = self.propagated_base_attrs(&r.path);
+            // Per-neighbour outbound export policy: drop or re-tag the transit route.
+            let path = match filter_path(self.export.as_ref(), r.prefix, &r.path) {
+                Some(p) => p,
+                None => continue,
+            };
+            let mut attributes = self.propagated_base_attrs(&path);
             if r.prefix.is_ipv4() {
                 // IPv4: base NLRI with the IPv4 NEXT_HOP — preserved for iBGP, set
                 // to ourselves for eBGP.
                 let nh = if self.from_ebgp {
                     self.local_ip
-                } else if let IpAddr::V4(v4) = r.path.next_hop {
+                } else if let IpAddr::V4(v4) = path.next_hop {
                     v4
                 } else {
                     continue; // a v4 prefix with a non-v4 next hop: malformed, skip
@@ -2506,7 +2557,7 @@ impl Session<'_> {
                             continue;
                         }
                     }
-                } else if let IpAddr::V6(v6) = r.path.next_hop {
+                } else if let IpAddr::V6(v6) = path.next_hop {
                     v6
                 } else {
                     continue;
@@ -2720,12 +2771,12 @@ mod tests {
         let path = learned_path(true, [10, 0, 0, 2]);
 
         // No filter: the path passes through untouched.
-        let out = apply_import(None, prefix, &path).expect("no filter accepts");
+        let out = filter_path(None, prefix, &path).expect("no filter accepts");
         assert_eq!(out.local_pref, 100);
         assert!(out.communities.is_empty());
 
         // reject-all drops the route.
-        assert!(apply_import(Some(&Filter::reject_all()), prefix, &path).is_none());
+        assert!(filter_path(Some(&Filter::reject_all()), prefix, &path).is_none());
 
         // A rule that matches the prefix, sets the preference (→LOCAL_PREF) and tags a
         // community; the modifications are folded back into the path.
@@ -2739,13 +2790,55 @@ mod tests {
             }],
             default: Action::Reject,
         };
-        let out = apply_import(Some(&filter), prefix, &path).expect("rule accepts");
+        let out = filter_path(Some(&filter), prefix, &path).expect("rule accepts");
         assert_eq!(out.local_pref, 250);
         assert_eq!(out.communities, vec![0xFFFF_FF01]);
 
         // A prefix the rule does not match falls to the default (reject).
         let other: Prefix = "192.168.0.0/24".parse().unwrap();
-        assert!(apply_import(Some(&filter), other, &path).is_none());
+        assert!(filter_path(Some(&filter), other, &path).is_none());
+    }
+
+    #[test]
+    fn export_filter_on_originated_routes() {
+        use wren_filter::{Action, Filter, Match, Modify, PrefixList, PrefixPattern, Rule};
+        let origin = |net: &str| OriginRoute {
+            prefix: net.parse().unwrap(),
+            communities: vec![],
+            large_communities: vec![],
+            ext_communities: vec![],
+            atomic_aggregate: false,
+        };
+
+        // No filter: pass-through.
+        let r = origin("10.50.1.0/24");
+        assert_eq!(filter_origin(None, &r), Some(r.clone()));
+
+        // A filter that rejects one prefix and tags another with a community.
+        let filter = Filter {
+            rules: vec![
+                Rule {
+                    matcher: Match::prefix(PrefixList(vec![PrefixPattern::exact(
+                        "10.50.2.0/24".parse().unwrap(),
+                    )])),
+                    modify: Modify::default(),
+                    action: Action::Reject,
+                },
+                Rule {
+                    matcher: Match::prefix(PrefixList(vec![PrefixPattern::exact(
+                        "10.50.1.0/24".parse().unwrap(),
+                    )])),
+                    modify: Modify { add_communities: vec![0x0001_0002], ..Modify::default() },
+                    action: Action::Accept,
+                },
+            ],
+            default: Action::Reject,
+        };
+        assert!(filter_origin(Some(&filter), &origin("10.50.2.0/24")).is_none());
+        let tagged = filter_origin(Some(&filter), &origin("10.50.1.0/24")).expect("accepted");
+        assert_eq!(tagged.communities, vec![0x0001_0002]);
+        // A prefix neither rule matches falls to the default (reject).
+        assert!(filter_origin(Some(&filter), &origin("10.99.0.0/24")).is_none());
     }
 
     #[test]

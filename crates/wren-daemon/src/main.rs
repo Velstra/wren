@@ -774,6 +774,10 @@ fn build_bgp_config(
             Some(name) => Some(named_filter(by_name, name, "bgp neighbor import")?),
             None => None,
         };
+        let export = match &n.export {
+            Some(name) => Some(named_filter(by_name, name, "bgp neighbor export")?),
+            None => None,
+        };
         peers.push(bgp::BgpPeerCfg {
             addr,
             remote_as: n.remote_as,
@@ -786,6 +790,7 @@ fn build_bgp_config(
             max_prefix: n.max_prefix.filter(|&m| m > 0),
             default_originate: n.default_originate,
             import,
+            export,
         });
     }
 
