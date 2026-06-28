@@ -348,6 +348,16 @@ fn format_as_path(segs: &[AsPathSegment]) -> String {
                 let inner: Vec<String> = asns.iter().map(|a| a.to_string()).collect();
                 parts.push(format!("{{{}}}", inner.join(" ")));
             }
+            // Confederation segments (RFC 5065) — rendered in parentheses (à la
+            // BIRD/FRR), a set inside additionally braced.
+            AsPathSegment::ConfedSequence(asns) => {
+                let inner: Vec<String> = asns.iter().map(|a| a.to_string()).collect();
+                parts.push(format!("({})", inner.join(" ")));
+            }
+            AsPathSegment::ConfedSet(asns) => {
+                let inner: Vec<String> = asns.iter().map(|a| a.to_string()).collect();
+                parts.push(format!("({{{}}})", inner.join(" ")));
+            }
         }
     }
     parts.join(" ")

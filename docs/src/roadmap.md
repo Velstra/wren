@@ -74,7 +74,10 @@ implemented to its RFC.
 
 - OSPF: stub / NSSA areas, type-4 ASBR-summaries across areas, explicit type-5
   forwarding-address resolution, authentication
-- BGP: confederations (RFC 5065)
+- BGP: confederations (RFC 5065) — the AS_CONFED_SEQUENCE / AS_CONFED_SET path
+  segments and their decision rules (excluded from AS_PATH length) are in place;
+  the runner wiring (member-AS config, confed-peer path manipulation, egress
+  stripping) is still to come
 - Babel: ETX costing for lossy links, Route/Seqno-Request handling, prefix
   compression on send, IPv4 routes over the IPv6 transport (`RTA_VIA` next hops),
   source-specific routing

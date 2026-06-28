@@ -70,23 +70,47 @@ pub enum AsPathSegment {
     Set(Vec<u32>),
     /// An ordered sequence of ASes the route has traversed.
     Sequence(Vec<u32>),
+    /// An ordered sequence of Member-AS numbers a route has traversed *within* a
+    /// confederation (RFC 5065 §3, AS_CONFED_SEQUENCE). Stripped before the route
+    /// leaves the confederation, and not counted in AS_PATH length.
+    ConfedSequence(Vec<u32>),
+    /// An unordered set of Member-AS numbers within a confederation (RFC 5065 §3,
+    /// AS_CONFED_SET). Like [`AsPathSegment::ConfedSequence`] but unordered.
+    ConfedSet(Vec<u32>),
 }
 
 impl AsPathSegment {
     const SET: u8 = 1;
     const SEQUENCE: u8 = 2;
+    const CONFED_SEQUENCE: u8 = 3;
+    const CONFED_SET: u8 = 4;
 
     /// The ASes this segment carries (in order).
     pub fn asns(&self) -> &[u32] {
         match self {
-            AsPathSegment::Set(a) | AsPathSegment::Sequence(a) => a,
+            AsPathSegment::Set(a)
+            | AsPathSegment::Sequence(a)
+            | AsPathSegment::ConfedSequence(a)
+            | AsPathSegment::ConfedSet(a) => a,
         }
+    }
+
+    /// Whether this is a confederation segment (AS_CONFED_SEQUENCE / AS_CONFED_SET),
+    /// which is internal to a confederation: stripped on egress to a true eBGP peer
+    /// and excluded from AS_PATH length.
+    pub fn is_confederation(&self) -> bool {
+        matches!(
+            self,
+            AsPathSegment::ConfedSequence(_) | AsPathSegment::ConfedSet(_)
+        )
     }
 
     fn encode(&self, out: &mut Vec<u8>, four_octet: bool) {
         let (kind, asns) = match self {
             AsPathSegment::Set(a) => (Self::SET, a),
             AsPathSegment::Sequence(a) => (Self::SEQUENCE, a),
+            AsPathSegment::ConfedSequence(a) => (Self::CONFED_SEQUENCE, a),
+            AsPathSegment::ConfedSet(a) => (Self::CONFED_SET, a),
         };
         out.push(kind);
         out.push(asns.len() as u8);
@@ -123,6 +147,8 @@ impl AsPathSegment {
         let seg = match kind {
             Self::SET => AsPathSegment::Set(asns),
             Self::SEQUENCE => AsPathSegment::Sequence(asns),
+            Self::CONFED_SEQUENCE => AsPathSegment::ConfedSequence(asns),
+            Self::CONFED_SET => AsPathSegment::ConfedSet(asns),
             _ => return None,
         };
         Some((seg, end))
@@ -586,6 +612,11 @@ pub fn reconstruct_as_path(
             match seg {
                 AsPathSegment::Sequence(asns) => els.extend(asns.iter().map(|&a| Element::As(a))),
                 AsPathSegment::Set(asns) => els.push(Element::Set(asns.clone())),
+                // Confederation segments are internal and never appear in AS4_PATH;
+                // carry them through verbatim so reconstruction preserves them.
+                AsPathSegment::ConfedSequence(_) | AsPathSegment::ConfedSet(_) => {
+                    els.push(Element::Confed(seg.clone()))
+                }
             }
         }
         els
@@ -610,6 +641,8 @@ pub fn reconstruct_as_path(
 enum Element {
     As(u32),
     Set(Vec<u32>),
+    /// A whole confederation segment, carried through reconstruction verbatim.
+    Confed(AsPathSegment),
 }
 
 /// Rebuild segments from a flat element list, coalescing runs of single ASes into
@@ -625,6 +658,12 @@ fn coalesce(els: &[Element]) -> Vec<AsPathSegment> {
                     out.push(AsPathSegment::Sequence(std::mem::take(&mut run)));
                 }
                 out.push(AsPathSegment::Set(s.clone()));
+            }
+            Element::Confed(seg) => {
+                if !run.is_empty() {
+                    out.push(AsPathSegment::Sequence(std::mem::take(&mut run)));
+                }
+                out.push(seg.clone());
             }
         }
     }
@@ -674,6 +713,35 @@ mod tests {
             AsPathSegment::Set(vec![65010, 65011]),
         ]));
         roundtrip(PathAttribute::AsPath(vec![])); // empty path (iBGP-originated)
+    }
+
+    #[test]
+    fn as_path_roundtrips_confederation_segments() {
+        // AS_CONFED_SEQUENCE / AS_CONFED_SET (RFC 5065) survive the codec, mixed
+        // with ordinary segments, at both widths.
+        roundtrip(PathAttribute::AsPath(vec![
+            AsPathSegment::ConfedSequence(vec![65001, 65002]),
+            AsPathSegment::ConfedSet(vec![65003, 65004]),
+            AsPathSegment::Sequence(vec![64500]),
+        ]));
+    }
+
+    #[test]
+    fn reconstruct_preserves_leading_confederation_segments() {
+        // A confed segment at the front is carried through AS4_PATH reconstruction
+        // verbatim while the real-AS tail is merged from AS4_PATH.
+        let as_path = vec![
+            AsPathSegment::ConfedSequence(vec![65001]),
+            AsPathSegment::Sequence(vec![crate::AS_TRANS as u32, 64500]),
+        ];
+        let as4 = vec![AsPathSegment::Sequence(vec![196_618, 64500])];
+        assert_eq!(
+            reconstruct_as_path(&as_path, &as4),
+            vec![
+                AsPathSegment::ConfedSequence(vec![65001]),
+                AsPathSegment::Sequence(vec![196_618, 64500]),
+            ]
+        );
     }
 
     #[test]

@@ -73,13 +73,15 @@ pub struct Path {
 
 impl Path {
     /// The AS_PATH length per §9.1.2.2: each AS in a sequence counts once, each
-    /// set counts as one regardless of size.
+    /// set counts as one regardless of size, and confederation segments
+    /// (AS_CONFED_SEQUENCE / AS_CONFED_SET) are not counted at all (RFC 5065 §5.3).
     pub fn as_path_len(&self) -> usize {
         self.as_path
             .iter()
             .map(|s| match s {
                 AsPathSegment::Sequence(a) => a.len(),
                 AsPathSegment::Set(_) => 1,
+                AsPathSegment::ConfedSequence(_) | AsPathSegment::ConfedSet(_) => 0,
             })
             .sum()
     }
@@ -193,6 +195,20 @@ mod tests {
             ..base()
         };
         assert_eq!(p.as_path_len(), 4); // 3 + 1
+    }
+
+    #[test]
+    fn as_path_length_excludes_confederation_segments() {
+        // Confed segments (RFC 5065 §5.3) do not count toward AS_PATH length.
+        let p = Path {
+            as_path: vec![
+                AsPathSegment::ConfedSequence(vec![65001, 65002]),
+                AsPathSegment::ConfedSet(vec![65003]),
+                AsPathSegment::Sequence(vec![64500, 64501]),
+            ],
+            ..base()
+        };
+        assert_eq!(p.as_path_len(), 2); // only the real-AS sequence counts
     }
 
     #[test]
