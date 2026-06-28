@@ -81,6 +81,11 @@ pub const MIN_MESSAGE_LEN: usize = HEADER_LEN;
 /// A conventional default Hold Time, in seconds (§4.2 suggests 90; many use 180).
 pub const DEFAULT_HOLD_TIME: u16 = 180;
 
+/// The Restart Time advertised in the Graceful Restart capability (RFC 4724 §3),
+/// in seconds: how long a helper should retain this speaker's routes after the
+/// session drops, awaiting its return. The 12-bit field caps it at 4095.
+pub const DEFAULT_RESTART_TIME: u16 = 120;
+
 // ---------------------------------------------------------------------------
 // Multiprotocol address families (RFC 4760 / IANA) — used by MP-BGP.
 // ---------------------------------------------------------------------------

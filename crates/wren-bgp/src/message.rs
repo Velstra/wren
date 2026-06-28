@@ -14,7 +14,10 @@ use wren_core::Prefix;
 
 use crate::attr::PathAttribute;
 use crate::capability::{encode_optional_parameters, parse_optional_parameters, Capability};
-use crate::{as_trans_fit, decode_prefix, encode_prefix, MessageType, HEADER_LEN, MARKER, VERSION};
+use crate::{
+    as_trans_fit, decode_prefix, encode_prefix, MessageType, AFI_IPV4, HEADER_LEN, MARKER,
+    SAFI_UNICAST, VERSION,
+};
 
 /// An OPEN message body (§4.2): the parameters two speakers agree on to start a
 /// session.
@@ -56,6 +59,18 @@ impl Open {
                 },
                 // We honour a received ROUTE-REFRESH by re-advertising (RFC 2918).
                 Capability::RouteRefresh,
+                // Graceful Restart (RFC 4724): a fresh OPEN (not mid-restart, R=0).
+                // wren preserves forwarding across a restart — the kernel FIB
+                // outlives the process — so the F flag is set for both unicast
+                // families, and we ask helpers to wait DEFAULT_RESTART_TIME.
+                Capability::GracefulRestart {
+                    restart_state: false,
+                    restart_time: crate::DEFAULT_RESTART_TIME,
+                    families: vec![
+                        (crate::AFI_IPV4, crate::SAFI_UNICAST, true),
+                        (crate::AFI_IPV6, crate::SAFI_UNICAST, true),
+                    ],
+                },
             ],
         }
     }
@@ -92,6 +107,31 @@ impl Open {
     pub fn supports_route_refresh(&self) -> bool {
         self.capabilities.iter().any(|c| matches!(c, Capability::RouteRefresh))
     }
+
+    /// Whether this OPEN advertised the Graceful Restart capability (RFC 4724 §3).
+    pub fn supports_graceful_restart(&self) -> bool {
+        self.gr_restart_time().is_some()
+    }
+
+    /// The Restart Time the peer asks helpers to wait (RFC 4724 §3), if it
+    /// advertised Graceful Restart — how long to retain its routes after the
+    /// session drops.
+    pub fn gr_restart_time(&self) -> Option<u16> {
+        self.capabilities.iter().find_map(|c| match c {
+            Capability::GracefulRestart { restart_time, .. } => Some(*restart_time),
+            _ => None,
+        })
+    }
+
+    /// Whether the peer's Graceful Restart capability marks the `(AFI, SAFI)`
+    /// family's forwarding state as preserved across its restart (the F flag,
+    /// RFC 4724 §3) — only then may a helper retain that family's routes.
+    pub fn gr_forwarding_preserved(&self, afi: u16, safi: u8) -> bool {
+        self.capabilities.iter().any(|c| {
+            matches!(c, Capability::GracefulRestart { families, .. }
+                if families.iter().any(|(a, s, f)| *a == afi && *s == safi && *f))
+        })
+    }
 }
 
 /// An UPDATE message body (§4.3): withdrawn routes, path attributes and the NLRI
@@ -104,6 +144,41 @@ pub struct Update {
     pub attributes: Vec<PathAttribute>,
     /// The destinations (NLRI) the attributes apply to.
     pub nlri: Vec<Prefix>,
+}
+
+impl Update {
+    /// Build the End-of-RIB marker for an address family (RFC 4724 §2): for IPv4
+    /// unicast a completely empty UPDATE; for any other family an UPDATE whose only
+    /// content is an empty MP_UNREACH_NLRI naming that family. Sent once the initial
+    /// routing update toward a peer is complete, so a graceful-restart helper knows
+    /// the re-advertisement has finished.
+    pub fn end_of_rib_marker(afi: u16, safi: u8) -> Update {
+        if afi == AFI_IPV4 && safi == SAFI_UNICAST {
+            Update::default()
+        } else {
+            Update {
+                withdrawn: vec![],
+                attributes: vec![PathAttribute::MpUnreachNlri { afi, safi, withdrawn: vec![] }],
+                nlri: vec![],
+            }
+        }
+    }
+
+    /// Whether this UPDATE is an End-of-RIB marker (RFC 4724 §2), and for which
+    /// `(AFI, SAFI)`: a completely empty UPDATE marks IPv4 unicast; an UPDATE whose
+    /// sole attribute is an empty MP_UNREACH_NLRI marks that attribute's family.
+    pub fn end_of_rib(&self) -> Option<(u16, u8)> {
+        if !self.withdrawn.is_empty() || !self.nlri.is_empty() {
+            return None;
+        }
+        match self.attributes.as_slice() {
+            [] => Some((AFI_IPV4, SAFI_UNICAST)),
+            [PathAttribute::MpUnreachNlri { afi, safi, withdrawn }] if withdrawn.is_empty() => {
+                Some((*afi, *safi))
+            }
+            _ => None,
+        }
+    }
 }
 
 /// A NOTIFICATION message body (§4.5): an error that closes the session.
@@ -432,6 +507,37 @@ mod tests {
     fn open_advertises_route_refresh_capability() {
         let open = Open::new(VERSION, 65001, DEFAULT_HOLD_TIME, ip([10, 0, 0, 1]));
         assert!(open.supports_route_refresh());
+    }
+
+    #[test]
+    fn open_advertises_graceful_restart_capability() {
+        use crate::{AFI_IPV4, AFI_IPV6, DEFAULT_RESTART_TIME, SAFI_UNICAST};
+        let open = Open::new(VERSION, 65001, DEFAULT_HOLD_TIME, ip([10, 0, 0, 1]));
+        assert!(open.supports_graceful_restart());
+        assert_eq!(open.gr_restart_time(), Some(DEFAULT_RESTART_TIME));
+        // Forwarding is preserved for both unicast families …
+        assert!(open.gr_forwarding_preserved(AFI_IPV4, SAFI_UNICAST));
+        assert!(open.gr_forwarding_preserved(AFI_IPV6, SAFI_UNICAST));
+        // … but not for an unadvertised family.
+        assert!(!open.gr_forwarding_preserved(AFI_IPV6, 2));
+        roundtrip(Message::Open(open));
+    }
+
+    #[test]
+    fn end_of_rib_markers_are_recognised() {
+        use crate::{AFI_IPV4, AFI_IPV6, SAFI_UNICAST};
+        // IPv4-unicast marker: a completely empty UPDATE.
+        let v4 = Update::end_of_rib_marker(AFI_IPV4, SAFI_UNICAST);
+        assert_eq!(v4, Update::default());
+        assert_eq!(v4.end_of_rib(), Some((AFI_IPV4, SAFI_UNICAST)));
+        roundtrip(Message::Update(v4));
+        // IPv6-unicast marker: an empty MP_UNREACH_NLRI, and it round-trips.
+        let v6 = Update::end_of_rib_marker(AFI_IPV6, SAFI_UNICAST);
+        assert_eq!(v6.end_of_rib(), Some((AFI_IPV6, SAFI_UNICAST)));
+        roundtrip(Message::Update(v6));
+        // A real withdrawal is not an End-of-RIB marker.
+        let real = Update { withdrawn: vec![p("10.0.0.0/8")], ..Update::default() };
+        assert_eq!(real.end_of_rib(), None);
     }
 
     #[test]

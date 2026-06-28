@@ -44,7 +44,15 @@ implemented to its RFC.
   ones, and a route looping back into our Member-AS is dropped — and **route
   refresh** (RFC 2918): the capability is negotiated in the OPEN, a received
   ROUTE-REFRESH makes us re-advertise our Adj-RIB-Out to that peer, and `wren bgp
-  refresh <peer>` sends one
+  refresh <peer>` sends one — and **graceful restart** (RFC 4724): the capability
+  is negotiated in the OPEN (advertising the forwarding state preserved across a
+  restart and a Restart Time), an End-of-RIB marker is sent once the initial
+  advertisement to a peer completes, and as a **helper** wren retains a restarting
+  peer's routes in service (and in the kernel FIB) instead of withdrawing them when
+  the session drops — reconciled when the peer returns and sends its End-of-RIB, or
+  flushed when the Restart Timer expires. Live-verified by
+  `scripts/bgp-graceful-restart-smoke.sh` (a peer is hard-killed and its routes
+  survive the restart)
 - [x] **Babel** (RFC 8966) — loop-avoiding distance-vector over IPv6 (UDP 6696,
   `ff02::1:6`), with the feasibility condition and Hello/IHU link costing
 - [x] **OSPFv3** (RFC 5340) — OSPF for IPv6, end to end. The `wren-ospfv3` library
@@ -143,8 +151,12 @@ implemented to its RFC.
 - [~] **Startup reconciliation** — on boot the kernel backend reads the routing
   table back (`RTM_GETROUTE` dump) and removes routes a previous wren instance
   left behind that the current config no longer programs, so a restart never
-  leaves stale routes. Full **graceful restart** (holding routes across a restart
-  while protocols reconverge, rather than a clean reconcile) is still to come.
+  leaves stale routes. **BGP graceful restart** (RFC 4724) builds on this: wren's
+  kernel FIB outlives the process, so a BGP peer that helps wren keeps forwarding to
+  it across the restart while wren re-advertises and sends End-of-RIB — and wren is
+  itself a helper for restarting peers (see the BGP entry). Signalling the Restart
+  State (R) flag in the first OPEN after our own restart, and graceful restart for
+  the IGPs, are still to come.
 - [ ] A `Fib` backend that writes routes into an **eBPF map** for the Sentinel
   XDP data plane
 
@@ -157,7 +169,7 @@ tracked but not yet scheduled, grouped by area:
   refinements (the RFC 5303 p2p three-way TLV, L1↔L2 route leaking), RIFT, EIGRP;
   IGMP/MLD for multicast group membership.
 - **BGP breadth:** unnumbered (RFC 5549), EVPN (RFC 7432), multipath / add-path
-  (RFC 7911), graceful restart + long-lived GR, BMP
+  (RFC 7911), long-lived graceful restart (RFC 9494), BMP
   (RFC 7854), FlowSpec (RFC 8955), RPKI origin validation, RTC (RFC 4684).
 - **Data-plane & overlays:** MPLS, SR-MPLS, SRv6, VXLAN, BFD (RFC 5880),
   MLAG, anycast gateway, dual-stack.

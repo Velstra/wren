@@ -90,6 +90,17 @@ impl BgpRib {
         events
     }
 
+    /// Every destination for which `peer` currently offers a path (its Adj-RIB-In
+    /// entries). Used by a graceful-restart helper to mark a peer's routes stale
+    /// when its session drops, without removing them (RFC 4724).
+    pub fn prefixes_from(&self, peer: Ipv4Addr) -> Vec<Prefix> {
+        self.entries
+            .iter()
+            .filter(|(_, peers)| peers.contains_key(&peer))
+            .map(|(p, _)| *p)
+            .collect()
+    }
+
     /// The current best path for `prefix`, if any.
     pub fn best(&self, prefix: &Prefix) -> Option<&Path> {
         self.best.get(prefix)
@@ -231,6 +242,21 @@ mod tests {
         let peer = ip([10, 0, 0, 1]);
         assert!(rib.update(peer, dst, path(100, [10, 0, 0, 1])).is_some());
         assert!(rib.update(peer, dst, path(100, [10, 0, 0, 1])).is_none());
+    }
+
+    #[test]
+    fn prefixes_from_lists_a_peers_destinations() {
+        let mut rib = BgpRib::new();
+        let peer = ip([10, 0, 0, 1]);
+        let other = ip([10, 0, 0, 2]);
+        rib.update(peer, pfx("10.0.0.0/8"), path(100, [10, 0, 0, 1]));
+        rib.update(peer, pfx("172.16.0.0/12"), path(100, [10, 0, 0, 1]));
+        rib.update(other, pfx("192.168.0.0/16"), path(100, [10, 0, 0, 2]));
+        let mut from_peer = rib.prefixes_from(peer);
+        from_peer.sort();
+        assert_eq!(from_peer, vec![pfx("10.0.0.0/8"), pfx("172.16.0.0/12")]);
+        assert_eq!(rib.prefixes_from(other), vec![pfx("192.168.0.0/16")]);
+        assert!(rib.prefixes_from(ip([9, 9, 9, 9])).is_empty());
     }
 
     #[test]

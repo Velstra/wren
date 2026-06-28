@@ -549,3 +549,45 @@ eBGP**. That class drives three things:
 A network originated in 65001 reaches the external peer with AS_PATH `65000` (the
 internal 65001 hidden), and a network from the external peer reaches 65001 with
 AS_PATH `(65002) 64500` (the Member-AS prepended in an AS_CONFED_SEQUENCE).
+
+## Graceful restart (RFC 4724)
+
+When a BGP session drops, the default is to withdraw every route learned over it at
+once — which tears down forwarding even when the peer is only **restarting** and
+its data plane is still up. Graceful restart lets a speaker signal that its
+forwarding state **survives** a control-plane restart, so a neighbour can keep using
+those routes for a bounded window instead of withdrawing them.
+
+Wren advertises the Graceful Restart capability (code 64) in every OPEN, carrying:
+
+- the **Restart State (R)** flag — wren leaves it clear (it does not yet persist a
+  "just restarted" marker across its own restart);
+- a **Restart Time** (`DEFAULT_RESTART_TIME`, 120 s) — how long a helper should wait
+  for it to return;
+- the **forwarding-state-preserved (F)** flag set for both IPv4- and IPv6-unicast,
+  because wren's kernel FIB outlives the daemon process.
+
+Once the initial advertisement to a peer is complete, wren sends an **End-of-RIB**
+marker (an empty UPDATE for IPv4 unicast; an empty `MP_UNREACH_NLRI` for IPv6) so
+the other side knows the dump has finished.
+
+### Helper behaviour
+
+As a **helper** — when a peer that advertised GR with the F flag drops — wren does
+**not** withdraw that peer's routes. It instead:
+
+1. **retains** them in the Loc-RIB and the kernel FIB (forwarding continues), marks
+   them *stale*, and starts the peer's **Restart Timer**;
+2. when the peer returns and re-advertises, each re-advertised prefix **refreshes**
+   (un-stales) in place;
+3. on the peer's **End-of-RIB** it flushes whatever is still stale (routes the peer
+   no longer has) — the restart is complete with no flap for the routes that stayed;
+4. if the Restart Timer expires first, the still-stale routes are flushed.
+
+A peer that did **not** advertise GR (or set F=0) is handled the old way: an
+immediate withdrawal on session down.
+
+`scripts/bgp-graceful-restart-smoke.sh` exercises this live (rootless): a peer that
+originates `10.20.0.0/24` is **hard-killed** (`SIGKILL`); the helper shows the
+session leave Established yet keeps `10.20.0.0/24 proto bgp` installed, and when the
+peer restarts the route is still there — it never left the FIB.

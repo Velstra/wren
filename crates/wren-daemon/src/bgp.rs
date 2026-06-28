@@ -21,7 +21,7 @@
 //! the listener on port 179 needs `CAP_NET_BIND_SERVICE` (the `unshare -Urn` netns
 //! used to smoke-test the other runners grants it); active-connect works without.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt::Write as _;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -214,6 +214,11 @@ enum SessionCmd {
     /// Send a ROUTE-REFRESH to the peer (RFC 2918), asking it to re-advertise its
     /// routes to us — triggered by the operator's `bgp refresh <peer>`.
     SendRefresh,
+    /// Send the End-of-RIB marker(s) (RFC 4724 §2): we have finished the initial
+    /// advertisement to this peer, so a graceful-restart helper on the other side
+    /// knows the re-advertisement is complete. Pushed by the central task right
+    /// after the origination snapshot and Loc-RIB propagation on Established.
+    SendEndOfRib,
 }
 
 /// One learned Loc-RIB route the central task asks a session to propagate. The
@@ -249,6 +254,10 @@ enum PeerMsg {
         peer_id: Ipv4Addr,
         inbound: bool,
         conn_id: u64,
+        /// The peer's Graceful Restart Restart Time (RFC 4724), if it advertised GR
+        /// with the forwarding state preserved for IPv4 unicast — `Some(secs)` makes
+        /// the central task retain this peer's routes for that long when it drops.
+        gr_restart_time: Option<u16>,
         cmd_tx: mpsc::Sender<SessionCmd>,
     },
     /// The session left Established / went down — flush the peer's routes, but only
@@ -258,6 +267,11 @@ enum PeerMsg {
     /// The peer sent a ROUTE-REFRESH (RFC 2918): re-advertise our Adj-RIB-Out to it.
     /// `conn_id` guards against a stale connection (like [`PeerMsg::Down`]).
     RefreshRequest { peer: Ipv4Addr, conn_id: u64 },
+    /// The peer sent an End-of-RIB marker (RFC 4724 §2): it has finished
+    /// re-advertising after a graceful restart, so any of its routes we retained as
+    /// stale but it did not re-advertise can now be flushed. `conn_id` guards
+    /// against a stale connection.
+    EndOfRib { peer: Ipv4Addr, conn_id: u64 },
     /// The peer sent an UPDATE.
     Update {
         peer: Ipv4Addr,
@@ -493,6 +507,13 @@ pub async fn run(
     // The id of the current connection per peer, so a stale loser connection's Down
     // (e.g. after it was Ceased) can't evict the surviving session.
     let mut current_conn: HashMap<Ipv4Addr, u64> = HashMap::new();
+    // Graceful Restart (RFC 4724): peers that negotiated GR with the forwarding
+    // state preserved for IPv4 unicast, mapped to their Restart Time — when such a
+    // peer drops we retain its routes for that long instead of withdrawing.
+    let mut gr_helper: HashMap<Ipv4Addr, u16> = HashMap::new();
+    // The routes currently retained as stale per restarting peer, with the deadline
+    // by which the peer must return (its Restart Timer).
+    let mut stale: HashMap<Ipv4Addr, StalePeer> = HashMap::new();
 
     let members = cfg.confederation_members.clone();
     let local = Arc::new(Local {
@@ -553,11 +574,35 @@ pub async fn run(
 
     let mut rib = BgpRib::new();
     loop {
+        // The nearest Restart Timer deadline across all restarting peers (RFC 4724);
+        // the timer future fires when it elapses, or never if none are pending.
+        let next_stale = stale.values().map(|s| s.deadline).min();
+        let restart_timer = async move {
+            match next_stale {
+                Some(d) => sleep_until(d).await,
+                None => std::future::pending::<()>().await,
+            }
+        };
+        tokio::pin!(restart_timer);
+
         let msg = tokio::select! {
             msg = rx.recv() => match msg {
                 Some(msg) => msg,
                 None => break, // all sessions gone — daemon shutting down
             },
+            () = &mut restart_timer => {
+                // A restarting peer did not return in time: flush its stale routes.
+                let now = Instant::now();
+                let expired: Vec<Ipv4Addr> =
+                    stale.iter().filter(|(_, s)| s.deadline <= now).map(|(p, _)| *p).collect();
+                for p in expired {
+                    if let Some(s) = stale.remove(&p) {
+                        warn!(peer = %p, count = s.prefixes.len(), "BGP graceful restart timer expired; flushing stale routes");
+                        flush_stale(p, s.prefixes, &mut rib, &updates, &sessions).await;
+                    }
+                }
+                continue;
+            }
             Some(req) = queries.recv() => {
                 let resp = match req.query {
                     BgpQuery::Routes => render_bgp_routes(&rib),
@@ -579,7 +624,7 @@ pub async fn run(
             }
         };
         match msg {
-            PeerMsg::Established { peer: p, peer_id, inbound, conn_id, cmd_tx } => {
+            PeerMsg::Established { peer: p, peer_id, inbound, conn_id, gr_restart_time, cmd_tx } => {
                 // §6.8 connection-collision detection: if a session already exists
                 // for this peer, two connections raced to Established. Keep the one
                 // opened by the speaker with the higher BGP Identifier (RFC 4271
@@ -606,6 +651,18 @@ pub async fn run(
                 }
                 est_inbound.insert(p, inbound);
                 current_conn.insert(p, conn_id);
+                // Remember whether this peer can be helped through a restart, and
+                // with what Restart Time (RFC 4724). A stale entry from a previous
+                // drop is kept: the re-advertisement below refreshes it, and the
+                // peer's End-of-RIB (or the Restart Timer) finalises it.
+                match gr_restart_time {
+                    Some(t) if t > 0 => {
+                        gr_helper.insert(p, t);
+                    }
+                    _ => {
+                        gr_helper.remove(&p);
+                    }
+                }
                 // Push the current origination snapshot to the new session, then
                 // remember it for future incremental redistribution changes.
                 let snapshot = origination_snapshot(&originated);
@@ -622,6 +679,10 @@ pub async fn run(
                 if !prop.is_empty() {
                     let _ = cmd_tx.send(SessionCmd::Propagate(prop)).await;
                 }
+                // Initial advertisement done: send the End-of-RIB marker so a helper
+                // on the peer's side knows our re-advertisement is complete (RFC 4724
+                // §2). Queued after Advertise/Propagate, so it arrives last.
+                let _ = cmd_tx.send(SessionCmd::SendEndOfRib).await;
                 sessions.insert(p, cmd_tx);
             }
             PeerMsg::Down { peer: p, conn_id } => {
@@ -639,8 +700,34 @@ pub async fn run(
                 sessions.remove(&p);
                 est_inbound.remove(&p);
                 current_conn.remove(&p);
-                for ev in rib.withdraw_peer(p) {
-                    apply_event(ev, &updates, &sessions).await;
+                // Graceful Restart helper (RFC 4724 §4.1): if the peer advertised GR
+                // with the forwarding state preserved, do NOT withdraw its routes —
+                // keep them in service (and in the kernel FIB) as stale and start its
+                // Restart Timer. Otherwise fall back to an ordinary withdrawal.
+                let retained = match gr_helper.get(&p).copied() {
+                    Some(time) => {
+                        let prefixes: HashSet<Prefix> = rib.prefixes_from(p).into_iter().collect();
+                        if prefixes.is_empty() {
+                            false
+                        } else {
+                            let secs = time.max(1) as u64;
+                            info!(peer = %p, count = prefixes.len(), seconds = secs, "BGP graceful restart: retaining peer routes (helper)");
+                            stale.insert(
+                                p,
+                                StalePeer {
+                                    prefixes,
+                                    deadline: Instant::now() + Duration::from_secs(secs),
+                                },
+                            );
+                            true
+                        }
+                    }
+                    None => false,
+                };
+                if !retained {
+                    for ev in rib.withdraw_peer(p) {
+                        apply_event(ev, &updates, &sessions).await;
+                    }
                 }
             }
             PeerMsg::RefreshRequest { peer: p, conn_id } => {
@@ -669,6 +756,25 @@ pub async fn run(
                     }
                 }
             }
+            PeerMsg::EndOfRib { peer: p, conn_id } => {
+                // The peer finished re-advertising after a graceful restart (RFC 4724
+                // §4.2). A restarting peer sends all its routes before any End-of-RIB
+                // marker, so by now every route it still has has refreshed its stale
+                // entry; whatever remains in the stale set is genuinely gone and is
+                // flushed. (Finalised on the first marker — covers both families,
+                // which arrive after all re-advertisements on the same ordered stream.)
+                if current_conn.get(&p) != Some(&conn_id) {
+                    continue;
+                }
+                if let Some(s) = stale.remove(&p) {
+                    if s.prefixes.is_empty() {
+                        info!(peer = %p, "BGP graceful restart complete; all routes refreshed");
+                    } else {
+                        info!(peer = %p, count = s.prefixes.len(), "BGP graceful restart complete; flushing un-refreshed routes");
+                    }
+                    flush_stale(p, s.prefixes, &mut rib, &updates, &sessions).await;
+                }
+            }
             PeerMsg::Update {
                 peer,
                 peer_as,
@@ -687,6 +793,19 @@ pub async fn run(
                     from_confed,
                     from_client,
                 };
+                // Graceful restart (RFC 4724 §4.2): a prefix the restarting peer
+                // re-advertises is no longer stale, so drop it from the retained set
+                // (the rib.update below refreshes its path in place).
+                if let Some(s) = stale.get_mut(&peer) {
+                    for prefix in &update.nlri {
+                        s.prefixes.remove(prefix);
+                    }
+                    if let Some((_, nlri, _)) = mp_reach_v6(&update) {
+                        for prefix in nlri {
+                            s.prefixes.remove(prefix);
+                        }
+                    }
+                }
                 // Withdrawals: base-NLRI IPv4 (the Withdrawn Routes field) and IPv6
                 // (MP_UNREACH_NLRI, RFC 4760 §4).
                 for w in update.withdrawn.iter().chain(mp_unreach_v6(&update)) {
@@ -842,6 +961,34 @@ async fn emit(ev: RibEvent, updates: &mpsc::Sender<RouteUpdate>) {
         },
     };
     let _ = updates.send(upd).await;
+}
+
+/// A graceful-restart helper's retained state for one peer (RFC 4724 §4.1): the
+/// routes we kept in service (and in the kernel FIB) while the peer is away, and
+/// the deadline by which it must return before we flush them.
+struct StalePeer {
+    /// The peer's prefixes still awaiting re-advertisement — refreshed (removed)
+    /// as the peer re-sends them, and the remainder flushed at End-of-RIB.
+    prefixes: HashSet<Prefix>,
+    /// When the Restart Timer expires and any still-stale routes are flushed.
+    deadline: Instant,
+}
+
+/// Flush a peer's still-stale routes from the RIB (a graceful restart did not
+/// complete in time, or the peer's End-of-RIB showed they are gone): withdraw each,
+/// propagating and updating the kernel FIB.
+async fn flush_stale(
+    peer: Ipv4Addr,
+    prefixes: impl IntoIterator<Item = Prefix>,
+    rib: &mut BgpRib,
+    updates: &mpsc::Sender<RouteUpdate>,
+    sessions: &HashMap<Ipv4Addr, mpsc::Sender<SessionCmd>>,
+) {
+    for prefix in prefixes {
+        if let Some(ev) = rib.withdraw(peer, prefix) {
+            apply_event(ev, updates, sessions).await;
+        }
+    }
 }
 
 /// The session facts a received UPDATE is tagged with, threaded into every [`Path`]
@@ -1159,6 +1306,7 @@ async fn drive_session(
         four_octet: false,
         mp_ipv6: false,
         peer_route_refresh: false,
+        peer_gr: None,
         established: false,
         hold_deadline: Instant::now() + FAR,
         ka_deadline: Instant::now() + FAR,
@@ -1198,6 +1346,12 @@ async fn drive_session(
                             sess.mp_ipv6 = o.supports_multiprotocol(AFI_IPV6, SAFI_UNICAST);
                             // Send a ROUTE-REFRESH only if the peer can honour it (RFC 2918).
                             sess.peer_route_refresh = o.supports_route_refresh();
+                            // Graceful Restart (RFC 4724): help this peer through a
+                            // restart only if it preserves IPv4-unicast forwarding;
+                            // remember the Restart Time to bound the retention.
+                            sess.peer_gr = o
+                                .gr_forwarding_preserved(AFI_IPV4, SAFI_UNICAST)
+                                .then(|| o.gr_restart_time().unwrap_or(0));
                             sess.neg_hold = sess.local.hold_time.min(o.hold_time);
                             sess.keepalive_int = (sess.neg_hold / 3).max(1);
                             Step::Event(Event::OpenReceived)
@@ -1206,16 +1360,27 @@ async fn drive_session(
                     Message::Keepalive => Step::Event(Event::KeepAliveReceived),
                     Message::Update(u) => {
                         if fsm.is_established() {
-                            let _ = sess.tx.send(PeerMsg::Update {
-                                peer: sess.peer.addr,
-                                peer_as: sess.peer.remote_as,
-                                peer_id: sess.peer_id,
-                                from_ebgp: sess.from_ebgp,
-                                from_confed: sess.peer_type == PeerType::Confed,
-                                from_client: sess.peer.rr_client,
-                                ingress_iface: sess.link.as_ref().map(|(n, _)| n.clone()),
-                                update: u.clone(),
-                            }).await;
+                            if u.end_of_rib().is_some() {
+                                // An End-of-RIB marker (RFC 4724 §2): the peer has
+                                // finished re-advertising. Signal the central task so
+                                // it can finalise a graceful restart, rather than
+                                // feeding an empty UPDATE into the RIB.
+                                let _ = sess.tx.send(PeerMsg::EndOfRib {
+                                    peer: sess.peer.addr,
+                                    conn_id: sess.conn_id,
+                                }).await;
+                            } else {
+                                let _ = sess.tx.send(PeerMsg::Update {
+                                    peer: sess.peer.addr,
+                                    peer_as: sess.peer.remote_as,
+                                    peer_id: sess.peer_id,
+                                    from_ebgp: sess.from_ebgp,
+                                    from_confed: sess.peer_type == PeerType::Confed,
+                                    from_client: sess.peer.rr_client,
+                                    ingress_iface: sess.link.as_ref().map(|(n, _)| n.clone()),
+                                    update: u.clone(),
+                                }).await;
+                            }
                         }
                         Step::Event(Event::UpdateReceived)
                     }
@@ -1296,6 +1461,21 @@ async fn drive_session(
                     }
                 }
             }
+            // Send the End-of-RIB marker(s) (RFC 4724 §2) now the initial
+            // advertisement to this peer is complete: IPv4 unicast always, and IPv6
+            // unicast too when that family is negotiated.
+            Step::Cmd(SessionCmd::SendEndOfRib) => {
+                if sess.established {
+                    let _ = sess
+                        .send(&Message::Update(Update::end_of_rib_marker(AFI_IPV4, SAFI_UNICAST)))
+                        .await;
+                    if sess.mp_ipv6 {
+                        let _ = sess
+                            .send(&Message::Update(Update::end_of_rib_marker(AFI_IPV6, SAFI_UNICAST)))
+                            .await;
+                    }
+                }
+            }
             Step::Cmd(SessionCmd::Shutdown) => {
                 // Lost §6.8 collision resolution: tell the peer with a Cease
                 // (Connection Collision Resolution) and close, but do NOT report
@@ -1369,6 +1549,10 @@ struct Session<'a> {
     /// Whether the peer advertised the Route Refresh capability (RFC 2918) — only
     /// then do we send it a ROUTE-REFRESH (it would not honour one otherwise).
     peer_route_refresh: bool,
+    /// The peer's Graceful Restart Restart Time (RFC 4724), if it advertised GR with
+    /// the forwarding state preserved for IPv4 unicast — handed to the central task
+    /// on Established so it retains this peer's routes through a restart.
+    peer_gr: Option<u16>,
     established: bool,
     hold_deadline: Instant,
     ka_deadline: Instant,
@@ -1427,6 +1611,7 @@ impl Session<'_> {
                             peer_id: self.peer_id,
                             inbound: self.inbound,
                             conn_id: self.conn_id,
+                            gr_restart_time: self.peer_gr,
                             cmd_tx: self.cmd_tx.clone(),
                         })
                         .await;

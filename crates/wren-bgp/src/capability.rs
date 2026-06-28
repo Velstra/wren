@@ -17,6 +17,9 @@ pub const CAP_MULTIPROTOCOL: u8 = 1;
 /// The Route Refresh capability code (RFC 2918 §3).
 pub const CAP_ROUTE_REFRESH: u8 = 2;
 
+/// The Graceful Restart capability code (RFC 4724 §3).
+pub const CAP_GRACEFUL_RESTART: u8 = 64;
+
 /// The 4-octet AS Number capability code (RFC 6793 §4).
 pub const CAP_FOUR_OCTET_AS: u8 = 65;
 
@@ -34,6 +37,19 @@ pub enum Capability {
     /// The Route Refresh capability (code 2, RFC 2918): the speaker can receive a
     /// ROUTE-REFRESH message and will re-advertise its Adj-RIB-Out. No value.
     RouteRefresh,
+    /// The Graceful Restart capability (code 64, RFC 4724 §3): the speaker can be
+    /// helped through a restart (and help others). Carries the Restart State (R)
+    /// flag — set in the first OPEN after a restart — the Restart Time a helper
+    /// should wait, and the address families whose forwarding state survives a
+    /// restart (each `(AFI, SAFI, F-flag)`, F set ⇒ forwarding preserved).
+    GracefulRestart {
+        /// The Restart State (R) flag (RFC 4724 §3): set while recovering.
+        restart_state: bool,
+        /// The Restart Time in seconds (12-bit; how long a helper retains routes).
+        restart_time: u16,
+        /// The advertised families and their per-family Forwarding State (F) flag.
+        families: Vec<(u16, u8, bool)>,
+    },
     /// The 4-octet AS Number capability (code 65): the speaker's real AS.
     FourOctetAs(u32),
     /// A capability this implementation does not model, kept verbatim.
@@ -51,6 +67,7 @@ impl Capability {
         match self {
             Capability::Multiprotocol { .. } => CAP_MULTIPROTOCOL,
             Capability::RouteRefresh => CAP_ROUTE_REFRESH,
+            Capability::GracefulRestart { .. } => CAP_GRACEFUL_RESTART,
             Capability::FourOctetAs(_) => CAP_FOUR_OCTET_AS,
             Capability::Unknown { code, .. } => *code,
         }
@@ -69,6 +86,19 @@ impl Capability {
             }
             Capability::RouteRefresh => {
                 out.push(0); // no value
+            }
+            Capability::GracefulRestart { restart_state, restart_time, families } => {
+                // Value: Restart Flags(4 bits) · Restart Time(12 bits), then a
+                // 4-octet (AFI(2) · SAFI(1) · Flags(1)) tuple per family.
+                out.push(2 + 4 * families.len() as u8);
+                let hdr: u16 =
+                    ((*restart_state as u16) << 15) | (restart_time & 0x0FFF);
+                out.extend_from_slice(&hdr.to_be_bytes());
+                for (afi, safi, preserved) in families {
+                    out.extend_from_slice(&afi.to_be_bytes());
+                    out.push(*safi);
+                    out.push(if *preserved { 0x80 } else { 0x00 });
+                }
             }
             Capability::FourOctetAs(asn) => {
                 out.push(4);
@@ -101,6 +131,22 @@ impl Capability {
                 safi: value[3],
             },
             CAP_ROUTE_REFRESH if value.is_empty() => Capability::RouteRefresh,
+            CAP_GRACEFUL_RESTART if value.len() >= 2 && (value.len() - 2) % 4 == 0 => {
+                let hdr = u16::from_be_bytes([value[0], value[1]]);
+                let restart_state = hdr & 0x8000 != 0;
+                let restart_time = hdr & 0x0FFF;
+                let mut families = Vec::new();
+                let mut o = 2;
+                while o + 4 <= value.len() {
+                    families.push((
+                        u16::from_be_bytes([value[o], value[o + 1]]),
+                        value[o + 2],
+                        value[o + 3] & 0x80 != 0,
+                    ));
+                    o += 4;
+                }
+                Capability::GracefulRestart { restart_state, restart_time, families }
+            }
             CAP_FOUR_OCTET_AS if value.len() == 4 => {
                 Capability::FourOctetAs(u32::from_be_bytes([value[0], value[1], value[2], value[3]]))
             }
@@ -202,6 +248,24 @@ mod tests {
         assert_eq!(opt[0], OPT_PARAM_CAPABILITIES);
         assert_eq!(opt[2], CAP_ROUTE_REFRESH);
         assert_eq!(opt[3], 0);
+        assert_eq!(parse_optional_parameters(&opt), caps);
+    }
+
+    #[test]
+    fn graceful_restart_capability_roundtrips() {
+        use crate::{AFI_IPV4, AFI_IPV6, SAFI_UNICAST};
+        let caps = vec![Capability::GracefulRestart {
+            restart_state: true,
+            restart_time: 120,
+            families: vec![(AFI_IPV4, SAFI_UNICAST, true), (AFI_IPV6, SAFI_UNICAST, false)],
+        }];
+        let opt = encode_optional_parameters(&caps);
+        // type 2 (capabilities param), then [cap 64, len 2 + 2*4 = 10].
+        assert_eq!(opt[0], OPT_PARAM_CAPABILITIES);
+        assert_eq!(opt[2], CAP_GRACEFUL_RESTART);
+        assert_eq!(opt[3], 10);
+        // The R flag is the top bit of the 16-bit flags+time word.
+        assert_eq!(u16::from_be_bytes([opt[4], opt[5]]), 0x8000 | 120);
         assert_eq!(parse_optional_parameters(&opt), caps);
     }
 
