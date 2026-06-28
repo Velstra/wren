@@ -383,10 +383,15 @@ rules apply per outgoing peer:
   roadmap, will add);
 - the well-known communities (`no-export`, `no-advertise`) are honoured per peer.
 
+Propagation is **dual-stack**: an IPv6 best path is re-advertised in MP_REACH_NLRI
+(and withdrawn in MP_UNREACH_NLRI), with the next hop preserved toward iBGP or set
+to `next-hop6` toward eBGP — the IPv4 rules above, over the multiprotocol encoding.
+
 `scripts/bgp-propagate-smoke.sh` exercises this live (rootless): an eBGP chain
 `A (AS 65001) — B (AS 65002) — C (AS 65003)` where A originates a network, B
 originates nothing, and C learns it via B with the AS_PATH `65002 65001` and
-installs it `proto bgp`. (IPv4 unicast for now; IPv6 propagation is on the roadmap.)
+installs it `proto bgp`. `scripts/bgp-propagate-ipv6-smoke.sh` is the IPv6
+counterpart (A originates an IPv6 network, C installs it from B over MP-BGP).
 
 ## Route reflection (RFC 4456)
 
@@ -432,5 +437,5 @@ installs it `proto bgp`.
 
 ## Not yet implemented
 
-**Connection-collision detection** (§6.8), IPv6 route propagation, and
-confederations. These are tracked in the [Roadmap](../roadmap.md).
+**Connection-collision detection** (§6.8) and confederations. These are tracked in
+the [Roadmap](../roadmap.md).

@@ -463,7 +463,6 @@ pub async fn run(
                 // rules — it drops anything it taught us, and iBGP→iBGP routes).
                 let prop: Vec<PropRoute> = rib
                     .iter_best()
-                    .filter(|(prefix, _)| prefix.is_ipv4())
                     .map(|(prefix, path)| PropRoute { prefix: *prefix, path: path.clone() })
                     .collect();
                 if !prop.is_empty() {
@@ -606,24 +605,18 @@ async fn apply_event(
 }
 
 /// Re-advertise a Loc-RIB change to every established session (the Adj-RIB-Out
-/// fan-out). This broadcasts unconditionally; each session applies the eBGP/iBGP
-/// propagation rules itself, and the session that taught us the route drops it
-/// (split horizon). IPv4 unicast only for now.
+/// fan-out), IPv4 or IPv6. This broadcasts unconditionally; each session applies
+/// the eBGP/iBGP propagation rules (and the IPv6 multiprotocol gating) itself, and
+/// the session that taught us the route drops it (split horizon).
 async fn propagate(ev: &RibEvent, sessions: &HashMap<Ipv4Addr, mpsc::Sender<SessionCmd>>) {
     match ev {
         RibEvent::Best { prefix, path } => {
-            if !prefix.is_ipv4() {
-                return;
-            }
             let pr = PropRoute { prefix: *prefix, path: path.clone() };
             for tx in sessions.values() {
                 let _ = tx.send(SessionCmd::Propagate(vec![pr.clone()])).await;
             }
         }
         RibEvent::Withdrawn(prefix) => {
-            if !prefix.is_ipv4() {
-                return;
-            }
             for tx in sessions.values() {
                 let _ = tx.send(SessionCmd::WithdrawPropagated(vec![*prefix])).await;
             }
@@ -1244,39 +1237,77 @@ impl Session<'_> {
     /// IPv4 unicast only for now.
     async fn propagate_routes(&mut self, routes: &[PropRoute]) -> Result<()> {
         for r in routes {
-            if !r.prefix.is_ipv4() {
-                continue;
-            }
             if !should_propagate(&r.path, self.from_ebgp, self.peer.rr_client, self.peer.addr) {
                 continue;
             }
-            let attributes = self.propagated_attrs(&r.path);
-            self.send(&Message::Update(Update {
-                withdrawn: vec![],
-                attributes,
-                nlri: vec![r.prefix],
-            }))
-            .await?;
+            let mut attributes = self.propagated_base_attrs(&r.path);
+            if r.prefix.is_ipv4() {
+                // IPv4: base NLRI with the IPv4 NEXT_HOP — preserved for iBGP, set
+                // to ourselves for eBGP.
+                let nh = if self.from_ebgp {
+                    self.local_ip
+                } else if let IpAddr::V4(v4) = r.path.next_hop {
+                    v4
+                } else {
+                    continue; // a v4 prefix with a non-v4 next hop: malformed, skip
+                };
+                attributes.push(PathAttribute::NextHop(nh));
+                self.send(&Message::Update(Update {
+                    withdrawn: vec![],
+                    attributes,
+                    nlri: vec![r.prefix],
+                }))
+                .await?;
+            } else {
+                // IPv6: MP_REACH_NLRI, only if the peer negotiated it. The next hop
+                // is preserved for iBGP, or our next-hop-self6 for eBGP.
+                if !self.mp_ipv6 {
+                    continue;
+                }
+                let nh6 = if self.from_ebgp {
+                    match self.local.next_hop6 {
+                        Some(n) => n,
+                        None => {
+                            warn!(peer = %self.peer.addr, "IPv6 route to propagate but no `[bgp] next-hop6` configured");
+                            continue;
+                        }
+                    }
+                } else if let IpAddr::V6(v6) = r.path.next_hop {
+                    v6
+                } else {
+                    continue;
+                };
+                attributes.push(PathAttribute::MpReachNlri {
+                    afi: AFI_IPV6,
+                    safi: SAFI_UNICAST,
+                    next_hop: nh6.octets().to_vec(),
+                    nlri: vec![r.prefix],
+                });
+                self.send(&Message::Update(Update {
+                    withdrawn: vec![],
+                    attributes,
+                    nlri: vec![],
+                }))
+                .await?;
+            }
         }
         Ok(())
     }
 
-    /// Build the path attributes for re-advertising a learned `path` to this peer.
-    fn propagated_attrs(&self, path: &Path) -> Vec<PathAttribute> {
+    /// Build the family-agnostic path attributes for re-advertising a learned
+    /// `path` to this peer — everything but the family-specific next hop (the IPv4
+    /// NEXT_HOP or the IPv6 MP_REACH_NLRI), which the caller appends.
+    fn propagated_base_attrs(&self, path: &Path) -> Vec<PathAttribute> {
         let mut attrs = vec![PathAttribute::Origin(path.origin)];
         let mut as_path = path.as_path.clone();
         if self.from_ebgp {
-            // eBGP: prepend our AS and set the next hop to ourselves.
+            // eBGP: prepend our AS.
             prepend_as(&mut as_path, self.local.local_as);
             attrs.push(PathAttribute::AsPath(as_path));
-            attrs.push(PathAttribute::NextHop(self.local_ip));
         } else {
-            // iBGP: AS_PATH unchanged, the next hop preserved, carry LOCAL_PREF / MED.
+            // iBGP: AS_PATH unchanged, carry LOCAL_PREF / MED.
             attrs.push(PathAttribute::AsPath(as_path));
             attrs.push(PathAttribute::LocalPref(path.local_pref));
-            if let IpAddr::V4(nh) = path.next_hop {
-                attrs.push(PathAttribute::NextHop(nh));
-            }
             if path.med != 0 {
                 attrs.push(PathAttribute::MultiExitDisc(path.med));
             }

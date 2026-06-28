@@ -27,10 +27,11 @@ implemented to its RFC.
   attached globally or per-prefix via a filter; and **extended communities**
   (RFC 4360 / RFC 5668): the EXTENDED_COMMUNITIES attribute (Route Target / Route
   Origin, `rt:`/`ro:`), likewise global or per-prefix. Learned best paths are
-  **propagated** onward to the other peers (transit): the local AS is prepended
-  and next-hop-self set toward eBGP, with the iBGP split-horizon rule applied —
-  and **route reflection** (RFC 4456): an iBGP peer marked a client has its routes
-  reflected to the other iBGP peers (ORIGINATOR_ID / CLUSTER_LIST loop avoidance)
+  **propagated** onward to the other peers (transit, IPv4 and IPv6): the local AS
+  is prepended and next-hop-self set toward eBGP, with the iBGP split-horizon rule
+  applied — and **route reflection** (RFC 4456): an iBGP peer marked a client has
+  its routes reflected to the other iBGP peers (ORIGINATOR_ID / CLUSTER_LIST loop
+  avoidance)
 - [x] **Babel** (RFC 8966) — loop-avoiding distance-vector over IPv6 (UDP 6696,
   `ff02::1:6`), with the feasibility condition and Hello/IHU link costing
 - [x] **OSPFv3** (RFC 5340) — OSPF for IPv6, end to end. The `wren-ospfv3` library
@@ -71,10 +72,9 @@ implemented to its RFC.
 
 - OSPF: stub / NSSA areas, type-4 ASBR-summaries across areas, explicit type-5
   forwarding-address resolution, authentication
-- BGP: IPv6 route propagation (transit re-advertisement is IPv4-only today),
-  connection-collision detection (§6.8), MP-BGP link-local next hops (RFC 2545 —
-  IPv6 routing over a link-local next hop with interface pinning, beyond the global
-  next hop carried today), confederations
+- BGP: connection-collision detection (§6.8), MP-BGP link-local next hops
+  (RFC 2545 — IPv6 routing over a link-local next hop with interface pinning,
+  beyond the global next hop carried today), confederations
 - Babel: ETX costing for lossy links, Route/Seqno-Request handling, prefix
   compression on send, IPv4 routes over the IPv6 transport (`RTA_VIA` next hops),
   source-specific routing
