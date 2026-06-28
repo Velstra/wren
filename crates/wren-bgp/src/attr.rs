@@ -17,7 +17,9 @@
 
 use std::net::Ipv4Addr;
 
-use crate::as_trans_fit;
+use wren_core::Prefix;
+
+use crate::{as_trans_fit, decode_prefix, decode_prefix_v6, encode_prefix_any, AFI_IPV6};
 
 /// Attribute flag: the attribute is optional (vs. well-known).
 pub const FLAG_OPTIONAL: u8 = 0x80;
@@ -150,6 +152,30 @@ pub enum PathAttribute {
     /// EXTENDED_COMMUNITIES (type 16, optional transitive) — the RFC 4360 8-octet
     /// tags (Route Target / Route Origin and friends), kept as raw octets.
     ExtendedCommunities(Vec<[u8; 8]>),
+    /// MP_REACH_NLRI (type 14, optional non-transitive) — multiprotocol
+    /// reachability (RFC 4760 §3): the destinations of one `(AFI, SAFI)` family
+    /// together with the next hop to reach them. Used here to carry IPv6 unicast.
+    MpReachNlri {
+        /// The Address Family Identifier (e.g. [`crate::AFI_IPV6`]).
+        afi: u16,
+        /// The Subsequent Address Family Identifier (e.g. [`crate::SAFI_UNICAST`]).
+        safi: u8,
+        /// The next hop, raw (16 octets for an IPv6 global, 32 for global +
+        /// link-local per RFC 2545) — kept opaque so the codec is family-agnostic.
+        next_hop: Vec<u8>,
+        /// The reachable prefixes (NLRI) in this family.
+        nlri: Vec<Prefix>,
+    },
+    /// MP_UNREACH_NLRI (type 15, optional non-transitive) — multiprotocol
+    /// withdrawal (RFC 4760 §4): prefixes of one `(AFI, SAFI)` being withdrawn.
+    MpUnreachNlri {
+        /// The Address Family Identifier.
+        afi: u16,
+        /// The Subsequent Address Family Identifier.
+        safi: u8,
+        /// The prefixes being withdrawn.
+        withdrawn: Vec<Prefix>,
+    },
     /// AGGREGATOR (type 7, optional transitive).
     Aggregator {
         /// The AS that formed the aggregate.
@@ -188,6 +214,8 @@ impl PathAttribute {
     const ATOMIC_AGGREGATE: u8 = 6;
     const AGGREGATOR: u8 = 7;
     const COMMUNITIES: u8 = 8;
+    const MP_REACH_NLRI: u8 = 14;
+    const MP_UNREACH_NLRI: u8 = 15;
     const EXTENDED_COMMUNITIES: u8 = 16;
     const AS4_PATH: u8 = 17;
     const AS4_AGGREGATOR: u8 = 18;
@@ -205,6 +233,8 @@ impl PathAttribute {
             PathAttribute::Aggregator { .. } => Self::AGGREGATOR,
             PathAttribute::Communities(_) => Self::COMMUNITIES,
             PathAttribute::ExtendedCommunities(_) => Self::EXTENDED_COMMUNITIES,
+            PathAttribute::MpReachNlri { .. } => Self::MP_REACH_NLRI,
+            PathAttribute::MpUnreachNlri { .. } => Self::MP_UNREACH_NLRI,
             PathAttribute::LargeCommunities(_) => Self::LARGE_COMMUNITIES,
             PathAttribute::As4Path(_) => Self::AS4_PATH,
             PathAttribute::As4Aggregator { .. } => Self::AS4_AGGREGATOR,
@@ -216,7 +246,9 @@ impl PathAttribute {
     /// MED is optional non-transitive; AGGREGATOR / AS4_* are optional transitive).
     fn canonical_flags(&self) -> u8 {
         match self {
-            PathAttribute::MultiExitDisc(_) => FLAG_OPTIONAL,
+            PathAttribute::MultiExitDisc(_)
+            | PathAttribute::MpReachNlri { .. }
+            | PathAttribute::MpUnreachNlri { .. } => FLAG_OPTIONAL,
             PathAttribute::Aggregator { .. }
             | PathAttribute::Communities(_)
             | PathAttribute::ExtendedCommunities(_)
@@ -257,6 +289,23 @@ impl PathAttribute {
             PathAttribute::ExtendedCommunities(comms) => {
                 for c in comms {
                     out.extend_from_slice(c);
+                }
+            }
+            PathAttribute::MpReachNlri { afi, safi, next_hop, nlri } => {
+                out.extend_from_slice(&afi.to_be_bytes());
+                out.push(*safi);
+                out.push(next_hop.len() as u8);
+                out.extend_from_slice(next_hop);
+                out.push(0); // Reserved (SNPA count, unused)
+                for p in nlri {
+                    encode_prefix_any(out, p);
+                }
+            }
+            PathAttribute::MpUnreachNlri { afi, safi, withdrawn } => {
+                out.extend_from_slice(&afi.to_be_bytes());
+                out.push(*safi);
+                for p in withdrawn {
+                    encode_prefix_any(out, p);
                 }
             }
             PathAttribute::Aggregator { asn, id } => {
@@ -379,6 +428,32 @@ impl PathAttribute {
                     .collect();
                 PathAttribute::LargeCommunities(comms)
             }
+            Self::MP_REACH_NLRI => {
+                // AFI(2) · SAFI(1) · NHLen(1) · NextHop(NHLen) · Reserved(1) · NLRI.
+                if value.len() < 5 {
+                    return None;
+                }
+                let afi = u16::from_be_bytes([value[0], value[1]]);
+                let safi = value[2];
+                let nh_len = value[3] as usize;
+                let nh_end = 4 + nh_len;
+                if value.len() < nh_end + 1 {
+                    return None;
+                }
+                let next_hop = value[4..nh_end].to_vec();
+                // value[nh_end] is the Reserved octet.
+                let nlri = decode_mp_prefixes(&value[nh_end + 1..], afi)?;
+                PathAttribute::MpReachNlri { afi, safi, next_hop, nlri }
+            }
+            Self::MP_UNREACH_NLRI => {
+                if value.len() < 3 {
+                    return None;
+                }
+                let afi = u16::from_be_bytes([value[0], value[1]]);
+                let safi = value[2];
+                let withdrawn = decode_mp_prefixes(&value[3..], afi)?;
+                PathAttribute::MpUnreachNlri { afi, safi, withdrawn }
+            }
             Self::AGGREGATOR => {
                 let (asn, id) = decode_aggregator(value, four_octet)?;
                 PathAttribute::Aggregator { asn, id }
@@ -402,6 +477,23 @@ fn read_u32(b: &[u8]) -> Option<u32> {
         return None;
     }
     Some(u32::from_be_bytes([b[0], b[1], b[2], b[3]]))
+}
+
+/// Decode a run of MP-BGP NLRI prefixes for the given address family (RFC 4760):
+/// IPv6 for [`AFI_IPV6`], IPv4 otherwise.
+fn decode_mp_prefixes(buf: &[u8], afi: u16) -> Option<Vec<Prefix>> {
+    let mut out = Vec::new();
+    let mut off = 0;
+    while off < buf.len() {
+        let (p, used) = if afi == AFI_IPV6 {
+            decode_prefix_v6(&buf[off..])?
+        } else {
+            decode_prefix(&buf[off..])?
+        };
+        out.push(p);
+        off += used;
+    }
+    Some(out)
 }
 
 /// Decode a whole AS_PATH / AS4_PATH value (a run of segments) at the given width.
@@ -646,6 +738,63 @@ mod tests {
         PathAttribute::Communities(vec![1]).encode(&mut buf, true);
         assert_eq!(buf[0], FLAG_OPTIONAL | FLAG_TRANSITIVE);
         assert_eq!(buf[1], 8);
+    }
+
+    fn p(s: &str) -> Prefix {
+        s.parse().unwrap()
+    }
+
+    #[test]
+    fn mp_reach_nlri_roundtrips_ipv6_unicast() {
+        use crate::{AFI_IPV6, SAFI_UNICAST};
+        // A 16-octet IPv6 global next hop and two IPv6 prefixes.
+        let attr = PathAttribute::MpReachNlri {
+            afi: AFI_IPV6,
+            safi: SAFI_UNICAST,
+            next_hop: std::net::Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1).octets().to_vec(),
+            nlri: vec![p("2001:db8:99::/64"), p("2001:db8:a::/48")],
+        };
+        roundtrip(attr.clone());
+        // Optional non-transitive, type 14.
+        let mut buf = Vec::new();
+        attr.encode(&mut buf, true);
+        assert_eq!(buf[0], FLAG_OPTIONAL);
+        assert_eq!(buf[1], 14);
+    }
+
+    #[test]
+    fn mp_reach_nlri_carries_a_linklocal_next_hop() {
+        use crate::{AFI_IPV6, SAFI_UNICAST};
+        // RFC 2545: a 32-octet next hop is global + link-local.
+        let mut nh = std::net::Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1).octets().to_vec();
+        nh.extend_from_slice(&std::net::Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1).octets());
+        roundtrip(PathAttribute::MpReachNlri {
+            afi: AFI_IPV6,
+            safi: SAFI_UNICAST,
+            next_hop: nh,
+            nlri: vec![p("2001:db8::/32")],
+        });
+    }
+
+    #[test]
+    fn mp_unreach_nlri_roundtrips_ipv6_withdrawals() {
+        use crate::{AFI_IPV6, SAFI_UNICAST};
+        let attr = PathAttribute::MpUnreachNlri {
+            afi: AFI_IPV6,
+            safi: SAFI_UNICAST,
+            withdrawn: vec![p("2001:db8:99::/64"), p("2001:db8::1/128")],
+        };
+        roundtrip(attr.clone());
+        let mut buf = Vec::new();
+        attr.encode(&mut buf, true);
+        assert_eq!(buf[0], FLAG_OPTIONAL);
+        assert_eq!(buf[1], 15);
+        // An empty withdrawal (end-of-RIB-ish) is legal too.
+        roundtrip(PathAttribute::MpUnreachNlri {
+            afi: AFI_IPV6,
+            safi: SAFI_UNICAST,
+            withdrawn: vec![],
+        });
     }
 
     #[test]

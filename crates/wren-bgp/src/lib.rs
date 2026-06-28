@@ -19,8 +19,15 @@
 //! * [`fsm`] — the per-peer session state machine (§8).
 //!
 //! The async TCP (port 179) session runner that drives all of this lives in
-//! `wren-daemon` (`bgp.rs`), as the RIP/OSPF runners do. Still to come: MP-BGP
-//! (RFC 4760) and route reflection.
+//! `wren-daemon` (`bgp.rs`), as the RIP/OSPF runners do.
+//!
+//! Multiprotocol BGP (RFC 4760) is supported at the wire-codec level: the
+//! Multiprotocol Extensions capability ([`capability::Capability::Multiprotocol`],
+//! code 1) advertises an `(AFI, SAFI)` pair in the OPEN, and the
+//! [`attr::PathAttribute::MpReachNlri`] / [`attr::PathAttribute::MpUnreachNlri`]
+//! attributes (types 14 / 15) carry IPv6-unicast reachability and withdrawals.
+//! Wiring the runner to advertise and install IPv6 routes is still to come, as is
+//! route reflection.
 //!
 //! Autonomous System numbers are **4-octet** throughout the library (RFC 6793):
 //! ASNs are kept as `u32`, the 4-octet AS Number capability (`code 65`) is
@@ -32,7 +39,7 @@
 
 #![forbid(unsafe_code)]
 
-use std::net::{IpAddr, Ipv4Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use wren_core::Prefix;
 
@@ -70,6 +77,17 @@ pub const MIN_MESSAGE_LEN: usize = HEADER_LEN;
 
 /// A conventional default Hold Time, in seconds (§4.2 suggests 90; many use 180).
 pub const DEFAULT_HOLD_TIME: u16 = 180;
+
+// ---------------------------------------------------------------------------
+// Multiprotocol address families (RFC 4760 / IANA) — used by MP-BGP.
+// ---------------------------------------------------------------------------
+
+/// Address Family Identifier: IPv4.
+pub const AFI_IPV4: u16 = 1;
+/// Address Family Identifier: IPv6.
+pub const AFI_IPV6: u16 = 2;
+/// Subsequent Address Family Identifier: unicast forwarding.
+pub const SAFI_UNICAST: u8 = 1;
 
 /// The reserved 2-octet AS number that stands in for a 4-octet AS in any field a
 /// legacy (2-octet) speaker reads — the OPEN `my_as` and a 2-octet AS_PATH /
@@ -159,6 +177,37 @@ pub(crate) fn decode_prefix(buf: &[u8]) -> Option<(Prefix, usize)> {
     Some((prefix, 1 + n))
 }
 
+/// Append `prefix` in BGP NLRI form for **either** address family — the length
+/// octet plus the minimal whole octets of the address (`ceil(len/8)`). This is the
+/// MP-BGP NLRI encoding (RFC 4760 §3/§4), where the address family is implied by
+/// the enclosing MP_REACH_NLRI / MP_UNREACH_NLRI AFI rather than the prefix itself.
+pub(crate) fn encode_prefix_any(out: &mut Vec<u8>, prefix: &Prefix) {
+    let len = prefix.len();
+    out.push(len);
+    let n = len.div_ceil(8) as usize;
+    match prefix.addr() {
+        IpAddr::V4(a) => out.extend_from_slice(&a.octets()[..n]),
+        IpAddr::V6(a) => out.extend_from_slice(&a.octets()[..n]),
+    }
+}
+
+/// Decode a BGP IPv6 NLRI prefix from the front of `buf` (the MP-BGP counterpart
+/// of [`decode_prefix`] for AFI IPv6), returning the prefix and the bytes consumed.
+pub(crate) fn decode_prefix_v6(buf: &[u8]) -> Option<(Prefix, usize)> {
+    let len = *buf.first()?;
+    if len > 128 {
+        return None;
+    }
+    let n = (len as usize).div_ceil(8);
+    if buf.len() < 1 + n {
+        return None;
+    }
+    let mut octets = [0u8; 16];
+    octets[..n].copy_from_slice(&buf[1..1 + n]);
+    let prefix = Prefix::new(IpAddr::V6(Ipv6Addr::from(octets)), len).ok()?;
+    Some((prefix, 1 + n))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -213,5 +262,27 @@ mod tests {
         assert!(decode_prefix(&[33, 1, 2, 3, 4, 5]).is_none()); // len > 32
         assert!(decode_prefix(&[24, 203, 0]).is_none()); // needs 3 octets, has 2
         assert!(decode_prefix(&[]).is_none());
+    }
+
+    #[test]
+    fn ipv6_prefix_roundtrips_via_any_codec() {
+        for s in ["::/0", "2001:db8::/32", "2001:db8:99::/64", "2001:db8::1/128"] {
+            let mut buf = Vec::new();
+            encode_prefix_any(&mut buf, &p(s));
+            let (decoded, used) = decode_prefix_v6(&buf).expect("decodes");
+            assert_eq!(decoded, p(s));
+            assert_eq!(used, buf.len());
+        }
+        // A /64 takes the length octet plus 8 address octets, no more.
+        let mut buf = Vec::new();
+        encode_prefix_any(&mut buf, &p("2001:db8:99::/64"));
+        assert_eq!(buf, vec![64, 0x20, 0x01, 0x0d, 0xb8, 0x00, 0x99, 0x00, 0x00]);
+    }
+
+    #[test]
+    fn decode_v6_rejects_overlong_and_truncated() {
+        assert!(decode_prefix_v6(&[129, 0]).is_none()); // len > 128
+        assert!(decode_prefix_v6(&[64, 0x20, 0x01]).is_none()); // needs 8 octets, has 2
+        assert!(decode_prefix_v6(&[]).is_none());
     }
 }

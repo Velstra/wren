@@ -67,6 +67,14 @@ impl Open {
     pub fn supports_four_octet_as(&self) -> bool {
         self.four_octet_as().is_some()
     }
+
+    /// Whether this OPEN advertised the Multiprotocol capability for the given
+    /// `(AFI, SAFI)` address family (RFC 4760 §8).
+    pub fn supports_multiprotocol(&self, afi: u16, safi: u8) -> bool {
+        self.capabilities.iter().any(|c| {
+            matches!(c, Capability::Multiprotocol { afi: a, safi: s } if *a == afi && *s == safi)
+        })
+    }
 }
 
 /// An UPDATE message body (§4.3): withdrawn routes, path attributes and the NLRI
@@ -375,6 +383,17 @@ mod tests {
         let open = Open::new(VERSION, 65001, DEFAULT_HOLD_TIME, ip([10, 0, 0, 1]));
         assert_eq!(open.my_as, 65001);
         assert_eq!(open.effective_as(), 65001);
+        roundtrip(Message::Open(open));
+    }
+
+    #[test]
+    fn open_advertises_and_detects_multiprotocol() {
+        use crate::capability::Capability;
+        use crate::{AFI_IPV6, SAFI_UNICAST};
+        let mut open = Open::new(VERSION, 65001, DEFAULT_HOLD_TIME, ip([10, 0, 0, 1]));
+        open.capabilities.push(Capability::Multiprotocol { afi: AFI_IPV6, safi: SAFI_UNICAST });
+        assert!(open.supports_multiprotocol(AFI_IPV6, SAFI_UNICAST));
+        assert!(!open.supports_multiprotocol(crate::AFI_IPV4, SAFI_UNICAST));
         roundtrip(Message::Open(open));
     }
 

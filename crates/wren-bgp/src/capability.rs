@@ -11,12 +11,23 @@
 /// The Optional Parameter type that carries capabilities (RFC 5492 §4).
 pub const OPT_PARAM_CAPABILITIES: u8 = 2;
 
+/// The Multiprotocol Extensions capability code (RFC 4760 §8).
+pub const CAP_MULTIPROTOCOL: u8 = 1;
+
 /// The 4-octet AS Number capability code (RFC 6793 §4).
 pub const CAP_FOUR_OCTET_AS: u8 = 65;
 
 /// One advertised BGP capability (RFC 5492).
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Capability {
+    /// The Multiprotocol Extensions capability (code 1, RFC 4760 §8): the speaker
+    /// can carry the named `(AFI, SAFI)` address family (e.g. IPv6 unicast).
+    Multiprotocol {
+        /// The Address Family Identifier (e.g. [`crate::AFI_IPV6`]).
+        afi: u16,
+        /// The Subsequent Address Family Identifier (e.g. [`crate::SAFI_UNICAST`]).
+        safi: u8,
+    },
     /// The 4-octet AS Number capability (code 65): the speaker's real AS.
     FourOctetAs(u32),
     /// A capability this implementation does not model, kept verbatim.
@@ -32,6 +43,7 @@ impl Capability {
     /// The on-wire capability code.
     pub fn code(&self) -> u8 {
         match self {
+            Capability::Multiprotocol { .. } => CAP_MULTIPROTOCOL,
             Capability::FourOctetAs(_) => CAP_FOUR_OCTET_AS,
             Capability::Unknown { code, .. } => *code,
         }
@@ -41,6 +53,13 @@ impl Capability {
     fn encode(&self, out: &mut Vec<u8>) {
         out.push(self.code());
         match self {
+            Capability::Multiprotocol { afi, safi } => {
+                // AFI(2) · Reserved(1) · SAFI(1).
+                out.push(4);
+                out.extend_from_slice(&afi.to_be_bytes());
+                out.push(0);
+                out.push(*safi);
+            }
             Capability::FourOctetAs(asn) => {
                 out.push(4);
                 out.extend_from_slice(&asn.to_be_bytes());
@@ -66,6 +85,11 @@ impl Capability {
         }
         let value = &buf[2..end];
         let cap = match code {
+            CAP_MULTIPROTOCOL if value.len() == 4 => Capability::Multiprotocol {
+                afi: u16::from_be_bytes([value[0], value[1]]),
+                // value[2] is Reserved.
+                safi: value[3],
+            },
             CAP_FOUR_OCTET_AS if value.len() == 4 => {
                 Capability::FourOctetAs(u32::from_be_bytes([value[0], value[1], value[2], value[3]]))
             }
@@ -147,10 +171,23 @@ mod tests {
     }
 
     #[test]
+    fn multiprotocol_capability_roundtrips() {
+        use crate::{AFI_IPV6, SAFI_UNICAST};
+        let caps = vec![Capability::Multiprotocol { afi: AFI_IPV6, safi: SAFI_UNICAST }];
+        let opt = encode_optional_parameters(&caps);
+        // type 2, then [cap 1, len 4, AFI hi/lo, reserved 0, SAFI].
+        assert_eq!(opt[0], OPT_PARAM_CAPABILITIES);
+        assert_eq!(opt[2], CAP_MULTIPROTOCOL);
+        assert_eq!(opt[3], 4);
+        assert_eq!(&opt[4..8], &[0x00, 0x02, 0x00, 0x01]);
+        assert_eq!(parse_optional_parameters(&opt), caps);
+    }
+
+    #[test]
     fn unknown_capabilities_are_preserved_alongside_known() {
         let caps = vec![
             Capability::Unknown {
-                code: 1, // multiprotocol, say
+                code: 70, // route-refresh-cisco, say — unmodelled
                 value: vec![0, 1, 0, 1],
             },
             Capability::FourOctetAs(65_536),

@@ -64,7 +64,12 @@ implemented to its RFC.
 
 - OSPF: stub / NSSA areas, type-4 ASBR-summaries across areas, explicit type-5
   forwarding-address resolution, authentication
-- BGP: MP-BGP (RFC 4760), route reflection, connection-collision detection (§6.8)
+- BGP: MP-BGP (RFC 4760) — the **wire codec is in place** (the Multiprotocol
+  Extensions capability advertising an `(AFI, SAFI)` in the OPEN, and the
+  MP_REACH_NLRI / MP_UNREACH_NLRI attributes carrying IPv6-unicast reachability
+  and withdrawals, over an address-family-agnostic NLRI encoder); wiring the
+  session runner to negotiate it and advertise / install IPv6 routes is the next
+  step. Route reflection (RFC 4456), connection-collision detection (§6.8)
 - Babel: ETX costing for lossy links, Route/Seqno-Request handling, prefix
   compression on send, IPv4 routes over the IPv6 transport (`RTA_VIA` next hops),
   source-specific routing
