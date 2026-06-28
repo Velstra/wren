@@ -36,7 +36,7 @@ wren-netlink = { path = "crates/wren-netlink", version = "0.0.1" }
 anyhow = "1"
 thiserror = "1"
 serde = { version = "1", features = ["derive"] }
-toml = "0.8"
+toml = "1.1"
 clap = { version = "4", features = ["derive"] }
 tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "macros", "signal", "sync", "io-util"] }
 tracing = "0.1"
