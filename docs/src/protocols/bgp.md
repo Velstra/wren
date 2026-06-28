@@ -535,6 +535,34 @@ with GTSM off, fails to establish with `ttl-security = 1` (the once-decremented
 packets fall below the minimum), and comes up again with `ttl-security = 2` — GTSM
 admits a peer at the configured distance and rejects only ones beyond it.
 
+## TCP-MD5 authentication (passwords, RFC 2385)
+
+Where GTSM raises the bar for an off-path attacker, a **TCP-MD5 signature** keeps one
+out entirely: each segment carries an MD5 digest of the segment and a shared secret,
+so a peer that does not hold the key cannot forge a segment the kernel will accept —
+not even the SYN. Set a shared `password` on the neighbour (both ends must match):
+
+```toml
+[[bgp.neighbor]]
+address   = "10.0.0.2"
+remote-as = 65002
+password  = "correct horse"     # up to 80 bytes; the peer needs the same key
+```
+
+The key must be on the socket *before* the handshake, since it signs the SYN, so Wren
+installs it with the `TCP_MD5SIG` socket option as the connection is built — on the
+**connector** (the dialled socket, before connecting) and on the **listener** (one
+key per password-protected peer, before `listen`, so inbound SYNs are verified). The
+kernel does the signing and checking; a mismatched or missing key makes the handshake
+fail, so the session never leaves `Idle`. This needs a kernel built with
+`CONFIG_TCP_MD5SIG` (the usual case). `scripts/bgp-password-smoke.sh` exercises it
+live (rootless): two directly-connected eBGP speakers establish with matching
+passwords, and fail to establish both when the passwords differ and when only one
+side sets one.
+
+> TCP-MD5 and GTSM are independent and combine: GTSM cheaply discards far-away
+> packets at the IP layer, while TCP-MD5 authenticates the ones that remain.
+
 ## Route refresh (RFC 2918)
 
 Without route refresh, re-applying an inbound policy means bouncing the session (a

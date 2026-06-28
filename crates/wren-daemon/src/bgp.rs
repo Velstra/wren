@@ -150,6 +150,10 @@ pub struct BgpPeerCfg {
     /// connected). When set the session sends with TTL 255 and rejects received
     /// packets whose TTL is below `255 − (hops − 1)`.
     pub ttl_security: Option<u8>,
+    /// TCP-MD5 signature password (RFC 2385) for this peer, if authentication is
+    /// enabled. Installed on the socket before the handshake so the kernel signs and
+    /// verifies every segment; the peer must share the same key.
+    pub password: Option<String>,
 }
 
 /// The shared, read-only facts every session task needs.
@@ -554,8 +558,16 @@ pub async fn run(
     let (tx, mut rx) = mpsc::channel::<PeerMsg>(PEER_QUEUE);
 
     // A listener for inbound connections (passive peers, and the peer that wins a
-    // simultaneous-open race). Port 179 needs CAP_NET_BIND_SERVICE.
-    match TcpListener::bind((Ipv4Addr::UNSPECIFIED, PORT)).await {
+    // simultaneous-open race). Port 179 needs CAP_NET_BIND_SERVICE. When any peer has
+    // a TCP-MD5 password we build the socket by hand to install each peer's key
+    // (`TCP_MD5SIG`) before listening, so the kernel verifies the signature on their
+    // inbound SYNs; otherwise the ordinary async bind is used unchanged.
+    let bound = if cfg.peers.iter().any(|p| p.password.is_some()) {
+        bind_listener_md5(&cfg.peers)
+    } else {
+        TcpListener::bind((Ipv4Addr::UNSPECIFIED, PORT)).await
+    };
+    match bound {
         Ok(listener) => {
             info!(port = PORT, "BGP listening");
             let local = local.clone();
@@ -577,9 +589,10 @@ pub async fn run(
             peer_type: classify(cfg.local_as, &members, peer.remote_as),
             ttl_security: peer.ttl_security,
         };
+        let password = peer.password.clone();
         let local = local.clone();
         let tx = tx.clone();
-        tokio::spawn(async move { connector(info, local, tx).await });
+        tokio::spawn(async move { connector(info, password, local, tx).await });
     }
     // Drop our own sender; the listener and connectors keep theirs, so `rx` stays
     // open for the life of the daemon.
@@ -1232,9 +1245,22 @@ fn should_advertise(communities: &[u32], to_type: PeerType) -> bool {
 }
 
 /// Actively dial a peer, run the session, and retry on failure.
-async fn connector(peer: PeerInfo, local: Arc<Local>, tx: mpsc::Sender<PeerMsg>) {
+async fn connector(
+    peer: PeerInfo,
+    password: Option<String>,
+    local: Arc<Local>,
+    tx: mpsc::Sender<PeerMsg>,
+) {
     loop {
-        match timeout(CONNECT_TIMEOUT, TcpStream::connect((peer.addr, PORT))).await {
+        // A TCP-MD5 peer needs its key installed on the socket before the handshake,
+        // so it gets a hand-built connect; an ordinary peer uses tokio's connect.
+        let dial = async {
+            match &password {
+                Some(pw) => connect_md5(peer.addr, pw).await,
+                None => TcpStream::connect((peer.addr, PORT)).await,
+            }
+        };
+        match timeout(CONNECT_TIMEOUT, dial).await {
             Ok(Ok(stream)) => {
                 if let Err(e) = drive_session(stream, peer, &local, &tx, false).await {
                     debug!(peer = %peer.addr, error = %e, "BGP session ended");
@@ -1277,6 +1303,180 @@ async fn accept_loop(listener: TcpListener, local: Arc<Local>, tx: mpsc::Sender<
             Err(e) => warn!(error = %e, "BGP accept error"),
         }
     }
+}
+
+/// Linux `struct tcp_md5sig` (the argument to the `TCP_MD5SIG` setsockopt). The libc
+/// crate exposes the `TCP_MD5SIG` constant but not this struct on glibc, so we mirror
+/// `<linux/tcp.h>` here. `tcpm_key` is `TCP_MD5SIG_MAXKEYLEN` (80) bytes; the field
+/// after `tcpm_keylen` is zero padding when no flags are set.
+#[repr(C)]
+struct TcpMd5Sig {
+    tcpm_addr: libc::sockaddr_storage,
+    tcpm_flags: u8,
+    tcpm_prefixlen: u8,
+    tcpm_keylen: u16,
+    tcpm_ifindex: u32,
+    tcpm_key: [u8; 80],
+}
+
+/// A `sockaddr_in` for `addr:port` in network byte order.
+fn sockaddr_in_v4(addr: Ipv4Addr, port: u16) -> libc::sockaddr_in {
+    libc::sockaddr_in {
+        sin_family: libc::AF_INET as libc::sa_family_t,
+        sin_port: port.to_be(),
+        sin_addr: libc::in_addr { s_addr: u32::from(addr).to_be() },
+        sin_zero: [0; 8],
+    }
+}
+
+/// Install a TCP-MD5 signature key (RFC 2385) for `peer` on socket `fd`. Set before
+/// the handshake, the kernel then signs every segment to that peer and rejects any
+/// inbound segment from it whose signature does not match the shared `password`. The
+/// key is at most `TCP_MD5SIG_MAXKEYLEN` (80) bytes.
+fn set_tcp_md5(fd: i32, peer: Ipv4Addr, password: &str) -> std::io::Result<()> {
+    let key = password.as_bytes();
+    if key.len() > 80 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "TCP-MD5 password exceeds 80 bytes",
+        ));
+    }
+    let mut sig: TcpMd5Sig = unsafe { std::mem::zeroed() };
+    let sin = sockaddr_in_v4(peer, 0);
+    // Copy the sockaddr_in into the (larger) sockaddr_storage field.
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            std::ptr::addr_of!(sin) as *const u8,
+            std::ptr::addr_of_mut!(sig.tcpm_addr) as *mut u8,
+            std::mem::size_of::<libc::sockaddr_in>(),
+        );
+    }
+    sig.tcpm_keylen = key.len() as u16;
+    sig.tcpm_key[..key.len()].copy_from_slice(key);
+    let rc = unsafe {
+        libc::setsockopt(
+            fd,
+            libc::IPPROTO_TCP,
+            libc::TCP_MD5SIG,
+            std::ptr::addr_of!(sig) as *const libc::c_void,
+            std::mem::size_of::<TcpMd5Sig>() as libc::socklen_t,
+        )
+    };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// Put `fd` into non-blocking mode, so a connect can be driven by tokio's reactor.
+fn set_nonblocking(fd: i32) -> std::io::Result<()> {
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    if unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// Connect to a peer that requires a TCP-MD5 password. tokio's `TcpStream::connect`
+/// hands back an already-connected socket — too late to install the key, which must
+/// cover the SYN — so we build the socket by hand: install the key, start a
+/// non-blocking connect, then drive it to completion through tokio. IPv4 only here.
+async fn connect_md5(peer: Ipv4Addr, password: &str) -> std::io::Result<TcpStream> {
+    use std::os::fd::FromRawFd;
+    let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0) };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // Until the fd is handed to a std stream below, close it ourselves on any error.
+    let prepared = (|| -> std::io::Result<()> {
+        set_tcp_md5(fd, peer, password)?;
+        set_nonblocking(fd)?;
+        let sin = sockaddr_in_v4(peer, PORT);
+        let rc = unsafe {
+            libc::connect(
+                fd,
+                std::ptr::addr_of!(sin) as *const libc::sockaddr,
+                std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+            )
+        };
+        if rc != 0 {
+            let e = std::io::Error::last_os_error();
+            // A non-blocking connect reports "in progress"; anything else is fatal.
+            if e.raw_os_error() != Some(libc::EINPROGRESS) {
+                return Err(e);
+            }
+        }
+        Ok(())
+    })();
+    if let Err(e) = prepared {
+        unsafe { libc::close(fd) };
+        return Err(e);
+    }
+    // From here the std stream owns the fd and closes it on drop.
+    let std_stream = unsafe { std::net::TcpStream::from_raw_fd(fd) };
+    let stream = TcpStream::from_std(std_stream)?;
+    stream.writable().await?; // resolves when the connect completes (or fails)
+    if let Some(e) = stream.take_error()? {
+        return Err(e);
+    }
+    Ok(stream)
+}
+
+/// Bind the BGP listener by hand so each password-protected peer's TCP-MD5 key is
+/// installed (`TCP_MD5SIG`) before `listen`, letting the kernel verify the signature
+/// on that peer's inbound connections. IPv4, port 179 on every address — the same
+/// bind tokio's `TcpListener::bind` does, with the keys added.
+fn bind_listener_md5(peers: &[BgpPeerCfg]) -> std::io::Result<TcpListener> {
+    use std::os::fd::FromRawFd;
+    let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0) };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let prepared = (|| -> std::io::Result<()> {
+        let one: i32 = 1;
+        let rc = unsafe {
+            libc::setsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                libc::SO_REUSEADDR,
+                std::ptr::addr_of!(one) as *const libc::c_void,
+                std::mem::size_of::<i32>() as libc::socklen_t,
+            )
+        };
+        if rc != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        for p in peers {
+            if let Some(pw) = &p.password {
+                set_tcp_md5(fd, p.addr, pw)?;
+            }
+        }
+        let sin = sockaddr_in_v4(Ipv4Addr::UNSPECIFIED, PORT);
+        if unsafe {
+            libc::bind(
+                fd,
+                std::ptr::addr_of!(sin) as *const libc::sockaddr,
+                std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+            )
+        } < 0
+        {
+            return Err(std::io::Error::last_os_error());
+        }
+        if unsafe { libc::listen(fd, 1024) } < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        set_nonblocking(fd)?;
+        Ok(())
+    })();
+    if let Err(e) = prepared {
+        unsafe { libc::close(fd) };
+        return Err(e);
+    }
+    let std_listener = unsafe { std::net::TcpListener::from_raw_fd(fd) };
+    TcpListener::from_std(std_listener)
 }
 
 /// Apply the Generalized TTL Security Mechanism (GTSM, RFC 5082) to a peer's TCP

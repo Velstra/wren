@@ -710,12 +710,20 @@ fn build_bgp_config(cfg: &wren_config::Config, bgp: &wren_config::Bgp) -> Result
             .address
             .parse()
             .with_context(|| format!("bgp neighbor address {:?} must be IPv4", n.address))?;
+        if let Some(pw) = &n.password {
+            if pw.is_empty() || pw.len() > 80 {
+                anyhow::bail!(
+                    "bgp neighbor {addr} password must be 1..=80 bytes (TCP-MD5, RFC 2385)"
+                );
+            }
+        }
         peers.push(bgp::BgpPeerCfg {
             addr,
             remote_as: n.remote_as,
             passive: n.passive,
             rr_client: n.route_reflector_client,
             ttl_security: n.ttl_security,
+            password: n.password.clone(),
         });
     }
 

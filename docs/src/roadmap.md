@@ -197,7 +197,10 @@ tracked but not yet scheduled, grouped by area:
 - **Security:** **TTL security (GTSM, RFC 5082) is done** — a per-neighbour
   `ttl-security = <hops>` makes a BGP session send with TTL 255 and reject received
   packets below `255 − (hops − 1)`, so a peer further than `hops` away cannot inject
-  into it. Still open: TCP-AO (RFC 5925), BGPsec (RFC 8205).
+  into it. **TCP-MD5 authentication (RFC 2385) is done too** — a per-neighbour
+  `password` installs a `TCP_MD5SIG` key on the connector and the listener, so the
+  kernel signs and verifies every segment and an unkeyed peer cannot even complete
+  the handshake. Still open: TCP-AO (RFC 5925), BGPsec (RFC 8205).
 - **Management:** YANG models, NETCONF, RESTCONF, gNMI.
 
 ## Testing

@@ -393,6 +393,13 @@ pub struct BgpNeighbor {
     /// `hops` away cannot inject into the session. Unset disables GTSM.
     #[serde(rename = "ttl-security")]
     pub ttl_security: Option<u8>,
+    /// A TCP-MD5 signature password (RFC 2385) for this peer's session. When set, Wren
+    /// installs the key on the connection (via `TCP_MD5SIG`) so the kernel signs every
+    /// segment it sends and rejects any received segment whose signature does not
+    /// match — a spoofed packet without the shared key cannot disturb the session. The
+    /// peer must be configured with the same password. Up to 80 bytes. Unset disables
+    /// authentication.
+    pub password: Option<String>,
 }
 
 /// Babel protocol configuration (`[babel]`, RFC 8966).
@@ -745,6 +752,25 @@ mod tests {
         .expect("valid config");
         let bgp = cfg.bgp.expect("bgp present");
         assert_eq!(bgp.neighbor[0].ttl_security, Some(1));
+    }
+
+    #[test]
+    fn parses_bgp_password() {
+        let cfg = Config::from_toml(
+            r#"
+            router-id = "10.0.0.1"
+            [bgp]
+            enabled = true
+            local-as = 65001
+            [[bgp.neighbor]]
+            address = "10.0.0.2"
+            remote-as = 65002
+            password = "s3cr3t"
+            "#,
+        )
+        .expect("valid config");
+        let bgp = cfg.bgp.expect("bgp present");
+        assert_eq!(bgp.neighbor[0].password.as_deref(), Some("s3cr3t"));
     }
 
     #[test]
