@@ -1,0 +1,12 @@
+[package]
+name = "wren-babel"
+description = "Babel (RFC 8966): packet/TLV wire codec, route table and feasibility logic."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+wren-core.workspace = true
