@@ -197,7 +197,8 @@ tracked but not yet scheduled, grouped by area:
 - **Data-plane & overlays:** MPLS, SR-MPLS, SRv6, VXLAN, BFD (RFC 5880),
   MLAG, anycast gateway, dual-stack.
 - **Forwarding & policy:** VRFs, policy-based routing, route maps, prefix lists,
-  route policies, prefix limits, max-AS-path.
+  route policies, max-AS-path. (Per-neighbour BGP `max-prefix` prefix-limiting with a
+  Cease teardown (RFC 4486) is **done**.)
 - **Security:** **TTL security (GTSM, RFC 5082) is done** — a per-neighbour
   `ttl-security = <hops>` makes a BGP session send with TTL 255 and reject received
   packets below `255 − (hops − 1)`, so a peer further than `hops` away cannot inject

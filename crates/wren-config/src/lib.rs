@@ -425,6 +425,11 @@ pub struct BgpNeighbor {
     /// two peers must configure the same value. Defaults to 100. Ignored without `ao-key`.
     #[serde(rename = "ao-key-id")]
     pub ao_key_id: Option<u8>,
+    /// The maximum number of prefixes to accept from this peer (RFC 4486 §4). When the
+    /// peer advertises more, Wren tears the session down with a Cease "Maximum Number of
+    /// Prefixes Reached" and keeps it down. Unset (or 0) means no limit.
+    #[serde(rename = "max-prefix")]
+    pub max_prefix: Option<u32>,
 }
 
 /// Babel protocol configuration (`[babel]`, RFC 8966).
@@ -817,6 +822,25 @@ mod tests {
         let bgp = cfg.bgp.expect("bgp present");
         assert_eq!(bgp.neighbor[0].ao_key.as_deref(), Some("aosecret"));
         assert_eq!(bgp.neighbor[0].ao_key_id, Some(42));
+    }
+
+    #[test]
+    fn parses_bgp_max_prefix() {
+        let cfg = Config::from_toml(
+            r#"
+            router-id = "10.0.0.1"
+            [bgp]
+            enabled = true
+            local-as = 65001
+            [[bgp.neighbor]]
+            address = "10.0.0.2"
+            remote-as = 65002
+            max-prefix = 1000
+            "#,
+        )
+        .expect("valid config");
+        let bgp = cfg.bgp.expect("bgp present");
+        assert_eq!(bgp.neighbor[0].max_prefix, Some(1000));
     }
 
     #[test]

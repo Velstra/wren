@@ -62,6 +62,9 @@ const FAR: Duration = Duration::from_secs(86_400);
 /// Cease NOTIFICATION subcode 7, "Connection Collision Resolution" (RFC 4486 §4) —
 /// sent to the connection that loses §6.8 collision detection.
 const CEASE_COLLISION: u8 = 7;
+/// Cease NOTIFICATION subcode 1, "Maximum Number of Prefixes Reached" (RFC 4486 §4) —
+/// sent when a peer advertises more prefixes than its configured `max-prefix` limit.
+const CEASE_MAXPREFIX: u8 = 1;
 
 /// A process-wide monotonic source of per-connection ids. Two connections to the
 /// same peer (a simultaneous open) share a peer address but get distinct ids, so
@@ -159,6 +162,9 @@ pub struct BgpPeerCfg {
     pub ao_key: Option<String>,
     /// The TCP-AO key id (SendID and RecvID), meaningful only with [`Self::ao_key`].
     pub ao_key_id: u8,
+    /// The maximum number of prefixes to accept from this peer before tearing the
+    /// session down with a Cease (RFC 4486 §4). `None` means no limit.
+    pub max_prefix: Option<u32>,
 }
 
 impl BgpPeerCfg {
@@ -234,6 +240,8 @@ struct PeerProps {
     peer_type: PeerType,
     /// GTSM (RFC 5082) max hop count for this peer, applied to inbound connections.
     ttl_security: Option<u8>,
+    /// The peer's `max-prefix` limit (RFC 4486 §4), if any.
+    max_prefix: Option<u32>,
 }
 
 /// One prefix this speaker originates, with the COMMUNITIES to attach. The central
@@ -270,6 +278,10 @@ enum SessionCmd {
     /// Lose §6.8 collision detection: close this connection with a Cease, without
     /// reporting Down — the winning connection owns the peer's slot.
     Shutdown,
+    /// The peer exceeded its `max-prefix` limit: close the connection with a Cease
+    /// "Maximum Number of Prefixes Reached" (RFC 4486 §4), without reporting Down —
+    /// the central task has already withdrawn the peer's routes and damped it.
+    CeaseOverLimit,
     /// Send a ROUTE-REFRESH to the peer (RFC 2918), asking it to re-advertise its
     /// routes to us — triggered by the operator's `bgp refresh <peer>`.
     SendRefresh,
@@ -575,6 +587,10 @@ pub async fn run(
     // The routes currently retained as stale per restarting peer, with the deadline
     // by which the peer must return (its Restart Timer).
     let mut stale: HashMap<Ipv4Addr, StalePeer> = HashMap::new();
+    // Peers that exceeded their max-prefix limit (RFC 4486 §4): their session is torn
+    // down and kept down — any reconnection is shut down again and their UPDATEs are
+    // ignored — until the daemon is reconfigured (no auto-restart timer yet).
+    let mut damped: HashSet<Ipv4Addr> = HashSet::new();
 
     let members = cfg.confederation_members.clone();
     let local = Arc::new(Local {
@@ -595,6 +611,7 @@ pub async fn run(
                         rr_client: p.rr_client,
                         peer_type: classify(cfg.local_as, &members, p.remote_as),
                         ttl_security: p.ttl_security,
+                        max_prefix: p.max_prefix,
                     },
                 )
             })
@@ -697,6 +714,13 @@ pub async fn run(
         };
         match msg {
             PeerMsg::Established { peer: p, peer_id, inbound, conn_id, gr_restart_time, cmd_tx } => {
+                // A peer damped for exceeding its max-prefix limit is kept down: shut
+                // any reconnection straight back down without advertising to it.
+                if damped.contains(&p) {
+                    debug!(peer = %p, "BGP peer is max-prefix damped; closing reconnection");
+                    let _ = cmd_tx.send(SessionCmd::CeaseOverLimit).await;
+                    continue;
+                }
                 // §6.8 connection-collision detection: if a session already exists
                 // for this peer, two connections raced to Established. Keep the one
                 // opened by the speaker with the higher BGP Identifier (RFC 4271
@@ -857,6 +881,11 @@ pub async fn run(
                 ingress_iface,
                 update,
             } => {
+                // A max-prefix-damped peer is kept out of the RIB entirely, so even a
+                // reconnection that re-floods its routes installs nothing.
+                if damped.contains(&peer) {
+                    continue;
+                }
                 let facts = PeerFacts {
                     addr: peer,
                     as_: peer_as,
@@ -898,6 +927,36 @@ pub async fn run(
                 if is_reflection_loop(&update, local.router_id, local.cluster_id) {
                     debug!(peer = %peer, "BGP UPDATE failed reflection loop check; reachability ignored");
                     continue;
+                }
+                // Max-prefix enforcement (RFC 4486 §4), checked BEFORE installing this
+                // update's reachability: if accepting it would push the peer over its
+                // limit, withdraw whatever it already had, tear the session down with a
+                // Cease, and damp it — without ever installing the over-limit routes
+                // (installing then immediately deleting the same prefix races the kernel
+                // and can leave the route behind).
+                if let Some(limit) = local.peers.get(&peer).and_then(|pp| pp.max_prefix) {
+                    let mut prospective: HashSet<Prefix> =
+                        rib.prefixes_from(peer).into_iter().collect();
+                    prospective.extend(update.nlri.iter().copied());
+                    if let Some((_, nlri, _)) = mp_reach_v6(&update) {
+                        prospective.extend(nlri.iter().copied());
+                    }
+                    if prospective.len() as u32 > limit {
+                        warn!(peer = %peer, count = prospective.len(), limit, "BGP peer exceeded max-prefix; tearing down");
+                        for ev in rib.withdraw_peer(peer) {
+                            apply_event(ev, &updates, &sessions).await;
+                        }
+                        if let Some(cmd_tx) = sessions.remove(&peer) {
+                            let _ = cmd_tx.send(SessionCmd::CeaseOverLimit).await;
+                        }
+                        if let Some(n) = neighbors.get_mut(&peer) {
+                            n.established = false;
+                        }
+                        est_inbound.remove(&peer);
+                        current_conn.remove(&peer);
+                        damped.insert(peer);
+                        continue;
+                    }
                 }
                 // IPv4 reachability: base NLRI with the IPv4 NEXT_HOP attribute.
                 if !update.nlri.is_empty() {
@@ -1847,6 +1906,19 @@ async fn drive_session(
                     .send(&Message::Notification(Notification {
                         code: CODE_CEASE,
                         subcode: CEASE_COLLISION,
+                        data: vec![],
+                    }))
+                    .await;
+                return Ok(());
+            }
+            Step::Cmd(SessionCmd::CeaseOverLimit) => {
+                // The peer blew its max-prefix limit: send a Cease "Maximum Number of
+                // Prefixes Reached" and close. Like Shutdown we do NOT report Down —
+                // the central task already withdrew this peer's routes and damped it.
+                let _ = sess
+                    .send(&Message::Notification(Notification {
+                        code: CODE_CEASE,
+                        subcode: CEASE_MAXPREFIX,
                         data: vec![],
                     }))
                     .await;

@@ -589,6 +589,30 @@ kernel with `CONFIG_TCP_AO` (Linux 5.18+). `scripts/bgp-tcp-ao-smoke.sh` exercis
 live (rootless): two directly-connected eBGP speakers establish with matching keys, and
 fail to establish both when the keys differ and when only one side sets one.
 
+## Maximum-prefix limit (RFC 4486)
+
+A misconfigured or hostile peer can flood the RIB by advertising far more routes than
+it should. A per-neighbour `max-prefix` caps how many prefixes Wren accepts from it;
+once the peer would exceed the cap, Wren tears the session down with a Cease
+"Maximum Number of Prefixes Reached" (RFC 4486 §4) and keeps it down:
+
+```toml
+[[bgp.neighbor]]
+address    = "10.0.0.2"
+remote-as  = 65002
+max-prefix = 100000     # accept at most 100000 prefixes from this peer
+```
+
+The limit is checked *before* the over-limit routes are installed, so they never reach
+the kernel even transiently. When it trips, Wren withdraws whatever the peer had
+already advertised, sends the Cease, and **damps** the peer: any reconnection is shut
+straight back down and its UPDATEs are ignored, so a flapping peer cannot keep
+re-flooding. The session stays down until the daemon is reconfigured (there is no
+auto-restart timer yet). `scripts/bgp-max-prefix-smoke.sh` exercises it live
+(rootless): a peer originating three networks is accepted under a limit of 10 and
+installed, then — under a limit of 2 — trips the limit, and the neighbour is left
+`Idle` with none of its routes in the table.
+
 ## Route refresh (RFC 2918)
 
 Without route refresh, re-applying an inbound policy means bouncing the session (a
