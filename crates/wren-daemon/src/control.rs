@@ -19,6 +19,7 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{mpsc, oneshot};
 use tracing::{info, warn};
 
+use crate::babel::{BabelQuery, BabelQueryRequest};
 use crate::bgp::{BgpQuery, BgpQueryRequest};
 use crate::isis::{IsisQuery, IsisQueryRequest};
 use crate::ospf::{OspfQuery, OspfQueryRequest};
@@ -37,6 +38,8 @@ pub struct Channels {
     pub ospf: Option<mpsc::Sender<OspfQueryRequest>>,
     /// To the IS-IS task (`show isis`), if IS-IS is running.
     pub isis: Option<mpsc::Sender<IsisQueryRequest>>,
+    /// To the Babel task (`show babel`), if Babel is running.
+    pub babel: Option<mpsc::Sender<BabelQueryRequest>>,
 }
 
 /// Serve the control socket at `path`, forwarding queries to the owning tasks.
@@ -94,13 +97,19 @@ async fn handle_conn(stream: UnixStream, channels: Channels) -> Result<()> {
             Some(isis) => ask_isis(isis, query).await,
             None => "isis is not enabled\n".to_string(),
         }
+    } else if let Some(query) = parse_babel_query(line) {
+        match &channels.babel {
+            Some(babel) => ask_babel(babel, query).await,
+            None => "babel is not enabled\n".to_string(),
+        }
     } else if let Some(query) = parse_query(line) {
         ask_router(&channels.router, query).await
     } else {
         format!(
             "error: unknown command {line:?}\n\
              usage: show routes [protocol] | show bgp [routes|neighbors] | \
-             show ospf [neighbors|interfaces] | show isis [neighbors|interfaces]\n"
+             show ospf [neighbors|interfaces] | show isis [neighbors|interfaces] | \
+             show babel [neighbors]\n"
         )
     };
 
@@ -150,6 +159,16 @@ async fn ask_isis(queries: &mpsc::Sender<IsisQueryRequest>, query: IsisQuery) ->
     }
     rx.await
         .unwrap_or_else(|_| "error: isis unavailable\n".to_string())
+}
+
+/// Forward a Babel query and await its rendered answer.
+async fn ask_babel(queries: &mpsc::Sender<BabelQueryRequest>, query: BabelQuery) -> String {
+    let (tx, rx) = oneshot::channel();
+    if queries.send(BabelQueryRequest { query, respond: tx }).await.is_err() {
+        return "error: babel unavailable\n".to_string();
+    }
+    rx.await
+        .unwrap_or_else(|_| "error: babel unavailable\n".to_string())
 }
 
 /// Parse one control command line into a [`Query`]. Returns `None` for anything
@@ -228,6 +247,24 @@ pub fn parse_isis_query(line: &str) -> Option<IsisQuery> {
             IsisQuery::Neighbors
         }
         Some("interfaces") | Some("interface") | Some("iface") => IsisQuery::Interfaces,
+        Some(_) => return None,
+    };
+    // A trailing extra token is a malformed command.
+    if tokens.next().is_some() {
+        return None;
+    }
+    Some(query)
+}
+
+/// Parse a `show babel [neighbors]` command into a [`BabelQuery`]. A bare
+/// `show babel` defaults to the neighbours view. Returns `None` for anything else.
+pub fn parse_babel_query(line: &str) -> Option<BabelQuery> {
+    let mut tokens = line.split_whitespace();
+    if tokens.next()? != "show" || tokens.next()? != "babel" {
+        return None;
+    }
+    let query = match tokens.next() {
+        None | Some("neighbors") | Some("neighbours") => BabelQuery::Neighbors,
         Some(_) => return None,
     };
     // A trailing extra token is a malformed command.
@@ -339,5 +376,20 @@ mod tests {
         assert!(parse_isis_query("show isis nonsense").is_none());
         assert!(parse_isis_query("show isis neighbors extra").is_none());
         assert!(parse_isis_query("").is_none());
+    }
+
+    #[test]
+    fn parse_babel_query_understands_show_babel() {
+        assert_eq!(parse_babel_query("show babel"), Some(BabelQuery::Neighbors));
+        assert_eq!(parse_babel_query("show babel neighbors"), Some(BabelQuery::Neighbors));
+        assert_eq!(parse_babel_query("show babel neighbours"), Some(BabelQuery::Neighbors));
+    }
+
+    #[test]
+    fn parse_babel_query_rejects_others() {
+        assert!(parse_babel_query("show isis").is_none()); // isis query, not babel
+        assert!(parse_babel_query("show babel nonsense").is_none());
+        assert!(parse_babel_query("show babel neighbors extra").is_none());
+        assert!(parse_babel_query("").is_none());
     }
 }

@@ -200,6 +200,9 @@ async fn main() -> Result<()> {
     let (isis_queries_tx, isis_queries_rx) = mpsc::channel(QUERY_QUEUE);
     let mut isis_queries_rx = Some(isis_queries_rx);
     let isis_enabled = cfg.isis.as_ref().is_some_and(|i| i.enabled);
+    let (babel_queries_tx, babel_queries_rx) = mpsc::channel(QUERY_QUEUE);
+    let mut babel_queries_rx = Some(babel_queries_rx);
+    let babel_enabled = cfg.babel.as_ref().is_some_and(|b| b.enabled);
     {
         let socket = args.socket.clone();
         let channels = control::Channels {
@@ -207,6 +210,7 @@ async fn main() -> Result<()> {
             bgp: bgp_enabled.then(|| bgp_queries_tx.clone()),
             ospf: ospf_enabled.then(|| ospf_queries_tx.clone()),
             isis: isis_enabled.then(|| isis_queries_tx.clone()),
+            babel: babel_enabled.then(|| babel_queries_tx.clone()),
         };
         tokio::spawn(async move {
             if let Err(e) = control::serve(socket, channels).await {
@@ -404,8 +408,9 @@ async fn main() -> Result<()> {
                     Err(e) => error!(error = %e, "Babel redistribution not configured"),
                 }
                 let tx = updates_tx.clone();
+                let qrx = babel_queries_rx.take().expect("babel queries rx taken once");
                 tokio::spawn(async move {
-                    if let Err(e) = babel::run(run_cfg, tx, redist_rx).await {
+                    if let Err(e) = babel::run(run_cfg, tx, redist_rx, qrx).await {
                         error!(error = %e, "Babel engine stopped");
                     }
                 });

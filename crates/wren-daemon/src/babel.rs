@@ -34,9 +34,11 @@ use std::ptr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use std::fmt::Write as _;
+
 use anyhow::{Context, Result};
 use tokio::net::UdpSocket;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tokio::time::MissedTickBehavior;
 use tracing::{debug, info, warn};
 
@@ -132,10 +134,69 @@ struct State {
 /// redistribution; Babel originates each (under our Router-ID, at
 /// `cfg.redistribute_metric`) and retracts it (metric infinity) when its best
 /// path goes away. Babel is dual-stack, so both IPv4 and IPv6 routes are carried.
+/// A `show babel …` query, answered by the Babel task itself out of the state it
+/// owns (its neighbour table with the Hello/IHU link costs).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum BabelQuery {
+    /// The neighbours and their link costs.
+    Neighbors,
+}
+
+/// A control-socket query plus the channel to answer it on.
+pub struct BabelQueryRequest {
+    /// What to report.
+    pub query: BabelQuery,
+    /// Where to send the rendered answer.
+    pub respond: oneshot::Sender<String>,
+}
+
+/// One neighbour, snapshotted for the (pure) renderer.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct BabelNeighborInfo {
+    /// The neighbour's address (its link-local on the shared link).
+    pub addr: IpAddr,
+    /// The receive cost the neighbour reported to us (IHU, §3.4.3).
+    pub rxcost: u16,
+    /// The link cost we use towards the neighbour (§3.4.3).
+    pub cost: u16,
+}
+
+/// Render the Babel neighbours, one per line (à la `show babel neighbour`).
+pub fn render_babel_neighbors(neighbors: &[BabelNeighborInfo]) -> String {
+    if neighbors.is_empty() {
+        return "no babel neighbours\n".to_string();
+    }
+    let mut out = String::new();
+    for n in neighbors {
+        let cost = if n.cost == METRIC_INFINITY {
+            "inf".to_string()
+        } else {
+            n.cost.to_string()
+        };
+        let _ = writeln!(out, "{} rxcost {} cost {}", n.addr, n.rxcost, cost);
+    }
+    out
+}
+
+/// Snapshot every neighbour and its link costs, for `show babel neighbors`.
+fn neighbor_infos(neighbours: &NeighbourTable) -> Vec<BabelNeighborInfo> {
+    let mut addrs = neighbours.addresses();
+    addrs.sort();
+    addrs
+        .into_iter()
+        .map(|addr| BabelNeighborInfo {
+            addr,
+            rxcost: neighbours.rxcost(&addr),
+            cost: neighbours.cost(&addr),
+        })
+        .collect()
+}
+
 pub async fn run(
     cfg: BabelConfig,
     updates: mpsc::Sender<RouteUpdate>,
     mut redist: mpsc::Receiver<Redistribution>,
+    mut queries: mpsc::Receiver<BabelQueryRequest>,
 ) -> Result<()> {
     let mut ifaces = Vec::with_capacity(cfg.interfaces.len());
     for name in &cfg.interfaces {
@@ -247,6 +308,12 @@ pub async fn run(
                     // A redistributed route changed — flush a triggered Update.
                     send_updates(&mut state, &ifaces).await;
                 }
+            }
+            Some(req) = queries.recv() => {
+                let answer = match req.query {
+                    BabelQuery::Neighbors => render_babel_neighbors(&neighbor_infos(&state.neighbours)),
+                };
+                let _ = req.respond.send(answer);
             }
         }
     }

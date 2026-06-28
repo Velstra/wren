@@ -271,8 +271,9 @@ Platform / core:
   LOCAL_PREF, origin) and neighbour states, `wren show ospf [neighbors|interfaces]`
   renders the OSPF adjacencies and interfaces (area, state, elected DR/BDR), and
   `wren show isis [neighbors|interfaces]` renders the IS-IS per-level adjacencies
-  and circuits (type, level, elected DIS), each answered by the task that owns the
-  data; more commands and a richer API to come
+  and circuits (type, level, elected DIS), and `wren show babel neighbors` renders
+  the Babel neighbours and their link costs, each answered by the task that owns
+  the data; more commands and a richer API to come
 - [~] **Startup reconciliation** — the kernel backend reads the routing table back
   on boot and removes routes a previous instance left behind that the current
   config no longer programs; full graceful restart is still to come
@@ -299,6 +300,7 @@ sudo ./target/release/wren --config ./examples/wren.toml --backend kernel
 ./target/release/wren show ospf interfaces # OSPF interfaces, area and elected DR/BDR
 ./target/release/wren show isis neighbors  # IS-IS per-level adjacencies and their state
 ./target/release/wren show isis interfaces # IS-IS circuits, level and elected DIS
+./target/release/wren show babel neighbors # Babel neighbours and their link costs
 
 # Try it unprivileged in a throwaway network namespace:
 unshare -Urn sh -c '

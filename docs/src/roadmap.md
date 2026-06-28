@@ -107,10 +107,11 @@ implemented to its RFC.
   ospf [neighbors|interfaces]` renders the OSPF adjacencies (Router ID, address,
   state) and interfaces (area, state, elected DR/BDR), and `wren show isis
   [neighbors|interfaces]` renders the IS-IS adjacencies (System ID, SNPA, per-level
-  state) and circuits (type, level, elected DIS). Each query is answered by
-  the task that owns the data (the router loop / the BGP / OSPF / IS-IS task),
-  with no shared access. More commands (other per-protocol neighbour/interface
-  views) and a richer API are to come.
+  state) and circuits (type, level, elected DIS), and `wren show babel neighbors`
+  renders the Babel neighbours and their Hello/IHU link costs. Each query is
+  answered by the task that owns the data (the router loop / the BGP / OSPF / IS-IS
+  / Babel task), with no shared access. More commands (other per-protocol
+  neighbour/interface views) and a richer API are to come.
 - [~] **Startup reconciliation** — on boot the kernel backend reads the routing
   table back (`RTM_GETROUTE` dump) and removes routes a previous wren instance
   left behind that the current config no longer programs, so a restart never
