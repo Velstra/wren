@@ -371,7 +371,7 @@ async fn main() -> Result<()> {
 
     // Spawn the BGP-4 engine if it is configured.
     if let Some(bgpcfg) = cfg.bgp.as_ref().filter(|b| b.enabled) {
-        match build_bgp_config(&cfg, bgpcfg) {
+        match build_bgp_config(&cfg, bgpcfg, &by_name) {
             Ok(run_cfg) => {
                 if backend == Backend::Memory {
                     warn!("BGP is enabled but the backend is in-memory — learned routes will not be installed in the kernel");
@@ -730,7 +730,11 @@ fn build_ospf3_config(
 /// Resolve the textual `[bgp]` config into the runner's [`bgp::BgpConfig`],
 /// parsing the local AS (required), the Router ID (from `[bgp]` or the top-level),
 /// the peers and the originated networks.
-fn build_bgp_config(cfg: &wren_config::Config, bgp: &wren_config::Bgp) -> Result<bgp::BgpConfig> {
+fn build_bgp_config(
+    cfg: &wren_config::Config,
+    bgp: &wren_config::Bgp,
+    by_name: &std::collections::HashMap<String, Filter>,
+) -> Result<bgp::BgpConfig> {
     if bgp.local_as == 0 {
         anyhow::bail!("bgp needs a non-zero `local-as`");
     }
@@ -766,6 +770,10 @@ fn build_bgp_config(cfg: &wren_config::Config, bgp: &wren_config::Bgp) -> Result
                 "bgp neighbor {addr} cannot use both password (TCP-MD5) and ao-key (TCP-AO)"
             );
         }
+        let import = match &n.import {
+            Some(name) => Some(named_filter(by_name, name, "bgp neighbor import")?),
+            None => None,
+        };
         peers.push(bgp::BgpPeerCfg {
             addr,
             remote_as: n.remote_as,
@@ -777,6 +785,7 @@ fn build_bgp_config(cfg: &wren_config::Config, bgp: &wren_config::Bgp) -> Result
             ao_key_id: n.ao_key_id.unwrap_or(100),
             max_prefix: n.max_prefix.filter(|&m| m > 0),
             default_originate: n.default_originate,
+            import,
         });
     }
 

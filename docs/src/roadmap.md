@@ -203,7 +203,11 @@ tracked but not yet scheduled, grouped by area:
   MLAG, anycast gateway, dual-stack.
 - **Forwarding & policy:** VRFs, policy-based routing, route maps, prefix lists,
   route policies, max-AS-path. (Per-neighbour BGP `max-prefix` prefix-limiting with a
-  Cease teardown (RFC 4486) is **done**.)
+  Cease teardown (RFC 4486) is **done**. **Per-neighbour inbound import filters** are
+  **done** — a neighbour's `import =` names a `[[filter]]` applied to every received
+  route before the RIB (reject drops it; accept folds set-metric→MED,
+  set-preference→LOCAL_PREF and set-community into the path); per-neighbour **outbound**
+  export policy is the natural next step.)
 - **Security:** **TTL security (GTSM, RFC 5082) is done** — a per-neighbour
   `ttl-security = <hops>` makes a BGP session send with TTL 255 and reject received
   packets below `255 − (hops − 1)`, so a peer further than `hops` away cannot inject

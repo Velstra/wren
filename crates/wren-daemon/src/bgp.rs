@@ -48,7 +48,8 @@ use wren_bgp::{
     AFI_IPV4, AFI_IPV6, AS_TRANS, HEADER_LEN, MARKER, MAX_MESSAGE_LEN, PORT, SAFI_UNICAST, VERSION,
 };
 
-use wren_core::{Prefix, Protocol};
+use wren_core::{Prefix, Protocol, Route};
+use wren_filter::Filter;
 
 use crate::router::{Redistribution, RouteUpdate};
 
@@ -186,6 +187,11 @@ pub struct BgpPeerCfg {
     /// Advertise a default route (`0.0.0.0/0`) to this peer unconditionally, with this
     /// router as the next hop (and without installing it locally).
     pub default_originate: bool,
+    /// Inbound route policy (RFC-style import route-map): a filter applied to every
+    /// route received from this peer before it enters the RIB. Reject drops the route;
+    /// accept admits it, with any set-metric (→MED), set-preference (→LOCAL_PREF) or
+    /// set-community modifications applied. `None` accepts everything unchanged.
+    pub import: Option<Filter>,
 }
 
 impl BgpPeerCfg {
@@ -671,6 +677,10 @@ pub async fn run(
     // Peers to which we advertise a default route (`0.0.0.0/0`) on Established.
     let default_originate: HashSet<Ipv4Addr> =
         cfg.peers.iter().filter(|p| p.default_originate).map(|p| p.addr).collect();
+    // Per-peer inbound import filters (RFC-style import route-maps), applied to every
+    // route received from the peer before it enters the RIB.
+    let imports: HashMap<Ipv4Addr, Filter> =
+        cfg.peers.iter().filter_map(|p| p.import.clone().map(|f| (p.addr, f))).collect();
 
     let members = cfg.confederation_members.clone();
     let local = Arc::new(Local {
@@ -1054,15 +1064,15 @@ pub async fn run(
                         continue;
                     }
                 }
+                let import = imports.get(&peer);
                 // IPv4 reachability: base NLRI with the IPv4 NEXT_HOP attribute.
                 if !update.nlri.is_empty() {
                     match base_next_hop(&update) {
                         Some(nh) => {
                             let path = build_path(&update, IpAddr::V4(nh), None, facts);
                             for p in &update.nlri {
-                                if let Some(ev) = rib.update(peer, *p, path.clone()) {
-                                    apply_event(ev, &updates, &sessions).await;
-                                }
+                                import_and_install(import, peer, *p, &path, &mut rib, &updates, &sessions)
+                                    .await;
                             }
                         }
                         None => warn!(peer = %peer, "UPDATE with NLRI but no NEXT_HOP — ignored"),
@@ -1074,9 +1084,8 @@ pub async fn run(
                     let iface = if is_link_local { ingress_iface.clone() } else { None };
                     let path = build_path(&update, IpAddr::V6(nh6), iface, facts);
                     for p in nlri {
-                        if let Some(ev) = rib.update(peer, *p, path.clone()) {
-                            apply_event(ev, &updates, &sessions).await;
-                        }
+                        import_and_install(import, peer, *p, &path, &mut rib, &updates, &sessions)
+                            .await;
                     }
                 }
             }
@@ -1176,6 +1185,57 @@ async fn apply_event(
 ) {
     propagate(&ev, sessions).await;
     emit(ev, updates).await;
+}
+
+/// A view of a received BGP path as a [`Route`] for the inbound import filter: the
+/// prefix, the MED as the metric, the LOCAL_PREF as the (higher-wins) preference, and
+/// the path's communities. This is the domain a `[[filter]]` route-map operates on.
+fn path_to_route(prefix: Prefix, path: &Path) -> Route {
+    let mut route = Route::new(prefix, Protocol::Bgp, vec![], path.med);
+    route.preference = path.local_pref;
+    route.communities = path.communities.clone();
+    route.large_communities = path.large_communities.clone();
+    route.ext_communities = path.ext_communities.clone();
+    route
+}
+
+/// Run a received path through this peer's inbound import filter (if any). Returns the
+/// path to install — possibly with set-metric (→MED), set-preference (→LOCAL_PREF) and
+/// set-community modifications folded back in — or `None` if the filter rejected it.
+fn apply_import(import: Option<&Filter>, prefix: Prefix, path: &Path) -> Option<Path> {
+    let Some(filter) = import else {
+        return Some(path.clone());
+    };
+    let modified = filter.apply(&path_to_route(prefix, path)).accepted()?;
+    let mut out = path.clone();
+    out.med = modified.metric;
+    out.local_pref = modified.preference;
+    out.communities = modified.communities;
+    out.large_communities = modified.large_communities;
+    out.ext_communities = modified.ext_communities;
+    Some(out)
+}
+
+/// Install one received prefix into the RIB after the peer's inbound import filter: a
+/// rejected prefix is instead withdrawn (so a route that was accepted before but is now
+/// rejected on re-advertisement is removed). Shared by the IPv4 and IPv6 reachability
+/// paths.
+async fn import_and_install(
+    import: Option<&Filter>,
+    peer: Ipv4Addr,
+    prefix: Prefix,
+    path: &Path,
+    rib: &mut BgpRib,
+    updates: &mpsc::Sender<RouteUpdate>,
+    sessions: &HashMap<Ipv4Addr, mpsc::Sender<SessionCmd>>,
+) {
+    let ev = match apply_import(import, prefix, path) {
+        Some(p) => rib.update(peer, prefix, p),
+        None => rib.withdraw(peer, prefix),
+    };
+    if let Some(ev) = ev {
+        apply_event(ev, updates, sessions).await;
+    }
 }
 
 /// Re-advertise a Loc-RIB change to every established session (the Adj-RIB-Out
@@ -2651,6 +2711,41 @@ mod tests {
             large_communities: vec![],
             ext_communities: vec![],
         }
+    }
+
+    #[test]
+    fn import_filter_rejects_passes_and_modifies() {
+        use wren_filter::{Action, Filter, Match, Modify, PrefixList, PrefixPattern, Rule};
+        let prefix: Prefix = "10.50.0.0/16".parse().unwrap();
+        let path = learned_path(true, [10, 0, 0, 2]);
+
+        // No filter: the path passes through untouched.
+        let out = apply_import(None, prefix, &path).expect("no filter accepts");
+        assert_eq!(out.local_pref, 100);
+        assert!(out.communities.is_empty());
+
+        // reject-all drops the route.
+        assert!(apply_import(Some(&Filter::reject_all()), prefix, &path).is_none());
+
+        // A rule that matches the prefix, sets the preference (→LOCAL_PREF) and tags a
+        // community; the modifications are folded back into the path.
+        let filter = Filter {
+            rules: vec![Rule {
+                matcher: Match::prefix(PrefixList(vec![PrefixPattern::orlonger(
+                    "10.50.0.0/16".parse().unwrap(),
+                )])),
+                modify: Modify { set_preference: Some(250), add_communities: vec![0xFFFF_FF01], ..Modify::default() },
+                action: Action::Accept,
+            }],
+            default: Action::Reject,
+        };
+        let out = apply_import(Some(&filter), prefix, &path).expect("rule accepts");
+        assert_eq!(out.local_pref, 250);
+        assert_eq!(out.communities, vec![0xFFFF_FF01]);
+
+        // A prefix the rule does not match falls to the default (reject).
+        let other: Prefix = "192.168.0.0/24".parse().unwrap();
+        assert!(apply_import(Some(&filter), other, &path).is_none());
     }
 
     #[test]

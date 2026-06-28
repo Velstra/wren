@@ -648,6 +648,50 @@ no aggregate a peer learns only the `/24`s; with the aggregate it learns the `/1
 **and** the `/24`s (and the originator never installs the `/16` itself); with
 `summary-only` it learns only the `/16`.
 
+## Inbound route policy — per-neighbour import filters
+
+A neighbour can carry an `import =` that names a [`[[filter]]`](../configuration.md)
+applied to **every route received from that peer** before it enters the RIB — the
+inbound half of a route-map. Reject drops the route; accept admits it, with the filter's modifications
+folded back into the path:
+
+| Filter field | BGP attribute it maps to |
+|---|---|
+| `set-metric` / `metric-le` / `metric-ge` | MULTI_EXIT_DISC (MED) |
+| `set-preference` | LOCAL_PREF (higher wins) |
+| `set-community` / `add-community` (+ large / ext) | the path's communities |
+| `prefix` patterns | the received prefix |
+
+```toml
+[[filter]]
+name    = "from-upstream"
+default = "accept"            # accept anything not matched below
+[[filter.rule]]
+prefix = ["10.50.2.0/24"]
+action = "reject"             # never accept this prefix from the peer
+[[filter.rule]]
+prefix         = ["10.50.1.0/24"]
+set-preference = 200          # bump LOCAL_PREF
+set-community  = ["65002:777"]
+action         = "accept"
+
+[[bgp.neighbor]]
+address   = "10.0.0.1"
+remote-as = 65001
+import    = "from-upstream"   # apply it to routes learned from this neighbour
+```
+
+A prefix that was accepted before but is rejected on a later re-advertisement is
+withdrawn from the RIB, so the policy is honoured incrementally. The filter is the same
+engine used by `[import]` and the redistribution `[export]` filters, operating on a
+`Route` view of the received path (prefix, MED-as-metric, LOCAL_PREF-as-preference,
+communities).
+
+Only the **inbound** direction is filtered today; per-neighbour **outbound** (export)
+policy is not yet wired. `scripts/bgp-import-filter-smoke.sh` exercises it live
+(rootless): without the filter a peer learns both `/24`s unchanged; with it one `/24` is
+rejected and the other arrives with `localpref 200` and community `65002:777`.
+
 ## Maximum-prefix limit (RFC 4486)
 
 A misconfigured or hostile peer can flood the RIB by advertising far more routes than

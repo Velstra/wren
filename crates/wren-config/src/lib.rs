@@ -450,6 +450,11 @@ pub struct BgpNeighbor {
     /// the upstream edge toward a stub customer. Defaults to false.
     #[serde(default, rename = "default-originate")]
     pub default_originate: bool,
+    /// Inbound route policy: the name of a `[[filter]]` applied to every route received
+    /// from this neighbour before it enters the RIB (an import route-map). Reject drops
+    /// the route; accept admits it, with any set-metric (→MED), set-preference
+    /// (→LOCAL_PREF) or set-community modifications applied. Unset accepts everything.
+    pub import: Option<String>,
 }
 
 /// Babel protocol configuration (`[babel]`, RFC 8966).
@@ -904,6 +909,25 @@ mod tests {
         assert!(bgp.aggregate[0].summary_only);
         assert_eq!(bgp.aggregate[1].prefix, "192.168.0.0/16");
         assert!(!bgp.aggregate[1].summary_only); // defaults to false
+    }
+
+    #[test]
+    fn parses_bgp_neighbor_import() {
+        let cfg = Config::from_toml(
+            r#"
+            router-id = "10.0.0.1"
+            [bgp]
+            enabled = true
+            local-as = 65001
+            [[bgp.neighbor]]
+            address = "10.0.0.2"
+            remote-as = 65002
+            import = "from-peer"
+            "#,
+        )
+        .expect("valid config");
+        let bgp = cfg.bgp.expect("bgp present");
+        assert_eq!(bgp.neighbor[0].import.as_deref(), Some("from-peer"));
     }
 
     #[test]
