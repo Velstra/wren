@@ -145,15 +145,24 @@ $ wren show ospf neighbors
 
 $ wren show ospf interfaces
 veth0 area 0.0.0.0 10.0.0.1 state PtP pri 1
+
+$ wren show ospf database
+area 0.0.0.0 router id 10.0.0.1 adv-router 10.0.0.1 seq 0x80000003 age 0
+area 0.0.0.0 router id 10.0.0.2 adv-router 10.0.0.2 seq 0x80000002 age 0
+as-external external id 10.99.0.0 adv-router 10.0.0.1 seq 0x80000001 age 0
 ```
 
 `show ospf neighbors` lists every neighbour on every interface — its Router ID,
 its interface address, the local interface and the adjacency state (`Down` …
 `Full`). `show ospf interfaces` lists each OSPF interface with its area, address,
 state (`PtP`, `DROther`, `Backup`, `DR`, …), this router's priority and, on a
-multi-access network, the elected `dr` / `bdr`. `scripts/ospf-show-smoke.sh`
-exercises both live (rootless): two routers form a point-to-point adjacency and
-the queries report it reaching Full.
+multi-access network, the elected `dr` / `bdr`. `show ospf database` (also `db` /
+`lsdb`) dumps the link-state database — every LSA in every area (in id order) then
+the AS-external LSAs — with each LSA's type, Link State ID, advertising router,
+sequence number and age. `scripts/ospf-show-smoke.sh` exercises the first two live
+(rootless), and `scripts/ospf-database-smoke.sh` the database: two routers, one an
+ASBR, converge to identical databases holding both Router-LSAs and the redistributed
+AS-external LSA.
 
 ## Stub areas (RFC 2328 §3.6)
 

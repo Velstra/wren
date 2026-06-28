@@ -156,8 +156,10 @@ implemented to its RFC.
   `wren show routes [protocol]` renders the central RIB's best routes à la `ip
   route`, `wren show bgp [routes|neighbors]` renders the BGP Loc-RIB (with
   AS_PATH, communities, LOCAL_PREF, origin) and neighbour states, `wren show
-  ospf [neighbors|interfaces]` renders the OSPF adjacencies (Router ID, address,
-  state) and interfaces (area, state, elected DR/BDR), `wren show ospf3
+  ospf [neighbors|interfaces|database]` renders the OSPF adjacencies (Router ID,
+  address, state), interfaces (area, state, elected DR/BDR) and the link-state
+  database (every LSA's type, Link State ID, advertising router, sequence, age),
+  `wren show ospf3
   [neighbors|interfaces]` does the same for OSPFv3 (neighbours by Router ID over
   their IPv6 link-local, interfaces by area and state), `wren show isis
   [neighbors|interfaces]` renders the IS-IS adjacencies (System ID, SNPA, per-level

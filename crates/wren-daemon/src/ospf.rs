@@ -257,6 +257,8 @@ pub enum OspfQuery {
     Neighbors,
     /// The OSPF-speaking interfaces, with their area, state and elected DR/BDR.
     Interfaces,
+    /// The link-state database: every LSA in every area, plus the AS-external LSAs.
+    Database,
 }
 
 /// A control-socket query plus the channel to answer it on.
@@ -372,6 +374,61 @@ pub fn render_ospf_interfaces(ifaces: &[OspfIfaceInfo]) -> String {
     out
 }
 
+/// One LSA, snapshotted for `show ospf database`. `area` is `None` for the
+/// AS-scoped AS-external (type-5) LSAs, which do not belong to any single area.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct OspfLsaInfo {
+    /// The area the LSA belongs to, or `None` for AS-external LSAs.
+    pub area: Option<Ipv4Addr>,
+    /// The LSA type.
+    pub ls_type: LsType,
+    /// The Link State ID (meaning depends on the type).
+    pub link_state_id: Ipv4Addr,
+    /// The originating router's id.
+    pub advertising_router: Ipv4Addr,
+    /// The instance's sequence number (signed, increasing).
+    pub seq: i32,
+    /// The LSA's age in seconds.
+    pub age: u16,
+}
+
+/// The short name of an LSA type, as shown by `show ospf database`.
+fn ls_type_name(t: LsType) -> &'static str {
+    match t {
+        LsType::Router => "router",
+        LsType::Network => "network",
+        LsType::SummaryNetwork => "summary",
+        LsType::SummaryAsbr => "asbr-summary",
+        LsType::AsExternal => "external",
+        LsType::Nssa => "nssa-external",
+    }
+}
+
+/// Render the OSPF link-state database, one LSA per line, grouped area by area with
+/// the AS-external LSAs last (à la `show ip ospf database`).
+pub fn render_ospf_database(lsas: &[OspfLsaInfo]) -> String {
+    if lsas.is_empty() {
+        return "no ospf lsas\n".to_string();
+    }
+    let mut out = String::new();
+    for l in lsas {
+        match l.area {
+            Some(area) => {
+                let _ = write!(out, "area {area} {}", ls_type_name(l.ls_type));
+            }
+            None => {
+                let _ = write!(out, "as-external {}", ls_type_name(l.ls_type));
+            }
+        }
+        let _ = writeln!(
+            out,
+            " id {} adv-router {} seq {:#010x} age {}",
+            l.link_state_id, l.advertising_router, l.seq as u32, l.age,
+        );
+    }
+    out
+}
+
 /// Run OSPF on the configured interfaces, announcing SPF routes to `updates`.
 ///
 /// `redist` carries RIB best-path routes the central router pushes for
@@ -478,6 +535,7 @@ pub async fn run(
                 let answer = match req.query {
                     OspfQuery::Neighbors => render_ospf_neighbors(&ospf.neighbor_infos()),
                     OspfQuery::Interfaces => render_ospf_interfaces(&ospf.iface_infos()),
+                    OspfQuery::Database => render_ospf_database(&ospf.lsa_infos()),
                 };
                 let _ = req.respond.send(answer);
             }
@@ -521,6 +579,47 @@ impl Ospf {
                 priority: iface.fsm.priority,
             })
             .collect()
+    }
+
+    /// Snapshot the whole link-state database, for `show ospf database`: every LSA in
+    /// every area (areas in id order), then the AS-external LSAs. Within each database
+    /// LSAs are ordered by (type, link-state-id, advertising-router) for a stable list.
+    fn lsa_infos(&self) -> Vec<OspfLsaInfo> {
+        fn sort_key(l: &OspfLsaInfo) -> (u8, u32, u32) {
+            (l.ls_type.as_u8(), u32::from(l.link_state_id), u32::from(l.advertising_router))
+        }
+        let mut out = Vec::new();
+        for (area_id, area) in &self.areas {
+            let mut area_lsas: Vec<OspfLsaInfo> = area
+                .lsdb
+                .iter()
+                .map(|lsa| OspfLsaInfo {
+                    area: Some(*area_id),
+                    ls_type: lsa.header.ls_type,
+                    link_state_id: lsa.header.link_state_id,
+                    advertising_router: lsa.header.advertising_router,
+                    seq: lsa.header.ls_seq,
+                    age: lsa.header.ls_age,
+                })
+                .collect();
+            area_lsas.sort_by_key(sort_key);
+            out.extend(area_lsas);
+        }
+        let mut ext: Vec<OspfLsaInfo> = self
+            .external_lsdb
+            .iter()
+            .map(|lsa| OspfLsaInfo {
+                area: None,
+                ls_type: lsa.header.ls_type,
+                link_state_id: lsa.header.link_state_id,
+                advertising_router: lsa.header.advertising_router,
+                seq: lsa.header.ls_seq,
+                age: lsa.header.ls_age,
+            })
+            .collect();
+        ext.sort_by_key(sort_key);
+        out.extend(ext);
+        out
     }
 
     /// Strip the IP header, decode the packet and dispatch it.
@@ -2122,6 +2221,25 @@ fn iface_ipv4(ifname: &str) -> Option<(Ipv4Addr, u8)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn render_ospf_database_groups_areas_then_externals() {
+        let lsa = |area, t, id: [u8; 4], adv: [u8; 4]| OspfLsaInfo {
+            area,
+            ls_type: t,
+            link_state_id: Ipv4Addr::from(id),
+            advertising_router: Ipv4Addr::from(adv),
+            seq: -2_147_483_647, // first sequence number (0x80000001)
+            age: 42,
+        };
+        assert_eq!(render_ospf_database(&[]), "no ospf lsas\n");
+        let out = render_ospf_database(&[
+            lsa(Some(Ipv4Addr::new(0, 0, 0, 0)), LsType::Router, [1, 1, 1, 1], [1, 1, 1, 1]),
+            lsa(None, LsType::AsExternal, [10, 9, 0, 0], [2, 2, 2, 2]),
+        ]);
+        assert!(out.contains("area 0.0.0.0 router id 1.1.1.1 adv-router 1.1.1.1 seq 0x80000001 age 42"));
+        assert!(out.contains("as-external external id 10.9.0.0 adv-router 2.2.2.2 seq 0x80000001"));
+    }
 
     #[test]
     fn len_to_mask_is_contiguous() {

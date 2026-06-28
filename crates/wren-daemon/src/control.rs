@@ -166,7 +166,7 @@ async fn handle_conn(stream: UnixStream, channels: Channels) -> Result<()> {
             "error: unknown command {line:?}\n\
              usage: show routes [protocol] | show bgp [routes|neighbors] | \
              bgp refresh <peer> | \
-             show ospf [neighbors|interfaces] | show ospf3 [neighbors|interfaces] | \
+             show ospf [neighbors|interfaces|database] | show ospf3 [neighbors|interfaces] | \
              show isis [neighbors|interfaces] | show babel [neighbors|routes] | \
              show rip | show ripng\n"
         )
@@ -278,6 +278,7 @@ pub fn parse_ospf_query(line: &str) -> Option<OspfQuery> {
     let query = match tokens.next() {
         None | Some("neighbors") | Some("neighbours") => OspfQuery::Neighbors,
         Some("interfaces") | Some("interface") | Some("iface") => OspfQuery::Interfaces,
+        Some("database") | Some("db") | Some("lsdb") => OspfQuery::Database,
         Some(_) => return None,
     };
     // A trailing extra token is a malformed command.
@@ -455,6 +456,9 @@ mod tests {
             Some(OspfQuery::Interfaces)
         );
         assert_eq!(parse_ospf_query("show ospf iface"), Some(OspfQuery::Interfaces));
+        assert_eq!(parse_ospf_query("show ospf database"), Some(OspfQuery::Database));
+        assert_eq!(parse_ospf_query("show ospf db"), Some(OspfQuery::Database));
+        assert_eq!(parse_ospf_query("show ospf lsdb"), Some(OspfQuery::Database));
     }
 
     #[test]
