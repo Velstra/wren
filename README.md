@@ -1,5 +1,10 @@
 # Wren
 
+[![CI](https://github.com/velstra/wren/actions/workflows/ci.yml/badge.svg)](https://github.com/velstra/wren/actions/workflows/ci.yml)
+[![crates.io](https://img.shields.io/crates/v/wren-core.svg)](https://crates.io/crates/wren-core)
+[![docs.rs](https://img.shields.io/docsrs/wren-core)](https://docs.rs/wren-core)
+[![License](https://img.shields.io/badge/license-Apache--2.0%20%2F%20GPL--2.0--or--later-blue.svg)](#license)
+
 **A routing daemon in Rust.** Wren speaks the standard routing protocols (per
 their RFCs) and programs the kernel forwarding table — the job of
 [BIRD](https://github.com/CZ-NIC/bird) and

@@ -43,19 +43,35 @@ read -r -p "Type 'publish' to continue: " ans
 
 for c in "${CRATES[@]}"; do
   echo "=== publishing $c ==="
-  # Idempotent: a crate already on crates.io at this version is skipped, so the
-  # script can be re-run safely (e.g. after publishing wren-core by hand first).
-  if out=$(cargo publish -p "$c" 2>&1); then
-    echo "$out" | tail -2
-    # cargo (>=1.66) waits for the new version to land in the index before it
-    # returns, so the next crate's dependency resolves; the sleep is belt-and-braces.
-    sleep 5
-  elif echo "$out" | grep -q "already exists"; then
-    echo "already published — skipping."
-  else
-    echo "$out"
-    echo "ERROR publishing $c — aborting."
-    exit 1
-  fi
+  # Idempotent + rate-limit aware: an already-published crate is skipped, and a
+  # crates.io "new crate" 429 is waited out (it returns a retry timestamp) and
+  # retried — so the whole stack publishes in one unattended run.
+  while true; do
+    if out=$(cargo publish -p "$c" 2>&1); then
+      echo "$out" | tail -2
+      # cargo (>=1.66) waits for the new version to land in the index before it
+      # returns, so the next crate's dependency resolves; sleep is belt-and-braces.
+      sleep 5
+      break
+    elif echo "$out" | grep -q "already exists"; then
+      echo "already published — skipping."
+      break
+    elif echo "$out" | grep -q "429 Too Many Requests"; then
+      when=$(echo "$out" | grep -oP 'try again after \K[A-Za-z0-9:, ]+GMT' | head -1)
+      target=$(date -d "$when" +%s 2>/dev/null || true)
+      now=$(date +%s)
+      if [[ -n "${target:-}" && "$target" -gt "$now" ]]; then
+        wait=$(( target - now + 15 ))
+      else
+        wait=630   # fallback: crates.io new-crate limit is ~1 per 10 min
+      fi
+      echo "rate-limited by crates.io (new-crate limit). waiting ${wait}s (until ${when:-~10min}), then retrying $c ..."
+      sleep "$wait"
+    else
+      echo "$out"
+      echo "ERROR publishing $c — aborting."
+      exit 1
+    fi
+  done
 done
 echo "done — all ${#CRATES[@]} crates are published."
