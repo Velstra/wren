@@ -1,0 +1,15 @@
+[package]
+name = "wren-bgp"
+description = "Wren routing daemon — BGP-4 (RFC 4271): message/path-attribute wire codec and best-path selection."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+# Like wren-ospf, the protocol logic and wire codec are dependency-free `std`.
+# The async TCP session runner (port 179) lives in wren-daemon behind tokio,
+# keeping this crate pure and unit-testable.
+[dependencies]
+wren-core.workspace = true
