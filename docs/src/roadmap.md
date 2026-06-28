@@ -33,7 +33,15 @@ implemented to its RFC.
   is prepended and next-hop-self set toward eBGP, with the iBGP split-horizon rule
   applied — and **route reflection** (RFC 4456): an iBGP peer marked a client has
   its routes reflected to the other iBGP peers (ORIGINATOR_ID / CLUSTER_LIST loop
-  avoidance)
+  avoidance) — and **confederations** (RFC 5065): a confederation is split into
+  Member-ASes (`confederation-id` + `confederation-members`), each peer being iBGP
+  (same Member-AS), confed-eBGP (a different Member-AS in the confederation — the
+  Member-AS is prepended to an AS_CONFED_SEQUENCE, LOCAL_PREF and next hop kept) or
+  true eBGP (outside — the internal confederation segments are stripped and the
+  Confederation Identifier prepended, so the confederation is seen as one AS);
+  confederation segments are excluded from AS_PATH length, the OPEN presents the
+  Member-AS to confederation peers and the Confederation Identifier to external
+  ones, and a route looping back into our Member-AS is dropped
 - [x] **Babel** (RFC 8966) — loop-avoiding distance-vector over IPv6 (UDP 6696,
   `ff02::1:6`), with the feasibility condition and Hello/IHU link costing
 - [x] **OSPFv3** (RFC 5340) — OSPF for IPv6, end to end. The `wren-ospfv3` library
@@ -74,10 +82,6 @@ implemented to its RFC.
 
 - OSPF: stub / NSSA areas, type-4 ASBR-summaries across areas, explicit type-5
   forwarding-address resolution, authentication
-- BGP: confederations (RFC 5065) — the AS_CONFED_SEQUENCE / AS_CONFED_SET path
-  segments and their decision rules (excluded from AS_PATH length) are in place;
-  the runner wiring (member-AS config, confed-peer path manipulation, egress
-  stripping) is still to come
 - Babel: ETX costing for lossy links, Route/Seqno-Request handling, prefix
   compression on send, IPv4 routes over the IPv6 transport (`RTA_VIA` next hops),
   source-specific routing
@@ -142,8 +146,7 @@ tracked but not yet scheduled, grouped by area:
   refinements (the RFC 5303 p2p three-way TLV, L1↔L2 route leaking), RIFT, EIGRP;
   IGMP/MLD for multicast group membership.
 - **BGP breadth:** unnumbered (RFC 5549), EVPN (RFC 7432), multipath / add-path
-  (RFC 7911), route-refresh (RFC 2918), graceful restart + long-lived GR, route
-  reflectors, confederations, extended communities, BMP
+  (RFC 7911), route-refresh (RFC 2918), graceful restart + long-lived GR, BMP
   (RFC 7854), FlowSpec (RFC 8955), RPKI origin validation, RTC (RFC 4684).
 - **Data-plane & overlays:** MPLS, SR-MPLS, SRv6, VXLAN, BFD (RFC 5880),
   MLAG, anycast gateway, dual-stack.

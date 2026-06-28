@@ -288,6 +288,20 @@ pub struct Bgp {
     /// `route-reflector-client`.
     #[serde(rename = "cluster-id")]
     pub cluster_id: Option<String>,
+    /// The Confederation Identifier (RFC 5065): the AS number this confederation
+    /// presents to true external (eBGP) peers. When set, `local-as` is this
+    /// router's **Member-AS** *within* the confederation, and a neighbour whose
+    /// `remote-as` is listed in `confederation-members` is a confederation-internal
+    /// (confed-eBGP) peer rather than a true external one. Unset means no
+    /// confederation: `local-as` is the externally visible AS.
+    #[serde(rename = "confederation-id")]
+    pub confederation_id: Option<u32>,
+    /// The Member-AS numbers of the *other* sub-ASes in this confederation
+    /// (RFC 5065). A neighbour whose `remote-as` is in this list is a
+    /// confederation-internal (confed-eBGP) peer; any other differing `remote-as`
+    /// is a true external peer. Ignored when `confederation-id` is unset.
+    #[serde(default, rename = "confederation-members")]
+    pub confederation_members: Vec<u32>,
     /// COMMUNITIES (RFC 1997) attached to every originated route, as `asn:value`
     /// or a well-known name (`no-export`, `no-advertise`, `no-export-subconfed`).
     #[serde(default)]

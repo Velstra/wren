@@ -40,8 +40,15 @@ pub struct Path {
     pub local_pref: u32,
     /// The MULTI_EXIT_DISC — lower is preferred, compared only within one peer AS.
     pub med: u32,
-    /// Whether this path was learned from an eBGP peer (vs iBGP).
+    /// Whether this path was learned from a true external (eBGP) peer (vs iBGP or
+    /// confed-eBGP). A confed-eBGP peer is interior for the decision (RFC 5065
+    /// §5.3), so this stays `false` for it.
     pub from_ebgp: bool,
+    /// Whether this path was learned from a confederation-internal (confed-eBGP)
+    /// peer (RFC 5065): interior for the decision, but — like an eBGP-learned route
+    /// — propagated onward without the iBGP split-horizon restriction. Not part of
+    /// the §9.1.2.2 comparison.
+    pub from_confed: bool,
     /// The neighbouring AS the path came from (for the same-AS MED comparison).
     pub peer_as: u32,
     /// The IGP cost to reach [`Path::next_hop`] — lower is preferred.
@@ -172,6 +179,7 @@ mod tests {
             local_pref: DEFAULT_LOCAL_PREF,
             med: 0,
             from_ebgp: true,
+            from_confed: false,
             peer_as: 65001,
             igp_metric: 10,
             peer_id: ip([10, 0, 0, 1]),

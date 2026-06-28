@@ -692,6 +692,12 @@ fn build_bgp_config(cfg: &wren_config::Config, bgp: &wren_config::Bgp) -> Result
         .context("bgp large-community")?;
     let ext_communities = parse_ext_communities(&bgp.ext_community).context("bgp ext-community")?;
 
+    // Confederation (RFC 5065): the Confederation Identifier presented externally,
+    // and the Member-AS numbers of the other sub-ASes (confed-eBGP peers).
+    if bgp.confederation_id.is_some() && bgp.confederation_members.is_empty() {
+        warn!("bgp `confederation-id` set but `confederation-members` is empty; every differing remote-as is treated as a true external peer");
+    }
+
     Ok(bgp::BgpConfig {
         local_as: bgp.local_as,
         router_id,
@@ -703,6 +709,8 @@ fn build_bgp_config(cfg: &wren_config::Config, bgp: &wren_config::Bgp) -> Result
         communities,
         large_communities,
         ext_communities,
+        confederation_id: bgp.confederation_id,
+        confederation_members: bgp.confederation_members.clone(),
     })
 }
 

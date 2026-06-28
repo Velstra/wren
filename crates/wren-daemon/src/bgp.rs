@@ -95,6 +95,40 @@ pub struct BgpConfig {
     pub large_communities: Vec<(u32, u32, u32)>,
     /// EXTENDED_COMMUNITIES (RFC 4360) attached to every originated route.
     pub ext_communities: Vec<[u8; 8]>,
+    /// The Confederation Identifier (RFC 5065): the AS this confederation presents
+    /// to true external peers. `None` means no confederation (`local_as` is the
+    /// externally visible AS).
+    pub confederation_id: Option<u32>,
+    /// The Member-AS numbers of the other sub-ASes in this confederation
+    /// (RFC 5065); a peer whose `remote_as` is here is a confed-eBGP peer.
+    pub confederation_members: Vec<u32>,
+}
+
+/// How a peer relates to this speaker, which drives the AS_PATH manipulation and
+/// the OPEN's My-AS (RFC 4271 + RFC 5065).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum PeerType {
+    /// Same AS — or, in a confederation, same Member-AS. Interior BGP.
+    Ibgp,
+    /// A different Member-AS in the same confederation (RFC 5065): confed-eBGP.
+    /// Treated as interior for the decision and LOCAL_PREF/next-hop, but the
+    /// Member-AS is prepended to an AS_CONFED_SEQUENCE on egress.
+    Confed,
+    /// A true external AS, outside any confederation: eBGP.
+    Ebgp,
+}
+
+/// Classify a peer from its `remote_as` against this speaker's Member-AS and the
+/// confederation membership (RFC 5065 §4): same AS → iBGP, a configured member →
+/// confed-eBGP, anything else → true eBGP.
+fn classify(local_as: u32, members: &[u32], remote_as: u32) -> PeerType {
+    if remote_as == local_as {
+        PeerType::Ibgp
+    } else if members.contains(&remote_as) {
+        PeerType::Confed
+    } else {
+        PeerType::Ebgp
+    }
 }
 
 /// One configured BGP peer.
@@ -118,8 +152,19 @@ struct Local {
     next_hop6: Option<Ipv6Addr>,
     /// This reflector's CLUSTER_ID (RFC 4456).
     cluster_id: Ipv4Addr,
+    /// The Confederation Identifier (RFC 5065): the AS presented to true external
+    /// peers. `None` means no confederation (`local_as` is the external AS).
+    confed_id: Option<u32>,
     /// peer address → its properties, for matching inbound connections.
     peers: HashMap<Ipv4Addr, PeerProps>,
+}
+
+impl Local {
+    /// The AS this speaker presents to a true external peer: the Confederation
+    /// Identifier if configured, else its (Member-)AS (RFC 5065 §4.2).
+    fn external_as(&self) -> u32 {
+        self.confed_id.unwrap_or(self.local_as)
+    }
 }
 
 /// A configured peer's properties, looked up by address for inbound connections.
@@ -127,6 +172,7 @@ struct Local {
 struct PeerProps {
     remote_as: u32,
     rr_client: bool,
+    peer_type: PeerType,
 }
 
 /// One prefix this speaker originates, with the COMMUNITIES to attach. The central
@@ -183,6 +229,8 @@ struct PeerInfo {
     remote_as: u32,
     /// Whether this iBGP peer is a route-reflector client (RFC 4456).
     rr_client: bool,
+    /// How this peer relates to us (RFC 5065): iBGP, confed-eBGP or true eBGP.
+    peer_type: PeerType,
 }
 
 /// A message from a per-peer session task to the central RIB task.
@@ -208,6 +256,9 @@ enum PeerMsg {
         peer_as: u32,
         peer_id: Ipv4Addr,
         from_ebgp: bool,
+        /// Whether the sending peer is a confederation-internal (confed-eBGP) peer
+        /// (RFC 5065): interior for the decision, externally propagated.
+        from_confed: bool,
         /// Whether the sending peer is a route-reflector client (RFC 4456).
         from_client: bool,
         /// The local interface this session rides, for pinning a received IPv6
@@ -417,19 +468,25 @@ pub async fn run(
     // (e.g. after it was Ceased) can't evict the surviving session.
     let mut current_conn: HashMap<Ipv4Addr, u64> = HashMap::new();
 
+    let members = cfg.confederation_members.clone();
     let local = Arc::new(Local {
         local_as: cfg.local_as,
         router_id: cfg.router_id,
         hold_time: cfg.hold_time,
         next_hop6: cfg.next_hop6,
         cluster_id: cfg.cluster_id,
+        confed_id: cfg.confederation_id,
         peers: cfg
             .peers
             .iter()
             .map(|p| {
                 (
                     p.addr,
-                    PeerProps { remote_as: p.remote_as, rr_client: p.rr_client },
+                    PeerProps {
+                        remote_as: p.remote_as,
+                        rr_client: p.rr_client,
+                        peer_type: classify(cfg.local_as, &members, p.remote_as),
+                    },
                 )
             })
             .collect(),
@@ -458,6 +515,7 @@ pub async fn run(
             addr: peer.addr,
             remote_as: peer.remote_as,
             rr_client: peer.rr_client,
+            peer_type: classify(cfg.local_as, &members, peer.remote_as),
         };
         let local = local.clone();
         let tx = tx.clone();
@@ -557,17 +615,32 @@ pub async fn run(
                 peer_as,
                 peer_id,
                 from_ebgp,
+                from_confed,
                 from_client,
                 ingress_iface,
                 update,
             } => {
-                let facts = PeerFacts { addr: peer, as_: peer_as, id: peer_id, from_ebgp, from_client };
+                let facts = PeerFacts {
+                    addr: peer,
+                    as_: peer_as,
+                    id: peer_id,
+                    from_ebgp,
+                    from_confed,
+                    from_client,
+                };
                 // Withdrawals: base-NLRI IPv4 (the Withdrawn Routes field) and IPv6
                 // (MP_UNREACH_NLRI, RFC 4760 §4).
                 for w in update.withdrawn.iter().chain(mp_unreach_v6(&update)) {
                     if let Some(ev) = rib.withdraw(peer, *w) {
                         apply_event(ev, &updates, &sessions).await;
                     }
+                }
+                // Confederation loop avoidance (RFC 5065 §5.4): drop reachability
+                // whose AS_CONFED_SEQUENCE / AS_CONFED_SET already names our
+                // Member-AS — withdrawals above are still honoured.
+                if is_confed_loop(&update, local.local_as) {
+                    debug!(peer = %peer, "BGP UPDATE failed confederation loop check; reachability ignored");
+                    continue;
                 }
                 // Route-reflection loop avoidance (RFC 4456 §8): drop reachability
                 // whose ORIGINATOR_ID is ours, or whose CLUSTER_LIST already names
@@ -720,6 +793,8 @@ struct PeerFacts {
     as_: u32,
     id: Ipv4Addr,
     from_ebgp: bool,
+    /// Whether the sending peer is a confederation-internal (confed-eBGP) peer.
+    from_confed: bool,
     /// Whether the sending peer is a route-reflector client (RFC 4456).
     from_client: bool,
 }
@@ -770,6 +845,7 @@ fn build_path(
         local_pref,
         med,
         from_ebgp: peer.from_ebgp,
+        from_confed: peer.from_confed,
         peer_as: peer.as_,
         igp_metric: 0,
         peer_id: peer.id,
@@ -804,6 +880,18 @@ fn is_reflection_loop(update: &Update, router_id: Ipv4Addr, cluster_id: Ipv4Addr
         }
     }
     false
+}
+
+/// Whether a received UPDATE's reachability must be ignored for confederation loop
+/// avoidance (RFC 5065 §5.4): one of its AS_CONFED_SEQUENCE / AS_CONFED_SET segments
+/// already contains our Member-AS, so the route has looped back into our sub-AS.
+fn is_confed_loop(update: &Update, member_as: u32) -> bool {
+    update.attributes.iter().any(|a| match a {
+        PathAttribute::AsPath(segs) => segs
+            .iter()
+            .any(|s| s.is_confederation() && s.asns().contains(&member_as)),
+        _ => false,
+    })
 }
 
 /// The base-NLRI IPv4 NEXT_HOP attribute of an UPDATE, if present.
@@ -857,21 +945,23 @@ fn mp_unreach_v6(update: &Update) -> &[Prefix] {
 ///   eBGP peers) — the iBGP split-horizon rule, which route reflection relaxes
 ///   precisely for clients.
 ///
-/// With no clients configured this collapses to plain iBGP split horizon.
-fn should_propagate(path: &Path, to_ebgp: bool, to_rr_client: bool, to_peer: Ipv4Addr) -> bool {
+/// With no clients configured this collapses to plain iBGP split horizon. A
+/// confed-eBGP peer counts as non-iBGP here (RFC 5065): an iBGP-learned route may
+/// cross into another Member-AS, and a confed-learned route propagates freely.
+fn should_propagate(path: &Path, to_type: PeerType, to_rr_client: bool, to_peer: Ipv4Addr) -> bool {
     if path.peer_addr == to_peer {
         return false; // don't echo a route back to where we learned it
     }
-    let reachable = if path.from_ebgp || path.from_client {
+    let reachable = if path.from_ebgp || path.from_confed || path.from_client {
         true
     } else {
-        // iBGP non-client learned: only to clients or eBGP peers.
-        to_rr_client || to_ebgp
+        // iBGP non-client learned: only to clients or non-iBGP peers (eBGP / confed).
+        to_rr_client || to_type != PeerType::Ibgp
     };
     if !reachable {
         return false;
     }
-    should_advertise(&path.communities, to_ebgp)
+    should_advertise(&path.communities, to_type)
 }
 
 /// Prepend `asn` to the front of an AS_PATH (RFC 4271 §5.1.2): grow the leading
@@ -883,18 +973,41 @@ fn prepend_as(segs: &mut Vec<AsPathSegment>, asn: u32) {
     }
 }
 
-/// Whether a route carrying `communities` may be advertised to a peer, honouring
-/// the RFC 1997 well-known communities: `NO_ADVERTISE` blocks every peer, and
-/// `NO_EXPORT` / `NO_EXPORT_SUBCONFED` block eBGP peers.
-fn should_advertise(communities: &[u32], to_ebgp: bool) -> bool {
+/// Prepend a Member-AS to the front of an AS_PATH inside an AS_CONFED_SEQUENCE
+/// (RFC 5065 §5.3): grow a leading AS_CONFED_SEQUENCE, or start a new one. Used when
+/// a route crosses a confederation sub-AS (confed-eBGP) boundary.
+fn prepend_confed(segs: &mut Vec<AsPathSegment>, asn: u32) {
+    match segs.first_mut() {
+        Some(AsPathSegment::ConfedSequence(v)) => v.insert(0, asn),
+        _ => segs.insert(0, AsPathSegment::ConfedSequence(vec![asn])),
+    }
+}
+
+/// Remove every confederation segment (AS_CONFED_SEQUENCE / AS_CONFED_SET) from an
+/// AS_PATH (RFC 5065 §6), done before the route leaves the confederation to a true
+/// external peer — the internal Member-AS hops must not be visible outside.
+fn strip_confed_segments(segs: &mut Vec<AsPathSegment>) {
+    segs.retain(|s| !s.is_confederation());
+}
+
+/// Whether a route carrying `communities` may be advertised to a peer of the given
+/// class, honouring the RFC 1997 well-known communities with the RFC 5065
+/// confederation refinement: `NO_ADVERTISE` blocks every peer; `NO_EXPORT` blocks
+/// only true eBGP (the route may still cross confederation sub-AS boundaries); and
+/// `NO_EXPORT_SUBCONFED` ("local-AS") blocks both confed-eBGP and true eBGP, keeping
+/// the route within the Member-AS.
+fn should_advertise(communities: &[u32], to_type: PeerType) -> bool {
     use wren_bgp::community::{NO_ADVERTISE, NO_EXPORT, NO_EXPORT_SUBCONFED};
     if communities.contains(&NO_ADVERTISE) {
         return false;
     }
-    if to_ebgp && (communities.contains(&NO_EXPORT) || communities.contains(&NO_EXPORT_SUBCONFED)) {
-        return false;
+    match to_type {
+        PeerType::Ibgp => true,
+        PeerType::Confed => !communities.contains(&NO_EXPORT_SUBCONFED),
+        PeerType::Ebgp => {
+            !communities.contains(&NO_EXPORT) && !communities.contains(&NO_EXPORT_SUBCONFED)
+        }
     }
-    true
 }
 
 /// Actively dial a peer, run the session, and retry on failure.
@@ -929,6 +1042,7 @@ async fn accept_loop(listener: TcpListener, local: Arc<Local>, tx: mpsc::Sender<
                     addr: ip,
                     remote_as: props.remote_as,
                     rr_client: props.rr_client,
+                    peer_type: props.peer_type,
                 };
                 let local = local.clone();
                 let tx = tx.clone();
@@ -972,7 +1086,10 @@ async fn drive_session(
         peer,
         tx,
         cmd_tx,
-        from_ebgp: peer.remote_as != local.local_as,
+        peer_type: peer.peer_type,
+        // "true eBGP": a confederation-internal (confed-eBGP) peer is treated as
+        // interior for next-hop-self and LOCAL_PREF (RFC 5065 §5.3).
+        from_ebgp: peer.peer_type == PeerType::Ebgp,
         local_ip,
         link,
         inbound,
@@ -1032,6 +1149,7 @@ async fn drive_session(
                                 peer_as: sess.peer.remote_as,
                                 peer_id: sess.peer_id,
                                 from_ebgp: sess.from_ebgp,
+                                from_confed: sess.peer_type == PeerType::Confed,
                                 from_client: sess.peer.rr_client,
                                 ingress_iface: sess.link.as_ref().map(|(n, _)| n.clone()),
                                 update: u.clone(),
@@ -1127,6 +1245,11 @@ struct Session<'a> {
     /// Handed to the central task on Established so it can push origination
     /// commands (advertise/withdraw) back to this session.
     cmd_tx: mpsc::Sender<SessionCmd>,
+    /// How this peer relates to us (RFC 5065): iBGP, confed-eBGP or true eBGP —
+    /// drives the AS_PATH manipulation and the OPEN's My-AS.
+    peer_type: PeerType,
+    /// Whether this peer is a *true* external (eBGP) peer — confed-eBGP is interior
+    /// here (next-hop-self, LOCAL_PREF drop, the received-path eBGP flag).
     from_ebgp: bool,
     local_ip: Ipv4Addr,
     /// The local interface this session rides and its IPv6 link-local, resolved
@@ -1162,9 +1285,17 @@ impl Session<'_> {
         for a in acts {
             match a {
                 Action::SendOpen => {
+                    // RFC 5065 §4.2: present the Confederation Identifier to a true
+                    // external peer, but the Member-AS to a confederation peer (iBGP
+                    // or confed-eBGP). Without a confederation both are `local_as`.
+                    let my_as = if self.peer_type == PeerType::Ebgp {
+                        self.local.external_as()
+                    } else {
+                        self.local.local_as
+                    };
                     let open = Message::Open(Open::new(
                         VERSION,
-                        self.local.local_as,
+                        my_as,
                         self.local.hold_time,
                         self.local.router_id,
                     ));
@@ -1263,7 +1394,7 @@ impl Session<'_> {
         type TagKey = (Vec<u32>, Vec<(u32, u32, u32)>, Vec<[u8; 8]>);
         let mut groups: BTreeMap<TagKey, Vec<Prefix>> = BTreeMap::new();
         for r in routes {
-            if should_advertise(&r.communities, self.from_ebgp) {
+            if should_advertise(&r.communities, self.peer_type) {
                 groups
                     .entry((
                         r.communities.clone(),
@@ -1279,21 +1410,32 @@ impl Session<'_> {
             // the family-specific next hop). For an IPv6 group the next hop rides in
             // MP_REACH_NLRI instead of the base NEXT_HOP attribute.
             let mut base = vec![PathAttribute::Origin(Origin::Igp)];
-            if self.from_ebgp {
-                base.push(PathAttribute::AsPath(vec![AsPathSegment::Sequence(vec![
-                    self.local.local_as,
-                ])]));
-                // Toward a legacy 2-octet peer our AS would collapse to AS_TRANS on
-                // the wire; carry the real 4-octet AS in AS4_PATH (RFC 6793).
-                if !self.four_octet && self.local.local_as > u16::MAX as u32 {
-                    base.push(PathAttribute::As4Path(vec![AsPathSegment::Sequence(vec![
+            match self.peer_type {
+                PeerType::Ebgp => {
+                    // True eBGP: prepend the externally visible AS (the Confederation
+                    // Identifier if we are in a confederation, else our AS).
+                    let ext = self.local.external_as();
+                    base.push(PathAttribute::AsPath(vec![AsPathSegment::Sequence(vec![ext])]));
+                    // Toward a legacy 2-octet peer our AS would collapse to AS_TRANS
+                    // on the wire; carry the real 4-octet AS in AS4_PATH (RFC 6793).
+                    if !self.four_octet && ext > u16::MAX as u32 {
+                        base.push(PathAttribute::As4Path(vec![AsPathSegment::Sequence(vec![ext])]));
+                    }
+                }
+                PeerType::Confed => {
+                    // Confed-eBGP (RFC 5065 §5.3): prepend our Member-AS to an
+                    // AS_CONFED_SEQUENCE — internal to the confederation — and carry
+                    // LOCAL_PREF, which is honoured across member-AS boundaries.
+                    base.push(PathAttribute::AsPath(vec![AsPathSegment::ConfedSequence(vec![
                         self.local.local_as,
                     ])]));
+                    base.push(PathAttribute::LocalPref(DEFAULT_LOCAL_PREF));
                 }
-            } else {
-                // iBGP: empty AS_PATH, carry LOCAL_PREF.
-                base.push(PathAttribute::AsPath(vec![]));
-                base.push(PathAttribute::LocalPref(DEFAULT_LOCAL_PREF));
+                PeerType::Ibgp => {
+                    // iBGP: empty AS_PATH, carry LOCAL_PREF.
+                    base.push(PathAttribute::AsPath(vec![]));
+                    base.push(PathAttribute::LocalPref(DEFAULT_LOCAL_PREF));
+                }
             }
             if !communities.is_empty() {
                 base.push(PathAttribute::Communities(communities));
@@ -1385,7 +1527,7 @@ impl Session<'_> {
     /// IPv4 unicast only for now.
     async fn propagate_routes(&mut self, routes: &[PropRoute]) -> Result<()> {
         for r in routes {
-            if !should_propagate(&r.path, self.from_ebgp, self.peer.rr_client, self.peer.addr) {
+            if !should_propagate(&r.path, self.peer_type, self.peer.rr_client, self.peer.addr) {
                 continue;
             }
             let mut attributes = self.propagated_base_attrs(&r.path);
@@ -1450,27 +1592,47 @@ impl Session<'_> {
     fn propagated_base_attrs(&self, path: &Path) -> Vec<PathAttribute> {
         let mut attrs = vec![PathAttribute::Origin(path.origin)];
         let mut as_path = path.as_path.clone();
-        if self.from_ebgp {
-            // eBGP: prepend our AS.
-            prepend_as(&mut as_path, self.local.local_as);
-            attrs.push(PathAttribute::AsPath(as_path));
-        } else {
-            // iBGP: AS_PATH unchanged, carry LOCAL_PREF / MED.
-            attrs.push(PathAttribute::AsPath(as_path));
-            attrs.push(PathAttribute::LocalPref(path.local_pref));
-            if path.med != 0 {
-                attrs.push(PathAttribute::MultiExitDisc(path.med));
+        match self.peer_type {
+            PeerType::Ebgp => {
+                // True eBGP egress (RFC 5065 §6): the route leaves the confederation,
+                // so strip the internal AS_CONFED_SEQUENCE / AS_CONFED_SET segments
+                // and prepend the externally visible AS (the Confederation Identifier
+                // when in a confederation, else our AS).
+                strip_confed_segments(&mut as_path);
+                prepend_as(&mut as_path, self.local.external_as());
+                attrs.push(PathAttribute::AsPath(as_path));
             }
-            // Route reflection (RFC 4456 §8): when reflecting an iBGP-learned route
-            // to an iBGP peer, stamp ORIGINATOR_ID (the router that introduced it,
-            // preserved if already present) and prepend our CLUSTER_ID to the
-            // CLUSTER_LIST so a later reflector can detect a loop.
-            if !path.from_ebgp {
-                let originator = path.originator_id.unwrap_or(path.peer_id);
-                attrs.push(PathAttribute::OriginatorId(originator));
-                let mut cl = path.cluster_list.clone();
-                cl.insert(0, self.local.cluster_id);
-                attrs.push(PathAttribute::ClusterList(cl));
+            PeerType::Confed => {
+                // Confed-eBGP (RFC 5065 §5.3): prepend our Member-AS to the
+                // AS_CONFED_SEQUENCE — the confed segments stay internal — and carry
+                // LOCAL_PREF / MED across the sub-AS boundary.
+                prepend_confed(&mut as_path, self.local.local_as);
+                attrs.push(PathAttribute::AsPath(as_path));
+                attrs.push(PathAttribute::LocalPref(path.local_pref));
+                if path.med != 0 {
+                    attrs.push(PathAttribute::MultiExitDisc(path.med));
+                }
+            }
+            PeerType::Ibgp => {
+                // iBGP: AS_PATH unchanged, carry LOCAL_PREF / MED.
+                attrs.push(PathAttribute::AsPath(as_path));
+                attrs.push(PathAttribute::LocalPref(path.local_pref));
+                if path.med != 0 {
+                    attrs.push(PathAttribute::MultiExitDisc(path.med));
+                }
+                // Route reflection (RFC 4456 §8): when reflecting an iBGP-learned
+                // route to an iBGP peer, stamp ORIGINATOR_ID (the router that
+                // introduced it, preserved if already present) and prepend our
+                // CLUSTER_ID to the CLUSTER_LIST so a later reflector detects a loop.
+                // A route entering this Member-AS from eBGP or confed-eBGP is a fresh
+                // introduction, not a reflection, so it gets no reflection attributes.
+                if !path.from_ebgp && !path.from_confed {
+                    let originator = path.originator_id.unwrap_or(path.peer_id);
+                    attrs.push(PathAttribute::OriginatorId(originator));
+                    let mut cl = path.cluster_list.clone();
+                    cl.insert(0, self.local.cluster_id);
+                    attrs.push(PathAttribute::ClusterList(cl));
+                }
             }
         }
         if !path.communities.is_empty() {
@@ -1542,6 +1704,7 @@ mod tests {
             local_pref: 100,
             med: 0,
             from_ebgp: true,
+            from_confed: false,
             peer_as: 65001,
             igp_metric: 0,
             peer_id: ip([10, 0, 0, 1]),
@@ -1590,6 +1753,7 @@ mod tests {
             local_pref: 100,
             med: 0,
             from_ebgp,
+            from_confed: false,
             peer_as: 65001,
             igp_metric: 0,
             peer_id: ip(from_peer),
@@ -1638,9 +1802,9 @@ mod tests {
     fn propagation_never_echoes_to_the_origin_peer() {
         let path = learned_path(true, [10, 0, 0, 1]);
         // To the very peer it came from: suppressed.
-        assert!(!should_propagate(&path, true, false, ip([10, 0, 0, 1])));
+        assert!(!should_propagate(&path, PeerType::Ebgp, false, ip([10, 0, 0, 1])));
         // To a different eBGP peer: propagated.
-        assert!(should_propagate(&path, true, false, ip([10, 0, 0, 2])));
+        assert!(should_propagate(&path, PeerType::Ebgp, false, ip([10, 0, 0, 2])));
     }
 
     #[test]
@@ -1648,28 +1812,44 @@ mod tests {
         // A route learned from a non-client iBGP peer is not passed to another
         // non-client iBGP peer …
         let ibgp = learned_path(false, [10, 0, 0, 1]);
-        assert!(!should_propagate(&ibgp, false, false, ip([10, 0, 0, 2])));
+        assert!(!should_propagate(&ibgp, PeerType::Ibgp, false, ip([10, 0, 0, 2])));
         // … but is passed on to an eBGP peer.
-        assert!(should_propagate(&ibgp, true, false, ip([10, 0, 0, 2])));
+        assert!(should_propagate(&ibgp, PeerType::Ebgp, false, ip([10, 0, 0, 2])));
         // A route learned from eBGP goes to both iBGP and eBGP peers.
         let ebgp = learned_path(true, [10, 0, 0, 1]);
-        assert!(should_propagate(&ebgp, false, false, ip([10, 0, 0, 2])));
-        assert!(should_propagate(&ebgp, true, false, ip([10, 0, 0, 2])));
+        assert!(should_propagate(&ebgp, PeerType::Ibgp, false, ip([10, 0, 0, 2])));
+        assert!(should_propagate(&ebgp, PeerType::Ebgp, false, ip([10, 0, 0, 2])));
+    }
+
+    #[test]
+    fn confederation_relaxes_the_split_horizon_for_confed_peers() {
+        // An iBGP-learned route crosses into another Member-AS (confed-eBGP), like
+        // it would to a true eBGP peer — the iBGP split horizon does not apply.
+        let ibgp = learned_path(false, [10, 0, 0, 1]);
+        assert!(should_propagate(&ibgp, PeerType::Confed, false, ip([10, 0, 0, 2])));
+
+        // A confed-learned route (interior for the decision) still propagates freely
+        // to iBGP, other confed and eBGP peers.
+        let mut confed = learned_path(false, [10, 0, 0, 1]);
+        confed.from_confed = true;
+        assert!(should_propagate(&confed, PeerType::Ibgp, false, ip([10, 0, 0, 2])));
+        assert!(should_propagate(&confed, PeerType::Confed, false, ip([10, 0, 0, 3])));
+        assert!(should_propagate(&confed, PeerType::Ebgp, false, ip([10, 0, 0, 4])));
     }
 
     #[test]
     fn route_reflection_relaxes_the_split_horizon_for_clients() {
         // A route learned from a non-client iBGP peer IS reflected to a client.
         let from_nonclient = learned_path(false, [10, 0, 0, 1]);
-        assert!(should_propagate(&from_nonclient, false, true, ip([10, 0, 0, 2])));
+        assert!(should_propagate(&from_nonclient, PeerType::Ibgp, true, ip([10, 0, 0, 2])));
 
         // A route learned from a client is reflected to every iBGP peer (client or
         // not) and to eBGP peers.
         let mut from_client = learned_path(false, [10, 0, 0, 1]);
         from_client.from_client = true;
-        assert!(should_propagate(&from_client, false, false, ip([10, 0, 0, 2]))); // non-client iBGP
-        assert!(should_propagate(&from_client, false, true, ip([10, 0, 0, 3]))); // client
-        assert!(should_propagate(&from_client, true, false, ip([10, 0, 0, 4]))); // eBGP
+        assert!(should_propagate(&from_client, PeerType::Ibgp, false, ip([10, 0, 0, 2]))); // non-client iBGP
+        assert!(should_propagate(&from_client, PeerType::Ibgp, true, ip([10, 0, 0, 3]))); // client
+        assert!(should_propagate(&from_client, PeerType::Ebgp, false, ip([10, 0, 0, 4]))); // eBGP
     }
 
     #[test]
@@ -1697,25 +1877,91 @@ mod tests {
     fn propagation_honours_no_advertise() {
         let mut path = learned_path(true, [10, 0, 0, 1]);
         path.communities = vec![NO_ADVERTISE];
-        assert!(!should_propagate(&path, true, false, ip([10, 0, 0, 2])));
+        assert!(!should_propagate(&path, PeerType::Ebgp, false, ip([10, 0, 0, 2])));
     }
 
     #[test]
     fn no_advertise_blocks_every_peer() {
-        assert!(!should_advertise(&[NO_ADVERTISE], true));
-        assert!(!should_advertise(&[NO_ADVERTISE], false));
+        assert!(!should_advertise(&[NO_ADVERTISE], PeerType::Ebgp));
+        assert!(!should_advertise(&[NO_ADVERTISE], PeerType::Confed));
+        assert!(!should_advertise(&[NO_ADVERTISE], PeerType::Ibgp));
     }
 
     #[test]
-    fn no_export_blocks_only_ebgp() {
-        assert!(!should_advertise(&[NO_EXPORT], true)); // eBGP: suppressed
-        assert!(should_advertise(&[NO_EXPORT], false)); // iBGP: still sent
+    fn no_export_keeps_a_route_inside_the_confederation() {
+        use wren_bgp::community::NO_EXPORT_SUBCONFED;
+        // NO_EXPORT blocks a true eBGP peer but still crosses confederation
+        // (confed-eBGP) and iBGP boundaries (RFC 1997 + RFC 5065).
+        assert!(!should_advertise(&[NO_EXPORT], PeerType::Ebgp));
+        assert!(should_advertise(&[NO_EXPORT], PeerType::Confed));
+        assert!(should_advertise(&[NO_EXPORT], PeerType::Ibgp));
+        // NO_EXPORT_SUBCONFED ("local-AS") keeps it within the Member-AS: confed and
+        // eBGP both blocked, iBGP still sent.
+        assert!(!should_advertise(&[NO_EXPORT_SUBCONFED], PeerType::Ebgp));
+        assert!(!should_advertise(&[NO_EXPORT_SUBCONFED], PeerType::Confed));
+        assert!(should_advertise(&[NO_EXPORT_SUBCONFED], PeerType::Ibgp));
     }
 
     #[test]
     fn ordinary_or_absent_communities_advertise_freely() {
-        assert!(should_advertise(&[], true));
-        assert!(should_advertise(&[0xFDE9_0064], true)); // 65001:100
+        assert!(should_advertise(&[], PeerType::Ebgp));
+        assert!(should_advertise(&[0xFDE9_0064], PeerType::Ebgp)); // 65001:100
+    }
+
+    #[test]
+    fn classify_distinguishes_ibgp_confed_and_ebgp() {
+        // Same AS → iBGP; a configured member → confed-eBGP; anything else → eBGP.
+        let members = [65002, 65003];
+        assert_eq!(classify(65001, &members, 65001), PeerType::Ibgp);
+        assert_eq!(classify(65001, &members, 65002), PeerType::Confed);
+        assert_eq!(classify(65001, &members, 64500), PeerType::Ebgp);
+        // With no members configured, any differing AS is a true external peer.
+        assert_eq!(classify(65001, &[], 65002), PeerType::Ebgp);
+    }
+
+    #[test]
+    fn confed_loop_check_drops_our_member_as() {
+        let upd = |attrs: Vec<PathAttribute>| Update { withdrawn: vec![], attributes: attrs, nlri: vec![] };
+        // Our Member-AS inside an AS_CONFED_SEQUENCE → a confederation loop.
+        let looped = upd(vec![PathAttribute::AsPath(vec![
+            AsPathSegment::ConfedSequence(vec![65002, 65001]),
+            AsPathSegment::Sequence(vec![64500]),
+        ])]);
+        assert!(is_confed_loop(&looped, 65001));
+        // Our AS only in the *regular* sequence is not a confed loop (it is the
+        // ordinary AS-path loop case, handled separately).
+        let clean = upd(vec![PathAttribute::AsPath(vec![
+            AsPathSegment::ConfedSequence(vec![65002]),
+            AsPathSegment::Sequence(vec![65001]),
+        ])]);
+        assert!(!is_confed_loop(&clean, 65001));
+    }
+
+    #[test]
+    fn prepend_confed_and_strip_confed_segments_round_trip() {
+        // prepend_confed grows a leading AS_CONFED_SEQUENCE …
+        let mut segs = vec![AsPathSegment::ConfedSequence(vec![65002])];
+        prepend_confed(&mut segs, 65001);
+        assert_eq!(segs, vec![AsPathSegment::ConfedSequence(vec![65001, 65002])]);
+        // … or starts one in front of a regular sequence.
+        let mut segs = vec![AsPathSegment::Sequence(vec![64500])];
+        prepend_confed(&mut segs, 65001);
+        assert_eq!(
+            segs,
+            vec![
+                AsPathSegment::ConfedSequence(vec![65001]),
+                AsPathSegment::Sequence(vec![64500]),
+            ]
+        );
+        // strip_confed_segments removes every confederation segment, keeping the
+        // real-AS sequence — the egress-to-true-eBGP transform.
+        let mut segs = vec![
+            AsPathSegment::ConfedSequence(vec![65001, 65002]),
+            AsPathSegment::ConfedSet(vec![65003]),
+            AsPathSegment::Sequence(vec![64500]),
+        ];
+        strip_confed_segments(&mut segs);
+        assert_eq!(segs, vec![AsPathSegment::Sequence(vec![64500])]);
     }
 
     fn static_route(prefix: &str) -> wren_core::Route {
@@ -1798,6 +2044,7 @@ mod tests {
             local_pref: 100,
             med: 0,
             from_ebgp: true,
+            from_confed: false,
             peer_as: 65002,
             igp_metric: 0,
             peer_id: ip([10, 0, 0, 2]),

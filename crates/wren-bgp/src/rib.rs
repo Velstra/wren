@@ -168,6 +168,7 @@ mod tests {
             local_pref,
             med: 0,
             from_ebgp: true,
+            from_confed: false,
             peer_as: 65001,
             igp_metric: 10,
             peer_id: ip(peer),

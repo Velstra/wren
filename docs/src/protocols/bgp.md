@@ -471,6 +471,53 @@ connection, so a closing loser can never evict the surviving session.
 both dial and accept converge to a single stable session and exchange routes,
 without the flap an unresolved collision would cause.
 
-## Not yet implemented
+## Confederations (RFC 5065)
 
-Confederations (RFC 5065), tracked in the [Roadmap](../roadmap.md).
+A confederation lets a large AS be split into several smaller **Member-ASes** while
+still appearing to the outside world as a single AS — the **Confederation
+Identifier**. Inside, the Member-ASes run eBGP-like sessions between them
+(*confed-eBGP*) which avoids the full-iBGP-mesh requirement, while each Member-AS
+still runs ordinary iBGP within itself.
+
+```toml
+[bgp]
+enabled               = true
+local-as              = 65002   # this router's Member-AS
+confederation-id      = 65000   # the AS the confederation presents externally
+confederation-members = [65001] # the other Member-ASes inside the confederation
+[[bgp.neighbor]]
+address   = "10.12.0.1"
+remote-as = 65001               # a different Member-AS → confed-eBGP
+[[bgp.neighbor]]
+address   = "10.23.0.3"
+remote-as = 64500               # outside the confederation → true eBGP
+```
+
+Each neighbour is classified from its `remote-as`: the same AS is **iBGP**, an AS
+listed in `confederation-members` is **confed-eBGP**, and anything else is **true
+eBGP**. That class drives three things:
+
+- **The OPEN's My-AS** (§4.2): a confederation peer (iBGP or confed-eBGP) sees our
+  **Member-AS**; a true external peer sees the **Confederation Identifier**, so it
+  configures `remote-as = <confederation-id>` and the whole confederation looks like
+  one AS to it.
+- **AS_PATH on egress** (§5.3, §6): to a confed-eBGP peer we prepend our Member-AS
+  to an **AS_CONFED_SEQUENCE** (an internal segment) and keep LOCAL_PREF and the
+  next hop, since the confederation shares one decision domain. To a true eBGP peer
+  we **strip every AS_CONFED_SEQUENCE / AS_CONFED_SET** and prepend the
+  Confederation Identifier to the ordinary AS_SEQUENCE, set next-hop-self and drop
+  LOCAL_PREF — the internal Member-AS hops never leak outside.
+- **Decision and loop avoidance**: confederation segments are **not counted** in
+  AS_PATH length (§5.3), a confed-eBGP route is interior for the decision (treated
+  like iBGP for *prefer-eBGP*, LOCAL_PREF honoured) yet propagated onward without
+  the iBGP split-horizon restriction, and a received route whose AS_CONFED_SEQUENCE
+  / AS_CONFED_SET already names our Member-AS is dropped as a confederation loop
+  (§5.4). The well-known communities follow suit: `no-export` keeps a route inside
+  the confederation (blocks only true eBGP) while `no-export-subconfed` keeps it
+  inside the Member-AS (blocks confed-eBGP too).
+
+`scripts/bgp-confederation-smoke.sh` exercises this live (rootless): a confederation
+(65000) of two Member-ASes (65001, 65002) plus one external AS (64500) in a line.
+A network originated in 65001 reaches the external peer with AS_PATH `65000` (the
+internal 65001 hidden), and a network from the external peer reaches 65001 with
+AS_PATH `(65002) 64500` (the Member-AS prepended in an AS_CONFED_SEQUENCE).
