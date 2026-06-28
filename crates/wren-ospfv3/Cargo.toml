@@ -1,0 +1,15 @@
+[package]
+name = "wren-ospfv3"
+description = "Wren routing daemon — OSPFv3 (RFC 5340): the IPv6 packet/LSA wire codec (link-state database and SPF to follow)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+# Like wren-ospf (OSPFv2), the protocol logic and wire codec are dependency-free
+# `std`. The async socket loop (raw IPv6 proto 89, ff02::5/ff02::6) will live in
+# wren-daemon behind tokio/libc, keeping this crate pure and unit-testable.
+[dependencies]
+wren-core.workspace = true
