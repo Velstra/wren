@@ -45,8 +45,11 @@ pub enum RibEvent {
 /// The BGP RIBs: the per-peer Adj-RIB-In and the selected Loc-RIB.
 #[derive(Clone)]
 pub struct BgpRib {
-    /// Adj-RIB-In: every peer's offered path per destination.
-    entries: BTreeMap<Prefix, BTreeMap<Ipv4Addr, Path>>,
+    /// Adj-RIB-In: every offered path per destination, keyed by `(peer, path_id)`.
+    /// Without ADD-PATH a peer offers one path per destination (`path_id` 0); with
+    /// ADD-PATH (RFC 7911) it can offer several, each under a distinct received Path
+    /// Identifier, and all of them coexist here as candidates for selection.
+    entries: BTreeMap<Prefix, BTreeMap<(Ipv4Addr, u32), Path>>,
     /// Loc-RIB: the selected best path per destination (for change detection).
     best: BTreeMap<Prefix, Path>,
     /// The equal-cost next-hop set last emitted per destination — tracked so a
@@ -81,18 +84,43 @@ impl BgpRib {
         Self { max_paths: max_paths.max(1), ..Self::new() }
     }
 
-    /// Record (or replace) the path `peer` offers for `prefix`, re-select the
-    /// best, and return the resulting change, if any.
+    /// Record (or replace) the path `peer` offers for `prefix` (with no ADD-PATH
+    /// Path Identifier), re-select the best, and return the resulting change.
     pub fn update(&mut self, peer: Ipv4Addr, prefix: Prefix, path: Path) -> Option<RibEvent> {
-        self.entries.entry(prefix).or_default().insert(peer, path);
+        self.update_with_id(peer, 0, prefix, path)
+    }
+
+    /// Record (or replace) the path `peer` offers for `prefix` under the received
+    /// ADD-PATH Path Identifier `path_id` (RFC 7911) — distinct ids from the same
+    /// peer coexist as separate candidates — re-select the best, and return the
+    /// resulting change.
+    pub fn update_with_id(
+        &mut self,
+        peer: Ipv4Addr,
+        path_id: u32,
+        prefix: Prefix,
+        path: Path,
+    ) -> Option<RibEvent> {
+        self.entries.entry(prefix).or_default().insert((peer, path_id), path);
         self.reselect(prefix)
     }
 
-    /// Withdraw the path `peer` offered for `prefix`, re-select the best, and
-    /// return the resulting change, if any.
+    /// Withdraw the path `peer` offered for `prefix` (Path Identifier 0), re-select
+    /// the best, and return the resulting change, if any.
     pub fn withdraw(&mut self, peer: Ipv4Addr, prefix: Prefix) -> Option<RibEvent> {
+        self.withdraw_with_id(peer, 0, prefix)
+    }
+
+    /// Withdraw the path `peer` offered for `prefix` under ADD-PATH Path Identifier
+    /// `path_id` (RFC 7911), re-select the best, and return the resulting change.
+    pub fn withdraw_with_id(
+        &mut self,
+        peer: Ipv4Addr,
+        path_id: u32,
+        prefix: Prefix,
+    ) -> Option<RibEvent> {
         if let Some(peers) = self.entries.get_mut(&prefix) {
-            peers.remove(&peer);
+            peers.remove(&(peer, path_id));
             if peers.is_empty() {
                 self.entries.remove(&prefix);
             }
@@ -106,13 +134,13 @@ impl BgpRib {
         let affected: Vec<Prefix> = self
             .entries
             .iter()
-            .filter(|(_, peers)| peers.contains_key(&peer))
+            .filter(|(_, peers)| peers.keys().any(|(p, _)| *p == peer))
             .map(|(p, _)| *p)
             .collect();
         let mut events = Vec::new();
         for prefix in affected {
             if let Some(peers) = self.entries.get_mut(&prefix) {
-                peers.remove(&peer);
+                peers.retain(|(p, _), _| *p != peer);
                 if peers.is_empty() {
                     self.entries.remove(&prefix);
                 }
@@ -130,14 +158,35 @@ impl BgpRib {
     pub fn prefixes_from(&self, peer: Ipv4Addr) -> Vec<Prefix> {
         self.entries
             .iter()
-            .filter(|(_, peers)| peers.contains_key(&peer))
+            .filter(|(_, peers)| peers.keys().any(|(p, _)| *p == peer))
             .map(|(p, _)| *p)
             .collect()
+    }
+
+    /// Every candidate path for `prefix` (the whole Adj-RIB-In set, not just the
+    /// selected best), in deterministic `(peer, path_id)` order. The ADD-PATH send
+    /// side advertises all of these — each under a Path Identifier it assigns — so a
+    /// peer learns more than the single best path (RFC 7911).
+    pub fn paths(&self, prefix: &Prefix) -> Vec<((Ipv4Addr, u32), &Path)> {
+        self.entries
+            .get(prefix)
+            .map(|peers| peers.iter().map(|(k, v)| (*k, v)).collect())
+            .unwrap_or_default()
     }
 
     /// The current best path for `prefix`, if any.
     pub fn best(&self, prefix: &Prefix) -> Option<&Path> {
         self.best.get(prefix)
+    }
+
+    /// Every candidate path across the whole Adj-RIB-In, as
+    /// `(prefix, peer, received-path-id, path)`, in `(prefix, peer, path-id)` order.
+    /// With ADD-PATH (RFC 7911) a destination can have several — used by
+    /// `show bgp paths` to list them.
+    pub fn iter_paths(&self) -> impl Iterator<Item = (&Prefix, Ipv4Addr, u32, &Path)> {
+        self.entries
+            .iter()
+            .flat_map(|(pfx, peers)| peers.iter().map(move |(&(peer, id), path)| (pfx, peer, id, path)))
     }
 
     /// Iterate every prefix's best path, in prefix order.
@@ -363,6 +412,26 @@ mod tests {
         // A third equal path exceeds the cap of 2 → the installed set is unchanged.
         assert!(rib.update(ip([10, 2, 0, 1]), dst, path(100, [10, 2, 0, 1])).is_none());
         assert_eq!(rib.hops.get(&dst).map(|h| h.len()), Some(2));
+    }
+
+    #[test]
+    fn add_path_keeps_two_paths_from_one_peer() {
+        // RFC 7911: with ADD-PATH a single peer can offer several paths for the same
+        // destination under distinct Path Identifiers; both must coexist as
+        // candidates rather than the second overwriting the first.
+        let mut rib = BgpRib::new();
+        let dst = pfx("10.50.0.0/24");
+        let peer = ip([10, 0, 0, 1]);
+        rib.update_with_id(peer, 1, dst, path(100, [10, 0, 0, 1]));
+        rib.update_with_id(peer, 2, dst, path(200, [10, 0, 0, 2]));
+        // Both paths are retained (id 1 and id 2), not collapsed to one.
+        assert_eq!(rib.paths(&dst).len(), 2);
+        // The higher-LOCAL_PREF path (id 2) is selected best.
+        assert_eq!(rib.best(&dst).unwrap().local_pref, 200);
+        // Withdrawing id 2 falls back to id 1 — the other path is still there.
+        let ev = rib.withdraw_with_id(peer, 2, dst).unwrap();
+        assert!(matches!(ev, RibEvent::Best { ref path, .. } if path.local_pref == 100));
+        assert_eq!(rib.paths(&dst).len(), 1);
     }
 
     #[test]

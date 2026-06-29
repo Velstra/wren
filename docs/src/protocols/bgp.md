@@ -26,9 +26,10 @@ unknown attributes are preserved verbatim.
 6. lowest **IGP metric** to the NEXT_HOP
 7. lowest peer **router-id**, then peer **address**
 
-**The RIBs** (§3.2) — an Adj-RIB-In holding every peer's offered path per
-destination, and a Loc-RIB selecting the single best, emitting a change event only
-when a prefix's best path actually appears, changes or disappears.
+**The RIBs** (§3.2) — an Adj-RIB-In holding every offered path per destination
+(keyed by `(peer, path-id)`, so ADD-PATH can keep several paths from one peer), and a
+Loc-RIB selecting the single best, emitting a change event only when a prefix's best
+path actually appears, changes or disappears.
 
 **The session FSM** (§8) — `Idle → Connect → Active → OpenSent → OpenConfirm →
 Established`, with the ConnectRetry, Hold and Keepalive timers and clean teardown
@@ -49,7 +50,9 @@ Established`, with the ConnectRetry, Hold and Keepalive timers and clean teardow
   announced into the kernel RIB as `proto bgp`;
 - learned best paths **propagated** onward to the other peers (transit), prepending
   our AS toward eBGP with next-hop-self, applying iBGP split horizon — see
-  [Propagation](#propagation-transit).
+  [Propagation](#propagation-transit);
+- **ADD-PATH** (RFC 7911) negotiated per neighbour: keep and advertise more than one
+  path per destination — see [ADD-PATH](#add-path-rfc-7911).
 
 A central task owns the BGP RIB and serialises every change; each peer's session
 runs in its own task owning its socket and FSM.
@@ -413,9 +416,47 @@ $ wren show bgp
 ```
 
 `show bgp` (or `show bgp routes`) lists the Loc-RIB best paths with their AS_PATH,
-communities, LOCAL_PREF, MED and origin; `show bgp neighbors` (or `summary`) lists
-each configured peer with its AS and session state. `scripts/bgp-show-smoke.sh`
-exercises both live (rootless).
+communities, LOCAL_PREF, MED and origin; `show bgp paths` lists **every** candidate
+path in the Adj-RIB-In (all paths per destination, each with its received ADD-PATH
+Path Identifier and marked `*` when it is the selected best); `show bgp neighbors`
+(or `summary`) lists each configured peer with its AS and session state.
+`scripts/bgp-show-smoke.sh` exercises them live (rootless).
+
+## ADD-PATH (RFC 7911)
+
+Without ADD-PATH a BGP speaker advertises only its single best path per destination,
+and a peer keeps only one path per `(prefix, neighbour)` — so a second path for a
+prefix from the same peer overwrites the first. ADD-PATH lifts that: every NLRI on
+the wire is prefixed with a 4-octet **Path Identifier**, so a speaker can advertise,
+and a peer can hold, several paths for one destination at once. This is what lets a
+route reflector hand its clients more than the single best path (faster convergence,
+better multipath).
+
+Enable it per neighbour:
+
+```toml
+[[bgp.neighbor]]
+address   = "10.3.0.2"
+remote-as = 65001
+add-path  = true       # negotiate ADD-PATH (send + receive) for IPv4 unicast
+```
+
+`add-path = true` advertises the ADD-PATH capability for IPv4 unicast with both the
+Send and Receive flags (RFC 7911 §4). The directions actually used are the
+intersection with the peer's capability: Wren **sends** multiple paths when the peer
+can receive, and **receives** (keeps) multiple paths when the peer can send. On a
+session where send is in effect, Wren advertises every candidate path in its
+Adj-RIB-In for a prefix (subject to the usual propagation rules and the export
+filter), each under a stable Path Identifier; on one where receive is in effect, it
+stores each received path under its Path Identifier so they coexist as selection
+candidates. ADD-PATH is negotiated for IPv4 unicast here; the IPv6 (MP) family is a
+future extension. `show bgp paths` shows the retained paths and their ids.
+
+`scripts/bgp-add-path-smoke.sh` exercises it live (rootless): two routers (B, C) each
+originate `10.50.0.0/24` to a third (A) over eBGP, and A reflects to an iBGP peer D.
+Without ADD-PATH, D learns one path; with `add-path = true` on the A–D session, D
+learns **both** paths under distinct Path Identifiers — impossible from a single
+iBGP peer otherwise.
 
 ## Propagation (transit)
 

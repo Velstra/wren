@@ -52,7 +52,13 @@ implemented to its RFC.
   the session drops — reconciled when the peer returns and sends its End-of-RIB, or
   flushed when the Restart Timer expires. Live-verified by
   `scripts/bgp-graceful-restart-smoke.sh` (a peer is hard-killed and its routes
-  survive the restart)
+  survive the restart) — and **ADD-PATH** (RFC 7911): the capability is negotiated
+  per neighbour (`add-path = true`, Send+Receive for IPv4 unicast), every NLRI then
+  carries a 4-octet Path Identifier, the Adj-RIB-In keeps multiple paths per
+  destination (keyed by `(peer, path-id)`), and a send-side peer is advertised every
+  candidate path (not just the best) under a stable Path Identifier — `show bgp
+  paths` lists them, live-verified by `scripts/bgp-add-path-smoke.sh` (a peer learns
+  two paths for one prefix from a single iBGP neighbour)
 - [x] **Babel** (RFC 8966) — loop-avoiding distance-vector over IPv6 (UDP 6696,
   `ff02::1:6`), with the feasibility condition and Hello/IHU link costing
 - [x] **OSPFv3** (RFC 5340) — OSPF for IPv6, end to end. The `wren-ospfv3` library
@@ -154,8 +160,9 @@ implemented to its RFC.
 - [~] A **management interface** and operational `show` commands — the daemon
   serves a Unix-domain control socket (`--socket`, default `/run/wren/wren.sock`).
   `wren show routes [protocol]` renders the central RIB's best routes à la `ip
-  route`, `wren show bgp [routes|neighbors]` renders the BGP Loc-RIB (with
-  AS_PATH, communities, LOCAL_PREF, origin) and neighbour states, `wren show
+  route`, `wren show bgp [routes|paths|neighbors]` renders the BGP Loc-RIB (with
+  AS_PATH, communities, LOCAL_PREF, origin), the full Adj-RIB-In (every candidate
+  path with its ADD-PATH Path Identifier) and neighbour states, `wren show
   ospf [neighbors|interfaces|database]` renders the OSPF adjacencies (Router ID,
   address, state), interfaces (area, state, elected DR/BDR) and the link-state
   database (every LSA's type, Link State ID, advertising router, sequence, age),
@@ -194,11 +201,13 @@ tracked but not yet scheduled, grouped by area:
 - **IGPs & link-state:** OSPFv3 NSSA + address families (RFC 5838), IS-IS
   refinements (the RFC 5303 p2p three-way TLV, L1↔L2 route leaking), RIFT, EIGRP;
   IGMP/MLD for multicast group membership.
-- **BGP breadth:** unnumbered (RFC 5549), EVPN (RFC 7432), add-path (RFC 7911 —
-  advertising several paths per prefix; equal-cost multipath *install* is already
-  done, see Platform & core), long-lived graceful restart (RFC 9494), BMP
-  (RFC 7854), FlowSpec (RFC 8955), RPKI origin validation, RTC (RFC 4684). (Per-peer
-  `default-originate` — advertising `0.0.0.0/0` to a neighbour — is **done**.
+- **BGP breadth:** unnumbered (RFC 5549), EVPN (RFC 7432), long-lived graceful
+  restart (RFC 9494), BMP (RFC 7854), FlowSpec (RFC 8955), RPKI origin validation,
+  RTC (RFC 4684). (**ADD-PATH** (RFC 7911) — advertising and keeping several paths
+  per prefix, each under a 4-octet Path Identifier, negotiated per neighbour with
+  `add-path = true` for IPv4 unicast — is **done** (IPv6/MP add-path is a future
+  extension). Per-peer `default-originate` — advertising `0.0.0.0/0` to a neighbour —
+  is **done**.
   **Address aggregation** (RFC 4271 §9.2.2.2) — a `[[bgp.aggregate]]` covering prefix
   advertised with ATOMIC_AGGREGATE/AGGREGATOR once a more-specific originated route
   contributes, with optional `summary-only` suppression — is **done** (for locally

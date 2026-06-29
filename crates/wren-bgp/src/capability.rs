@@ -23,6 +23,16 @@ pub const CAP_GRACEFUL_RESTART: u8 = 64;
 /// The 4-octet AS Number capability code (RFC 6793 §4).
 pub const CAP_FOUR_OCTET_AS: u8 = 65;
 
+/// The ADD-PATH capability code (RFC 7911 §4).
+pub const CAP_ADD_PATH: u8 = 69;
+
+/// ADD-PATH Send/Receive: able to **receive** multiple paths (RFC 7911 §4).
+pub const ADD_PATH_RECEIVE: u8 = 1;
+/// ADD-PATH Send/Receive: able to **send** multiple paths (RFC 7911 §4).
+pub const ADD_PATH_SEND: u8 = 2;
+/// ADD-PATH Send/Receive: able to both send and receive (RFC 7911 §4).
+pub const ADD_PATH_BOTH: u8 = 3;
+
 /// One advertised BGP capability (RFC 5492).
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Capability {
@@ -52,6 +62,11 @@ pub enum Capability {
     },
     /// The 4-octet AS Number capability (code 65): the speaker's real AS.
     FourOctetAs(u32),
+    /// The ADD-PATH capability (code 69, RFC 7911 §4): the speaker can send and/or
+    /// receive multiple paths for the same destination. Carries one
+    /// `(AFI, SAFI, Send/Receive)` tuple per family, where the Send/Receive byte is
+    /// [`ADD_PATH_RECEIVE`] / [`ADD_PATH_SEND`] / [`ADD_PATH_BOTH`].
+    AddPath(Vec<(u16, u8, u8)>),
     /// A capability this implementation does not model, kept verbatim.
     Unknown {
         /// The capability code.
@@ -69,6 +84,7 @@ impl Capability {
             Capability::RouteRefresh => CAP_ROUTE_REFRESH,
             Capability::GracefulRestart { .. } => CAP_GRACEFUL_RESTART,
             Capability::FourOctetAs(_) => CAP_FOUR_OCTET_AS,
+            Capability::AddPath(_) => CAP_ADD_PATH,
             Capability::Unknown { code, .. } => *code,
         }
     }
@@ -103,6 +119,15 @@ impl Capability {
             Capability::FourOctetAs(asn) => {
                 out.push(4);
                 out.extend_from_slice(&asn.to_be_bytes());
+            }
+            Capability::AddPath(families) => {
+                // One 4-octet (AFI(2) · SAFI(1) · Send/Receive(1)) tuple per family.
+                out.push(4 * families.len() as u8);
+                for (afi, safi, sr) in families {
+                    out.extend_from_slice(&afi.to_be_bytes());
+                    out.push(*safi);
+                    out.push(*sr);
+                }
             }
             Capability::Unknown { value, .. } => {
                 out.push(value.len() as u8);
@@ -149,6 +174,19 @@ impl Capability {
             }
             CAP_FOUR_OCTET_AS if value.len() == 4 => {
                 Capability::FourOctetAs(u32::from_be_bytes([value[0], value[1], value[2], value[3]]))
+            }
+            CAP_ADD_PATH if value.len() % 4 == 0 => {
+                let mut families = Vec::new();
+                let mut o = 0;
+                while o + 4 <= value.len() {
+                    families.push((
+                        u16::from_be_bytes([value[o], value[o + 1]]),
+                        value[o + 2],
+                        value[o + 3],
+                    ));
+                    o += 4;
+                }
+                Capability::AddPath(families)
             }
             _ => Capability::Unknown {
                 code,
@@ -266,6 +304,23 @@ mod tests {
         assert_eq!(opt[3], 10);
         // The R flag is the top bit of the 16-bit flags+time word.
         assert_eq!(u16::from_be_bytes([opt[4], opt[5]]), 0x8000 | 120);
+        assert_eq!(parse_optional_parameters(&opt), caps);
+    }
+
+    #[test]
+    fn add_path_capability_roundtrips() {
+        use crate::{AFI_IPV4, AFI_IPV6, SAFI_UNICAST};
+        let caps = vec![Capability::AddPath(vec![
+            (AFI_IPV4, SAFI_UNICAST, ADD_PATH_BOTH),
+            (AFI_IPV6, SAFI_UNICAST, ADD_PATH_SEND),
+        ])];
+        let opt = encode_optional_parameters(&caps);
+        // type 2 (capabilities param), then [cap 69, len 2*4 = 8].
+        assert_eq!(opt[0], OPT_PARAM_CAPABILITIES);
+        assert_eq!(opt[2], CAP_ADD_PATH);
+        assert_eq!(opt[3], 8);
+        // First family: AFI 1, SAFI 1, Send/Receive 3 (both).
+        assert_eq!(&opt[4..8], &[0x00, 0x01, 0x01, ADD_PATH_BOTH]);
         assert_eq!(parse_optional_parameters(&opt), caps);
     }
 

@@ -789,6 +789,7 @@ fn build_bgp_config(
             ao_key_id: n.ao_key_id.unwrap_or(100),
             max_prefix: n.max_prefix.filter(|&m| m > 0),
             default_originate: n.default_originate,
+            add_path: n.add_path,
             import,
             export,
         });

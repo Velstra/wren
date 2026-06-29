@@ -37,12 +37,13 @@ use tokio::time::{sleep, sleep_until, timeout, Instant};
 use tracing::{debug, info, warn};
 
 use wren_bgp::attr::{reconstruct_as_path, AsPathSegment, Origin, PathAttribute};
+use wren_bgp::capability::{Capability, ADD_PATH_BOTH, ADD_PATH_RECEIVE, ADD_PATH_SEND};
 use wren_bgp::community::format_community;
 use wren_bgp::decision::{Path, DEFAULT_LOCAL_PREF};
 use wren_bgp::ext_community::format_ext_community;
 use wren_bgp::fsm::{Action, BgpFsm, Event, State, CODE_CEASE};
 use wren_bgp::large_community::format_large_community;
-use wren_bgp::message::{Message, Notification, Open, Update};
+use wren_bgp::message::{AddPath, Message, Notification, Open, Update};
 use wren_bgp::rib::{BgpRib, RibEvent};
 use wren_bgp::{
     AFI_IPV4, AFI_IPV6, AS_TRANS, HEADER_LEN, MARKER, MAX_MESSAGE_LEN, PORT, SAFI_UNICAST, VERSION,
@@ -198,6 +199,9 @@ pub struct BgpPeerCfg {
     /// set-community (and, for a propagated route, set-metric→MED / set-preference→
     /// LOCAL_PREF) modifications applied. `None` advertises everything unchanged.
     pub export: Option<Filter>,
+    /// Negotiate ADD-PATH (RFC 7911) with this peer for IPv4 unicast — keep every
+    /// path the peer sends and advertise all candidate paths back to it.
+    pub add_path: bool,
 }
 
 impl BgpPeerCfg {
@@ -278,6 +282,8 @@ struct PeerProps {
     ttl_security: Option<u8>,
     /// The peer's `max-prefix` limit (RFC 4486 §4), if any.
     max_prefix: Option<u32>,
+    /// Whether ADD-PATH (RFC 7911) is configured for this peer (IPv4 unicast).
+    add_path: bool,
 }
 
 /// One prefix this speaker originates, with the COMMUNITIES to attach. The central
@@ -310,10 +316,18 @@ enum SessionCmd {
     Withdraw(Vec<Prefix>),
     /// Re-advertise these learned Loc-RIB best paths to this peer (the Adj-RIB-Out),
     /// applying the eBGP / iBGP propagation rules. The session decides per route
-    /// whether and how to send it.
+    /// whether and how to send it. ADD-PATH (RFC 7911) sessions ignore this — they
+    /// are driven only by [`SessionCmd::AdvertiseAddPath`] / [`Self::WithdrawAddPath`].
     Propagate(Vec<PropRoute>),
-    /// Withdraw these learned prefixes whose best path disappeared.
+    /// Withdraw these learned prefixes whose best path disappeared. ADD-PATH sessions
+    /// ignore this (see [`Self::WithdrawAddPath`]).
     WithdrawPropagated(Vec<Prefix>),
+    /// ADD-PATH (RFC 7911): advertise these learned paths, each under its assigned
+    /// Path Identifier, to an ADD-PATH-send peer — more than one path per prefix.
+    AdvertiseAddPath(Vec<AddPathRoute>),
+    /// ADD-PATH: withdraw the given Path Identifiers for `prefix` from an
+    /// ADD-PATH-send peer (a path that was advertised under one of them is gone).
+    WithdrawAddPath(Prefix, Vec<u32>),
     /// Lose §6.8 collision detection: close this connection with a Cease, without
     /// reporting Down — the winning connection owns the peer's slot.
     Shutdown,
@@ -342,6 +356,20 @@ struct PropRoute {
     path: Path,
 }
 
+/// One learned path advertised to an ADD-PATH (RFC 7911) peer under a Path
+/// Identifier the central task assigned, so the peer can hold several paths for the
+/// same destination at once.
+#[derive(Clone)]
+struct AddPathRoute {
+    /// The destination.
+    prefix: Prefix,
+    /// The Path Identifier this path is advertised under (locally assigned, stable
+    /// per source path so a later withdrawal references the same id).
+    path_id: u32,
+    /// The path to advertise (its attributes and the peer it was learned from).
+    path: Path,
+}
+
 /// One peer's identity as a session task sees it.
 #[derive(Clone, Copy)]
 struct PeerInfo {
@@ -353,6 +381,8 @@ struct PeerInfo {
     peer_type: PeerType,
     /// GTSM (RFC 5082) max hop count for this peer, if enabled.
     ttl_security: Option<u8>,
+    /// Whether ADD-PATH (RFC 7911) is configured for this peer (IPv4 unicast).
+    add_path: bool,
 }
 
 /// A message from a per-peer session task to the central RIB task.
@@ -370,6 +400,10 @@ enum PeerMsg {
         /// with the forwarding state preserved for IPv4 unicast — `Some(secs)` makes
         /// the central task retain this peer's routes for that long when it drops.
         gr_restart_time: Option<u16>,
+        /// Whether ADD-PATH send (RFC 7911) was negotiated for IPv4 unicast — the
+        /// central task then advertises every candidate path to this peer (not just
+        /// the single best) and drives it with [`SessionCmd::AdvertiseAddPath`].
+        add_path_send: bool,
         cmd_tx: mpsc::Sender<SessionCmd>,
     },
     /// The session left Established / went down — flush the peer's routes, but only
@@ -407,6 +441,9 @@ enum PeerMsg {
 pub enum BgpQuery {
     /// The Loc-RIB best paths, with their path attributes.
     Routes,
+    /// Every candidate path in the Adj-RIB-In (all paths per destination, with their
+    /// received ADD-PATH Path Identifier) — `show bgp paths`.
+    Paths,
     /// The configured neighbours and their session state.
     Neighbors,
     /// Send a ROUTE-REFRESH to this peer (RFC 2918) — `bgp refresh <addr>`. Not a
@@ -564,6 +601,31 @@ pub fn render_bgp_routes(rib: &BgpRib) -> String {
     out
 }
 
+/// Render every candidate path in the Adj-RIB-In (à la `show ip bgp` with all paths):
+/// one line per path, grouped by destination, each marked `*` when it is the selected
+/// best and tagged with its received ADD-PATH Path Identifier (RFC 7911). This is how
+/// the multiple paths ADD-PATH keeps per destination become visible.
+pub fn render_bgp_paths(rib: &BgpRib) -> String {
+    let mut lines = 0;
+    let mut out = String::new();
+    for (prefix, peer, path_id, path) in rib.iter_paths() {
+        lines += 1;
+        let best = rib.best(prefix) == Some(path);
+        let mark = if best { "*" } else { " " };
+        let as_path = format_as_path(&path.as_path);
+        let as_path = if as_path.is_empty() { "i".to_string() } else { as_path };
+        let _ = writeln!(
+            out,
+            "{mark} {prefix} path-id {path_id} via {} from {peer} as-path {as_path} localpref {}",
+            path.next_hop, path.local_pref,
+        );
+    }
+    if lines == 0 {
+        return "no bgp paths\n".to_string();
+    }
+    out
+}
+
 /// Render the configured neighbours and their session state.
 pub fn render_bgp_neighbors(neighbors: &[NeighborSummary]) -> String {
     if neighbors.is_empty() {
@@ -690,6 +752,11 @@ pub async fn run(
     // route received from the peer before it enters the RIB.
     let imports: HashMap<Ipv4Addr, Filter> =
         cfg.peers.iter().filter_map(|p| p.import.clone().map(|f| (p.addr, f))).collect();
+    // ADD-PATH (RFC 7911): the established sessions for which send was negotiated (we
+    // advertise every candidate path, not just the best), and the per-peer Adj-RIB-Out
+    // state tracking which Path Identifiers we have advertised for each prefix.
+    let mut addpath_send: HashSet<Ipv4Addr> = HashSet::new();
+    let mut addpath = AddPathState::default();
 
     let members = cfg.confederation_members.clone();
     let local = Arc::new(Local {
@@ -711,6 +778,7 @@ pub async fn run(
                         peer_type: classify(cfg.local_as, &members, p.remote_as),
                         ttl_security: p.ttl_security,
                         max_prefix: p.max_prefix,
+                        add_path: p.add_path,
                     },
                 )
             })
@@ -755,6 +823,7 @@ pub async fn run(
             rr_client: peer.rr_client,
             peer_type: classify(cfg.local_as, &members, peer.remote_as),
             ttl_security: peer.ttl_security,
+            add_path: peer.add_path,
         };
         let auth = peer.tcp_auth();
         let local = local.clone();
@@ -799,6 +868,7 @@ pub async fn run(
             Some(req) = queries.recv() => {
                 let resp = match req.query {
                     BgpQuery::Routes => render_bgp_routes(&rib),
+                    BgpQuery::Paths => render_bgp_paths(&rib),
                     BgpQuery::Neighbors => render_bgp_neighbors(&neighbor_summaries(&neighbors)),
                     BgpQuery::Refresh(addr) => match sessions.get(&addr) {
                         Some(cmd_tx) => {
@@ -818,7 +888,7 @@ pub async fn run(
             }
         };
         match msg {
-            PeerMsg::Established { peer: p, peer_id, inbound, conn_id, gr_restart_time, cmd_tx } => {
+            PeerMsg::Established { peer: p, peer_id, inbound, conn_id, gr_restart_time, add_path_send: ap_send, cmd_tx } => {
                 // A peer damped for exceeding its max-prefix limit is kept down: shut
                 // any reconnection straight back down without advertising to it.
                 if damped.contains(&p) {
@@ -900,6 +970,16 @@ pub async fn run(
                 // §2). Queued after Advertise/Propagate, so it arrives last.
                 let _ = cmd_tx.send(SessionCmd::SendEndOfRib).await;
                 sessions.insert(p, cmd_tx);
+                // ADD-PATH (RFC 7911): for an add-path-send peer, the single-best
+                // Propagate above is ignored by the session — instead advertise every
+                // candidate path for each known prefix under its Path Identifier.
+                if ap_send {
+                    addpath_send.insert(p);
+                    let prefixes: Vec<Prefix> = rib.iter_best().map(|(pfx, _)| *pfx).collect();
+                    for pfx in prefixes {
+                        propagate_addpath(pfx, &rib, &local, &mut addpath, &addpath_send, &sessions).await;
+                    }
+                }
             }
             PeerMsg::Down { peer: p, conn_id } => {
                 // Ignore a Down from a connection that is no longer the current one
@@ -940,10 +1020,23 @@ pub async fn run(
                     }
                     None => false,
                 };
+                // ADD-PATH (RFC 7911): stop tracking what we advertised to this peer
+                // (if it was an add-path-send peer), and remember its prefixes so we
+                // can withdraw its paths from the OTHER add-path-send peers below.
+                addpath_send.remove(&p);
+                addpath.drop_peer(p);
+                let addpath_affected: Vec<Prefix> = if retained || addpath_send.is_empty() {
+                    Vec::new()
+                } else {
+                    rib.prefixes_from(p).into_iter().filter(|x| x.is_ipv4()).collect()
+                };
                 if !retained {
                     for ev in rib.withdraw_peer(p) {
                         apply_event(ev, &updates, &sessions).await;
                     }
+                }
+                for pfx in addpath_affected {
+                    propagate_addpath(pfx, &rib, &local, &mut addpath, &addpath_send, &sessions).await;
                 }
             }
             PeerMsg::RefreshRequest { peer: p, conn_id } => {
@@ -1027,9 +1120,16 @@ pub async fn run(
                         }
                     }
                 }
-                // Withdrawals: base-NLRI IPv4 (the Withdrawn Routes field) and IPv6
-                // (MP_UNREACH_NLRI, RFC 4760 §4).
-                for w in update.withdrawn.iter().chain(mp_unreach_v6(&update)) {
+                // Withdrawals: base-NLRI IPv4 (the Withdrawn Routes field, carrying a
+                // per-route ADD-PATH Path Identifier when negotiated) and IPv6
+                // (MP_UNREACH_NLRI, RFC 4760 §4, never ADD-PATH here → path-id 0).
+                for (i, w) in update.withdrawn.iter().enumerate() {
+                    let path_id = update.withdrawn_path_ids.get(i).copied().unwrap_or(0);
+                    if let Some(ev) = rib.withdraw_with_id(peer, path_id, *w) {
+                        apply_event(ev, &updates, &sessions).await;
+                    }
+                }
+                for w in mp_unreach_v6(&update) {
                     if let Some(ev) = rib.withdraw(peer, *w) {
                         apply_event(ev, &updates, &sessions).await;
                     }
@@ -1084,8 +1184,9 @@ pub async fn run(
                     match base_next_hop(&update) {
                         Some(nh) => {
                             let path = build_path(&update, IpAddr::V4(nh), None, facts);
-                            for p in &update.nlri {
-                                import_and_install(import, peer, *p, &path, &mut rib, &updates, &sessions)
+                            for (i, p) in update.nlri.iter().enumerate() {
+                                let path_id = update.nlri_path_ids.get(i).copied().unwrap_or(0);
+                                import_and_install(import, peer, path_id, *p, &path, &mut rib, &updates, &sessions)
                                     .await;
                             }
                         }
@@ -1098,8 +1199,26 @@ pub async fn run(
                     let iface = if is_link_local { ingress_iface.clone() } else { None };
                     let path = build_path(&update, IpAddr::V6(nh6), iface, facts);
                     for p in nlri {
-                        import_and_install(import, peer, *p, &path, &mut rib, &updates, &sessions)
+                        import_and_install(import, peer, 0, *p, &path, &mut rib, &updates, &sessions)
                             .await;
+                    }
+                }
+                // ADD-PATH (RFC 7911): for every IPv4 prefix this UPDATE touched,
+                // recompute the full path set advertised to add-path-send peers. A
+                // non-best path appearing or leaving does not move the Loc-RIB best,
+                // so the single-best propagation above would not carry it.
+                if !addpath_send.is_empty() {
+                    let mut touched: Vec<Prefix> = update
+                        .nlri
+                        .iter()
+                        .chain(update.withdrawn.iter())
+                        .copied()
+                        .filter(|p| p.is_ipv4())
+                        .collect();
+                    touched.sort();
+                    touched.dedup();
+                    for pfx in touched {
+                        propagate_addpath(pfx, &rib, &local, &mut addpath, &addpath_send, &sessions).await;
                     }
                 }
             }
@@ -1257,18 +1376,22 @@ fn filter_origin(filter: Option<&Filter>, r: &OriginRoute) -> Option<OriginRoute
 /// rejected prefix is instead withdrawn (so a route that was accepted before but is now
 /// rejected on re-advertisement is removed). Shared by the IPv4 and IPv6 reachability
 /// paths.
+#[allow(clippy::too_many_arguments)] // a cohesive install helper: filter, RIB keying and fan-out
 async fn import_and_install(
     import: Option<&Filter>,
     peer: Ipv4Addr,
+    path_id: u32,
     prefix: Prefix,
     path: &Path,
     rib: &mut BgpRib,
     updates: &mpsc::Sender<RouteUpdate>,
     sessions: &HashMap<Ipv4Addr, mpsc::Sender<SessionCmd>>,
 ) {
+    // ADD-PATH (RFC 7911): `path_id` distinguishes several paths the same peer
+    // offers for one prefix (0 without ADD-PATH), so they coexist in the Adj-RIB-In.
     let ev = match filter_path(import, prefix, path) {
-        Some(p) => rib.update(peer, prefix, p),
-        None => rib.withdraw(peer, prefix),
+        Some(p) => rib.update_with_id(peer, path_id, prefix, p),
+        None => rib.withdraw_with_id(peer, path_id, prefix),
     };
     if let Some(ev) = ev {
         apply_event(ev, updates, sessions).await;
@@ -1290,6 +1413,100 @@ async fn propagate(ev: &RibEvent, sessions: &HashMap<Ipv4Addr, mpsc::Sender<Sess
         RibEvent::Withdrawn(prefix) => {
             for tx in sessions.values() {
                 let _ = tx.send(SessionCmd::WithdrawPropagated(vec![*prefix])).await;
+            }
+        }
+    }
+}
+
+/// The central task's ADD-PATH (RFC 7911) send-side bookkeeping: a stable Path
+/// Identifier per source path, and which ids we have advertised to each peer.
+#[derive(Default)]
+struct AddPathState {
+    /// Source path `(learned-from peer, received path-id)` → the Path Identifier we
+    /// advertise it under. Stable for the life of the speaker, so a later withdrawal
+    /// names the same id. Ids start at 1; 0 is reserved for non-ADD-PATH NLRI.
+    ids: HashMap<(Ipv4Addr, u32), u32>,
+    /// The last id handed out.
+    next: u32,
+    /// Per out-peer, the set of Path Identifiers currently advertised for each prefix
+    /// (the ADD-PATH Adj-RIB-Out), used to compute incremental withdrawals.
+    out: HashMap<Ipv4Addr, HashMap<Prefix, std::collections::BTreeSet<u32>>>,
+}
+
+impl AddPathState {
+    /// The stable send Path Identifier for a source path, assigning a fresh one
+    /// (≥ 1) the first time that source is seen.
+    fn id_for(&mut self, src: (Ipv4Addr, u32)) -> u32 {
+        if let Some(id) = self.ids.get(&src) {
+            return *id;
+        }
+        self.next += 1;
+        self.ids.insert(src, self.next);
+        self.next
+    }
+
+    /// Forget everything advertised to `peer` (its session went down).
+    fn drop_peer(&mut self, peer: Ipv4Addr) {
+        self.out.remove(&peer);
+    }
+}
+
+/// Re-advertise `prefix` to every ADD-PATH-send peer (RFC 7911): compute the full set
+/// of candidate paths to offer that peer (the Adj-RIB-In minus split-horizon and the
+/// import/propagation rules, each through the peer's export filter), assign each a
+/// stable Path Identifier, and send the peer the additions plus a withdrawal of any
+/// id it held that is no longer offered. ADD-PATH is IPv4 unicast only here.
+async fn propagate_addpath(
+    prefix: Prefix,
+    rib: &BgpRib,
+    local: &Local,
+    state: &mut AddPathState,
+    addpath_send: &HashSet<Ipv4Addr>,
+    sessions: &HashMap<Ipv4Addr, mpsc::Sender<SessionCmd>>,
+) {
+    if !prefix.is_ipv4() {
+        return;
+    }
+    for &peer in addpath_send {
+        let Some(tx) = sessions.get(&peer) else { continue };
+        let Some(pp) = local.peers.get(&peer) else { continue };
+        let export = local.exports.get(&peer);
+        // The paths to offer this peer, each under its stable Path Identifier.
+        let mut desired: std::collections::BTreeMap<u32, Path> = std::collections::BTreeMap::new();
+        for (src, path) in rib.paths(&prefix) {
+            // Split horizon: never advertise a path back to the peer it came from.
+            if src.0 == peer {
+                continue;
+            }
+            if !should_propagate(path, pp.peer_type, pp.rr_client, peer) {
+                continue;
+            }
+            let Some(fpath) = filter_path(export, prefix, path) else { continue };
+            desired.insert(state.id_for(src), fpath);
+        }
+        // Diff against what this peer currently holds for the prefix.
+        let advertised = state.out.entry(peer).or_default().entry(prefix).or_default();
+        let gone: Vec<u32> = advertised.iter().filter(|id| !desired.contains_key(id)).copied().collect();
+        for id in &gone {
+            advertised.remove(id);
+        }
+        for id in desired.keys() {
+            advertised.insert(*id);
+        }
+        let empty = advertised.is_empty();
+        if !gone.is_empty() {
+            let _ = tx.send(SessionCmd::WithdrawAddPath(prefix, gone)).await;
+        }
+        if !desired.is_empty() {
+            let routes: Vec<AddPathRoute> = desired
+                .into_iter()
+                .map(|(path_id, path)| AddPathRoute { prefix, path_id, path })
+                .collect();
+            let _ = tx.send(SessionCmd::AdvertiseAddPath(routes)).await;
+        }
+        if empty {
+            if let Some(m) = state.out.get_mut(&peer) {
+                m.remove(&prefix);
             }
         }
     }
@@ -1611,6 +1828,7 @@ async fn accept_loop(listener: TcpListener, local: Arc<Local>, tx: mpsc::Sender<
                     rr_client: props.rr_client,
                     peer_type: props.peer_type,
                     ttl_security: props.ttl_security,
+                    add_path: props.add_path,
                 };
                 let local = local.clone();
                 let tx = tx.clone();
@@ -1941,6 +2159,9 @@ async fn drive_session(
         peer_id: peer.addr,
         four_octet: false,
         mp_ipv6: false,
+        add_path_cfg: peer.add_path,
+        add_path_send: false,
+        add_path_recv: false,
         peer_route_refresh: false,
         peer_gr: None,
         established: false,
@@ -1965,8 +2186,9 @@ async fn drive_session(
         tokio::pin!(hold, ka);
 
         let four = sess.four_octet;
+        let ap_recv = AddPath::ipv4(sess.add_path_recv);
         let step = tokio::select! {
-            r = read_message(&mut rd, four) => match r {
+            r = read_message(&mut rd, four, ap_recv) => match r {
                 Ok(msg) => match &msg {
                     Message::Open(o) => {
                         let peer_as = o.effective_as();
@@ -1980,6 +2202,15 @@ async fn drive_session(
                             sess.four_octet = o.supports_four_octet_as();
                             // Send IPv6 NLRI only if the peer can receive it (RFC 4760).
                             sess.mp_ipv6 = o.supports_multiprotocol(AFI_IPV6, SAFI_UNICAST);
+                            // ADD-PATH (RFC 7911 §4): the directions in effect are the
+                            // intersection of what we offered (Send+Receive when
+                            // configured) and what the peer advertised. We may SEND when
+                            // the peer can receive; we may RECEIVE when the peer can send.
+                            let peer_sr = o.supports_add_path(AFI_IPV4, SAFI_UNICAST);
+                            let peer_can_recv = matches!(peer_sr, Some(ADD_PATH_RECEIVE | ADD_PATH_BOTH));
+                            let peer_can_send = matches!(peer_sr, Some(ADD_PATH_SEND | ADD_PATH_BOTH));
+                            sess.add_path_send = sess.add_path_cfg && peer_can_recv;
+                            sess.add_path_recv = sess.add_path_cfg && peer_can_send;
                             // Send a ROUTE-REFRESH only if the peer can honour it (RFC 2918).
                             sess.peer_route_refresh = o.supports_route_refresh();
                             // Graceful Restart (RFC 4724): help this peer through a
@@ -2072,13 +2303,25 @@ async fn drive_session(
                 }
             }
             Step::Cmd(SessionCmd::Propagate(routes)) => {
-                if sess.established {
+                // ADD-PATH (RFC 7911) sessions are driven by AdvertiseAddPath, not the
+                // single-best propagation; ignore the best-path broadcast for them.
+                if sess.established && !sess.add_path_send {
                     sess.propagate_routes(&routes).await?;
                 }
             }
             Step::Cmd(SessionCmd::WithdrawPropagated(prefixes)) => {
-                if sess.established {
+                if sess.established && !sess.add_path_send {
                     sess.withdraw(&prefixes).await?;
+                }
+            }
+            Step::Cmd(SessionCmd::AdvertiseAddPath(routes)) => {
+                if sess.established {
+                    sess.advertise_add_path(&routes).await?;
+                }
+            }
+            Step::Cmd(SessionCmd::WithdrawAddPath(prefix, ids)) => {
+                if sess.established {
+                    sess.withdraw_add_path(prefix, &ids).await?;
                 }
             }
             Step::Handled => {}
@@ -2198,6 +2441,15 @@ struct Session<'a> {
     /// Whether the peer advertised the IPv6-unicast Multiprotocol capability
     /// (RFC 4760) — only then do we send it IPv6 NLRI in MP_REACH_NLRI.
     mp_ipv6: bool,
+    /// Whether ADD-PATH (RFC 7911) is configured for this peer — we then advertise
+    /// the ADD-PATH capability (Send+Receive, IPv4 unicast) in our OPEN.
+    add_path_cfg: bool,
+    /// Negotiated: we may SEND multiple paths to this peer (we offered it and the
+    /// peer can receive). Every IPv4 NLRI we encode then carries a Path Identifier.
+    add_path_send: bool,
+    /// Negotiated: we may RECEIVE multiple paths from this peer (we offered it and
+    /// the peer can send). Every IPv4 NLRI we decode then carries a Path Identifier.
+    add_path_recv: bool,
     /// Whether the peer advertised the Route Refresh capability (RFC 2918) — only
     /// then do we send it a ROUTE-REFRESH (it would not honour one otherwise).
     peer_route_refresh: bool,
@@ -2226,13 +2478,22 @@ impl Session<'_> {
                     } else {
                         self.local.local_as
                     };
-                    let open = Message::Open(Open::new(
+                    let mut open = Open::new(
                         VERSION,
                         my_as,
                         self.local.hold_time,
                         self.local.router_id,
-                    ));
-                    self.send(&open).await?;
+                    );
+                    // ADD-PATH (RFC 7911): when configured for this peer, advertise the
+                    // ability to both send and receive multiple IPv4-unicast paths.
+                    if self.add_path_cfg {
+                        open.capabilities.push(Capability::AddPath(vec![(
+                            AFI_IPV4,
+                            SAFI_UNICAST,
+                            ADD_PATH_BOTH,
+                        )]));
+                    }
+                    self.send(&Message::Open(open)).await?;
                 }
                 Action::SendKeepalive => {
                     self.send(&Message::Keepalive).await?;
@@ -2264,6 +2525,7 @@ impl Session<'_> {
                             inbound: self.inbound,
                             conn_id: self.conn_id,
                             gr_restart_time: self.peer_gr,
+                            add_path_send: self.add_path_send,
                             cmd_tx: self.cmd_tx.clone(),
                         })
                         .await;
@@ -2452,7 +2714,7 @@ impl Session<'_> {
         if !v4.is_empty() {
             let mut attributes = base.clone();
             attributes.push(PathAttribute::NextHop(self.local_ip));
-            self.send(&Message::Update(Update { withdrawn: vec![], attributes, nlri: v4 }))
+            self.send(&Message::Update(Update { withdrawn: vec![], attributes, nlri: v4, ..Default::default() }))
                 .await?;
         }
 
@@ -2469,7 +2731,7 @@ impl Session<'_> {
                         next_hop: self.v6_next_hop_field(nh6, true),
                         nlri: v6,
                     });
-                    self.send(&Message::Update(Update { withdrawn: vec![], attributes, nlri: vec![] }))
+                    self.send(&Message::Update(Update { withdrawn: vec![], attributes, nlri: vec![], ..Default::default() }))
                         .await?;
                 }
                 (false, _) => debug!(peer = %self.peer.addr, "peer has no IPv6 capability; not advertising IPv6 NLRI"),
@@ -2492,6 +2754,7 @@ impl Session<'_> {
                 withdrawn: v4,
                 attributes: vec![],
                 nlri: vec![],
+            ..Default::default()
             }))
             .await?;
         }
@@ -2504,6 +2767,7 @@ impl Session<'_> {
                     withdrawn: v6,
                 }],
                 nlri: vec![],
+                ..Default::default()
             }))
             .await?;
         }
@@ -2541,6 +2805,7 @@ impl Session<'_> {
                     withdrawn: vec![],
                     attributes,
                     nlri: vec![r.prefix],
+            ..Default::default()
                 }))
                 .await?;
             } else {
@@ -2574,10 +2839,59 @@ impl Session<'_> {
                     withdrawn: vec![],
                     attributes,
                     nlri: vec![],
+            ..Default::default()
                 }))
                 .await?;
             }
         }
+        Ok(())
+    }
+
+    /// ADD-PATH (RFC 7911) advertise: send each learned path under its assigned Path
+    /// Identifier, one single-prefix IPv4 UPDATE per path, so the peer holds several
+    /// paths for one destination. The central task has already applied the
+    /// propagation rules and the export filter (so the advertised set it tracks
+    /// matches what we send); we only build the attributes and the next hop here.
+    async fn advertise_add_path(&mut self, routes: &[AddPathRoute]) -> Result<()> {
+        for r in routes {
+            if !r.prefix.is_ipv4() {
+                continue; // ADD-PATH is negotiated for IPv4 unicast only
+            }
+            let mut attributes = self.propagated_base_attrs(&r.path);
+            let nh = if self.from_ebgp {
+                self.local_ip
+            } else if let IpAddr::V4(v4) = r.path.next_hop {
+                v4
+            } else {
+                continue;
+            };
+            attributes.push(PathAttribute::NextHop(nh));
+            self.send(&Message::Update(Update {
+                withdrawn: vec![],
+                attributes,
+                nlri: vec![r.prefix],
+                nlri_path_ids: vec![r.path_id],
+                ..Default::default()
+            }))
+            .await?;
+        }
+        Ok(())
+    }
+
+    /// ADD-PATH withdraw: remove the given Path Identifiers for `prefix` from this
+    /// peer — one Withdrawn Route per id, each carrying its Path Identifier (RFC 7911).
+    async fn withdraw_add_path(&mut self, prefix: Prefix, ids: &[u32]) -> Result<()> {
+        if ids.is_empty() || !prefix.is_ipv4() {
+            return Ok(());
+        }
+        self.send(&Message::Update(Update {
+            withdrawn: vec![prefix; ids.len()],
+            withdrawn_path_ids: ids.to_vec(),
+            attributes: vec![],
+            nlri: vec![],
+            nlri_path_ids: vec![],
+        }))
+        .await?;
         Ok(())
     }
 
@@ -2645,7 +2959,7 @@ impl Session<'_> {
     /// Frame and write one BGP message at the session's negotiated AS width.
     async fn send(&mut self, msg: &Message) -> Result<()> {
         self.wr
-            .write_all(&msg.encode(self.four_octet))
+            .write_all(&msg.encode(self.four_octet, AddPath::ipv4(self.add_path_send)))
             .await
             .context("writing BGP message")?;
         Ok(())
@@ -2655,7 +2969,7 @@ impl Session<'_> {
 /// Read one length-prefixed BGP message: the 19-byte header gives the total
 /// length, then the remaining body follows. `four_octet` is the session's
 /// negotiated AS_PATH width for decoding an UPDATE (RFC 6793).
-async fn read_message(rd: &mut OwnedReadHalf, four_octet: bool) -> Result<Message> {
+async fn read_message(rd: &mut OwnedReadHalf, four_octet: bool, add_path: AddPath) -> Result<Message> {
     let mut hdr = [0u8; HEADER_LEN];
     rd.read_exact(&mut hdr)
         .await
@@ -2674,7 +2988,7 @@ async fn read_message(rd: &mut OwnedReadHalf, four_octet: bool) -> Result<Messag
             .await
             .context("reading BGP body")?;
     }
-    Message::decode(&buf, four_octet).map_err(|e| anyhow::anyhow!("decoding BGP message: {e}"))
+    Message::decode(&buf, four_octet, add_path).map_err(|e| anyhow::anyhow!("decoding BGP message: {e}"))
 }
 
 #[cfg(test)]
@@ -2928,7 +3242,7 @@ mod tests {
 
     #[test]
     fn reflection_loop_check_drops_own_originator_or_cluster() {
-        let upd = |attrs: Vec<PathAttribute>| Update { withdrawn: vec![], attributes: attrs, nlri: vec![] };
+        let upd = |attrs: Vec<PathAttribute>| Update { withdrawn: vec![], attributes: attrs, nlri: vec![], ..Default::default() };
         let rid = ip([10, 0, 0, 1]);
         let cid = ip([1, 1, 1, 1]);
         // Our own ORIGINATOR_ID → loop.
@@ -2995,7 +3309,7 @@ mod tests {
 
     #[test]
     fn confed_loop_check_drops_our_member_as() {
-        let upd = |attrs: Vec<PathAttribute>| Update { withdrawn: vec![], attributes: attrs, nlri: vec![] };
+        let upd = |attrs: Vec<PathAttribute>| Update { withdrawn: vec![], attributes: attrs, nlri: vec![], ..Default::default() };
         // Our Member-AS inside an AS_CONFED_SEQUENCE → a confederation loop.
         let looped = upd(vec![PathAttribute::AsPath(vec![
             AsPathSegment::ConfedSequence(vec![65002, 65001]),

@@ -450,6 +450,13 @@ pub struct BgpNeighbor {
     /// the upstream edge toward a stub customer. Defaults to false.
     #[serde(default, rename = "default-originate")]
     pub default_originate: bool,
+    /// Negotiate ADD-PATH (RFC 7911) with this neighbour for IPv4 unicast: advertise
+    /// the ability to both send and receive multiple paths per destination. When the
+    /// peer also supports it, Wren keeps every path the peer sends (rather than the
+    /// second overwriting the first) and advertises all of its candidate paths to the
+    /// peer (rather than only the single best). Defaults to false.
+    #[serde(default, rename = "add-path")]
+    pub add_path: bool,
     /// Inbound route policy: the name of a `[[filter]]` applied to every route received
     /// from this neighbour before it enters the RIB (an import route-map). Reject drops
     /// the route; accept admits it, with any set-metric (→MED), set-preference
@@ -891,6 +898,39 @@ mod tests {
         .expect("valid config");
         let bgp = cfg.bgp.expect("bgp present");
         assert!(bgp.neighbor[0].default_originate);
+    }
+
+    #[test]
+    fn parses_bgp_add_path() {
+        let cfg = Config::from_toml(
+            r#"
+            router-id = "10.0.0.1"
+            [bgp]
+            enabled = true
+            local-as = 65001
+            [[bgp.neighbor]]
+            address = "10.0.0.2"
+            remote-as = 65002
+            add-path = true
+            "#,
+        )
+        .expect("valid config");
+        let bgp = cfg.bgp.expect("bgp present");
+        assert!(bgp.neighbor[0].add_path);
+        // Defaults to false when unset.
+        let cfg2 = Config::from_toml(
+            r#"
+            router-id = "10.0.0.1"
+            [bgp]
+            enabled = true
+            local-as = 65001
+            [[bgp.neighbor]]
+            address = "10.0.0.3"
+            remote-as = 65003
+            "#,
+        )
+        .expect("valid config");
+        assert!(!cfg2.bgp.expect("bgp present").neighbor[0].add_path);
     }
 
     #[test]

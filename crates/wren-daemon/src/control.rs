@@ -164,7 +164,7 @@ async fn handle_conn(stream: UnixStream, channels: Channels) -> Result<()> {
     } else {
         format!(
             "error: unknown command {line:?}\n\
-             usage: show routes [protocol] | show bgp [routes|neighbors] | \
+             usage: show routes [protocol] | show bgp [routes|paths|neighbors] | \
              bgp refresh <peer> | \
              show ospf [neighbors|interfaces|database] | show ospf3 [neighbors|interfaces] | \
              show isis [neighbors|interfaces|database] | show babel [neighbors|routes] | \
@@ -242,6 +242,7 @@ pub fn parse_bgp_query(line: &str) -> Option<BgpQuery> {
             }
             let query = match tokens.next() {
                 None | Some("routes") | Some("route") => BgpQuery::Routes,
+                Some("paths") | Some("path") => BgpQuery::Paths,
                 Some("neighbors") | Some("neighbours") | Some("summary") => BgpQuery::Neighbors,
                 Some(_) => return None,
             };
@@ -424,6 +425,8 @@ mod tests {
         assert_eq!(parse_bgp_query("show bgp routes"), Some(BgpQuery::Routes));
         assert_eq!(parse_bgp_query("show bgp neighbors"), Some(BgpQuery::Neighbors));
         assert_eq!(parse_bgp_query("show bgp summary"), Some(BgpQuery::Neighbors));
+        assert_eq!(parse_bgp_query("show bgp paths"), Some(BgpQuery::Paths));
+        assert_eq!(parse_bgp_query("show bgp path"), Some(BgpQuery::Paths));
     }
 
     #[test]

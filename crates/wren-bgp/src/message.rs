@@ -108,6 +108,20 @@ impl Open {
         self.capabilities.iter().any(|c| matches!(c, Capability::RouteRefresh))
     }
 
+    /// The peer's ADD-PATH Send/Receive flags for the given `(AFI, SAFI)` family
+    /// (RFC 7911 §4), if it advertised ADD-PATH for it — [`ADD_PATH_RECEIVE`],
+    /// [`ADD_PATH_SEND`] or [`ADD_PATH_BOTH`] (from [`crate::capability`]). `None`
+    /// means the peer offered no ADD-PATH for that family.
+    pub fn supports_add_path(&self, afi: u16, safi: u8) -> Option<u8> {
+        self.capabilities.iter().find_map(|c| match c {
+            Capability::AddPath(families) => families
+                .iter()
+                .find(|(a, s, _)| *a == afi && *s == safi)
+                .map(|(_, _, sr)| *sr),
+            _ => None,
+        })
+    }
+
     /// Whether this OPEN advertised the Graceful Restart capability (RFC 4724 §3).
     pub fn supports_graceful_restart(&self) -> bool {
         self.gr_restart_time().is_some()
@@ -134,6 +148,31 @@ impl Open {
     }
 }
 
+/// Which address families have ADD-PATH (RFC 7911) in effect on a session, in the
+/// direction a message is being encoded or decoded. When a family's flag is set,
+/// every NLRI/withdrawn entry of that family on the wire is preceded by a 4-octet
+/// Path Identifier. ADD-PATH presence is **not** self-describing on the wire — it
+/// must be supplied from the negotiated session state, which is why the codec takes
+/// this alongside `four_octet`.
+///
+/// Only IPv4 unicast (base NLRI) is modelled here; ADD-PATH for MP families (IPv6)
+/// is a future extension and is simply never negotiated, so it stays off-wire.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct AddPath {
+    /// ADD-PATH is in effect for IPv4 unicast in this direction.
+    pub ipv4_unicast: bool,
+}
+
+impl AddPath {
+    /// No family has ADD-PATH — the classic single-path encoding.
+    pub const NONE: AddPath = AddPath { ipv4_unicast: false };
+
+    /// ADD-PATH for IPv4 unicast only.
+    pub const fn ipv4(on: bool) -> AddPath {
+        AddPath { ipv4_unicast: on }
+    }
+}
+
 /// An UPDATE message body (§4.3): withdrawn routes, path attributes and the NLRI
 /// they describe.
 #[derive(Clone, PartialEq, Eq, Debug, Default)]
@@ -144,6 +183,14 @@ pub struct Update {
     pub attributes: Vec<PathAttribute>,
     /// The destinations (NLRI) the attributes apply to.
     pub nlri: Vec<Prefix>,
+    /// RFC 7911 ADD-PATH Path Identifiers parallel to [`Update::nlri`]: either empty
+    /// (ADD-PATH off for IPv4 unicast on the session) or aligned 1:1 with `nlri`.
+    /// The codec writes/reads these only when [`AddPath::ipv4_unicast`] is set; all
+    /// existing consumers that read `nlri` as bare prefixes stay correct.
+    pub nlri_path_ids: Vec<u32>,
+    /// RFC 7911 ADD-PATH Path Identifiers parallel to [`Update::withdrawn`] — same
+    /// alignment rule as [`Update::nlri_path_ids`].
+    pub withdrawn_path_ids: Vec<u32>,
 }
 
 impl Update {
@@ -160,6 +207,7 @@ impl Update {
                 withdrawn: vec![],
                 attributes: vec![PathAttribute::MpUnreachNlri { afi, safi, withdrawn: vec![] }],
                 nlri: vec![],
+                ..Default::default()
             }
         }
     }
@@ -262,14 +310,14 @@ impl Message {
     /// Serialise the message, framed with the 19-byte header. `four_octet` chooses
     /// the AS_PATH / AGGREGATOR width in an UPDATE (RFC 6793); other messages
     /// ignore it.
-    pub fn encode(&self, four_octet: bool) -> Vec<u8> {
+    pub fn encode(&self, four_octet: bool, add_path: AddPath) -> Vec<u8> {
         let mut out = Vec::with_capacity(HEADER_LEN + 32);
         out.extend_from_slice(&MARKER);
         out.extend_from_slice(&[0, 0]); // length, patched below
         out.push(self.message_type().as_u8());
         match self {
             Message::Open(o) => encode_open(o, &mut out),
-            Message::Update(u) => encode_update(u, &mut out, four_octet),
+            Message::Update(u) => encode_update(u, &mut out, four_octet, add_path),
             Message::Notification(n) => encode_notification(n, &mut out),
             Message::Keepalive => {}
             // ROUTE-REFRESH body: AFI(2) · Reserved(1) · SAFI(1) (RFC 2918 §3).
@@ -285,8 +333,9 @@ impl Message {
     }
 
     /// Parse and validate a whole BGP message from `buf`. `four_octet` chooses the
-    /// AS_PATH / AGGREGATOR width when the message is an UPDATE (RFC 6793).
-    pub fn decode(buf: &[u8], four_octet: bool) -> Result<Message, DecodeError> {
+    /// AS_PATH / AGGREGATOR width when the message is an UPDATE (RFC 6793);
+    /// `add_path` says which families carry RFC 7911 Path Identifiers in their NLRI.
+    pub fn decode(buf: &[u8], four_octet: bool, add_path: AddPath) -> Result<Message, DecodeError> {
         if buf.len() < HEADER_LEN {
             return Err(DecodeError::TooShort);
         }
@@ -304,7 +353,7 @@ impl Message {
         let body = &buf[HEADER_LEN..];
         Ok(match mtype {
             MessageType::Open => Message::Open(decode_open(body)?),
-            MessageType::Update => Message::Update(decode_update(body, four_octet)?),
+            MessageType::Update => Message::Update(decode_update(body, four_octet, add_path)?),
             MessageType::Notification => Message::Notification(decode_notification(body)?),
             MessageType::Keepalive => {
                 if !body.is_empty() {
@@ -361,10 +410,17 @@ fn decode_open(body: &[u8]) -> Result<Open, DecodeError> {
 
 // --- UPDATE ----------------------------------------------------------------
 
-fn encode_update(u: &Update, out: &mut Vec<u8>, four_octet: bool) {
-    // Withdrawn Routes, length-prefixed.
+fn encode_update(u: &Update, out: &mut Vec<u8>, four_octet: bool, add_path: AddPath) {
+    let ap = add_path.ipv4_unicast;
+
+    // Withdrawn Routes, length-prefixed. With ADD-PATH each route is preceded by
+    // its 4-octet Path Identifier (RFC 7911 §3).
     let mut withdrawn = Vec::new();
-    for p in &u.withdrawn {
+    for (i, p) in u.withdrawn.iter().enumerate() {
+        if ap {
+            let id = u.withdrawn_path_ids.get(i).copied().unwrap_or(0);
+            withdrawn.extend_from_slice(&id.to_be_bytes());
+        }
         encode_prefix(&mut withdrawn, p);
     }
     out.extend_from_slice(&(withdrawn.len() as u16).to_be_bytes());
@@ -378,22 +434,28 @@ fn encode_update(u: &Update, out: &mut Vec<u8>, four_octet: bool) {
     out.extend_from_slice(&(attrs.len() as u16).to_be_bytes());
     out.extend_from_slice(&attrs);
 
-    // NLRI fills the rest (no length prefix).
-    for p in &u.nlri {
+    // NLRI fills the rest (no length prefix), each preceded by its Path Identifier
+    // under ADD-PATH.
+    for (i, p) in u.nlri.iter().enumerate() {
+        if ap {
+            let id = u.nlri_path_ids.get(i).copied().unwrap_or(0);
+            out.extend_from_slice(&id.to_be_bytes());
+        }
         encode_prefix(out, p);
     }
 }
 
-fn decode_update(body: &[u8], four_octet: bool) -> Result<Update, DecodeError> {
+fn decode_update(body: &[u8], four_octet: bool, add_path: AddPath) -> Result<Update, DecodeError> {
     if body.len() < 4 {
         return Err(DecodeError::TooShort);
     }
+    let ap = add_path.ipv4_unicast;
     let wlen = u16::from_be_bytes([body[0], body[1]]) as usize;
     let mut off = 2;
     if body.len() < off + wlen {
         return Err(DecodeError::Malformed);
     }
-    let withdrawn = decode_prefixes(&body[off..off + wlen])?;
+    let (withdrawn, withdrawn_path_ids) = decode_prefixes(&body[off..off + wlen], ap)?;
     off += wlen;
 
     if body.len() < off + 2 {
@@ -407,22 +469,35 @@ fn decode_update(body: &[u8], four_octet: bool) -> Result<Update, DecodeError> {
     let attributes = decode_attributes(&body[off..off + alen], four_octet)?;
     off += alen;
 
-    let nlri = decode_prefixes(&body[off..])?;
+    let (nlri, nlri_path_ids) = decode_prefixes(&body[off..], ap)?;
     Ok(Update {
         withdrawn,
         attributes,
         nlri,
+        nlri_path_ids,
+        withdrawn_path_ids,
     })
 }
 
-fn decode_prefixes(mut buf: &[u8]) -> Result<Vec<Prefix>, DecodeError> {
+/// Decode a run of NLRI prefixes (IPv4 base NLRI). With `add_path`, each prefix is
+/// preceded by a 4-octet Path Identifier (RFC 7911 §3); the returned id vector is
+/// then aligned 1:1 with the prefixes (and empty otherwise).
+fn decode_prefixes(mut buf: &[u8], add_path: bool) -> Result<(Vec<Prefix>, Vec<u32>), DecodeError> {
     let mut out = Vec::new();
+    let mut ids = Vec::new();
     while !buf.is_empty() {
+        if add_path {
+            if buf.len() < 4 {
+                return Err(DecodeError::Malformed);
+            }
+            ids.push(u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]));
+            buf = &buf[4..];
+        }
         let (p, used) = decode_prefix(buf).ok_or(DecodeError::Malformed)?;
         out.push(p);
         buf = &buf[used..];
     }
-    Ok(out)
+    Ok((out, ids))
 }
 
 fn decode_attributes(mut buf: &[u8], four_octet: bool) -> Result<Vec<PathAttribute>, DecodeError> {
@@ -474,15 +549,15 @@ mod tests {
     }
 
     fn roundtrip_w(msg: Message, four_octet: bool) {
-        let bytes = msg.encode(four_octet);
+        let bytes = msg.encode(four_octet, AddPath::NONE);
         assert_eq!(&bytes[..16], &MARKER);
         assert_eq!(u16::from_be_bytes([bytes[16], bytes[17]]) as usize, bytes.len());
-        assert_eq!(Message::decode(&bytes, four_octet).expect("decodes"), msg);
+        assert_eq!(Message::decode(&bytes, four_octet, AddPath::NONE).expect("decodes"), msg);
     }
 
     #[test]
     fn keepalive_is_header_only() {
-        let bytes = Message::Keepalive.encode(true);
+        let bytes = Message::Keepalive.encode(true, AddPath::NONE);
         assert_eq!(bytes.len(), HEADER_LEN);
         roundtrip(Message::Keepalive);
     }
@@ -491,16 +566,16 @@ mod tests {
     fn route_refresh_roundtrips() {
         use crate::{AFI_IPV4, AFI_IPV6, SAFI_UNICAST};
         // Header (19) + AFI(2) + Reserved(1) + SAFI(1) = 23 octets, type 5.
-        let bytes = Message::RouteRefresh { afi: AFI_IPV4, safi: SAFI_UNICAST }.encode(true);
+        let bytes = Message::RouteRefresh { afi: AFI_IPV4, safi: SAFI_UNICAST }.encode(true, AddPath::NONE);
         assert_eq!(bytes.len(), HEADER_LEN + 4);
         assert_eq!(bytes[18], 5); // ROUTE-REFRESH type code
         roundtrip(Message::RouteRefresh { afi: AFI_IPV4, safi: SAFI_UNICAST });
         roundtrip(Message::RouteRefresh { afi: AFI_IPV6, safi: SAFI_UNICAST });
         // A wrong-length body is rejected.
-        let mut short = Message::RouteRefresh { afi: AFI_IPV4, safi: SAFI_UNICAST }.encode(true);
+        let mut short = Message::RouteRefresh { afi: AFI_IPV4, safi: SAFI_UNICAST }.encode(true, AddPath::NONE);
         short.truncate(HEADER_LEN + 3);
         short[17] = (HEADER_LEN + 3) as u8;
-        assert!(matches!(Message::decode(&short, true), Err(DecodeError::Malformed)));
+        assert!(matches!(Message::decode(&short, true, AddPath::NONE), Err(DecodeError::Malformed)));
     }
 
     #[test]
@@ -577,6 +652,7 @@ mod tests {
                 PathAttribute::LocalPref(100),
             ],
             nlri: vec![p("10.0.0.0/8"), p("203.0.113.0/24")],
+            ..Default::default()
         }));
     }
 
@@ -584,6 +660,40 @@ mod tests {
     fn empty_update_is_a_keepalive_of_routes() {
         // A withdrawn-only / empty UPDATE is legal.
         roundtrip(Message::Update(Update::default()));
+    }
+
+    #[test]
+    fn update_roundtrips_with_add_path_identifiers() {
+        // With ADD-PATH (RFC 7911) every NLRI / withdrawn route on the wire carries
+        // a 4-octet Path Identifier; the codec must round-trip them aligned 1:1.
+        let ap = AddPath::ipv4(true);
+        let update = Update {
+            withdrawn: vec![p("198.51.100.0/24")],
+            withdrawn_path_ids: vec![7],
+            attributes: vec![
+                PathAttribute::Origin(Origin::Igp),
+                PathAttribute::AsPath(vec![AsPathSegment::Sequence(vec![65001])]),
+                PathAttribute::NextHop(ip([192, 0, 2, 1])),
+            ],
+            nlri: vec![p("10.0.0.0/8"), p("10.0.0.0/8")],
+            nlri_path_ids: vec![1, 2],
+        };
+        let bytes = Message::Update(update.clone()).encode(false, ap);
+        let Message::Update(decoded) = Message::decode(&bytes, false, ap).unwrap() else {
+            panic!("not an update");
+        };
+        assert_eq!(decoded.nlri, update.nlri);
+        assert_eq!(decoded.nlri_path_ids, vec![1, 2]);
+        assert_eq!(decoded.withdrawn_path_ids, vec![7]);
+        // The same two prefixes with DIFFERENT path-ids are two distinct paths —
+        // exactly what ADD-PATH exists to carry.
+        assert_eq!(decoded.nlri.len(), 2);
+
+        // Decoded WITHOUT add-path the 4-octet ids would be misread as prefixes —
+        // proving the flag is required out-of-band (not self-describing).
+        assert!(Message::decode(&bytes, false, AddPath::NONE)
+            .map(|m| matches!(m, Message::Update(u) if u.nlri != update.nlri))
+            .unwrap_or(true));
     }
 
     #[test]
@@ -602,10 +712,11 @@ mod tests {
                 PathAttribute::NextHop(ip([192, 0, 2, 1])),
             ],
             nlri: vec![p("10.0.0.0/8")],
+            ..Default::default()
         };
         // Encode toward the legacy peer (four_octet = false).
-        let bytes = Message::Update(update).encode(false);
-        let Message::Update(decoded) = Message::decode(&bytes, false).unwrap() else {
+        let bytes = Message::Update(update).encode(false, AddPath::NONE);
+        let Message::Update(decoded) = Message::decode(&bytes, false, AddPath::NONE).unwrap() else {
             panic!("not an update");
         };
 
@@ -640,20 +751,20 @@ mod tests {
 
     #[test]
     fn decode_rejects_bad_marker_length_type_version() {
-        let mut bytes = Message::Keepalive.encode(true);
+        let mut bytes = Message::Keepalive.encode(true, AddPath::NONE);
         bytes[0] ^= 0x01;
-        assert_eq!(Message::decode(&bytes, true), Err(DecodeError::BadMarker));
+        assert_eq!(Message::decode(&bytes, true, AddPath::NONE), Err(DecodeError::BadMarker));
 
-        let mut bytes = Message::Keepalive.encode(true);
+        let mut bytes = Message::Keepalive.encode(true, AddPath::NONE);
         bytes.push(0); // length field no longer matches
-        assert!(matches!(Message::decode(&bytes, true), Err(DecodeError::BadLength { .. })));
+        assert!(matches!(Message::decode(&bytes, true, AddPath::NONE), Err(DecodeError::BadLength { .. })));
 
-        let mut bytes = Message::Keepalive.encode(true);
+        let mut bytes = Message::Keepalive.encode(true, AddPath::NONE);
         bytes[18] = 9; // bad type
-        assert_eq!(Message::decode(&bytes, true), Err(DecodeError::BadType(9)));
+        assert_eq!(Message::decode(&bytes, true, AddPath::NONE), Err(DecodeError::BadType(9)));
 
-        let mut bytes = Message::Open(Open::new(VERSION, 1, 90, ip([1, 1, 1, 1]))).encode(true);
+        let mut bytes = Message::Open(Open::new(VERSION, 1, 90, ip([1, 1, 1, 1]))).encode(true, AddPath::NONE);
         bytes[HEADER_LEN] = 3; // version 3
-        assert_eq!(Message::decode(&bytes, true), Err(DecodeError::BadVersion(3)));
+        assert_eq!(Message::decode(&bytes, true, AddPath::NONE), Err(DecodeError::BadVersion(3)));
     }
 }
