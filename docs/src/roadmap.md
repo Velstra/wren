@@ -221,8 +221,10 @@ tracked but not yet scheduled, grouped by area:
 - **IGPs & link-state:** OSPFv3 NSSA + address families (RFC 5838), IS-IS
   refinements (the RFC 5303 p2p three-way TLV, L1↔L2 route leaking), RIFT, EIGRP;
   IGMP/MLD for multicast group membership.
-- **BGP breadth:** EVPN (RFC 7432), long-lived graceful restart (RFC 9494), BMP
-  (RFC 7854), FlowSpec (RFC 8955), RTC (RFC 4684).
+- **BGP breadth:** EVPN (RFC 7432), long-lived graceful restart (RFC 9494),
+  FlowSpec (RFC 8955), RTC (RFC 4684). (**BMP** (RFC 7854) — streaming BGP state
+  (Initiation, Peer Up, Route Monitoring, Peer Down) to a monitoring station via
+  `[bgp.bmp]` — is **done**; see [Monitoring](monitoring.md).)
   (**Extended Next Hop / IPv4-over-IPv6** (RFC 5549 / RFC 8950) — advertising IPv4
   routes with an IPv6 next hop and installing them via the kernel's `RTA_VIA`,
   negotiated per neighbour with `extended-nexthop = true` — is **done**, including

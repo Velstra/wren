@@ -44,6 +44,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use wren_core::Prefix;
 
 pub mod attr;
+pub mod bmp;
 pub mod capability;
 pub mod community;
 pub mod decision;

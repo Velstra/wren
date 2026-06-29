@@ -392,9 +392,28 @@ pub struct Bgp {
     /// An RTR (RFC 8210) validating cache to fetch ROAs from live, instead of (or in
     /// addition to) the static `[[bgp.roa]]` entries. Unset disables RTR.
     pub rtr: Option<BgpRtr>,
+    /// A BMP (RFC 7854) monitoring station to stream this speaker's BGP state to.
+    /// Unset disables BMP.
+    pub bmp: Option<BgpBmp>,
     /// The configured peers.
     #[serde(default)]
     pub neighbor: Vec<BgpNeighbor>,
+}
+
+/// A BMP monitoring station to stream BGP state to (`[bgp.bmp]`, RFC 7854). Wren
+/// connects out to the station and sends Initiation, then Peer Up / Route Monitoring
+/// / Peer Down as sessions and routes change.
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct BgpBmp {
+    /// The station's `host:port` (the BMP port is conventionally 11019).
+    pub station: String,
+    /// The sysName reported in the Initiation message. Defaults to the router id.
+    #[serde(rename = "sys-name")]
+    pub sys_name: Option<String>,
+    /// The sysDescr reported in the Initiation message. Defaults to `"wren"`.
+    #[serde(rename = "sys-descr")]
+    pub sys_descr: Option<String>,
 }
 
 /// An RTR validating cache to fetch RPKI ROAs from (`[bgp.rtr]`, RFC 8210).

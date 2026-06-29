@@ -430,6 +430,16 @@ enum PeerMsg {
         /// the single best) and drives it with [`SessionCmd::AdvertiseAddPath`].
         add_path_send: bool,
         cmd_tx: mpsc::Sender<SessionCmd>,
+        /// Our local transport address on the session — for the BMP Peer Up (§4.10).
+        local_addr: IpAddr,
+        /// Our local TCP port.
+        local_port: u16,
+        /// The peer's TCP port.
+        remote_port: u16,
+        /// The OPEN we sent (a full BGP PDU), for the BMP Peer Up.
+        sent_open: Vec<u8>,
+        /// The OPEN we received (a full BGP PDU), for the BMP Peer Up.
+        received_open: Vec<u8>,
     },
     /// The session left Established / went down — flush the peer's routes, but only
     /// if `conn_id` is still the current connection (a stale loser's Down is
@@ -825,6 +835,7 @@ pub async fn run(
     mut queries: mpsc::Receiver<BgpQueryRequest>,
     mut redist: mpsc::Receiver<Redistribution>,
     mut rtr_rx: mpsc::Receiver<Vec<Roa>>,
+    bmp_tx: Option<mpsc::Sender<crate::bmp::BmpEvent>>,
 ) -> Result<()> {
     // The neighbour table: every configured peer, its AS and whether the session
     // is currently Established. Sorted for stable `show bgp neighbors` output.
@@ -838,6 +849,10 @@ pub async fn run(
             )
         })
         .collect();
+
+    // The BGP Identifier each Established peer last reported, so a later Peer Down's
+    // BMP Per-Peer Header can name it (the Down message itself carries no id).
+    let mut bmp_peer_ids: BTreeMap<IpAddr, Ipv4Addr> = BTreeMap::new();
 
     // The origination set: the configured `network`s up front (each carrying the
     // configured communities), plus redistributed prefixes added as they arrive.
@@ -1069,7 +1084,7 @@ pub async fn run(
             }
         };
         match msg {
-            PeerMsg::Established { peer: p, peer_id, inbound, conn_id, gr_restart_time, add_path_send: ap_send, cmd_tx } => {
+            PeerMsg::Established { peer: p, peer_id, inbound, conn_id, gr_restart_time, add_path_send: ap_send, cmd_tx, local_addr, local_port, remote_port, sent_open, received_open } => {
                 // A peer damped for exceeding its max-prefix limit is kept down: shut
                 // any reconnection straight back down without advertising to it.
                 if damped.contains(&p) {
@@ -1100,6 +1115,22 @@ pub async fn run(
                 info!(peer = %p, "BGP session established");
                 if let Some(n) = neighbors.get_mut(&p) {
                     n.established = true;
+                }
+                // BMP Peer Up (RFC 7854 §4.10): tell the monitoring station this
+                // session is up, with both OPENs. Best-effort — never block routing.
+                bmp_peer_ids.insert(p, peer_id);
+                if let Some(tx) = &bmp_tx {
+                    let asn = neighbors.get(&p).map(|n| n.remote_as).unwrap_or(0);
+                    let _ = tx.try_send(crate::bmp::BmpEvent::PeerUp {
+                        peer: p,
+                        asn,
+                        bgp_id: peer_id,
+                        local_addr,
+                        local_port,
+                        remote_port,
+                        sent_open,
+                        received_open,
+                    });
                 }
                 est_inbound.insert(p, inbound);
                 current_conn.insert(p, conn_id);
@@ -1173,6 +1204,13 @@ pub async fn run(
                 info!(peer = %p, "BGP session down");
                 if let Some(n) = neighbors.get_mut(&p) {
                     n.established = false;
+                }
+                // BMP Peer Down (RFC 7854 §4.9), named with the id the peer reported
+                // at Established. Best-effort.
+                if let Some(tx) = &bmp_tx {
+                    let asn = neighbors.get(&p).map(|n| n.remote_as).unwrap_or(0);
+                    let bgp_id = bmp_peer_ids.remove(&p).unwrap_or(Ipv4Addr::UNSPECIFIED);
+                    let _ = tx.try_send(crate::bmp::BmpEvent::PeerDown { peer: p, asn, bgp_id });
                 }
                 sessions.remove(&p);
                 est_inbound.remove(&p);
@@ -1279,6 +1317,19 @@ pub async fn run(
                 // reconnection that re-floods its routes installs nothing.
                 if damped.contains(&peer) {
                     continue;
+                }
+                // BMP Route Monitoring (RFC 7854 §4.6): forward the UPDATE the peer
+                // sent to the monitoring station, re-encoded as a full BGP PDU
+                // (4-octet AS_PATH; the monitored copy does not reproduce ADD-PATH
+                // Path Identifiers). Best-effort — never block routing.
+                if let Some(tx) = &bmp_tx {
+                    let pdu = Message::Update(update.clone()).encode(true, AddPath::ipv4(false));
+                    let _ = tx.try_send(crate::bmp::BmpEvent::RouteMonitor {
+                        peer,
+                        asn: peer_as,
+                        bgp_id: peer_id,
+                        update: pdu,
+                    });
                 }
                 let facts = PeerFacts {
                     addr: peer,
@@ -2454,6 +2505,10 @@ async fn drive_session(
         apply_gtsm(&stream, hops);
     }
     let local_full = normalize_ip(stream.local_addr()?.ip());
+    // Capture the transport addressing for the BMP Peer Up (RFC 7854 §4.10) before
+    // the stream is split. `peer_addr()` may fail on an odd socket — default the port.
+    let local_port = stream.local_addr().map(|a| a.port()).unwrap_or(0);
+    let remote_port = stream.peer_addr().map(|a| a.port()).unwrap_or(0);
     // The IPv4 next-hop-self for numbered v4 advertisements; for an unnumbered (IPv6)
     // session there is no local IPv4, so fall back to the router id (IPv4 routes ride
     // MP_REACH with an IPv6 next hop via Extended Next Hop, RFC 5549).
@@ -2489,6 +2544,11 @@ async fn drive_session(
         local_ip,
         link,
         inbound,
+        local_addr: local_full,
+        local_port,
+        remote_port,
+        sent_open: Vec::new(),
+        received_open: Vec::new(),
         conn_id: NEXT_CONN_ID.fetch_add(1, Ordering::Relaxed),
         neg_hold: local.hold_time,
         keepalive_int: (local.hold_time / 3).max(1),
@@ -2536,6 +2596,8 @@ async fn drive_session(
                             Step::Event(Event::OpenError)
                         } else {
                             sess.peer_id = o.identifier;
+                            // Keep the encoded OPEN for the BMP Peer Up (RFC 7854 §4.10).
+                            sess.received_open = msg.encode(true, AddPath::ipv4(false));
                             // 4-octet AS_PATH only when both speakers advertised the
                             // capability (RFC 6793 §4); we always do.
                             sess.four_octet = o.supports_four_octet_as();
@@ -2774,6 +2836,18 @@ struct Session<'a> {
     /// Whether this connection was accepted (inbound) vs dialled (outbound), for
     /// §6.8 collision detection.
     inbound: bool,
+    /// Our local transport address and TCP ports on this connection, captured at
+    /// setup — reported in the BMP Peer Up (RFC 7854 §4.10).
+    local_addr: IpAddr,
+    /// Our local TCP port.
+    local_port: u16,
+    /// The peer's TCP port.
+    remote_port: u16,
+    /// The OPEN we sent and the OPEN we received, each a full BGP PDU, captured for
+    /// the BMP Peer Up. Empty until each is exchanged.
+    sent_open: Vec<u8>,
+    /// The OPEN we received (a full BGP PDU), for the BMP Peer Up.
+    received_open: Vec<u8>,
     /// This connection's unique id, so the central task can distinguish the
     /// surviving session's Established/Down from a stale loser's.
     conn_id: u64,
@@ -2853,7 +2927,10 @@ impl Session<'_> {
                             AFI_IPV6,
                         )]));
                     }
-                    self.send(&Message::Open(open)).await?;
+                    // Keep the encoded OPEN for the BMP Peer Up (RFC 7854 §4.10).
+                    let open_msg = Message::Open(open);
+                    self.sent_open = open_msg.encode(true, AddPath::ipv4(false));
+                    self.send(&open_msg).await?;
                 }
                 Action::SendKeepalive => {
                     self.send(&Message::Keepalive).await?;
@@ -2887,6 +2964,11 @@ impl Session<'_> {
                             gr_restart_time: self.peer_gr,
                             add_path_send: self.add_path_send,
                             cmd_tx: self.cmd_tx.clone(),
+                            local_addr: self.local_addr,
+                            local_port: self.local_port,
+                            remote_port: self.remote_port,
+                            sent_open: self.sent_open.clone(),
+                            received_open: self.received_open.clone(),
                         })
                         .await;
                 }

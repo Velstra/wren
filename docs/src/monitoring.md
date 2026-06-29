@@ -75,5 +75,30 @@ or a one-liner that serves the socket on demand:
 socat TCP-LISTEN:9999,reuseaddr,fork EXEC:'wren show metrics'
 ```
 
+## BMP — streaming BGP state to a monitoring station
+
+For BGP specifically, Wren speaks the [BGP Monitoring Protocol][bmp] (BMP,
+RFC 7854): it connects out to a monitoring station and streams its BGP state as it
+changes — an Initiation message, a **Peer Up** when a session establishes (carrying
+both OPEN messages), a **Route Monitoring** message wrapping every UPDATE a peer
+sends (so the station sees the router's Adj-RIB-In), and a **Peer Down** when a
+session drops. This is what feeds collectors like `pmacct`, OpenBMP or a BMP-aware
+Kafka pipeline.
+
+Point Wren at a station with `[bgp.bmp]`:
+
+```toml
+[bgp.bmp]
+station   = "203.0.113.9:11019"   # the station's host:port (BMP is conventionally 11019)
+sys-name  = "edge-router-1"        # optional; defaults to the router id
+sys-descr = "wren edge"            # optional; defaults to "wren"
+```
+
+BMP is **best-effort and never back-pressures routing**: events are offered to the
+client with a non-blocking send and dropped if the station is slow or down, and the
+client reconnects on failure. State is not replayed on reconnect — the station sees
+observations from connect time forward.
+
 [fmt]: https://prometheus.io/docs/instrumenting/exposition_formats/#text-based-format
 [tc]: https://github.com/prometheus/node_exporter#textfile-collector
+[bmp]: https://datatracker.ietf.org/doc/html/rfc7854

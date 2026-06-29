@@ -13,6 +13,7 @@
 #[cfg(feature = "babel")]
 mod babel;
 mod bgp;
+mod bmp;
 mod connected;
 mod control;
 mod metrics;
@@ -109,6 +110,11 @@ const REDIST_QUEUE: usize = 1024;
 
 /// The mpsc capacity for control → router queries.
 const QUERY_QUEUE: usize = 16;
+
+/// The mpsc capacity for the BGP engine → BMP client event feed. Generous, since the
+/// engine offers events with `try_send` and drops on a full queue (best-effort
+/// monitoring must never back-pressure routing).
+const BMP_QUEUE: usize = 1024;
 
 /// Where the daemon serves — and the client connects to — by default.
 const DEFAULT_CONTROL_SOCKET: &str = "/run/wren/wren.sock";
@@ -221,6 +227,13 @@ async fn main() -> Result<()> {
     // gets a clone.
     let (rtr_tx, rtr_rx) = mpsc::channel::<Vec<wren_bgp::rpki::Roa>>(QUERY_QUEUE);
     let mut rtr_rx = Some(rtr_rx);
+    // The BMP (RFC 7854) event feed from the BGP engine to the monitoring-station
+    // client. The receiver is taken when the client is spawned; the sender is handed
+    // to `bgp::run` only when `[bgp.bmp]` is configured, so otherwise no events are
+    // produced. The channel is bounded and the engine offers events with `try_send`,
+    // so a slow/absent station never back-pressures routing.
+    let (bmp_tx, bmp_rx) = mpsc::channel::<bmp::BmpEvent>(BMP_QUEUE);
+    let mut bmp_rx = Some(bmp_rx);
     #[cfg(feature = "ospf")]
     let (ospf_queries_tx, ospf_queries_rx) = mpsc::channel(QUERY_QUEUE);
     #[cfg(feature = "ospf")]
@@ -454,11 +467,39 @@ async fn main() -> Result<()> {
                         }
                     }
                 }
+                // Spawn the BMP client if a monitoring station is configured; the BGP
+                // engine streams Peer Up / Route Monitoring / Peer Down to it. The
+                // engine gets a sender only when BMP is on, so it produces no events
+                // otherwise.
+                let bmp_for_engine = if let Some(bmpcfg) = bgpcfg.bmp.as_ref() {
+                    match bmpcfg.station.parse::<std::net::SocketAddr>() {
+                        Ok(station) => {
+                            let sys_name = bmpcfg
+                                .sys_name
+                                .clone()
+                                .unwrap_or_else(|| run_cfg.router_id.to_string());
+                            let sys_descr =
+                                bmpcfg.sys_descr.clone().unwrap_or_else(|| "wren".to_string());
+                            let brx = bmp_rx.take().expect("bmp rx taken once");
+                            info!(%station, "BMP client starting");
+                            tokio::spawn(async move {
+                                bmp::run(bmp::BmpConfig { station, sys_name, sys_descr }, brx).await
+                            });
+                            Some(bmp_tx.clone())
+                        }
+                        Err(e) => {
+                            error!(station = %bmpcfg.station, error = %e, "BMP station must be host:port; BMP disabled");
+                            None
+                        }
+                    }
+                } else {
+                    None
+                };
                 let tx = updates_tx.clone();
                 let qrx = bgp_queries_rx.take().expect("bgp queries rx taken once");
                 let rrx = rtr_rx.take().expect("rtr rx taken once");
                 tokio::spawn(async move {
-                    if let Err(e) = bgp::run(run_cfg, tx, qrx, redist_rx, rrx).await {
+                    if let Err(e) = bgp::run(run_cfg, tx, qrx, redist_rx, rrx, bmp_for_engine).await {
                         error!(error = %e, "BGP engine stopped");
                     }
                 });
