@@ -858,6 +858,27 @@ fn build_bgp_config(
         aggregates.push(bgp::Aggregate { prefix, summary_only: agg.summary_only });
     }
 
+    // Static RPKI ROAs (RFC 6811): the Validated ROA Payloads received-route origins
+    // are checked against. `max-length` defaults to the prefix's own length.
+    let mut roas = Vec::with_capacity(bgp.roa.len());
+    for r in &bgp.roa {
+        let prefix: wren_core::Prefix = r
+            .prefix
+            .parse()
+            .with_context(|| format!("bgp roa {:?} must be addr/len", r.prefix))?;
+        let max_length = r.max_length.unwrap_or(prefix.len());
+        if max_length < prefix.len() || max_length > prefix.max_len() {
+            anyhow::bail!(
+                "bgp roa {:?} max-length {} must be between the prefix length {} and {}",
+                r.prefix,
+                max_length,
+                prefix.len(),
+                prefix.max_len()
+            );
+        }
+        roas.push(wren_bgp::rpki::Roa { prefix, max_length, origin_as: r.origin_as });
+    }
+
     let next_hop6 = match bgp.next_hop6.as_deref() {
         Some(s) => Some(
             s.parse::<std::net::Ipv6Addr>()
@@ -906,6 +927,8 @@ fn build_bgp_config(
         confederation_members: bgp.confederation_members.clone(),
         max_paths: bgp.multipath.unwrap_or(1).max(1),
         aggregates,
+        roas,
+        rpki_reject_invalid: bgp.rpki_reject_invalid,
     })
 }
 

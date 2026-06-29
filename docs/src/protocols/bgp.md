@@ -956,3 +956,55 @@ immediate withdrawal on session down.
 originates `10.20.0.0/24` is **hard-killed** (`SIGKILL`); the helper shows the
 session leave Established yet keeps `10.20.0.0/24 proto bgp` installed, and when the
 peer restarts the route is still there — it never left the FIB.
+
+## RPKI origin validation (RFC 6811)
+
+Origin validation checks that the AS originating a prefix is actually authorised to,
+using **ROAs** (Route Origin Authorizations). Each ROA — a Validated ROA Payload —
+authorises one origin AS to announce a prefix and any more-specific within it up to a
+`max-length`. Wren validates every received route's `{ prefix, origin AS }` against the
+configured ROA table and classifies it (RFC 6811 §2):
+
+- **Valid** — at least one ROA *matches* (covers the prefix within `max-length`, and the
+  origin AS is equal);
+- **Invalid** — at least one ROA *covers* the prefix but none matches (wrong origin AS,
+  or the prefix is longer than every covering ROA's `max-length`);
+- **NotFound** — no ROA covers the prefix.
+
+The route's origin AS is the right-most AS of its `AS_PATH` (RFC 6811 §2).
+
+ROAs are configured statically; combined with `rpki-reject-invalid`, an **Invalid**
+route is dropped at import — it never enters the RIB, the kernel FIB, or the
+Adj-RIB-Out (so it is not re-advertised). `Valid` and `NotFound` routes are always
+accepted; without `rpki-reject-invalid` everything is accepted and only *shown*.
+
+```toml
+[bgp]
+rpki-reject-invalid = true            # drop RPKI-Invalid routes (default false)
+
+[[bgp.roa]]
+prefix     = "10.99.0.0/24"
+max-length = 24                       # defaults to the prefix length if omitted
+origin-as  = 65002
+
+[[bgp.roa]]
+prefix     = "2001:db8::/32"
+max-length = 48
+origin-as  = 65001
+```
+
+`show bgp roa` lists the ROA table, and — when any ROA is configured — `show bgp` tags
+each route with its validity:
+
+```
+> show bgp
+10.99.0.0/24 via 10.0.0.2 as-path 65002 localpref 100 origin igp rpki valid
+```
+
+`scripts/bgp-rpki-smoke.sh` exercises it live (rootless): a validating router learns
+two prefixes from a peer — one authorised by a ROA (Valid, installed `proto bgp`) and
+one not (Invalid), and with `rpki-reject-invalid` the Invalid prefix is absent from
+both its RIB and the kernel.
+
+Fetching ROAs live from a validating cache over the **RTR protocol** (RFC 8210),
+rather than configuring them statically, is the natural follow-up.

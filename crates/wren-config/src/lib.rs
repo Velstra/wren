@@ -380,8 +380,34 @@ pub struct Bgp {
     #[serde(default, rename = "aggregate")]
     pub aggregate: Vec<BgpAggregate>,
     /// The configured peers.
+    /// Static RPKI ROAs (Validated ROA Payloads, RFC 6811) to validate the origin of
+    /// received routes against. Fetching them live over RTR (RFC 8210) is future work.
+    #[serde(default, rename = "roa")]
+    pub roa: Vec<BgpRoa>,
+    /// Reject (drop, never enter the RIB) any received route that RPKI origin
+    /// validation classifies as **Invalid** (RFC 6811). `Valid` and `NotFound` routes
+    /// are always accepted. Defaults to false (validate and show, but accept all).
+    #[serde(default, rename = "rpki-reject-invalid")]
+    pub rpki_reject_invalid: bool,
+    /// The configured peers.
     #[serde(default)]
     pub neighbor: Vec<BgpNeighbor>,
+}
+
+/// One static RPKI ROA (`[[bgp.roa]]`, RFC 6811): an authorisation that `origin_as`
+/// may originate `prefix` and more-specifics within it up to `max-length`.
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct BgpRoa {
+    /// The authorised prefix, as `addr/len`.
+    pub prefix: String,
+    /// The longest prefix length the origin may announce within `prefix`. Defaults to
+    /// the prefix's own length (an exact-match ROA).
+    #[serde(rename = "max-length")]
+    pub max_length: Option<u8>,
+    /// The Autonomous System authorised to originate it (4-octet, RFC 6793).
+    #[serde(rename = "origin-as")]
+    pub origin_as: u32,
 }
 
 /// One BGP address aggregate (`[[bgp.aggregate]]`, RFC 4271 §9.2.2.2).

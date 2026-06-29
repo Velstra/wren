@@ -45,6 +45,7 @@ use wren_bgp::fsm::{Action, BgpFsm, Event, State, CODE_CEASE};
 use wren_bgp::large_community::format_large_community;
 use wren_bgp::message::{AddPath, Message, Notification, Open, Update};
 use wren_bgp::rib::{BgpRib, RibEvent};
+use wren_bgp::rpki::{Roa, RoaTable, Validity};
 use wren_bgp::{
     AFI_IPV4, AFI_IPV6, AS_TRANS, HEADER_LEN, MARKER, MAX_MESSAGE_LEN, PORT, SAFI_UNICAST, VERSION,
 };
@@ -115,6 +116,11 @@ pub struct BgpConfig {
     /// Address aggregates (RFC 4271 §9.2.2.2): a covering prefix advertised whenever
     /// a more-specific, locally-originated/redistributed route contributes to it.
     pub aggregates: Vec<Aggregate>,
+    /// Static RPKI ROAs (RFC 6811) to validate the origin of received routes against.
+    pub roas: Vec<Roa>,
+    /// Drop received routes that RPKI origin validation classifies as Invalid
+    /// (RFC 6811); `Valid` and `NotFound` are always accepted.
+    pub rpki_reject_invalid: bool,
 }
 
 /// A configured address aggregate (RFC 4271 §9.2.2.2). The `prefix` is advertised
@@ -463,6 +469,8 @@ pub enum BgpQuery {
     /// Every candidate path in the Adj-RIB-In (all paths per destination, with their
     /// received ADD-PATH Path Identifier) — `show bgp paths`.
     Paths,
+    /// The configured RPKI ROA table (RFC 6811) — `show bgp roa`.
+    Roa,
     /// The configured neighbours and their session state.
     Neighbors,
     /// Send a ROUTE-REFRESH to this peer (RFC 2918) — `bgp refresh <addr>`. Not a
@@ -583,8 +591,34 @@ fn neighbor_summaries(neighbors: &BTreeMap<IpAddr, NeighborState>) -> Vec<Neighb
         .collect()
 }
 
-/// Render the BGP Loc-RIB best paths, one per line (à la `show ip bgp`).
-pub fn render_bgp_routes(rib: &BgpRib) -> String {
+/// The origin AS of a route per RFC 6811 §2: the right-most AS of the AS_PATH (the last
+/// element of its last segment). `None` for an empty AS_PATH (a locally-originated or
+/// plain iBGP route with no path), in which case the caller falls back to the peer AS.
+fn origin_as(as_path: &[AsPathSegment]) -> Option<u32> {
+    as_path.iter().rev().find_map(|seg| match seg {
+        // The origin segment's last AS is the origin (sequences keep order).
+        AsPathSegment::Sequence(a) | AsPathSegment::ConfedSequence(a) => a.last().copied(),
+        // An AS_SET origin is unordered; RFC 6811 leaves it to local policy — take a
+        // member so a set-origined route is still validated rather than skipped.
+        AsPathSegment::Set(a) | AsPathSegment::ConfedSet(a) => a.first().copied(),
+    })
+}
+
+/// Render the RPKI ROA table (RFC 6811), one VRP per line — `show bgp roa`.
+pub fn render_roa_table(roa: &RoaTable) -> String {
+    if roa.is_empty() {
+        return "no rpki roas configured\n".to_string();
+    }
+    let mut out = String::new();
+    for r in roa.iter() {
+        let _ = writeln!(out, "{} maxlen {} as {}", r.prefix, r.max_length, r.origin_as);
+    }
+    out
+}
+
+/// Render the BGP Loc-RIB best paths, one per line (à la `show ip bgp`). When the ROA
+/// table is non-empty each route is tagged with its RPKI validity (RFC 6811).
+pub fn render_bgp_routes(rib: &BgpRib, roa: &RoaTable) -> String {
     if rib.is_empty() {
         return "no bgp routes\n".to_string();
     }
@@ -615,7 +649,13 @@ pub fn render_bgp_routes(rib: &BgpRib) -> String {
         if path.med != 0 {
             let _ = write!(out, " med {}", path.med);
         }
-        let _ = writeln!(out, " origin {}", origin_str(path.origin));
+        let _ = write!(out, " origin {}", origin_str(path.origin));
+        // RPKI origin validity (RFC 6811), shown only when ROAs are configured.
+        if !roa.is_empty() {
+            let origin = origin_as(&path.as_path).unwrap_or(path.peer_as);
+            let _ = write!(out, " rpki {}", roa.validate(prefix, origin).as_str());
+        }
+        out.push('\n');
     }
     out
 }
@@ -745,6 +785,10 @@ pub async fn run(
     // changes are diffed against.
     let aggregates = cfg.aggregates.clone();
     let mut advertised = effective_origination(&originated, &aggregates);
+    // RPKI origin validation (RFC 6811): the static ROA table and whether to drop
+    // Invalid routes. Built once; validation is read-only per received route.
+    let roa = RoaTable::new(cfg.roas.clone());
+    let rpki_reject = cfg.rpki_reject_invalid;
     // Established sessions we can push origination changes to, keyed by peer.
     let mut sessions: HashMap<IpAddr, mpsc::Sender<SessionCmd>> = HashMap::new();
     // Whether each established session's connection was inbound, for §6.8 collision
@@ -894,8 +938,9 @@ pub async fn run(
             }
             Some(req) = queries.recv() => {
                 let resp = match req.query {
-                    BgpQuery::Routes => render_bgp_routes(&rib),
+                    BgpQuery::Routes => render_bgp_routes(&rib, &roa),
                     BgpQuery::Paths => render_bgp_paths(&rib),
+                    BgpQuery::Roa => render_roa_table(&roa),
                     BgpQuery::Neighbors => render_bgp_neighbors(&neighbor_summaries(&neighbors)),
                     BgpQuery::Refresh(addr) => match sessions.get(&addr) {
                         Some(cmd_tx) => {
@@ -1213,7 +1258,7 @@ pub async fn run(
                             let path = build_path(&update, IpAddr::V4(nh), None, facts);
                             for (i, p) in update.nlri.iter().enumerate() {
                                 let path_id = update.nlri_path_ids.get(i).copied().unwrap_or(0);
-                                import_and_install(import, peer, path_id, *p, &path, &mut rib, &updates, &sessions)
+                                import_and_install(import, peer, path_id, *p, &path, &roa, rpki_reject, &mut rib, &updates, &sessions)
                                     .await;
                             }
                         }
@@ -1226,7 +1271,7 @@ pub async fn run(
                     let iface = if is_link_local { ingress_iface.clone() } else { None };
                     let path = build_path(&update, IpAddr::V6(nh6), iface, facts);
                     for p in nlri {
-                        import_and_install(import, peer, 0, *p, &path, &mut rib, &updates, &sessions)
+                        import_and_install(import, peer, 0, *p, &path, &roa, rpki_reject, &mut rib, &updates, &sessions)
                             .await;
                     }
                 }
@@ -1238,7 +1283,7 @@ pub async fn run(
                     let iface = if is_link_local { ingress_iface.clone() } else { None };
                     let path = build_path(&update, IpAddr::V6(nh6), iface, facts);
                     for p in nlri {
-                        import_and_install(import, peer, 0, *p, &path, &mut rib, &updates, &sessions)
+                        import_and_install(import, peer, 0, *p, &path, &roa, rpki_reject, &mut rib, &updates, &sessions)
                             .await;
                     }
                 }
@@ -1422,10 +1467,26 @@ async fn import_and_install(
     path_id: u32,
     prefix: Prefix,
     path: &Path,
+    roa: &RoaTable,
+    reject_invalid: bool,
     rib: &mut BgpRib,
     updates: &mpsc::Sender<RouteUpdate>,
     sessions: &HashMap<IpAddr, mpsc::Sender<SessionCmd>>,
 ) {
+    // RPKI origin validation (RFC 6811): when configured to reject Invalid routes, a
+    // route whose (prefix, origin AS) validates as Invalid is dropped — withdrawing any
+    // path previously accepted for it — before the import route-map runs. Valid and
+    // NotFound routes fall through to the filter unchanged.
+    if reject_invalid && !roa.is_empty() {
+        let origin = origin_as(&path.as_path).unwrap_or(path.peer_as);
+        if roa.validate(&prefix, origin) == Validity::Invalid {
+            debug!(%prefix, origin, "RPKI invalid; rejecting route");
+            if let Some(ev) = rib.withdraw_with_id(peer, path_id, prefix) {
+                apply_event(ev, updates, sessions).await;
+            }
+            return;
+        }
+    }
     // ADD-PATH (RFC 7911): `path_id` distinguishes several paths the same peer
     // offers for one prefix (0 without ADD-PATH), so they coexist in the Adj-RIB-In.
     let ev = match filter_path(import, prefix, path) {
@@ -3240,7 +3301,7 @@ mod tests {
             ext_communities: vec![[0x00, 0x02, 0xFD, 0xE9, 0x00, 0x00, 0x00, 0x64]], // rt:65001:100
         };
         rib.update(ip([10, 0, 0, 1]), "10.0.0.0/8".parse::<Prefix>().unwrap(), path);
-        let out = render_bgp_routes(&rib);
+        let out = render_bgp_routes(&rib, &RoaTable::default());
         assert!(out.contains("10.0.0.0/8 via 192.0.2.1"));
         assert!(out.contains("large-communities 65001:1:2"));
         assert!(out.contains("ext-communities rt:65001:100"));
@@ -3252,7 +3313,67 @@ mod tests {
 
     #[test]
     fn render_routes_empty_rib() {
-        assert_eq!(render_bgp_routes(&BgpRib::new()), "no bgp routes\n");
+        assert_eq!(render_bgp_routes(&BgpRib::new(), &RoaTable::default()), "no bgp routes\n");
+    }
+
+    #[test]
+    fn origin_as_takes_the_rightmost_as() {
+        // The origin is the last AS of the AS_PATH (the right-most segment's last AS).
+        let path = vec![AsPathSegment::Sequence(vec![65001, 65002, 65003])];
+        assert_eq!(origin_as(&path), Some(65003));
+        // A trailing confed sequence still yields its last AS.
+        let confed = vec![
+            AsPathSegment::Sequence(vec![65001]),
+            AsPathSegment::ConfedSequence(vec![65010, 65011]),
+        ];
+        assert_eq!(origin_as(&confed), Some(65011));
+        // An empty AS_PATH has no origin (caller falls back to the peer AS).
+        assert_eq!(origin_as(&[]), None);
+    }
+
+    #[test]
+    fn render_routes_tags_rpki_validity() {
+        use wren_bgp::rpki::Roa;
+        let mut rib = BgpRib::new();
+        // A route 10.1.2.0/24 originated by AS 65002 (the AS_PATH origin).
+        let path = Path {
+            origin: Origin::Igp,
+            as_path: vec![AsPathSegment::Sequence(vec![65001, 65002])],
+            next_hop: ip([192, 0, 2, 1]),
+            next_hop_iface: None,
+            local_pref: 100,
+            med: 0,
+            from_ebgp: true,
+            from_confed: false,
+            peer_as: 65001,
+            igp_metric: 0,
+            peer_id: id([10, 0, 0, 1]),
+            peer_addr: ip([10, 0, 0, 1]),
+            from_client: false,
+            originator_id: None,
+            cluster_list: vec![],
+            communities: vec![],
+            large_communities: vec![],
+            ext_communities: vec![],
+        };
+        rib.update(ip([10, 0, 0, 1]), "10.1.2.0/24".parse::<Prefix>().unwrap(), path);
+
+        // A ROA authorising AS 65002 for 10.0.0.0/8 up to /24 → Valid.
+        let valid = RoaTable::new(vec![Roa {
+            prefix: "10.0.0.0/8".parse().unwrap(),
+            max_length: 24,
+            origin_as: 65002,
+        }]);
+        assert!(render_bgp_routes(&rib, &valid).contains("rpki valid"));
+        // A ROA for the wrong origin AS → Invalid.
+        let invalid = RoaTable::new(vec![Roa {
+            prefix: "10.0.0.0/8".parse().unwrap(),
+            max_length: 24,
+            origin_as: 65009,
+        }]);
+        assert!(render_bgp_routes(&rib, &invalid).contains("rpki invalid"));
+        // No ROAs configured → no rpki tag at all.
+        assert!(!render_bgp_routes(&rib, &RoaTable::default()).contains("rpki"));
     }
 
     #[test]
@@ -3662,7 +3783,7 @@ mod tests {
             ext_communities: vec![],
         };
         rib.update(ip([10, 0, 0, 2]), "2001:db8:99::/64".parse::<Prefix>().unwrap(), path.clone());
-        let out = render_bgp_routes(&rib);
+        let out = render_bgp_routes(&rib, &RoaTable::default());
         assert!(out.contains("2001:db8:99::/64 via 2001:db8::2"));
         // And to_route carries the v6 next hop into the kernel route.
         path.next_hop = IpAddr::V6("2001:db8::2".parse().unwrap());

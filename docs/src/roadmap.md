@@ -68,7 +68,12 @@ implemented to its RFC.
   itself rides IPv6 (a neighbour `address` may be an IPv6 literal, or a link-local
   `fe80::1%eth0` with an interface scope), bound on a single dual-stack listener, with
   the BGP Identifier still a 32-bit `router-id` — live-verified over an IPv6-only veth
-  (no IPv4 on the link) by `scripts/bgp-unnumbered-smoke.sh`
+  (no IPv4 on the link) by `scripts/bgp-unnumbered-smoke.sh` — and **RPKI origin
+  validation** (RFC 6811): received routes are classified Valid / Invalid / NotFound
+  against a static ROA table (`[[bgp.roa]]`), `rpki-reject-invalid` drops Invalid
+  routes at import, and `show bgp` / `show bgp roa` expose the validity and the table
+  — live-verified by `scripts/bgp-rpki-smoke.sh` (a feed of one valid + one invalid
+  origin; the latter never reaches the RIB or kernel)
 - [x] **Babel** (RFC 8966) — loop-avoiding distance-vector over IPv6 (UDP 6696,
   `ff02::1:6`), with the feasibility condition and Hello/IHU link costing
 - [x] **OSPFv3** (RFC 5340) — OSPF for IPv6, end to end. The `wren-ospfv3` library
@@ -212,7 +217,8 @@ tracked but not yet scheduled, grouped by area:
   refinements (the RFC 5303 p2p three-way TLV, L1↔L2 route leaking), RIFT, EIGRP;
   IGMP/MLD for multicast group membership.
 - **BGP breadth:** EVPN (RFC 7432), long-lived graceful restart (RFC 9494), BMP
-  (RFC 7854), FlowSpec (RFC 8955), RPKI origin validation, RTC (RFC 4684).
+  (RFC 7854), FlowSpec (RFC 8955), RPKI over RTR (the live ROA feed, RFC 8210),
+  RTC (RFC 4684).
   (**Extended Next Hop / IPv4-over-IPv6** (RFC 5549 / RFC 8950) — advertising IPv4
   routes with an IPv6 next hop and installing them via the kernel's `RTA_VIA`,
   negotiated per neighbour with `extended-nexthop = true` — is **done**, including

@@ -244,6 +244,7 @@ pub fn parse_bgp_query(line: &str) -> Option<BgpQuery> {
                 None | Some("routes") | Some("route") => BgpQuery::Routes,
                 Some("paths") | Some("path") => BgpQuery::Paths,
                 Some("neighbors") | Some("neighbours") | Some("summary") => BgpQuery::Neighbors,
+                Some("roa") | Some("roas") => BgpQuery::Roa,
                 Some(_) => return None,
             };
             // A trailing extra token is a malformed command.
@@ -427,6 +428,8 @@ mod tests {
         assert_eq!(parse_bgp_query("show bgp summary"), Some(BgpQuery::Neighbors));
         assert_eq!(parse_bgp_query("show bgp paths"), Some(BgpQuery::Paths));
         assert_eq!(parse_bgp_query("show bgp path"), Some(BgpQuery::Paths));
+        assert_eq!(parse_bgp_query("show bgp roa"), Some(BgpQuery::Roa));
+        assert_eq!(parse_bgp_query("show bgp roas"), Some(BgpQuery::Roa));
     }
 
     #[test]
