@@ -389,9 +389,23 @@ pub struct Bgp {
     /// are always accepted. Defaults to false (validate and show, but accept all).
     #[serde(default, rename = "rpki-reject-invalid")]
     pub rpki_reject_invalid: bool,
+    /// An RTR (RFC 8210) validating cache to fetch ROAs from live, instead of (or in
+    /// addition to) the static `[[bgp.roa]]` entries. Unset disables RTR.
+    pub rtr: Option<BgpRtr>,
     /// The configured peers.
     #[serde(default)]
     pub neighbor: Vec<BgpNeighbor>,
+}
+
+/// An RTR validating cache to fetch RPKI ROAs from (`[bgp.rtr]`, RFC 8210).
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct BgpRtr {
+    /// The cache's `host:port` (the RTR port is conventionally 3323).
+    pub server: String,
+    /// The refresh interval in seconds (how often to Serial Query for the delta).
+    /// Unset uses the interval the cache advertises in its End of Data.
+    pub refresh: Option<u32>,
 }
 
 /// One static RPKI ROA (`[[bgp.roa]]`, RFC 6811): an authorisation that `origin_as`

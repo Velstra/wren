@@ -748,6 +748,7 @@ pub async fn run(
     updates: mpsc::Sender<RouteUpdate>,
     mut queries: mpsc::Receiver<BgpQueryRequest>,
     mut redist: mpsc::Receiver<Redistribution>,
+    mut rtr_rx: mpsc::Receiver<Vec<Roa>>,
 ) -> Result<()> {
     // The neighbour table: every configured peer, its AS and whether the session
     // is currently Established. Sorted for stable `show bgp neighbors` output.
@@ -785,9 +786,11 @@ pub async fn run(
     // changes are diffed against.
     let aggregates = cfg.aggregates.clone();
     let mut advertised = effective_origination(&originated, &aggregates);
-    // RPKI origin validation (RFC 6811): the static ROA table and whether to drop
-    // Invalid routes. Built once; validation is read-only per received route.
-    let roa = RoaTable::new(cfg.roas.clone());
+    // RPKI origin validation (RFC 6811): the ROA table and whether to drop Invalid
+    // routes. The table is the static `[[bgp.roa]]` set plus whatever an RTR cache
+    // (RFC 8210) feeds in live; it is rebuilt on every RTR update.
+    let static_roas = cfg.roas.clone();
+    let mut roa = RoaTable::new(static_roas.clone());
     let rpki_reject = cfg.rpki_reject_invalid;
     // Established sessions we can push origination changes to, keyed by peer.
     let mut sessions: HashMap<IpAddr, mpsc::Sender<SessionCmd>> = HashMap::new();
@@ -956,6 +959,33 @@ pub async fn run(
             Some(r) = redist.recv() => {
                 apply_redistribution(r, &mut originated, &aggregates, &mut advertised, &sessions)
                     .await;
+                continue;
+            }
+            // An RTR cache (RFC 8210) pushed a fresh ROA set: rebuild the table as the
+            // static ROAs plus the live feed. When rejecting Invalid routes, revalidate
+            // the current best paths and withdraw any that have just become Invalid (the
+            // safety direction; a previously-rejected route was never stored, so it
+            // returns only when the peer re-advertises it).
+            Some(feed) = rtr_rx.recv() => {
+                let mut all = static_roas.clone();
+                all.extend(feed);
+                roa = RoaTable::new(all);
+                if rpki_reject && !roa.is_empty() {
+                    let now_invalid: Vec<(IpAddr, Prefix)> = rib
+                        .iter_best()
+                        .filter(|(pfx, path)| {
+                            let origin = origin_as(&path.as_path).unwrap_or(path.peer_as);
+                            roa.validate(pfx, origin) == Validity::Invalid
+                        })
+                        .map(|(pfx, path)| (path.peer_addr, *pfx))
+                        .collect();
+                    for (peer, pfx) in now_invalid {
+                        debug!(%pfx, "RPKI: route became invalid after RTR update; withdrawing");
+                        if let Some(ev) = rib.withdraw(peer, pfx) {
+                            apply_event(ev, &updates, &sessions).await;
+                        }
+                    }
+                }
                 continue;
             }
         };

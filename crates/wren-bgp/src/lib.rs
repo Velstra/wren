@@ -54,6 +54,7 @@ pub mod message;
 pub mod nexthop;
 pub mod rib;
 pub mod rpki;
+pub mod rtr;
 
 pub use nexthop::{decode_v6_next_hop, encode_v6_next_hop};
 

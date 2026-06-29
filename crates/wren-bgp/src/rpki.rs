@@ -21,7 +21,7 @@ use wren_core::Prefix;
 
 /// One Validated ROA Payload (RFC 6811): an authorisation that `origin_as` may
 /// originate `prefix` and any more-specific within it up to `max_length`.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub struct Roa {
     /// The authorised prefix.
     pub prefix: Prefix,

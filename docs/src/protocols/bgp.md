@@ -1006,5 +1006,28 @@ two prefixes from a peer — one authorised by a ROA (Valid, installed `proto bg
 one not (Invalid), and with `rpki-reject-invalid` the Invalid prefix is absent from
 both its RIB and the kernel.
 
-Fetching ROAs live from a validating cache over the **RTR protocol** (RFC 8210),
-rather than configuring them statically, is the natural follow-up.
+### Fetching ROAs over RTR (RFC 8210)
+
+Rather than configuring ROAs statically, Wren can fetch them live from a validating
+cache over the **RPKI-to-Router (RTR)** protocol. Point it at a cache:
+
+```toml
+[bgp.rtr]
+server  = "192.0.2.1:3323"   # the cache's host:port (3323 is the conventional port)
+refresh = 3600               # optional; defaults to the cache's advertised interval
+```
+
+The client opens a TCP session, sends a **Reset Query** to pull the full ROA set,
+accumulates the streamed Prefix PDUs, and on each **End of Data** hands the BGP engine
+a fresh table — the union of these and any static `[[bgp.roa]]`. It then refreshes
+incrementally with **Serial Query** (on the refresh timer or a Serial Notify),
+re-syncs on a **Cache Reset**, and reconnects with a backoff if the session drops.
+`show bgp roa` shows the live table just like the static one.
+
+When `rpki-reject-invalid` is set, an RTR update also **revalidates** the current best
+paths and withdraws any that have just become Invalid (the safety direction); a route
+that becomes Valid again returns when its peer next advertises it.
+
+`scripts/bgp-rtr-smoke.sh` exercises it live (rootless) against a small independent
+(Python) RTR cache: the router learns two ROAs over RTR — with no static `[[bgp.roa]]`
+— and uses them to accept a matching origin and reject a mismatching one.

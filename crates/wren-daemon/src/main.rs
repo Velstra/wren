@@ -20,6 +20,7 @@ mod ospf3;
 mod rip;
 mod ripng;
 mod router;
+mod rtr;
 
 use std::collections::HashSet;
 use std::net::Ipv4Addr;
@@ -205,6 +206,12 @@ async fn main() -> Result<()> {
     let (bgp_queries_tx, bgp_queries_rx) = mpsc::channel(QUERY_QUEUE);
     let mut bgp_queries_rx = Some(bgp_queries_rx);
     let bgp_enabled = cfg.bgp.as_ref().is_some_and(|b| b.enabled);
+    // The RTR (RFC 8210) ROA feed into the BGP engine. `rtr_tx` is held here for the
+    // daemon's lifetime so the channel stays open even when no RTR cache is configured
+    // (the BGP select branch then simply never fires); the client task, if spawned,
+    // gets a clone.
+    let (rtr_tx, rtr_rx) = mpsc::channel::<Vec<wren_bgp::rpki::Roa>>(QUERY_QUEUE);
+    let mut rtr_rx = Some(rtr_rx);
     let (ospf_queries_tx, ospf_queries_rx) = mpsc::channel(QUERY_QUEUE);
     let mut ospf_queries_rx = Some(ospf_queries_rx);
     let ospf_enabled = cfg.ospf.as_ref().is_some_and(|o| o.enabled);
@@ -395,10 +402,26 @@ async fn main() -> Result<()> {
                     Ok(None) => {}
                     Err(e) => error!(error = %e, "BGP redistribution not configured"),
                 }
+                // Spawn the RTR client if a validating cache is configured; it feeds
+                // ROAs into the BGP engine over `rtr_tx`.
+                if let Some(rtrcfg) = bgpcfg.rtr.as_ref() {
+                    match rtrcfg.server.parse::<std::net::SocketAddr>() {
+                        Ok(server) => {
+                            let rtr_run = rtr::RtrConfig { server, refresh: rtrcfg.refresh };
+                            let roas_tx = rtr_tx.clone();
+                            info!(%server, "RTR client starting");
+                            tokio::spawn(async move { rtr::run(rtr_run, roas_tx).await });
+                        }
+                        Err(e) => {
+                            error!(server = %rtrcfg.server, error = %e, "RTR server must be host:port; RTR disabled")
+                        }
+                    }
+                }
                 let tx = updates_tx.clone();
                 let qrx = bgp_queries_rx.take().expect("bgp queries rx taken once");
+                let rrx = rtr_rx.take().expect("rtr rx taken once");
                 tokio::spawn(async move {
-                    if let Err(e) = bgp::run(run_cfg, tx, qrx, redist_rx).await {
+                    if let Err(e) = bgp::run(run_cfg, tx, qrx, redist_rx, rrx).await {
                         error!(error = %e, "BGP engine stopped");
                     }
                 });
