@@ -17,6 +17,35 @@ cargo clippy --all-targets     # lint
 
 The release binary lands at `target/release/wren`.
 
+## Building a subset (cargo features)
+
+By default the daemon includes every routing protocol. Each one is behind a cargo
+feature, so an embedder (e.g. [Sentinel](core.md)) that only needs a couple can
+compile the rest out entirely — smaller binary, faster builds, fewer dependencies:
+
+| Feature | Protocol(s) |
+|---|---|
+| `ospf`  | OSPFv2 |
+| `ospf3` | OSPFv3 |
+| `rip`   | RIPv2 + RIPng |
+| `babel` | Babel |
+| `isis`  | IS-IS |
+
+`default = ["ospf", "ospf3", "rip", "babel", "isis"]`. **BGP and the core** (the RIB,
+FIB, filters, config and netlink) are always built in — they are the floor.
+
+```sh
+# Only BGP + core — no OSPF/RIP/Babel/IS-IS compiled at all:
+cargo build --release -p wren-daemon --no-default-features
+
+# BGP + core + just OSPFv2 and IS-IS:
+cargo build --release -p wren-daemon --no-default-features --features "ospf,isis"
+```
+
+A disabled protocol's `[section]` in the config is simply inert, and its `show`
+command returns the unknown-command help — the daemon still runs everything you did
+build in.
+
 ## Running
 
 Wren reads a single TOML file (see the [Configuration](configuration.md)

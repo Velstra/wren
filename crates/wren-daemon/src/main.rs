@@ -10,17 +10,25 @@
 //! announces them to the router, which installs the winners via the chosen
 //! [`Fib`] backend (the kernel over netlink, or the in-memory dry-run plane).
 
+#[cfg(feature = "babel")]
 mod babel;
 mod bgp;
 mod connected;
 mod control;
+#[cfg(feature = "isis")]
 mod isis;
+#[cfg(feature = "ospf")]
 mod ospf;
+#[cfg(feature = "ospf3")]
 mod ospf3;
+#[cfg(feature = "rip")]
 mod rip;
+#[cfg(feature = "rip")]
 mod ripng;
 mod router;
 mod rtr;
+#[cfg(feature = "_rawsock")]
+mod sockopt;
 
 use std::collections::HashSet;
 use std::net::Ipv4Addr;
@@ -212,34 +220,58 @@ async fn main() -> Result<()> {
     // gets a clone.
     let (rtr_tx, rtr_rx) = mpsc::channel::<Vec<wren_bgp::rpki::Roa>>(QUERY_QUEUE);
     let mut rtr_rx = Some(rtr_rx);
+    #[cfg(feature = "ospf")]
     let (ospf_queries_tx, ospf_queries_rx) = mpsc::channel(QUERY_QUEUE);
+    #[cfg(feature = "ospf")]
     let mut ospf_queries_rx = Some(ospf_queries_rx);
+    #[cfg(feature = "ospf")]
     let ospf_enabled = cfg.ospf.as_ref().is_some_and(|o| o.enabled);
+    #[cfg(feature = "ospf3")]
     let (ospf3_queries_tx, ospf3_queries_rx) = mpsc::channel(QUERY_QUEUE);
+    #[cfg(feature = "ospf3")]
     let mut ospf3_queries_rx = Some(ospf3_queries_rx);
+    #[cfg(feature = "ospf3")]
     let ospf3_enabled = cfg.ospf3.as_ref().is_some_and(|o| o.enabled);
+    #[cfg(feature = "isis")]
     let (isis_queries_tx, isis_queries_rx) = mpsc::channel(QUERY_QUEUE);
+    #[cfg(feature = "isis")]
     let mut isis_queries_rx = Some(isis_queries_rx);
+    #[cfg(feature = "isis")]
     let isis_enabled = cfg.isis.as_ref().is_some_and(|i| i.enabled);
+    #[cfg(feature = "babel")]
     let (babel_queries_tx, babel_queries_rx) = mpsc::channel(QUERY_QUEUE);
+    #[cfg(feature = "babel")]
     let mut babel_queries_rx = Some(babel_queries_rx);
+    #[cfg(feature = "babel")]
     let babel_enabled = cfg.babel.as_ref().is_some_and(|b| b.enabled);
+    #[cfg(feature = "rip")]
     let (rip_queries_tx, rip_queries_rx) = mpsc::channel(QUERY_QUEUE);
+    #[cfg(feature = "rip")]
     let mut rip_queries_rx = Some(rip_queries_rx);
+    #[cfg(feature = "rip")]
     let rip_enabled = cfg.rip.as_ref().is_some_and(|r| r.enabled);
+    #[cfg(feature = "rip")]
     let (ripng_queries_tx, ripng_queries_rx) = mpsc::channel(QUERY_QUEUE);
+    #[cfg(feature = "rip")]
     let mut ripng_queries_rx = Some(ripng_queries_rx);
+    #[cfg(feature = "rip")]
     let ripng_enabled = cfg.ripng.as_ref().is_some_and(|r| r.enabled);
     {
         let socket = args.socket.clone();
         let channels = control::Channels {
             router: queries_tx.clone(),
             bgp: bgp_enabled.then(|| bgp_queries_tx.clone()),
+            #[cfg(feature = "ospf")]
             ospf: ospf_enabled.then(|| ospf_queries_tx.clone()),
+            #[cfg(feature = "ospf3")]
             ospf3: ospf3_enabled.then(|| ospf3_queries_tx.clone()),
+            #[cfg(feature = "isis")]
             isis: isis_enabled.then(|| isis_queries_tx.clone()),
+            #[cfg(feature = "babel")]
             babel: babel_enabled.then(|| babel_queries_tx.clone()),
+            #[cfg(feature = "rip")]
             rip: rip_enabled.then(|| rip_queries_tx.clone()),
+            #[cfg(feature = "rip")]
             ripng: ripng_enabled.then(|| ripng_queries_tx.clone()),
         };
         tokio::spawn(async move {
@@ -250,6 +282,7 @@ async fn main() -> Result<()> {
     }
 
     // Spawn the RIP engine if it is configured.
+    #[cfg(feature = "rip")]
     if let Some(ripcfg) = cfg.rip.as_ref().filter(|r| r.enabled) {
         if backend == Backend::Memory {
             warn!("RIP is enabled but the backend is in-memory — learned routes will not be installed in the kernel");
@@ -285,6 +318,7 @@ async fn main() -> Result<()> {
     }
 
     // Spawn the RIPng (IPv6) engine if it is configured.
+    #[cfg(feature = "rip")]
     if let Some(ripngcfg) = cfg.ripng.as_ref().filter(|r| r.enabled) {
         if backend == Backend::Memory {
             warn!("RIPng is enabled but the backend is in-memory — learned routes will not be installed in the kernel");
@@ -320,6 +354,7 @@ async fn main() -> Result<()> {
     }
 
     // Spawn the OSPFv2 engine if it is configured.
+    #[cfg(feature = "ospf")]
     if let Some(ospfcfg) = cfg.ospf.as_ref().filter(|o| o.enabled) {
         match build_ospf_config(&cfg, ospfcfg) {
             Ok(run_cfg) => {
@@ -358,6 +393,7 @@ async fn main() -> Result<()> {
     }
 
     // Spawn the OSPFv3 (IPv6) engine if it is configured.
+    #[cfg(feature = "ospf3")]
     if let Some(ospf3cfg) = cfg.ospf3.as_ref().filter(|o| o.enabled) {
         match build_ospf3_config(&cfg, ospf3cfg) {
             Ok(run_cfg) => {
@@ -431,6 +467,7 @@ async fn main() -> Result<()> {
     }
 
     // Spawn the Babel engine if it is configured.
+    #[cfg(feature = "babel")]
     if let Some(babelcfg) = cfg.babel.as_ref().filter(|b| b.enabled) {
         match build_babel_config(&cfg, babelcfg) {
             Ok(run_cfg) => {
@@ -469,6 +506,7 @@ async fn main() -> Result<()> {
     }
 
     // Spawn the IS-IS engine if it is configured.
+    #[cfg(feature = "isis")]
     if let Some(isiscfg) = cfg.isis.as_ref().filter(|i| i.enabled) {
         match build_isis_config(&cfg, isiscfg) {
             Ok(run_cfg) => {
@@ -525,6 +563,7 @@ async fn main() -> Result<()> {
 
 /// Resolve the textual `[ospf]` config into the runner's [`ospf::OspfConfig`],
 /// parsing the Router ID (required) and area and applying the defaults.
+#[cfg(feature = "ospf")]
 fn build_ospf_config(
     cfg: &wren_config::Config,
     ospf: &wren_config::Ospf,
@@ -641,6 +680,7 @@ fn build_ospf_config(
 /// Build the OSPF packet authentication (RFC 2328 §D) from the `[ospf]` `auth-*`
 /// fields: `"none"` (the default), `"text"` for a simple cleartext password (≤ 8
 /// bytes), or `"md5"` for keyed-MD5 (key ≤ 16 bytes, key id defaulting to 1).
+#[cfg(feature = "ospf")]
 fn build_ospf_auth(ospf: &wren_config::Ospf) -> Result<wren_ospf::packet::Auth> {
     use wren_ospf::packet::Auth;
     match ospf.auth_type.as_deref() {
@@ -678,6 +718,7 @@ fn build_ospf_auth(ospf: &wren_config::Ospf) -> Result<wren_ospf::packet::Auth> 
 /// Resolve the textual `[ospf3]` config into the runner's [`ospf3::Ospf3Config`],
 /// parsing the Router ID (required, still a 32-bit id over IPv6), the area and the
 /// Instance ID, and redistributing only the IPv6 statics.
+#[cfg(feature = "ospf3")]
 fn build_ospf3_config(
     cfg: &wren_config::Config,
     ospf3: &wren_config::Ospf3,
@@ -995,6 +1036,7 @@ fn build_redist_target(
 /// Resolve the textual `[babel]` config into the runner's [`babel::BabelConfig`],
 /// deriving the 8-octet Router-ID from `[babel]` or the top-level `router-id` and
 /// parsing the originated networks.
+#[cfg(feature = "babel")]
 fn build_babel_config(
     cfg: &wren_config::Config,
     babel: &wren_config::Babel,
@@ -1202,6 +1244,7 @@ fn protocol_from_name(name: &str) -> Option<Protocol> {
 /// Resolve the textual `[isis]` config into the runner's [`isis::IsisConfig`]:
 /// the System ID (explicit or derived from the Router ID), the area, the level and
 /// the interfaces with their network type.
+#[cfg(feature = "isis")]
 fn build_isis_config(
     cfg: &wren_config::Config,
     isis: &wren_config::Isis,

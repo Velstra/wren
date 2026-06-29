@@ -63,7 +63,7 @@ use wren_isis::{
 };
 
 use crate::connected;
-use crate::rip::setsockopt_struct;
+use crate::sockopt::setsockopt_struct;
 use crate::router::{Redistribution, RouteUpdate};
 
 /// The lifetime stamped on an originated LSP (seconds). Refreshed before expiry.

@@ -2350,10 +2350,10 @@ fn apply_gtsm(stream: &TcpStream, hops: u8) {
     use std::os::fd::AsRawFd;
     let fd = stream.as_raw_fd();
     let min_ttl = 255 - (hops.max(1) as i32 - 1);
-    if let Err(e) = crate::rip::setsockopt_int(fd, libc::IPPROTO_IP, libc::IP_TTL, 255) {
+    if let Err(e) = setsockopt_i32(fd, libc::IPPROTO_IP, libc::IP_TTL, 255) {
         debug!(error = %e, "GTSM: could not set IP_TTL 255");
     }
-    if let Err(e) = crate::rip::setsockopt_int(fd, libc::IPPROTO_IP, libc::IP_MINTTL, min_ttl) {
+    if let Err(e) = setsockopt_i32(fd, libc::IPPROTO_IP, libc::IP_MINTTL, min_ttl) {
         debug!(error = %e, "GTSM: could not set IP_MINTTL {min_ttl}");
     }
 }

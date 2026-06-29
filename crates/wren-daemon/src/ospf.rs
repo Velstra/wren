@@ -56,7 +56,7 @@ use wren_ospf::{
     ALL_D_ROUTERS, ALL_SPF_ROUTERS, INITIAL_SEQUENCE_NUMBER, IP_PROTOCOL, MAX_AGE, OPT_E, OPT_NP,
 };
 
-use crate::rip::{setsockopt_int, setsockopt_struct};
+use crate::sockopt::{setsockopt_int, setsockopt_struct};
 use crate::router::{Redistribution, RouteUpdate};
 
 /// How often (seconds) the housekeeping timer advances dead/wait timers.

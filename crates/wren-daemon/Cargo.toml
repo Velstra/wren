@@ -14,17 +14,36 @@ authors.workspace = true
 name = "wren"
 path = "src/main.rs"
 
+[features]
+# By default every protocol is built in (the full daemon). An embedder that only
+# needs a subset — e.g. Sentinel wanting just BGP — can disable the others with
+# `default-features = false, features = ["ospf"]`, so unused protocol crates are not
+# compiled at all. BGP + the core (RIB/FIB/filter/config/netlink) are always present.
+default = ["ospf", "ospf3", "rip", "babel", "isis"]
+ospf = ["dep:wren-ospf", "_rawsock"]
+ospf3 = ["dep:wren-ospfv3", "_rawsock"]
+# `rip` covers both RIPv2 and RIPng (they share the `wren-rip` crate).
+rip = ["dep:wren-rip", "_connected", "_rawsock"]
+babel = ["dep:wren-babel", "_connected", "_rawsock"]
+isis = ["dep:wren-isis", "_connected", "_rawsock"]
+# Internal: the connected-network discovery in `connected.rs`, pulled in by every
+# protocol that originates connected routes (RIP/RIPng, Babel, IS-IS). Not a public knob.
+_connected = []
+# Internal: the `setsockopt` helpers in `sockopt.rs`, pulled in by every protocol that
+# hand-builds a raw or multicast socket (everything but BGP). Not a public knob.
+_rawsock = []
+
 [dependencies]
 wren-core.workspace = true
 wren-config.workspace = true
-wren-rip.workspace = true
-wren-ospf.workspace = true
-wren-ospfv3.workspace = true
 wren-bgp.workspace = true
-wren-babel.workspace = true
-wren-isis.workspace = true
 wren-filter.workspace = true
 wren-netlink.workspace = true
+wren-rip = { workspace = true, optional = true }
+wren-ospf = { workspace = true, optional = true }
+wren-ospfv3 = { workspace = true, optional = true }
+wren-babel = { workspace = true, optional = true }
+wren-isis = { workspace = true, optional = true }
 anyhow.workspace = true
 clap.workspace = true
 tokio.workspace = true

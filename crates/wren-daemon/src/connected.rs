@@ -12,13 +12,28 @@
 //! minimal-dependency style as the rest of the daemon's platform glue.
 
 use std::ffi::CStr;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::net::{Ipv4Addr, Ipv6Addr};
 use std::ptr;
 
+// `IpAddr` and `Prefix` are only used by the connected-network discovery below.
+#[cfg(feature = "_connected")]
+use std::net::IpAddr;
+#[cfg(feature = "_connected")]
 use wren_core::Prefix;
-use wren_rip::netmask_to_len;
+
+/// Convert an IPv4 netmask to a prefix length, or `None` if it is not a contiguous
+/// run of high bits. Kept local so this module (used by every protocol runner) does
+/// not depend on a protocol crate.
+#[cfg(feature = "_connected")]
+fn netmask_to_len(mask: Ipv4Addr) -> Option<u8> {
+    let bits = u32::from(mask);
+    let len = bits.leading_ones();
+    let expected = if len == 0 { 0 } else { u32::MAX << (32 - len) };
+    (bits == expected).then_some(len as u8)
+}
 
 /// A directly-attached network found on one of our interfaces.
+#[cfg(feature = "_connected")]
 pub struct ConnectedNet {
     /// The interface the network is reached on.
     pub ifname: String,
@@ -29,6 +44,7 @@ pub struct ConnectedNet {
 /// Discover the IPv4/IPv6 networks directly attached to `ifnames`. Interfaces not
 /// in the list, non-contiguous netmasks and IPv6 link-local prefixes are skipped.
 /// Returns an empty list if the interfaces can't be read.
+#[cfg(feature = "_connected")]
 pub fn discover(ifnames: &[String]) -> Vec<ConnectedNet> {
     let mut head: *mut libc::ifaddrs = ptr::null_mut();
     // SAFETY: getifaddrs allocates a linked list into `head`; we check its result
@@ -169,6 +185,7 @@ pub fn resolve_link6(local_v6: Ipv6Addr) -> Option<(String, Ipv6Addr)> {
 /// Build the attached [`Prefix`] from an interface's address + netmask sockaddrs,
 /// for AF_INET / AF_INET6. Returns `None` for other families, a non-contiguous
 /// mask, or an IPv6 link-local address.
+#[cfg(feature = "_connected")]
 fn prefix_of(addr: *const libc::sockaddr, netmask: *const libc::sockaddr) -> Option<Prefix> {
     // SAFETY: `addr` points to a sockaddr; reading sa_family is always valid.
     let family = unsafe { (*addr).sa_family } as i32;
@@ -209,6 +226,7 @@ fn read_sin6_addr(sa: *const libc::sockaddr) -> Ipv6Addr {
 
 /// The prefix length implied by a 16-byte IPv6 netmask, or `None` if it is not a
 /// contiguous run of one-bits.
+#[cfg(feature = "_connected")]
 fn v6_mask_len(mask: Ipv6Addr) -> Option<u8> {
     let bits = u128::from(mask);
     let ones = bits.leading_ones();

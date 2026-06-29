@@ -19,11 +19,16 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{mpsc, oneshot};
 use tracing::{info, warn};
 
+#[cfg(feature = "babel")]
 use crate::babel::{BabelQuery, BabelQueryRequest};
 use crate::bgp::{BgpQuery, BgpQueryRequest};
+#[cfg(feature = "isis")]
 use crate::isis::{IsisQuery, IsisQueryRequest};
+#[cfg(feature = "ospf")]
 use crate::ospf::{OspfQuery, OspfQueryRequest};
+#[cfg(feature = "ospf3")]
 use crate::ospf3::{Ospf3Query, Ospf3QueryRequest};
+#[cfg(feature = "rip")]
 use crate::rip::{RipQuery, RipQueryRequest};
 use crate::router::{Query, QueryRequest};
 
@@ -37,16 +42,22 @@ pub struct Channels {
     /// To the BGP task (`show bgp`), if BGP is running.
     pub bgp: Option<mpsc::Sender<BgpQueryRequest>>,
     /// To the OSPF task (`show ospf`), if OSPF is running.
+    #[cfg(feature = "ospf")]
     pub ospf: Option<mpsc::Sender<OspfQueryRequest>>,
     /// To the OSPFv3 task (`show ospf3`), if OSPFv3 is running.
+    #[cfg(feature = "ospf3")]
     pub ospf3: Option<mpsc::Sender<Ospf3QueryRequest>>,
     /// To the IS-IS task (`show isis`), if IS-IS is running.
+    #[cfg(feature = "isis")]
     pub isis: Option<mpsc::Sender<IsisQueryRequest>>,
     /// To the Babel task (`show babel`), if Babel is running.
+    #[cfg(feature = "babel")]
     pub babel: Option<mpsc::Sender<BabelQueryRequest>>,
     /// To the RIP task (`show rip`), if RIPv2 is running.
+    #[cfg(feature = "rip")]
     pub rip: Option<mpsc::Sender<RipQueryRequest>>,
     /// To the RIPng task (`show ripng`), if RIPng is running.
+    #[cfg(feature = "rip")]
     pub ripng: Option<mpsc::Sender<RipQueryRequest>>,
 }
 
@@ -74,30 +85,35 @@ impl OwnedQuery for BgpQueryRequest {
         BgpQueryRequest { query, respond }
     }
 }
+#[cfg(feature = "ospf")]
 impl OwnedQuery for OspfQueryRequest {
     type Query = OspfQuery;
     fn build(query: OspfQuery, respond: oneshot::Sender<String>) -> Self {
         OspfQueryRequest { query, respond }
     }
 }
+#[cfg(feature = "ospf3")]
 impl OwnedQuery for Ospf3QueryRequest {
     type Query = Ospf3Query;
     fn build(query: Ospf3Query, respond: oneshot::Sender<String>) -> Self {
         Ospf3QueryRequest { query, respond }
     }
 }
+#[cfg(feature = "isis")]
 impl OwnedQuery for IsisQueryRequest {
     type Query = IsisQuery;
     fn build(query: IsisQuery, respond: oneshot::Sender<String>) -> Self {
         IsisQueryRequest { query, respond }
     }
 }
+#[cfg(feature = "babel")]
 impl OwnedQuery for BabelQueryRequest {
     type Query = BabelQuery;
     fn build(query: BabelQuery, respond: oneshot::Sender<String>) -> Self {
         BabelQueryRequest { query, respond }
     }
 }
+#[cfg(feature = "rip")]
 impl OwnedQuery for RipQueryRequest {
     type Query = RipQuery;
     fn build(query: RipQuery, respond: oneshot::Sender<String>) -> Self {
@@ -145,23 +161,51 @@ async fn handle_conn(stream: UnixStream, channels: Channels) -> Result<()> {
         .context("reading command")?;
     let line = line.trim();
 
-    let response = if let Some(query) = parse_bgp_query(line) {
-        ask_opt(&channels.bgp, query, "bgp").await
-    } else if let Some(query) = parse_ospf3_query(line) {
-        ask_opt(&channels.ospf3, query, "ospf3").await
-    } else if let Some(query) = parse_ospf_query(line) {
-        ask_opt(&channels.ospf, query, "ospf").await
-    } else if let Some(query) = parse_isis_query(line) {
-        ask_opt(&channels.isis, query, "isis").await
-    } else if let Some(query) = parse_babel_query(line) {
-        ask_opt(&channels.babel, query, "babel").await
-    } else if let Some(query) = parse_rip_query(line, "ripng") {
-        ask_opt(&channels.ripng, query, "ripng").await
-    } else if let Some(query) = parse_rip_query(line, "rip") {
-        ask_opt(&channels.rip, query, "rip").await
-    } else if let Some(query) = parse_query(line) {
-        ask(&channels.router, query, "router").await
-    } else {
+    // Dispatch the command to the first protocol that recognises it. Each disabled
+    // protocol's arm is compiled out with its feature, so the unknown-command fallback
+    // simply takes over. BGP and `show routes` are always present.
+    let mut response: Option<String> = None;
+    if let Some(query) = parse_bgp_query(line) {
+        response = Some(ask_opt(&channels.bgp, query, "bgp").await);
+    }
+    #[cfg(feature = "ospf3")]
+    if response.is_none() {
+        if let Some(query) = parse_ospf3_query(line) {
+            response = Some(ask_opt(&channels.ospf3, query, "ospf3").await);
+        }
+    }
+    #[cfg(feature = "ospf")]
+    if response.is_none() {
+        if let Some(query) = parse_ospf_query(line) {
+            response = Some(ask_opt(&channels.ospf, query, "ospf").await);
+        }
+    }
+    #[cfg(feature = "isis")]
+    if response.is_none() {
+        if let Some(query) = parse_isis_query(line) {
+            response = Some(ask_opt(&channels.isis, query, "isis").await);
+        }
+    }
+    #[cfg(feature = "babel")]
+    if response.is_none() {
+        if let Some(query) = parse_babel_query(line) {
+            response = Some(ask_opt(&channels.babel, query, "babel").await);
+        }
+    }
+    #[cfg(feature = "rip")]
+    if response.is_none() {
+        if let Some(query) = parse_rip_query(line, "ripng") {
+            response = Some(ask_opt(&channels.ripng, query, "ripng").await);
+        } else if let Some(query) = parse_rip_query(line, "rip") {
+            response = Some(ask_opt(&channels.rip, query, "rip").await);
+        }
+    }
+    if response.is_none() {
+        if let Some(query) = parse_query(line) {
+            response = Some(ask(&channels.router, query, "router").await);
+        }
+    }
+    let response = response.unwrap_or_else(|| {
         format!(
             "error: unknown command {line:?}\n\
              usage: show routes [protocol] | show bgp [routes|paths|neighbors] | \
@@ -170,7 +214,7 @@ async fn handle_conn(stream: UnixStream, channels: Channels) -> Result<()> {
              show isis [neighbors|interfaces|database] | show babel [neighbors|routes] | \
              show rip | show ripng\n"
         )
-    };
+    });
 
     reader
         .get_mut()
@@ -272,6 +316,7 @@ pub fn parse_bgp_query(line: &str) -> Option<BgpQuery> {
 /// Parse a `show ospf [neighbors|interfaces]` command into an [`OspfQuery`]. A
 /// bare `show ospf` defaults to the neighbours view. Returns `None` for anything
 /// else (so the caller can fall through to the other query parsers).
+#[cfg(feature = "ospf")]
 pub fn parse_ospf_query(line: &str) -> Option<OspfQuery> {
     let mut tokens = line.split_whitespace();
     if tokens.next()? != "show" || tokens.next()? != "ospf" {
@@ -294,6 +339,7 @@ pub fn parse_ospf_query(line: &str) -> Option<OspfQuery> {
 /// bare `show ospf3` defaults to the neighbours view. Returns `None` for anything
 /// else (so the caller can fall through; note the keyword is the exact token
 /// `ospf3`, so `show ospf` is not matched here).
+#[cfg(feature = "ospf3")]
 pub fn parse_ospf3_query(line: &str) -> Option<Ospf3Query> {
     let mut tokens = line.split_whitespace();
     if tokens.next()? != "show" || tokens.next()? != "ospf3" {
@@ -314,6 +360,7 @@ pub fn parse_ospf3_query(line: &str) -> Option<Ospf3Query> {
 /// Parse a `show isis [neighbors|interfaces|database]` command into an
 /// [`IsisQuery`]. A bare `show isis` defaults to the adjacencies view. Returns
 /// `None` for anything else (so the caller can fall through to the other parsers).
+#[cfg(feature = "isis")]
 pub fn parse_isis_query(line: &str) -> Option<IsisQuery> {
     let mut tokens = line.split_whitespace();
     if tokens.next()? != "show" || tokens.next()? != "isis" {
@@ -336,6 +383,7 @@ pub fn parse_isis_query(line: &str) -> Option<IsisQuery> {
 
 /// Parse a `show babel [neighbors|routes]` command into a [`BabelQuery`]. A bare
 /// `show babel` defaults to the neighbours view. Returns `None` for anything else.
+#[cfg(feature = "babel")]
 pub fn parse_babel_query(line: &str) -> Option<BabelQuery> {
     let mut tokens = line.split_whitespace();
     if tokens.next()? != "show" || tokens.next()? != "babel" {
@@ -357,6 +405,7 @@ pub fn parse_babel_query(line: &str) -> Option<BabelQuery> {
 /// given `keyword` (`"rip"` or `"ripng"`). RIP keeps no adjacency state, so the
 /// only view is its routing table; a bare `show rip` (or `show rip routes`) is the
 /// table. Returns `None` for anything else (so the caller can fall through).
+#[cfg(feature = "rip")]
 pub fn parse_rip_query(line: &str, keyword: &str) -> Option<RipQuery> {
     let mut tokens = line.split_whitespace();
     if tokens.next()? != "show" || tokens.next()? != keyword {
@@ -459,6 +508,7 @@ mod tests {
         assert!(parse_bgp_query("bgp nonsense").is_none());
     }
 
+    #[cfg(feature = "ospf")]
     #[test]
     fn parse_ospf_query_understands_show_ospf() {
         assert_eq!(parse_ospf_query("show ospf"), Some(OspfQuery::Neighbors));
@@ -473,6 +523,7 @@ mod tests {
         assert_eq!(parse_ospf_query("show ospf lsdb"), Some(OspfQuery::Database));
     }
 
+    #[cfg(feature = "ospf")]
     #[test]
     fn parse_ospf_query_rejects_others() {
         assert!(parse_ospf_query("show bgp").is_none()); // bgp query, not ospf
@@ -481,6 +532,7 @@ mod tests {
         assert!(parse_ospf_query("").is_none());
     }
 
+    #[cfg(feature = "ospf3")]
     #[test]
     fn parse_ospf3_query_understands_show_ospf3() {
         assert_eq!(parse_ospf3_query("show ospf3"), Some(Ospf3Query::Neighbors));
@@ -492,6 +544,7 @@ mod tests {
         assert_eq!(parse_ospf3_query("show ospf3 iface"), Some(Ospf3Query::Interfaces));
     }
 
+    #[cfg(all(feature = "ospf", feature = "ospf3"))]
     #[test]
     fn parse_ospf3_and_ospf_stay_distinct() {
         // Exact-token keywords: `show ospf3` is not an `ospf` query and vice-versa,
@@ -503,6 +556,7 @@ mod tests {
         assert!(parse_ospf3_query("").is_none());
     }
 
+    #[cfg(feature = "isis")]
     #[test]
     fn parse_isis_query_understands_show_isis() {
         assert_eq!(parse_isis_query("show isis"), Some(IsisQuery::Neighbors));
@@ -523,6 +577,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "isis")]
     #[test]
     fn parse_isis_query_rejects_others() {
         assert!(parse_isis_query("show ospf").is_none()); // ospf query, not isis
@@ -531,6 +586,7 @@ mod tests {
         assert!(parse_isis_query("").is_none());
     }
 
+    #[cfg(feature = "babel")]
     #[test]
     fn parse_babel_query_understands_show_babel() {
         assert_eq!(parse_babel_query("show babel"), Some(BabelQuery::Neighbors));
@@ -539,6 +595,7 @@ mod tests {
         assert_eq!(parse_babel_query("show babel routes"), Some(BabelQuery::Routes));
     }
 
+    #[cfg(feature = "babel")]
     #[test]
     fn parse_babel_query_rejects_others() {
         assert!(parse_babel_query("show isis").is_none()); // isis query, not babel
@@ -547,6 +604,7 @@ mod tests {
         assert!(parse_babel_query("").is_none());
     }
 
+    #[cfg(feature = "rip")]
     #[test]
     fn parse_rip_query_understands_show_rip_and_ripng() {
         assert_eq!(parse_rip_query("show rip", "rip"), Some(RipQuery::Routes));
@@ -555,6 +613,7 @@ mod tests {
         assert_eq!(parse_rip_query("show ripng route", "ripng"), Some(RipQuery::Routes));
     }
 
+    #[cfg(feature = "rip")]
     #[test]
     fn parse_rip_query_keeps_rip_and_ripng_distinct() {
         // The keyword match is exact, so `show ripng` is not a `rip` query and

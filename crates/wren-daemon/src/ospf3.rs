@@ -62,7 +62,7 @@ use wren_ospfv3::{
     OPT_V6,
 };
 
-use crate::rip::{setsockopt_int, setsockopt_struct};
+use crate::sockopt::{setsockopt_int, setsockopt_struct};
 use crate::router::RouteUpdate;
 
 /// How often (seconds) the housekeeping timer advances dead/wait timers.

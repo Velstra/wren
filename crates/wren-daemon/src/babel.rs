@@ -47,7 +47,7 @@ use wren_babel::{BabelEvent, NeighbourTable, Packet, RouteTable, METRIC_INFINITY
 use wren_core::{NextHop, Prefix, Protocol, Route};
 
 use crate::connected;
-use crate::rip::{setsockopt_int, setsockopt_struct};
+use crate::sockopt::{setsockopt_int, setsockopt_struct};
 use crate::router::{Redistribution, RouteUpdate};
 
 /// Send a Hello (and per-neighbour IHUs) this often (seconds).

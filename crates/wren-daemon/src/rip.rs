@@ -30,6 +30,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
+
+use crate::sockopt::{setsockopt_int, setsockopt_struct};
 use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::MissedTickBehavior;
@@ -459,39 +461,5 @@ fn open_rip_socket(ifname: &str) -> Result<(u32, std::net::UdpSocket)> {
     Ok((ifindex, sock))
 }
 
-/// `setsockopt` with an `int` optval. Shared with the RIPng runner.
-pub(crate) fn setsockopt_int(fd: i32, level: i32, name: i32, value: i32) -> Result<()> {
-    let v: libc::c_int = value;
-    // SAFETY: `&v` is a valid optval of the declared size for the option's lifetime.
-    let rc = unsafe {
-        libc::setsockopt(
-            fd,
-            level,
-            name,
-            &v as *const _ as *const c_void,
-            mem::size_of::<libc::c_int>() as libc::socklen_t,
-        )
-    };
-    if rc < 0 {
-        return Err(io::Error::last_os_error()).with_context(|| format!("setsockopt {name}"));
-    }
-    Ok(())
-}
-
-/// `setsockopt` with a struct optval (e.g. `ip_mreqn`). Shared with RIPng.
-pub(crate) fn setsockopt_struct<T>(fd: i32, level: i32, name: i32, value: &T) -> Result<()> {
-    // SAFETY: `value` points to a `T` that lives across the call; its size matches.
-    let rc = unsafe {
-        libc::setsockopt(
-            fd,
-            level,
-            name,
-            value as *const T as *const c_void,
-            mem::size_of::<T>() as libc::socklen_t,
-        )
-    };
-    if rc < 0 {
-        return Err(io::Error::last_os_error()).with_context(|| format!("setsockopt {name}"));
-    }
-    Ok(())
-}
+// The `setsockopt_int` / `setsockopt_struct` helpers now live in `crate::sockopt`
+// (shared by every protocol runner) and are imported at the top of this module.
