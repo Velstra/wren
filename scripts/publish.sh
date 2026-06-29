@@ -20,6 +20,7 @@ cd "$(dirname "$0")/.."
 
 CRATES=(
   wren-core                                                   # Apache-2.0, no deps
+  wren-bfd                                                    # dependency-free (BFD codec/FSM)
   wren-netlink wren-filter wren-config                        # libs (depend on core)
   wren-rip wren-ospf wren-ospfv3 wren-isis wren-bgp wren-babel
   wren-daemon                                                 # binary, depends on all
