@@ -31,6 +31,9 @@ pub(crate) fn setsockopt_int(fd: i32, level: i32, name: i32, value: i32) -> Resu
 }
 
 /// `setsockopt` with a struct optval (e.g. `ip_mreqn`).
+// Only the multicast IGP runners use this; a BFD-only (`--no-default-features`) build
+// reaches `setsockopt_int` but not this, so it can be dead there.
+#[allow(dead_code)]
 pub(crate) fn setsockopt_struct<T>(fd: i32, level: i32, name: i32, value: &T) -> Result<()> {
     // SAFETY: `value` points to a `T` that lives across the call; its size matches.
     let rc = unsafe {

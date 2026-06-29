@@ -334,6 +334,11 @@ pub struct Ospf3 {
     /// The external metric advertised for redistributed routes. Defaults to 20.
     #[serde(rename = "redistribute-metric")]
     pub redistribute_metric: Option<u32>,
+    /// Run BFD (RFC 5880) to each Full neighbour and tear the adjacency down at once
+    /// when BFD reports the path failed (RFC 5882), rather than waiting for the dead
+    /// interval. Requires a peer that also runs BFD; timing comes from `[bfd]`.
+    #[serde(default)]
+    pub bfd: bool,
 }
 
 /// BGP-4 protocol configuration (`[bgp]`).
@@ -1429,6 +1434,27 @@ mod tests {
         )
         .expect("valid config");
         assert!(!cfg.ospf.expect("ospf present").bfd);
+    }
+
+    #[test]
+    fn parses_ospf3_bfd() {
+        let cfg = Config::from_toml(
+            r#"
+            router-id = "10.0.0.1"
+            [ospf3]
+            enabled = true
+            interfaces = ["eth1"]
+            bfd = true
+            "#,
+        )
+        .expect("valid config");
+        assert!(cfg.ospf3.expect("ospf3 present").bfd);
+        // Defaults to false when unset.
+        let cfg = Config::from_toml(
+            "router-id = \"10.0.0.1\"\n[ospf3]\nenabled = true\ninterfaces = [\"eth1\"]\n",
+        )
+        .expect("valid config");
+        assert!(!cfg.ospf3.expect("ospf3 present").bfd);
     }
 
     #[test]

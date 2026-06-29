@@ -103,6 +103,10 @@ pub struct Ospf3Config {
     /// External destinations to redistribute as AS-external LSAs. A non-empty list
     /// makes this router an AS boundary router (ASBR).
     pub redistribute: Vec<RedistRoute>,
+    /// Run BFD (RFC 5880) to each Full neighbour and tear the adjacency down at once
+    /// when BFD reports the path failed (RFC 5882), instead of waiting for the dead
+    /// interval. `[ospf3] bfd = true`.
+    pub bfd: bool,
 }
 
 /// One configured OSPFv3 interface and the area it is in.
@@ -225,6 +229,16 @@ struct Ospf {
     /// The prefixes we currently have announced to the RIB (for reconciliation).
     announced: HashSet<Prefix>,
     updates: mpsc::Sender<RouteUpdate>,
+    /// BFD (RFC 5880): the channel to the BFD engine to register/deregister
+    /// per-neighbour sessions, the notify sender included in each registration (the
+    /// engine reports a session going down on it), and the set of `(link-local
+    /// address, interface index)` pairs currently registered (the Full neighbours).
+    /// Unused when `cfg.bfd` is false. The scope is the interface index — OSPFv3
+    /// neighbours are link-local, so the scope is what keeps two links' sessions
+    /// distinct.
+    bfd_register: mpsc::Sender<crate::bfd::BfdCommand>,
+    bfd_notify: mpsc::Sender<IpAddr>,
+    bfd_registered: HashSet<(Ipv6Addr, u32)>,
 }
 
 /// Run OSPFv3 on the configured interfaces, announcing SPF routes to `updates`.
@@ -357,6 +371,9 @@ pub async fn run(
     cfg: Ospf3Config,
     updates: mpsc::Sender<RouteUpdate>,
     mut queries: mpsc::Receiver<Ospf3QueryRequest>,
+    bfd_register: mpsc::Sender<crate::bfd::BfdCommand>,
+    bfd_notify: mpsc::Sender<IpAddr>,
+    mut bfd_down: mpsc::Receiver<IpAddr>,
 ) -> Result<()> {
     let mut ifaces = Vec::new();
     let mut areas: BTreeMap<Ipv4Addr, Area> = BTreeMap::new();
@@ -416,6 +433,9 @@ pub async fn run(
         next_dd_seq: 0x0100_0000,
         announced: HashSet::new(),
         updates,
+        bfd_register,
+        bfd_notify,
+        bfd_registered: HashSet::new(),
     };
     ospf.originate_externals();
     ospf.reoriginate_and_flood().await;
@@ -453,7 +473,18 @@ pub async fn run(
                 };
                 let _ = req.respond.send(resp);
             }
+            // BFD (RFC 5880) reported a neighbour's forwarding path down: tear that
+            // adjacency down at once (RFC 5882 §4.4), exactly as an inactivity
+            // timeout would, instead of waiting for the dead interval.
+            Some(peer) = bfd_down.recv() => {
+                if let IpAddr::V6(v6) = peer {
+                    ospf.force_neighbor_down(v6).await;
+                }
+            }
         }
+        // Keep the set of registered BFD sessions in step with the Full neighbours
+        // (a no-op when `[ospf3] bfd` is off).
+        ospf.reconcile_bfd().await;
     }
     Ok(())
 }
@@ -1553,6 +1584,82 @@ impl Ospf {
                 if self.run_interface_event(idx, InterfaceEvent::NeighborChange) {
                     self.reeval_adjacencies(idx).await;
                 }
+            }
+        }
+        if changed {
+            self.reoriginate_and_flood().await;
+            self.run_spf_and_announce().await;
+        }
+    }
+
+    /// Keep the BFD (RFC 5880) registrations in step with the set of **Full**
+    /// neighbours: register a session as a neighbour reaches Full, deregister it as
+    /// the neighbour leaves Full or disappears. A no-op unless `[ospf3] bfd` is set.
+    /// OSPFv3 neighbours are IPv6 link-local, so each session is keyed by the
+    /// neighbour's address *and* the interface index (its BFD scope). The BFD engine
+    /// reports a session going down on [`Self::bfd_notify`], which the run loop turns
+    /// into [`Self::force_neighbor_down`].
+    async fn reconcile_bfd(&mut self) {
+        if !self.cfg.bfd {
+            return;
+        }
+        let mut full: HashSet<(Ipv6Addr, u32)> = HashSet::new();
+        for iface in &self.ifaces {
+            for n in iface.neighbors.values() {
+                if n.fsm.state == NeighborState::Full {
+                    full.insert((n.addr, iface.ifindex));
+                }
+            }
+        }
+        let added: Vec<(Ipv6Addr, u32)> =
+            full.difference(&self.bfd_registered).copied().collect();
+        for (addr, scope) in added {
+            let _ = self
+                .bfd_register
+                .send(crate::bfd::BfdCommand::Register {
+                    peer: IpAddr::V6(addr),
+                    scope_id: scope,
+                    consumer: crate::bfd::BfdConsumer::Ospf3,
+                    notify: self.bfd_notify.clone(),
+                })
+                .await;
+        }
+        let removed: Vec<(Ipv6Addr, u32)> =
+            self.bfd_registered.difference(&full).copied().collect();
+        for (addr, scope) in removed {
+            let _ = self
+                .bfd_register
+                .send(crate::bfd::BfdCommand::Deregister {
+                    peer: IpAddr::V6(addr),
+                    scope_id: scope,
+                    consumer: crate::bfd::BfdConsumer::Ospf3,
+                })
+                .await;
+        }
+        self.bfd_registered = full;
+    }
+
+    /// Tear down the adjacency to the neighbour at `peer` (a BFD-reported path
+    /// failure), mirroring [`Self::age_neighbors`]: remove the neighbour, drive its
+    /// FSM down, re-run the interface's DR election and adjacency evaluation, and
+    /// re-originate / re-run SPF. The BFD reconcile then drops the stale session.
+    async fn force_neighbor_down(&mut self, peer: Ipv6Addr) {
+        let mut changed = false;
+        for idx in 0..self.ifaces.len() {
+            let id = self.ifaces[idx]
+                .neighbors
+                .iter()
+                .find(|(_, n)| n.addr == peer)
+                .map(|(id, _)| *id);
+            let Some(id) = id else { continue };
+            if let Some(mut n) = self.ifaces[idx].neighbors.remove(&id) {
+                n.fsm
+                    .handle(NeighborEvent::InactivityTimer, NeighborContext::default());
+                info!(interface = %self.ifaces[idx].name, neighbor = %id, %peer, "OSPFv3 neighbour down (BFD)");
+                changed = true;
+            }
+            if self.run_interface_event(idx, InterfaceEvent::NeighborChange) {
+                self.reeval_adjacencies(idx).await;
             }
         }
         if changed {

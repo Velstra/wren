@@ -14,13 +14,12 @@ protocol-independent hello mechanism that detects a forwarding-path failure in
 Two systems exchange small UDP Control packets at a sub-second rate. When a system
 stops hearing its neighbour for `detect-mult` receive intervals it declares the
 session **Down**, and the protocols riding that path drop their adjacency
-immediately rather than waiting for the hold / dead timer. **BGP** and **OSPFv2**
-both use it.
+immediately rather than waiting for the hold / dead timer. **BGP**, **OSPFv2** and
+**OSPFv3** all use it.
 
-Scope: **single-hop asynchronous mode**, IPv4, no authentication and no Echo — the
-configuration that drives routing-protocol failover. The Demand and Echo modes,
-authentication (§6.7), and BFD for the other IGPs (OSPFv3, IS-IS) are future
-extensions.
+Scope: **single-hop asynchronous mode**, **IPv4 and IPv6**, no authentication and no
+Echo — the configuration that drives routing-protocol failover. The Demand and Echo
+modes, authentication (§6.7), and BFD for IS-IS are future extensions.
 
 ## What is implemented
 
@@ -42,15 +41,19 @@ sessions are cheap, and drops to the configured rate once Up. The transmit inter
 carries the §6.8.7 jitter; the Detection Time is `detect-mult ×` the negotiated
 receive interval (§6.8.4).
 
-**The UDP runner** (in `wren-daemon`) ties them together — a shared receive socket
-on UDP port **3784**, a connected transmit socket per peer sending with **IP TTL
+**The UDP runner** (in `wren-daemon`) ties them together — shared receive sockets on
+UDP port **3784** for **both IPv4 and IPv6** (the latter bound `IPV6_V6ONLY` so the
+two coexist), a connected transmit socket per peer sending with **TTL / hop limit
 255** (the GTSM check single-hop BFD relies on, RFC 5881 §5), per-session transmit
-and detection timers, and demultiplexing received packets to a session by source
-address. Sessions are **dynamic and multi-consumer**: a protocol registers a peer
-(BGP statically at startup, OSPF as a neighbour reaches Full), and the runner
-creates the session on first registration and tears it down when the last
-subscriber deregisters. When a session that had come up goes down, every subscribed
-protocol is notified and tears its adjacency to that peer down at once.
+and detection timers, and demultiplexing received packets to a session by
+`(source address, scope)`. The **scope** is the receiving interface index, which is
+what keeps IPv6 **link-local** peers distinct — exactly how OSPFv3 identifies its
+neighbours. Sessions are **dynamic and multi-consumer**: a protocol registers a peer
+(BGP statically at startup, the OSPF IGPs as a neighbour reaches Full), and the
+runner creates the session on first registration and tears it down when the last
+subscriber deregisters. A peer shared by two protocols has one session. When a
+session that had come up goes down, every subscribed protocol is notified and tears
+its adjacency to that peer down at once.
 
 ## Configuration
 
@@ -84,6 +87,18 @@ adjacency down at once (RFC 5882 §4.4) instead of waiting for the dead interval
 
 ```toml
 [ospf]
+enabled    = true
+interfaces = ["eth1"]
+bfd        = true
+```
+
+**OSPFv3** — the same, with `[ospf3] bfd = true`. OSPFv3 neighbours are IPv6
+link-local addresses, so each session runs over IPv6 (the engine binds an IPv6
+control socket and keys the session by the neighbour's link-local address and the
+interface scope); nothing else differs:
+
+```toml
+[ospf3]
 enabled    = true
 interfaces = ["eth1"]
 bfd        = true

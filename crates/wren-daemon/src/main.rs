@@ -30,7 +30,8 @@ mod rip;
 mod ripng;
 mod router;
 mod rtr;
-#[cfg(feature = "_rawsock")]
+// Always compiled: BFD (always-on) uses `setsockopt_int` for IPv6 hop limit /
+// `IPV6_V6ONLY`, on top of every `_rawsock` protocol runner.
 mod sockopt;
 
 use std::collections::HashSet;
@@ -242,6 +243,10 @@ async fn main() -> Result<()> {
     let (ospf_bfd_tx, ospf_bfd_rx) = mpsc::channel::<std::net::IpAddr>(QUERY_QUEUE);
     #[cfg(feature = "ospf")]
     let mut ospf_bfd_rx = Some(ospf_bfd_rx);
+    #[cfg(feature = "ospf3")]
+    let (ospf3_bfd_tx, ospf3_bfd_rx) = mpsc::channel::<std::net::IpAddr>(QUERY_QUEUE);
+    #[cfg(feature = "ospf3")]
+    let mut ospf3_bfd_rx = Some(ospf3_bfd_rx);
     let bgp_bfd = cfg
         .bgp
         .as_ref()
@@ -250,7 +255,11 @@ async fn main() -> Result<()> {
     let ospf_bfd = cfg.ospf.as_ref().is_some_and(|o| o.enabled && o.bfd);
     #[cfg(not(feature = "ospf"))]
     let ospf_bfd = false;
-    let bfd_enabled = bgp_bfd || ospf_bfd;
+    #[cfg(feature = "ospf3")]
+    let ospf3_bfd = cfg.ospf3.as_ref().is_some_and(|o| o.enabled && o.bfd);
+    #[cfg(not(feature = "ospf3"))]
+    let ospf3_bfd = false;
+    let bfd_enabled = bgp_bfd || ospf_bfd || ospf3_bfd;
     // Spawn the single BFD engine if any protocol enables it; protocols register
     // their peers over `bfd_register` once their sessions warrant it.
     if bfd_enabled {
@@ -468,8 +477,14 @@ async fn main() -> Result<()> {
                 }
                 let tx = updates_tx.clone();
                 let qrx = ospf3_queries_rx.take().expect("ospf3 queries rx taken once");
+                // BFD (RFC 5880) plumbing: the engine registration channel, OSPFv3's
+                // own notify channel, and the down channel the engine reports failures
+                // on. Inert unless `[ospf3] bfd` is set.
+                let breg = bfd_register_tx.clone();
+                let bnotify = ospf3_bfd_tx.clone();
+                let bdrx = ospf3_bfd_rx.take().expect("ospf3 bfd rx taken once");
                 tokio::spawn(async move {
-                    if let Err(e) = ospf3::run(run_cfg, tx, qrx).await {
+                    if let Err(e) = ospf3::run(run_cfg, tx, qrx, breg, bnotify, bdrx).await {
                         error!(error = %e, "OSPFv3 engine stopped");
                     }
                 });
@@ -558,25 +573,23 @@ async fn main() -> Result<()> {
                         error!(error = %e, "BGP engine stopped");
                     }
                 });
-                // Register each `bfd = true` neighbour (IPv4 only) with the BFD engine
-                // (RFC 5880). When BFD reports the peer down, the engine notifies
-                // `bfd_down_tx`, which the BGP engine reads to tear the session down.
+                // Register each `bfd = true` neighbour with the BFD engine (RFC 5880).
+                // When BFD reports the peer down, the engine notifies `bfd_down_tx`,
+                // which the BGP engine reads to tear the session down.
                 for n in &bgpcfg.neighbor {
                     if !n.bfd {
                         continue;
                     }
                     match parse_neighbor_addr(&n.address) {
-                        Ok((std::net::IpAddr::V4(v4), _scope)) => {
+                        Ok((peer, scope)) => {
                             let _ = bfd_register_tx
                                 .send(bfd::BfdCommand::Register {
-                                    peer: v4,
+                                    peer,
+                                    scope_id: scope.unwrap_or(0),
                                     consumer: bfd::BfdConsumer::Bgp,
                                     notify: bfd_down_tx.clone(),
                                 })
                                 .await;
-                        }
-                        Ok((other, _)) => {
-                            warn!(peer = %other, "BFD is IPv4-only for now; ignoring `bfd` on this IPv6 neighbour")
                         }
                         Err(e) => warn!(error = %e, "skipping BFD for an unparsable neighbour address"),
                     }
@@ -909,6 +922,7 @@ fn build_ospf3_config(
         instance_id: ospf3.instance_id.unwrap_or(0),
         interfaces,
         redistribute,
+        bfd: ospf3.bfd,
     })
 }
 

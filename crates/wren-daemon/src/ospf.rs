@@ -1831,7 +1831,8 @@ impl Ospf {
             let _ = self
                 .bfd_register
                 .send(crate::bfd::BfdCommand::Register {
-                    peer,
+                    peer: std::net::IpAddr::V4(peer),
+                    scope_id: 0,
                     consumer: crate::bfd::BfdConsumer::Ospf,
                     notify: self.bfd_notify.clone(),
                 })
@@ -1842,7 +1843,8 @@ impl Ospf {
             let _ = self
                 .bfd_register
                 .send(crate::bfd::BfdCommand::Deregister {
-                    peer,
+                    peer: std::net::IpAddr::V4(peer),
+                    scope_id: 0,
                     consumer: crate::bfd::BfdConsumer::Ospf,
                 })
                 .await;
