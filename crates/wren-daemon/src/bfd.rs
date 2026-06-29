@@ -12,14 +12,20 @@
 //!   (single-hop, one session per peer);
 //! * drives each session's transmit timer (jittered, sub-second once Up) and its
 //!   detection timer (Detect Mult × the negotiated receive interval);
-//! * reports a session going **down** (after it had come up) to the BGP engine on
-//!   `down_tx`, so the BGP session to that peer is torn down at once rather than
-//!   waiting for the Hold Timer.
+//! * reports a session going **down** (after it had come up) to the protocols that
+//!   subscribed to it, so they tear their adjacency to that peer down at once
+//!   rather than waiting for a hold / dead timer.
+//!
+//! Sessions are **dynamic and multi-consumer**: a protocol [registers](BfdCommand)
+//! a peer (BGP statically at startup, OSPF as neighbours reach Full and leave it),
+//! and the runner creates the session on first registration and tears it down when
+//! the last subscriber deregisters. A peer shared by two protocols has one session;
+//! both are notified when it fails.
 //!
 //! Scope: single-hop asynchronous mode, IPv4, no authentication, no Echo — the
-//! configuration that drives BGP failover. Sessions are started for the BGP
-//! neighbours configured with `bfd = true`.
+//! configuration that drives routing-protocol failover.
 
+use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::net::{IpAddr, Ipv4Addr};
 
@@ -38,18 +44,54 @@ const CONTROL_PORT: u16 = 3784;
 /// check that the neighbour is exactly one hop away (RFC 5881 §5).
 const SINGLE_HOP_TTL: u32 = 255;
 
-/// The resolved BFD configuration handed to the runner.
+/// The resolved BFD configuration handed to the runner: just the shared session
+/// timing, since sessions are created dynamically by registration.
 pub struct BfdConfig {
-    /// The peers to run a session to (the BGP neighbours with `bfd = true`).
-    pub peers: Vec<Ipv4Addr>,
     /// The shared session timing parameters from `[bfd]`.
     pub session: SessionConfig,
+}
+
+/// Which protocol a BFD subscription belongs to, so one peer can be tracked by
+/// several protocols at once and deregistered independently.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum BfdConsumer {
+    /// A BGP neighbour (`[[bgp.neighbor]] bfd = true`).
+    Bgp,
+    /// An OSPF neighbour (`[ospf] bfd = true`). Only constructed when the OSPF engine
+    /// is compiled in.
+    #[cfg_attr(not(feature = "ospf"), allow(dead_code))]
+    Ospf,
+}
+
+/// A registration command from a protocol to the BFD engine.
+pub enum BfdCommand {
+    /// Track `peer` for `consumer`, notifying `notify` with the peer's address when
+    /// the session goes down (after having come up). Creates the session if new;
+    /// adds the subscriber if the session already exists.
+    Register {
+        /// The peer's address (the session's transmit/demux key).
+        peer: Ipv4Addr,
+        /// Which protocol is subscribing.
+        consumer: BfdConsumer,
+        /// Where to report this peer going down.
+        notify: mpsc::Sender<IpAddr>,
+    },
+    /// Stop tracking `peer` for `consumer`. The session is torn down once no
+    /// protocol subscribes to it any more. Only used by the OSPF consumer (BGP
+    /// registrations are static), so unconstructed when OSPF is compiled out.
+    #[cfg_attr(not(feature = "ospf"), allow(dead_code))]
+    Deregister {
+        /// The peer's address.
+        peer: Ipv4Addr,
+        /// Which protocol is unsubscribing.
+        consumer: BfdConsumer,
+    },
 }
 
 /// A `show bfd` query, answered by the BFD task out of the sessions it owns.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum BfdQuery {
-    /// The configured sessions and their current state.
+    /// The live sessions and their current state.
     Sessions,
 }
 
@@ -61,8 +103,8 @@ pub struct BfdQueryRequest {
     pub respond: oneshot::Sender<String>,
 }
 
-/// One peer's live session: the FSM, its transmit socket, and the two timer
-/// deadlines the runner maintains.
+/// One peer's live session: the FSM, its transmit socket, the timer deadlines the
+/// runner maintains, and the protocols subscribed to its down notifications.
 struct PeerSession {
     peer: Ipv4Addr,
     sess: Session,
@@ -72,6 +114,8 @@ struct PeerSession {
     /// When the session fails if no packet arrives; `None` until the neighbour is
     /// first heard (detection is not armed before then).
     detect_deadline: Option<Instant>,
+    /// The protocols to notify when this session goes down, by consumer.
+    subscribers: HashMap<BfdConsumer, mpsc::Sender<IpAddr>>,
 }
 
 /// A flat snapshot of one session for the (pure) `show bfd` renderer.
@@ -84,44 +128,24 @@ struct SessionInfo {
     detect_ms: u64,
 }
 
-/// Run the BFD engine: bring up a session to every configured peer and drive them
-/// until the daemon shuts down. `down_tx` carries the address of a peer whose
-/// session has just gone down (after being up) to the BGP engine.
+/// Run the BFD engine until the daemon shuts down: create a session per registered
+/// peer, drive them, and notify subscribers when a session that had come up fails.
 pub async fn run(
     cfg: BfdConfig,
-    down_tx: mpsc::Sender<IpAddr>,
+    mut register: mpsc::Receiver<BfdCommand>,
     mut queries: mpsc::Receiver<BfdQueryRequest>,
 ) -> Result<()> {
     // The shared receive socket: every peer sends its Control packets to our 3784.
     let rx = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, CONTROL_PORT))
         .await
         .with_context(|| format!("binding BFD control socket 0.0.0.0:{CONTROL_PORT}"))?;
-    info!(port = CONTROL_PORT, sessions = cfg.peers.len(), "BFD listening");
+    info!(port = CONTROL_PORT, "BFD listening");
 
-    // One session (and connected transmit socket) per peer. Discriminators are
-    // assigned from a per-process counter — unique on this system, which is all the
-    // single-hop demux (by source address) needs.
-    let now = Instant::now();
-    let mut sessions: Vec<PeerSession> = Vec::with_capacity(cfg.peers.len());
+    // Sessions are created on registration. Discriminators come from a per-process
+    // counter — unique on this system, which is all the single-hop demux (by source
+    // address) needs.
+    let mut sessions: HashMap<Ipv4Addr, PeerSession> = HashMap::new();
     let mut next_discr: u32 = 1;
-    for peer in cfg.peers {
-        let tx = match build_tx_socket(peer).await {
-            Ok(s) => s,
-            Err(e) => {
-                warn!(%peer, error = %e, "BFD could not open transmit socket; skipping session");
-                continue;
-            }
-        };
-        let discr = next_discr;
-        next_discr += 1;
-        sessions.push(PeerSession {
-            peer,
-            sess: Session::new(discr, cfg.session),
-            tx,
-            next_tx: now, // begin the handshake immediately
-            detect_deadline: None,
-        });
-    }
 
     let mut buf = [0u8; 128];
     loop {
@@ -138,11 +162,14 @@ pub async fn run(
         tokio::select! {
             r = rx.recv_from(&mut buf) => {
                 match r {
-                    Ok((n, src)) => on_receive(&mut sessions, &buf[..n], src.ip(), &down_tx).await,
+                    Ok((n, src)) => on_receive(&mut sessions, &buf[..n], src.ip()),
                     Err(e) => debug!(error = %e, "BFD recv error"),
                 }
             }
             () = &mut timer => {}
+            Some(cmd) = register.recv() => {
+                handle_command(&mut sessions, &mut next_discr, cfg.session, cmd).await;
+            }
             Some(req) = queries.recv() => {
                 let resp = match req.query {
                     BfdQuery::Sessions => render_bfd_sessions(&snapshot(&sessions)),
@@ -152,7 +179,58 @@ pub async fn run(
         }
 
         // Service every session: fire detection timeouts, then due transmits.
-        service(&mut sessions, &down_tx).await;
+        service(&mut sessions);
+    }
+}
+
+/// Apply a registration command: create or extend a session on Register, shrink or
+/// remove it on Deregister.
+async fn handle_command(
+    sessions: &mut HashMap<Ipv4Addr, PeerSession>,
+    next_discr: &mut u32,
+    session_cfg: SessionConfig,
+    cmd: BfdCommand,
+) {
+    match cmd {
+        BfdCommand::Register { peer, consumer, notify } => {
+            if let Some(s) = sessions.get_mut(&peer) {
+                s.subscribers.insert(consumer, notify);
+                debug!(%peer, ?consumer, "BFD subscription added to existing session");
+                return;
+            }
+            let tx = match build_tx_socket(peer).await {
+                Ok(s) => s,
+                Err(e) => {
+                    warn!(%peer, error = %e, "BFD could not open transmit socket; not tracking");
+                    return;
+                }
+            };
+            let discr = *next_discr;
+            *next_discr += 1;
+            let mut subscribers = HashMap::new();
+            subscribers.insert(consumer, notify);
+            info!(%peer, ?consumer, "BFD session started");
+            sessions.insert(
+                peer,
+                PeerSession {
+                    peer,
+                    sess: Session::new(discr, session_cfg),
+                    tx,
+                    next_tx: Instant::now(), // begin the handshake immediately
+                    detect_deadline: None,
+                    subscribers,
+                },
+            );
+        }
+        BfdCommand::Deregister { peer, consumer } => {
+            if let Some(s) = sessions.get_mut(&peer) {
+                s.subscribers.remove(&consumer);
+                if s.subscribers.is_empty() {
+                    sessions.remove(&peer);
+                    info!(%peer, "BFD session torn down (no subscribers)");
+                }
+            }
+        }
     }
 }
 
@@ -166,22 +244,24 @@ async fn build_tx_socket(peer: Ipv4Addr) -> Result<UdpSocket> {
     Ok(sock)
 }
 
+/// Notify every subscriber that `peer`'s session has gone down.
+fn notify_down(s: &PeerSession) {
+    for tx in s.subscribers.values() {
+        let _ = tx.try_send(IpAddr::V4(s.peer));
+    }
+}
+
 /// Handle a received datagram: decode it, demultiplex by source address to the
 /// matching session, fold it into the FSM, and (re)arm that session's detection
-/// timer. A transition out of Up to Down is reported to BGP.
-async fn on_receive(
-    sessions: &mut [PeerSession],
-    buf: &[u8],
-    src: IpAddr,
-    down_tx: &mpsc::Sender<IpAddr>,
-) {
+/// timer. A transition out of Up to Down notifies the subscribers.
+fn on_receive(sessions: &mut HashMap<Ipv4Addr, PeerSession>, buf: &[u8], src: IpAddr) {
     let IpAddr::V4(sip) = src else { return }; // IPv4 single-hop only for now
     let Some(pkt) = ControlPacket::decode(buf) else { return };
-    let Some(s) = sessions.iter_mut().find(|s| s.peer == sip) else { return };
+    let Some(s) = sessions.get_mut(&sip) else { return };
     if let Some(t) = s.sess.on_packet(&pkt) {
         info!(peer = %sip, from = t.from.label(), to = t.to.label(), "BFD session state change");
         if t.from == State::Up && t.to == State::Down {
-            let _ = down_tx.try_send(IpAddr::V4(sip));
+            notify_down(s);
         }
         // A state change must be advertised to the neighbour as soon as practical.
         s.next_tx = Instant::now();
@@ -193,10 +273,10 @@ async fn on_receive(
 }
 
 /// Fire any elapsed detection timeout, then send any due Control packet, for every
-/// session. A detection timeout on a session that had been up is reported to BGP.
-async fn service(sessions: &mut [PeerSession], down_tx: &mpsc::Sender<IpAddr>) {
+/// session. A detection timeout on a session that had been up notifies subscribers.
+fn service(sessions: &mut HashMap<Ipv4Addr, PeerSession>) {
     let now = Instant::now();
-    for s in sessions.iter_mut() {
+    for s in sessions.values_mut() {
         if let Some(d) = s.detect_deadline {
             if now >= d {
                 if let Some(t) = s.sess.on_detect_timeout() {
@@ -204,7 +284,7 @@ async fn service(sessions: &mut [PeerSession], down_tx: &mpsc::Sender<IpAddr>) {
                     s.detect_deadline = None; // disarm until the neighbour is heard again
                     s.next_tx = now; // announce the Down state immediately
                     if t.from == State::Up {
-                        let _ = down_tx.try_send(IpAddr::V4(s.peer));
+                        notify_down(s);
                     }
                 }
             }
@@ -219,10 +299,10 @@ async fn service(sessions: &mut [PeerSession], down_tx: &mpsc::Sender<IpAddr>) {
 }
 
 /// The earliest deadline across all sessions (transmit or detection), or `None`
-/// when there are no sessions (the runner then idles).
-fn next_wakeup(sessions: &[PeerSession]) -> Option<Instant> {
+/// when there are no sessions (the runner then idles until a registration).
+fn next_wakeup(sessions: &HashMap<Ipv4Addr, PeerSession>) -> Option<Instant> {
     let mut wake: Option<Instant> = None;
-    for s in sessions {
+    for s in sessions.values() {
         wake = Some(wake.map_or(s.next_tx, |w: Instant| w.min(s.next_tx)));
         if let Some(d) = s.detect_deadline {
             wake = Some(wake.map_or(d, |w: Instant| w.min(d)));
@@ -231,10 +311,11 @@ fn next_wakeup(sessions: &[PeerSession]) -> Option<Instant> {
     wake
 }
 
-/// Snapshot the sessions for the renderer (so rendering touches no live state).
-fn snapshot(sessions: &[PeerSession]) -> Vec<SessionInfo> {
-    sessions
-        .iter()
+/// Snapshot the sessions for the renderer (so rendering touches no live state),
+/// sorted by peer for a stable listing.
+fn snapshot(sessions: &HashMap<Ipv4Addr, PeerSession>) -> Vec<SessionInfo> {
+    let mut out: Vec<SessionInfo> = sessions
+        .values()
         .map(|s| SessionInfo {
             peer: s.peer,
             state: s.sess.state(),
@@ -243,7 +324,9 @@ fn snapshot(sessions: &[PeerSession]) -> Vec<SessionInfo> {
             tx_ms: s.sess.transmit_interval_us() / 1000,
             detect_ms: s.sess.detection_time_us() / 1000,
         })
-        .collect()
+        .collect();
+    out.sort_by_key(|i| u32::from(i.peer));
+    out
 }
 
 /// Render the BFD sessions, one per line — `show bfd`.

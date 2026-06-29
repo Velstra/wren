@@ -13,12 +13,14 @@ protocol-independent hello mechanism that detects a forwarding-path failure in
 
 Two systems exchange small UDP Control packets at a sub-second rate. When a system
 stops hearing its neighbour for `detect-mult` receive intervals it declares the
-session **Down**, and the protocol riding that path (here BGP) drops its adjacency
-immediately rather than waiting for the hold timer.
+session **Down**, and the protocols riding that path drop their adjacency
+immediately rather than waiting for the hold / dead timer. **BGP** and **OSPFv2**
+both use it.
 
 Scope: **single-hop asynchronous mode**, IPv4, no authentication and no Echo — the
-configuration that drives BGP failover. The Demand and Echo modes, authentication
-(§6.7), and BFD for the IGPs are future extensions.
+configuration that drives routing-protocol failover. The Demand and Echo modes,
+authentication (§6.7), and BFD for the other IGPs (OSPFv3, IS-IS) are future
+extensions.
 
 ## What is implemented
 
@@ -44,31 +46,48 @@ receive interval (§6.8.4).
 on UDP port **3784**, a connected transmit socket per peer sending with **IP TTL
 255** (the GTSM check single-hop BFD relies on, RFC 5881 §5), per-session transmit
 and detection timers, and demultiplexing received packets to a session by source
-address. When a session that had come up goes down, the runner reports it to the
-BGP engine, which tears the BGP session to that peer down at once.
+address. Sessions are **dynamic and multi-consumer**: a protocol registers a peer
+(BGP statically at startup, OSPF as a neighbour reaches Full), and the runner
+creates the session on first registration and tears it down when the last
+subscriber deregisters. When a session that had come up goes down, every subscribed
+protocol is notified and tears its adjacency to that peer down at once.
 
 ## Configuration
 
-BFD is enabled **per BGP neighbour** with `bfd = true`; the timing is shared by
-every session and comes from a global `[bfd]` block (all optional):
+The timing is shared by every session and comes from a global `[bfd]` block (all
+optional); BFD is then enabled per protocol.
 
 ```toml
 [bfd]
 min-tx      = 300   # Desired Min TX Interval, milliseconds (default 300)
 min-rx      = 300   # Required Min RX Interval, milliseconds (default 300)
 detect-mult = 3     # session fails after this many missed intervals (default 3)
-
-[bgp]
-enabled  = true
-local-as = 65001
-[[bgp.neighbor]]
-address   = "10.0.0.2"
-remote-as = 65002
-bfd       = true     # run a BFD session to this peer; drop BGP fast when it fails
 ```
 
 At the defaults the Detection Time is `300 ms × 3 = 900 ms`. The peer must also be
 configured to run BFD.
+
+**BGP** — enable it per neighbour. A BFD-down tears the BGP session down (rather
+than waiting for the Hold Timer); the connector re-establishes when the path
+recovers:
+
+```toml
+[[bgp.neighbor]]
+address   = "10.0.0.2"
+remote-as = 65002
+bfd       = true
+```
+
+**OSPFv2** — enable it for the instance with `[ospf] bfd = true`. A session is
+brought up to each neighbour that reaches **Full**, and a BFD-down tears that
+adjacency down at once (RFC 5882 §4.4) instead of waiting for the dead interval:
+
+```toml
+[ospf]
+enabled    = true
+interfaces = ["eth1"]
+bfd        = true
+```
 
 ## Operational view
 

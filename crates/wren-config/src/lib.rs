@@ -276,6 +276,13 @@ pub struct Ospf {
     /// Defaults to 1.
     #[serde(rename = "auth-key-id")]
     pub auth_key_id: Option<u8>,
+    /// Run a BFD (RFC 5880) session to each OSPF neighbour for fast failure
+    /// detection. When a neighbour reaches Full, a BFD session is brought up to it;
+    /// if BFD goes down the adjacency is torn down at once instead of waiting for the
+    /// dead interval. Timing comes from the global `[bfd]` defaults. Defaults to
+    /// false.
+    #[serde(default)]
+    pub bfd: bool,
 }
 
 /// One OSPF interface placed in a specific area (`[[ospf.interface]]`).
@@ -1401,6 +1408,27 @@ mod tests {
         assert_eq!(ospf.auth_type.as_deref(), Some("md5"));
         assert_eq!(ospf.auth_key.as_deref(), Some("secret"));
         assert_eq!(ospf.auth_key_id, Some(3));
+    }
+
+    #[test]
+    fn parses_ospf_bfd() {
+        let cfg = Config::from_toml(
+            r#"
+            router-id = "10.0.0.1"
+            [ospf]
+            enabled = true
+            interfaces = ["eth1"]
+            bfd = true
+            "#,
+        )
+        .expect("valid config");
+        assert!(cfg.ospf.expect("ospf present").bfd);
+        // Defaults to false when unset.
+        let cfg = Config::from_toml(
+            "router-id = \"10.0.0.1\"\n[ospf]\nenabled = true\ninterfaces = [\"eth1\"]\n",
+        )
+        .expect("valid config");
+        assert!(!cfg.ospf.expect("ospf present").bfd);
     }
 
     #[test]

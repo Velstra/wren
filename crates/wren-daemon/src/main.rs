@@ -112,6 +112,10 @@ const REDIST_QUEUE: usize = 1024;
 /// The mpsc capacity for control → router queries.
 const QUERY_QUEUE: usize = 16;
 
+/// The mpsc capacity for protocol → BFD-engine registration commands. Generous so a
+/// burst of OSPF neighbours reaching Full at once never blocks the protocol task.
+const BFD_QUEUE: usize = 256;
+
 /// The mpsc capacity for the BGP engine → BMP client event feed. Generous, since the
 /// engine offers events with `try_send` and drops on a full queue (best-effort
 /// monitoring must never back-pressure routing).
@@ -222,19 +226,44 @@ async fn main() -> Result<()> {
     let (bgp_queries_tx, bgp_queries_rx) = mpsc::channel(QUERY_QUEUE);
     let mut bgp_queries_rx = Some(bgp_queries_rx);
     let bgp_enabled = cfg.bgp.as_ref().is_some_and(|b| b.enabled);
-    // BFD (RFC 5880): the `show bfd` query channel, and the channel on which the BFD
-    // engine reports a session going down to the BGP engine (so it can tear the BGP
-    // session down at once). Both `_tx` ends are held for the daemon's life so the
-    // owning task's select branch never sees a closed channel; the BFD engine, when
-    // spawned, gets clones. BFD is enabled when any BGP neighbour sets `bfd = true`.
+    // BFD (RFC 5880): one engine, registered with by every protocol that enables it.
+    // `bfd_register` carries Register/Deregister commands to the engine; each protocol
+    // has its own down channel the engine notifies (BGP's `bfd_down`, OSPF's
+    // `ospf_bfd`). `bfd_queries` answers `show bfd`. All `_tx` ends are held for the
+    // daemon's life so channels never close. The engine is spawned once when any
+    // protocol enables BFD.
+    let (bfd_register_tx, bfd_register_rx) = mpsc::channel::<bfd::BfdCommand>(BFD_QUEUE);
+    let mut bfd_register_rx = Some(bfd_register_rx);
     let (bfd_queries_tx, bfd_queries_rx) = mpsc::channel(QUERY_QUEUE);
     let mut bfd_queries_rx = Some(bfd_queries_rx);
     let (bfd_down_tx, bfd_down_rx) = mpsc::channel::<std::net::IpAddr>(QUERY_QUEUE);
     let mut bfd_down_rx = Some(bfd_down_rx);
-    let bfd_enabled = cfg
+    #[cfg(feature = "ospf")]
+    let (ospf_bfd_tx, ospf_bfd_rx) = mpsc::channel::<std::net::IpAddr>(QUERY_QUEUE);
+    #[cfg(feature = "ospf")]
+    let mut ospf_bfd_rx = Some(ospf_bfd_rx);
+    let bgp_bfd = cfg
         .bgp
         .as_ref()
         .is_some_and(|b| b.enabled && b.neighbor.iter().any(|n| n.bfd));
+    #[cfg(feature = "ospf")]
+    let ospf_bfd = cfg.ospf.as_ref().is_some_and(|o| o.enabled && o.bfd);
+    #[cfg(not(feature = "ospf"))]
+    let ospf_bfd = false;
+    let bfd_enabled = bgp_bfd || ospf_bfd;
+    // Spawn the single BFD engine if any protocol enables it; protocols register
+    // their peers over `bfd_register` once their sessions warrant it.
+    if bfd_enabled {
+        let session = bfd_session_config(cfg.bfd.as_ref());
+        let rrx = bfd_register_rx.take().expect("bfd register rx taken once");
+        let bqrx = bfd_queries_rx.take().expect("bfd queries rx taken once");
+        info!("BFD engine starting");
+        tokio::spawn(async move {
+            if let Err(e) = bfd::run(bfd::BfdConfig { session }, rrx, bqrx).await {
+                error!(error = %e, "BFD engine stopped");
+            }
+        });
+    }
     // The RTR (RFC 8210) ROA feed into the BGP engine. `rtr_tx` is held here for the
     // daemon's lifetime so the channel stays open even when no RTR cache is configured
     // (the BGP select branch then simply never fires); the client task, if spawned,
@@ -411,8 +440,16 @@ async fn main() -> Result<()> {
                 }
                 let tx = updates_tx.clone();
                 let qrx = ospf_queries_rx.take().expect("ospf queries rx taken once");
+                // BFD (RFC 5880) plumbing: the engine registration channel, OSPF's own
+                // notify sender (included in each registration), and the down channel
+                // the engine reports failures on. Inert unless `[ospf] bfd` is set.
+                let breg = bfd_register_tx.clone();
+                let bnotify = ospf_bfd_tx.clone();
+                let bdrx = ospf_bfd_rx.take().expect("ospf bfd rx taken once");
                 tokio::spawn(async move {
-                    if let Err(e) = ospf::run(run_cfg, tx, redist_rx, qrx).await {
+                    if let Err(e) =
+                        ospf::run(run_cfg, tx, redist_rx, qrx, breg, bnotify, bdrx).await
+                    {
                         error!(error = %e, "OSPF engine stopped");
                     }
                 });
@@ -521,19 +558,28 @@ async fn main() -> Result<()> {
                         error!(error = %e, "BGP engine stopped");
                     }
                 });
-                // Spawn the BFD engine (RFC 5880) if any neighbour enabled `bfd`. It
-                // runs a session per such peer and reports a session going down to the
-                // BGP engine over `bfd_down_tx`, for sub-second failover.
-                let bfd_run = build_bfd_config(bgpcfg, cfg.bfd.as_ref());
-                if !bfd_run.peers.is_empty() {
-                    info!(sessions = bfd_run.peers.len(), "BFD enabled for BGP neighbours");
-                    let down = bfd_down_tx.clone();
-                    let bqrx = bfd_queries_rx.take().expect("bfd queries rx taken once");
-                    tokio::spawn(async move {
-                        if let Err(e) = bfd::run(bfd_run, down, bqrx).await {
-                            error!(error = %e, "BFD engine stopped");
+                // Register each `bfd = true` neighbour (IPv4 only) with the BFD engine
+                // (RFC 5880). When BFD reports the peer down, the engine notifies
+                // `bfd_down_tx`, which the BGP engine reads to tear the session down.
+                for n in &bgpcfg.neighbor {
+                    if !n.bfd {
+                        continue;
+                    }
+                    match parse_neighbor_addr(&n.address) {
+                        Ok((std::net::IpAddr::V4(v4), _scope)) => {
+                            let _ = bfd_register_tx
+                                .send(bfd::BfdCommand::Register {
+                                    peer: v4,
+                                    consumer: bfd::BfdConsumer::Bgp,
+                                    notify: bfd_down_tx.clone(),
+                                })
+                                .await;
                         }
-                    });
+                        Ok((other, _)) => {
+                            warn!(peer = %other, "BFD is IPv4-only for now; ignoring `bfd` on this IPv6 neighbour")
+                        }
+                        Err(e) => warn!(error = %e, "skipping BFD for an unparsable neighbour address"),
+                    }
                 }
             }
             Err(e) => error!(error = %e, "BGP not started"),
@@ -748,6 +794,7 @@ fn build_ospf_config(
         totally_nssa_areas,
         nssa_default_areas,
         auth,
+        bfd: ospf.bfd,
     })
 }
 
@@ -895,34 +942,19 @@ fn parse_neighbor_addr(s: &str) -> Result<(std::net::IpAddr, Option<u32>)> {
     Ok((addr, scope_id))
 }
 
-/// Resolve the BFD (RFC 5880) configuration: every BGP neighbour with `bfd = true`
-/// (IPv4 transport only for now) becomes a session, all sharing the `[bfd]` timing
-/// defaults — `min-tx` / `min-rx` in milliseconds and `detect-mult`. Returns a
-/// config whose `peers` is empty when no neighbour enabled BFD (the caller then
-/// does not spawn the engine).
-fn build_bfd_config(bgp: &wren_config::Bgp, bfd: Option<&wren_config::Bfd>) -> bfd::BfdConfig {
+/// Resolve the shared BFD (RFC 5880) session timing from the `[bfd]` block: the
+/// `min-tx` / `min-rx` intervals (milliseconds, default 300) and `detect-mult`
+/// (default 3), converted to the microsecond units the session FSM uses. Every BFD
+/// session — across protocols — shares this timing.
+fn bfd_session_config(bfd: Option<&wren_config::Bfd>) -> wren_bfd::SessionConfig {
     let min_tx_ms = bfd.and_then(|b| b.min_tx).unwrap_or(300).max(1);
     let min_rx_ms = bfd.and_then(|b| b.min_rx).unwrap_or(300).max(1);
     let detect_mult = bfd.and_then(|b| b.detect_mult).unwrap_or(3).max(1);
-    let session = wren_bfd::SessionConfig {
+    wren_bfd::SessionConfig {
         desired_min_tx_us: min_tx_ms.saturating_mul(1000),
         required_min_rx_us: min_rx_ms.saturating_mul(1000),
         detect_mult,
-    };
-    let mut peers = Vec::new();
-    for n in &bgp.neighbor {
-        if !n.bfd {
-            continue;
-        }
-        match parse_neighbor_addr(&n.address) {
-            Ok((std::net::IpAddr::V4(v4), _scope)) => peers.push(v4),
-            Ok((other, _)) => {
-                warn!(peer = %other, "BFD is IPv4-only for now; ignoring `bfd` on this IPv6 neighbour")
-            }
-            Err(e) => warn!(error = %e, "skipping BFD for an unparsable neighbour address"),
-        }
     }
-    bfd::BfdConfig { peers, session }
 }
 
 fn build_bgp_config(

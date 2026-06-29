@@ -120,6 +120,10 @@ pub struct OspfConfig {
     /// MD5 the carried sequence number is a template (0); the runner stamps an
     /// increasing value on each sent packet via [`Ospf::send_auth`].
     pub auth: Auth,
+    /// Run a BFD (RFC 5880) session to each neighbour for fast failure detection:
+    /// when a neighbour reaches Full a session is registered, and a BFD-down tears
+    /// the adjacency down at once instead of waiting for the dead interval.
+    pub bfd: bool,
 }
 
 /// One configured OSPF interface and the area it is in.
@@ -247,6 +251,14 @@ struct Ospf {
     /// The prefixes we currently have announced to the RIB (for reconciliation).
     announced: HashSet<Prefix>,
     updates: mpsc::Sender<RouteUpdate>,
+    /// BFD (RFC 5880): the channel to the BFD engine to register/deregister
+    /// per-neighbour sessions, the notify sender included in each registration (the
+    /// engine reports a session going down on it), and the set of neighbour
+    /// addresses currently registered (the Full neighbours). Unused when
+    /// `cfg.bfd` is false.
+    bfd_register: mpsc::Sender<crate::bfd::BfdCommand>,
+    bfd_notify: mpsc::Sender<std::net::IpAddr>,
+    bfd_registered: HashSet<Ipv4Addr>,
 }
 
 /// A `show ospf …` query, answered by the OSPF task itself out of the state it
@@ -440,6 +452,9 @@ pub async fn run(
     updates: mpsc::Sender<RouteUpdate>,
     mut redist: mpsc::Receiver<Redistribution>,
     mut queries: mpsc::Receiver<OspfQueryRequest>,
+    bfd_register: mpsc::Sender<crate::bfd::BfdCommand>,
+    bfd_notify: mpsc::Sender<std::net::IpAddr>,
+    mut bfd_down: mpsc::Receiver<std::net::IpAddr>,
 ) -> Result<()> {
     let mut ifaces = Vec::new();
     let mut areas: BTreeMap<Ipv4Addr, Area> = BTreeMap::new();
@@ -498,6 +513,9 @@ pub async fn run(
         next_dd_seq: 0x0100_0000,
         announced: HashSet::new(),
         updates,
+        bfd_register,
+        bfd_notify,
+        bfd_registered: HashSet::new(),
     };
     ospf.originate_externals().await;
     ospf.reoriginate_and_flood().await;
@@ -539,7 +557,18 @@ pub async fn run(
                 };
                 let _ = req.respond.send(answer);
             }
+            // BFD (RFC 5880) reported a neighbour's forwarding path down: tear that
+            // adjacency down at once (RFC 5882 §4.4), exactly as an inactivity
+            // timeout would, instead of waiting for the dead interval.
+            Some(peer) = bfd_down.recv() => {
+                if let std::net::IpAddr::V4(v4) = peer {
+                    ospf.force_neighbor_down(v4).await;
+                }
+            }
         }
+        // Keep the set of registered BFD sessions in step with the Full neighbours
+        // (a no-op when `[ospf] bfd` is off). Cheap: a few neighbours per interface.
+        ospf.reconcile_bfd().await;
     }
     Ok(())
 }
@@ -1772,6 +1801,75 @@ impl Ospf {
                 if self.run_interface_event(idx, InterfaceEvent::NeighborChange) {
                     self.reeval_adjacencies(idx).await;
                 }
+            }
+        }
+        if changed {
+            self.reoriginate_and_flood().await;
+            self.run_spf_and_announce().await;
+        }
+    }
+
+    /// Keep the BFD (RFC 5880) registrations in step with the set of **Full**
+    /// neighbours: register a session as a neighbour reaches Full, deregister it as
+    /// the neighbour leaves Full or disappears. A no-op unless `[ospf] bfd` is set.
+    /// The BFD engine reports a session going down on [`Self::bfd_notify`], which the
+    /// run loop turns into [`Self::force_neighbor_down`].
+    async fn reconcile_bfd(&mut self) {
+        if !self.cfg.bfd {
+            return;
+        }
+        let mut full: HashSet<Ipv4Addr> = HashSet::new();
+        for iface in &self.ifaces {
+            for n in iface.neighbors.values() {
+                if n.fsm.state == NeighborState::Full {
+                    full.insert(n.addr);
+                }
+            }
+        }
+        let added: Vec<Ipv4Addr> = full.difference(&self.bfd_registered).copied().collect();
+        for peer in added {
+            let _ = self
+                .bfd_register
+                .send(crate::bfd::BfdCommand::Register {
+                    peer,
+                    consumer: crate::bfd::BfdConsumer::Ospf,
+                    notify: self.bfd_notify.clone(),
+                })
+                .await;
+        }
+        let removed: Vec<Ipv4Addr> = self.bfd_registered.difference(&full).copied().collect();
+        for peer in removed {
+            let _ = self
+                .bfd_register
+                .send(crate::bfd::BfdCommand::Deregister {
+                    peer,
+                    consumer: crate::bfd::BfdConsumer::Ospf,
+                })
+                .await;
+        }
+        self.bfd_registered = full;
+    }
+
+    /// Tear down the adjacency to the neighbour at `peer` (a BFD-reported path
+    /// failure), mirroring [`Self::age_neighbors`]: remove the neighbour, drive its
+    /// FSM down, re-run the interface's DR election and adjacency evaluation, and
+    /// re-originate / re-run SPF. The BFD reconcile then drops the stale session.
+    async fn force_neighbor_down(&mut self, peer: Ipv4Addr) {
+        let mut changed = false;
+        for idx in 0..self.ifaces.len() {
+            let id = self.ifaces[idx]
+                .neighbors
+                .iter()
+                .find(|(_, n)| n.addr == peer)
+                .map(|(id, _)| *id);
+            let Some(id) = id else { continue };
+            if let Some(mut n) = self.ifaces[idx].neighbors.remove(&id) {
+                n.fsm.handle(NeighborEvent::InactivityTimer, NeighborContext::default());
+                info!(interface = %self.ifaces[idx].name, neighbor = %id, %peer, "OSPF neighbour down (BFD)");
+                changed = true;
+            }
+            if self.run_interface_event(idx, InterfaceEvent::NeighborChange) {
+                self.reeval_adjacencies(idx).await;
             }
         }
         if changed {

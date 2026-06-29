@@ -242,13 +242,16 @@ tracked but not yet scheduled, grouped by area:
   dual-stack. (**BFD** (RFC 5880 / RFC 5881) — sub-second forwarding-path failure
   detection — is **done** for single-hop asynchronous mode (IPv4, no auth/Echo):
   the dependency-free `wren-bfd` crate (Control-packet codec + the §6.8.6 session
-  FSM) and a UDP runner driving it on port 3784 with TTL-255 single-hop packets. A
-  BGP neighbour with `bfd = true` gets a session whose failure tears the BGP
-  session down at once instead of waiting for the Hold Timer; `[bfd]` sets the
+  FSM) and a UDP runner driving it on port 3784 with TTL-255 single-hop packets.
+  Sessions are dynamic and multi-consumer. **BGP** (a neighbour with `bfd = true`)
+  and **OSPFv2** (`[ospf] bfd = true`, a session per Full neighbour) both use it: a
+  BFD-down tears the BGP session down (instead of the Hold Timer) or the OSPF
+  adjacency down (instead of the dead interval, RFC 5882 §4.4). `[bfd]` sets the
   timing and `show bfd` lists the sessions. Live-verified by
-  `scripts/bgp-bfd-smoke.sh` (a blackholed path is detected and BGP dropped in
-  ~0.6 s against a 180 s hold time). BFD for the IGPs, authentication and the Echo
-  function are future extensions. See [BFD](protocols/bfd.md).)
+  `scripts/bgp-bfd-smoke.sh` (a blackholed path drops BGP in ~0.6 s against a 180 s
+  hold time) and `scripts/ospf-bfd-smoke.sh` (drops the OSPF adjacency in ~0.65 s
+  against a 40 s dead interval). BFD for OSPFv3 / IS-IS, authentication and the
+  Echo function are future extensions. See [BFD](protocols/bfd.md).)
 - **Forwarding & policy:** VRFs, policy-based routing, route maps, prefix lists,
   route policies, max-AS-path. (Per-neighbour BGP `max-prefix` prefix-limiting with a
   Cease teardown (RFC 4486) is **done**. **Per-neighbour import *and* export filters**
