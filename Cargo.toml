@@ -9,7 +9,7 @@ resolver = "2"
 members = ["crates/*"]
 
 [workspace.package]
-version = "0.0.1"
+version = "0.1.0"
 edition = "2021"
 rust-version = "1.74"
 # The daemon and every crate are GPL-2.0-or-later (like BIRD), EXCEPT the
@@ -21,17 +21,17 @@ authors = ["The Wren authors"]
 
 [workspace.dependencies]
 # Internal crates.
-wren-core = { path = "crates/wren-core", version = "0.0.1" }
-wren-rip = { path = "crates/wren-rip", version = "0.0.1" }
-wren-ospf = { path = "crates/wren-ospf", version = "0.0.1" }
-wren-ospfv3 = { path = "crates/wren-ospfv3", version = "0.0.1" }
-wren-isis = { path = "crates/wren-isis", version = "0.0.1" }
-wren-bgp = { path = "crates/wren-bgp", version = "0.0.1" }
-wren-bfd = { path = "crates/wren-bfd", version = "0.0.1" }
-wren-babel = { path = "crates/wren-babel", version = "0.0.1" }
-wren-filter = { path = "crates/wren-filter", version = "0.0.1" }
-wren-config = { path = "crates/wren-config", version = "0.0.1" }
-wren-netlink = { path = "crates/wren-netlink", version = "0.0.1" }
+wren-core = { path = "crates/wren-core", version = "0.1.0" }
+wren-rip = { path = "crates/wren-rip", version = "0.1.0" }
+wren-ospf = { path = "crates/wren-ospf", version = "0.1.0" }
+wren-ospfv3 = { path = "crates/wren-ospfv3", version = "0.1.0" }
+wren-isis = { path = "crates/wren-isis", version = "0.1.0" }
+wren-bgp = { path = "crates/wren-bgp", version = "0.1.0" }
+wren-bfd = { path = "crates/wren-bfd", version = "0.1.0" }
+wren-babel = { path = "crates/wren-babel", version = "0.1.0" }
+wren-filter = { path = "crates/wren-filter", version = "0.1.0" }
+wren-config = { path = "crates/wren-config", version = "0.1.0" }
+wren-netlink = { path = "crates/wren-netlink", version = "0.1.0" }
 
 # Third-party (used by the daemon/protocols; NOT by wren-core).
 anyhow = "1"
