@@ -1,0 +1,16 @@
+[package]
+name = "wren-bfd"
+description = "Wren routing daemon — BFD (RFC 5880) control-packet codec and session state machine."
+keywords = ["routing", "bfd", "networking", "failure-detection"]
+categories = ["network-programming"]
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+# Dependency-free `std`: the control-packet wire codec and the session state
+# machine carry no dependencies, so they unit-test with no I/O and embed anywhere.
+# The async UDP runner lives in the daemon (`bfd.rs`), behind tokio, not here.
+[dependencies]

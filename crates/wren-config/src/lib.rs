@@ -71,6 +71,30 @@ pub struct Config {
     /// Export filters: applied to best-path routes leaving the RIB.
     #[serde(default)]
     pub export: Option<Export>,
+    /// BFD (RFC 5880) timing defaults, shared by every session a protocol starts
+    /// (currently the per-neighbour BGP sessions enabled with `bfd = true`).
+    #[serde(default)]
+    pub bfd: Option<Bfd>,
+}
+
+/// BFD (RFC 5880) global timing defaults (`[bfd]`). These apply to every BFD
+/// session Wren brings up; per-session enablement is on the protocol side (a BGP
+/// neighbour's `bfd = true`). Single-hop asynchronous mode.
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct Bfd {
+    /// Desired Min TX Interval in milliseconds — how fast we transmit Control
+    /// packets once a session is Up. Defaults to 300.
+    #[serde(rename = "min-tx")]
+    pub min_tx: Option<u32>,
+    /// Required Min RX Interval in milliseconds — the fastest we are willing to
+    /// receive (the neighbour will not transmit faster than this). Defaults to 300.
+    #[serde(rename = "min-rx")]
+    pub min_rx: Option<u32>,
+    /// Detect Mult — the session fails after this many missed receive intervals.
+    /// Defaults to 3 (so detection ≈ `min-rx × 3`, e.g. 900 ms at the defaults).
+    #[serde(rename = "detect-mult")]
+    pub detect_mult: Option<u8>,
 }
 
 /// Export filter attachments (`[export]`): which named filter gates routes on
@@ -535,6 +559,12 @@ pub struct BgpNeighbor {
     /// with any set-community (and, for transit routes, set-metric/set-preference)
     /// modifications applied. Unset advertises everything.
     pub export: Option<String>,
+    /// Run a BFD (RFC 5880) session to this neighbour for fast failure detection.
+    /// When the BFD session goes down, the BGP session to this peer is torn down at
+    /// once instead of waiting for the Hold Timer. Timing comes from the global
+    /// `[bfd]` defaults. IPv4 transport only for now. Defaults to false.
+    #[serde(default)]
+    pub bfd: bool,
 }
 
 /// Babel protocol configuration (`[babel]`, RFC 8966).
@@ -927,6 +957,37 @@ mod tests {
         let bgp = cfg.bgp.expect("bgp present");
         assert_eq!(bgp.neighbor[0].ao_key.as_deref(), Some("aosecret"));
         assert_eq!(bgp.neighbor[0].ao_key_id, Some(42));
+    }
+
+    #[test]
+    fn parses_bgp_bfd_and_defaults() {
+        let cfg = Config::from_toml(
+            r#"
+            router-id = "10.0.0.1"
+            [bfd]
+            min-tx = 250
+            min-rx = 250
+            detect-mult = 4
+            [bgp]
+            enabled = true
+            local-as = 65001
+            [[bgp.neighbor]]
+            address = "10.0.0.2"
+            remote-as = 65002
+            bfd = true
+            [[bgp.neighbor]]
+            address = "10.0.0.3"
+            remote-as = 65003
+            "#,
+        )
+        .expect("valid config");
+        let bfd = cfg.bfd.expect("bfd present");
+        assert_eq!(bfd.min_tx, Some(250));
+        assert_eq!(bfd.min_rx, Some(250));
+        assert_eq!(bfd.detect_mult, Some(4));
+        let bgp = cfg.bgp.expect("bgp present");
+        assert!(bgp.neighbor[0].bfd);
+        assert!(!bgp.neighbor[1].bfd); // defaults to false
     }
 
     #[test]

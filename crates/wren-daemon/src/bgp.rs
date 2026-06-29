@@ -356,6 +356,11 @@ enum SessionCmd {
     /// "Maximum Number of Prefixes Reached" (RFC 4486 §4), without reporting Down —
     /// the central task has already withdrawn the peer's routes and damped it.
     CeaseOverLimit,
+    /// BFD (RFC 5880) signalled the forwarding path to this peer is down (RFC 5882
+    /// §3.2): close the connection with a Cease and **do** report Down, so the
+    /// central task withdraws the peer's routes and the connector re-establishes
+    /// once the path recovers — sub-second failover instead of the Hold Timer.
+    BfdDown,
     /// Send a ROUTE-REFRESH to the peer (RFC 2918), asking it to re-advertise its
     /// routes to us — triggered by the operator's `bgp refresh <peer>`.
     SendRefresh,
@@ -836,6 +841,7 @@ pub async fn run(
     mut redist: mpsc::Receiver<Redistribution>,
     mut rtr_rx: mpsc::Receiver<Vec<Roa>>,
     bmp_tx: Option<mpsc::Sender<crate::bmp::BmpEvent>>,
+    mut bfd_down: mpsc::Receiver<IpAddr>,
 ) -> Result<()> {
     // The neighbour table: every configured peer, its AS and whether the session
     // is currently Established. Sorted for stable `show bgp neighbors` output.
@@ -1079,6 +1085,19 @@ pub async fn run(
                             apply_event(ev, &updates, &sessions).await;
                         }
                     }
+                }
+                continue;
+            }
+            // A BFD session (RFC 5880) to a peer went down: tear the BGP session to
+            // it down at once instead of waiting for the Hold Timer. The connector
+            // then reconnects as usual once the path (and BFD) recover. Harmless if
+            // the peer is not currently established (no session to shut).
+            Some(peer) = bfd_down.recv() => {
+                if let Some(cmd_tx) = sessions.get(&peer) {
+                    info!(%peer, "BFD session down; tearing down BGP session");
+                    let _ = cmd_tx.send(SessionCmd::BfdDown).await;
+                } else {
+                    debug!(%peer, "BFD down for a peer with no established BGP session");
                 }
                 continue;
             }
@@ -2773,6 +2792,25 @@ async fn drive_session(
                         subcode: CEASE_COLLISION,
                         data: vec![],
                     }))
+                    .await;
+                return Ok(());
+            }
+            Step::Cmd(SessionCmd::BfdDown) => {
+                // The forwarding path failed (BFD). Notify the peer with a Cease and
+                // — unlike Shutdown — report Down so the central task withdraws this
+                // peer's routes and the connector re-establishes when the path is
+                // back. The Cease send may not reach the peer over the dead path;
+                // that's fine, reporting Down is what matters.
+                let _ = sess
+                    .send(&Message::Notification(Notification {
+                        code: CODE_CEASE,
+                        subcode: 0,
+                        data: vec![],
+                    }))
+                    .await;
+                let _ = sess
+                    .tx
+                    .send(PeerMsg::Down { peer: sess.peer.addr, conn_id: sess.conn_id })
                     .await;
                 return Ok(());
             }

@@ -37,6 +37,7 @@ _rawsock = []
 wren-core.workspace = true
 wren-config.workspace = true
 wren-bgp.workspace = true
+wren-bfd.workspace = true
 wren-filter.workspace = true
 wren-netlink.workspace = true
 wren-rip = { workspace = true, optional = true }

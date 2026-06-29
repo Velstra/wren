@@ -21,6 +21,7 @@ use tracing::{info, warn};
 
 #[cfg(feature = "babel")]
 use crate::babel::{BabelQuery, BabelQueryRequest};
+use crate::bfd::{BfdQuery, BfdQueryRequest};
 use crate::bgp::{BgpQuery, BgpQueryRequest};
 #[cfg(feature = "isis")]
 use crate::isis::{IsisQuery, IsisQueryRequest};
@@ -41,6 +42,8 @@ pub struct Channels {
     pub router: mpsc::Sender<QueryRequest>,
     /// To the BGP task (`show bgp`), if BGP is running.
     pub bgp: Option<mpsc::Sender<BgpQueryRequest>>,
+    /// To the BFD task (`show bfd`), if any BFD session is configured.
+    pub bfd: Option<mpsc::Sender<BfdQueryRequest>>,
     /// To the OSPF task (`show ospf`), if OSPF is running.
     #[cfg(feature = "ospf")]
     pub ospf: Option<mpsc::Sender<OspfQueryRequest>>,
@@ -83,6 +86,12 @@ impl OwnedQuery for BgpQueryRequest {
     type Query = BgpQuery;
     fn build(query: BgpQuery, respond: oneshot::Sender<String>) -> Self {
         BgpQueryRequest { query, respond }
+    }
+}
+impl OwnedQuery for BfdQueryRequest {
+    type Query = BfdQuery;
+    fn build(query: BfdQuery, respond: oneshot::Sender<String>) -> Self {
+        BfdQueryRequest { query, respond }
     }
 }
 #[cfg(feature = "ospf")]
@@ -181,6 +190,11 @@ async fn handle_conn(stream: UnixStream, channels: Channels) -> Result<()> {
             response = Some(ask_opt(&channels.bgp, query, "bgp").await);
         }
     }
+    if response.is_none() {
+        if let Some(query) = parse_bfd_query(line) {
+            response = Some(ask_opt(&channels.bfd, query, "bfd").await);
+        }
+    }
     #[cfg(feature = "ospf3")]
     if response.is_none() {
         if let Some(query) = parse_ospf3_query(line) {
@@ -225,7 +239,7 @@ async fn handle_conn(stream: UnixStream, channels: Channels) -> Result<()> {
              bgp refresh <peer> | \
              show ospf [neighbors|interfaces|database] | show ospf3 [neighbors|interfaces] | \
              show isis [neighbors|interfaces|database] | show babel [neighbors|routes] | \
-             show rip | show ripng | show metrics\n"
+             show bfd | show rip | show ripng | show metrics\n"
         )
     });
 
@@ -336,6 +350,28 @@ pub fn parse_bgp_query(line: &str) -> Option<BgpQuery> {
         }
         _ => None,
     }
+}
+
+/// Parse a `show bfd` command into a [`BfdQuery`]. BFD keeps only session state,
+/// so the sole view is the session table; a bare `show bfd` (or `show bfd
+/// sessions`) is it. Returns `None` for anything else (so the caller can fall
+/// through to the other parsers).
+pub fn parse_bfd_query(line: &str) -> Option<BfdQuery> {
+    let mut tokens = line.split_whitespace();
+    if tokens.next()? != "show" || tokens.next()? != "bfd" {
+        return None;
+    }
+    let query = match tokens.next() {
+        None | Some("sessions") | Some("session") | Some("neighbors") | Some("neighbours") => {
+            BfdQuery::Sessions
+        }
+        Some(_) => return None,
+    };
+    // A trailing extra token is a malformed command.
+    if tokens.next().is_some() {
+        return None;
+    }
+    Some(query)
 }
 
 /// Parse a `show ospf [neighbors|interfaces]` command into an [`OspfQuery`]. A
@@ -545,6 +581,18 @@ mod tests {
         assert!(parse_bgp_query("bgp refresh nonsense").is_none());
         assert!(parse_bgp_query("bgp refresh 10.0.0.2 extra").is_none());
         assert!(parse_bgp_query("bgp nonsense").is_none());
+    }
+
+    #[test]
+    fn parse_bfd_query_understands_show_bfd() {
+        assert_eq!(parse_bfd_query("show bfd"), Some(BfdQuery::Sessions));
+        assert_eq!(parse_bfd_query("show bfd sessions"), Some(BfdQuery::Sessions));
+        assert_eq!(parse_bfd_query("show bfd neighbors"), Some(BfdQuery::Sessions));
+        // Not a bfd command / malformed.
+        assert!(parse_bfd_query("show bgp").is_none());
+        assert!(parse_bfd_query("show bfd nonsense").is_none());
+        assert!(parse_bfd_query("show bfd sessions extra").is_none());
+        assert!(parse_bfd_query("").is_none());
     }
 
     #[cfg(feature = "ospf")]

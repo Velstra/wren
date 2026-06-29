@@ -18,6 +18,7 @@
 - [BGP-4](protocols/bgp.md)
 - [Babel](protocols/babel.md)
 - [IS-IS](protocols/isis.md)
+- [BFD](protocols/bfd.md)
 
 # Internals
 

@@ -555,6 +555,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "wren-bfd"
+version = "0.0.1"
+
+[[package]]
 name = "wren-bgp"
 version = "0.0.1"
 dependencies = [
@@ -585,6 +589,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "wren-babel",
+ "wren-bfd",
  "wren-bgp",
  "wren-config",
  "wren-core",
