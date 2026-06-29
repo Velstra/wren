@@ -39,7 +39,7 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::time::{sleep_until, Duration, Instant};
 use tracing::{debug, info, warn};
 
-use wren_bfd::{ControlPacket, Session, SessionConfig, State};
+use wren_bfd::{AuthConfig, AuthState, ControlPacket, Session, SessionConfig, State};
 
 use crate::sockopt::setsockopt_int;
 
@@ -61,6 +61,10 @@ type PeerKey = (IpAddr, u32);
 pub struct BfdConfig {
     /// The shared session timing parameters from `[bfd]`.
     pub session: SessionConfig,
+    /// Optional shared authentication (RFC 5880 §6.7) applied to every session. When
+    /// set, every packet carries an Authentication Section and a received packet must
+    /// pass verification; the peer must be configured with the same type and key.
+    pub auth: Option<AuthConfig>,
 }
 
 /// Which protocol a BFD subscription belongs to, so one peer can be tracked by
@@ -77,6 +81,10 @@ pub enum BfdConsumer {
     /// engine is compiled in.
     #[cfg_attr(not(feature = "ospf3"), allow(dead_code))]
     Ospf3,
+    /// An IS-IS neighbour (`[isis] bfd = true`). Only constructed when the IS-IS
+    /// engine is compiled in.
+    #[cfg_attr(not(feature = "isis"), allow(dead_code))]
+    Isis,
 }
 
 /// A registration command from a protocol to the BFD engine.
@@ -93,12 +101,17 @@ pub enum BfdCommand {
         consumer: BfdConsumer,
         /// Where to report this peer going down.
         notify: mpsc::Sender<IpAddr>,
+        /// A per-session authentication override (RFC 5880 §6.7) — e.g. a distinct key
+        /// per BGP neighbour. `None` falls back to the global `[bfd]` key. Only honoured
+        /// when the session is first created; a session shared by several subscribers
+        /// keeps the key of whichever created it.
+        auth: Option<AuthConfig>,
     },
     /// Stop tracking `peer` for `consumer`. The session is torn down once no
-    /// protocol subscribes to it any more. Only used by the OSPF consumers (BGP
-    /// registrations are static), so unconstructed when both IGPs are compiled out.
+    /// protocol subscribes to it any more. Only used by the IGP consumers (BGP
+    /// registrations are static), so unconstructed when every IGP is compiled out.
     #[cfg_attr(
-        not(any(feature = "ospf", feature = "ospf3")),
+        not(any(feature = "ospf", feature = "ospf3", feature = "isis")),
         allow(dead_code)
     )]
     Deregister {
@@ -131,6 +144,9 @@ pub struct BfdQueryRequest {
 struct PeerSession {
     peer: IpAddr,
     sess: Session,
+    /// Per-session authentication state (RFC 5880 §6.7), `None` for an unauthenticated
+    /// session. Holds the transmit/receive sequence numbers, so it lives per peer.
+    auth: Option<AuthState>,
     tx: UdpSocket,
     /// When to transmit the next Control packet.
     next_tx: Instant,
@@ -212,7 +228,7 @@ pub async fn run(
             }
             () = &mut timer => {}
             Some(cmd) = register.recv() => {
-                handle_command(&mut sessions, &mut next_discr, cfg.session, cmd).await;
+                handle_command(&mut sessions, &mut next_discr, cfg.session, cfg.auth.as_ref(), cmd).await;
             }
             Some(req) = queries.recv() => {
                 let resp = match req.query {
@@ -260,16 +276,19 @@ async fn handle_command(
     sessions: &mut HashMap<PeerKey, PeerSession>,
     next_discr: &mut u32,
     session_cfg: SessionConfig,
+    auth_cfg: Option<&AuthConfig>,
     cmd: BfdCommand,
 ) {
     match cmd {
-        BfdCommand::Register { peer, scope_id, consumer, notify } => {
+        BfdCommand::Register { peer, scope_id, consumer, notify, auth } => {
             let key = (peer, scope_id);
             if let Some(s) = sessions.get_mut(&key) {
                 s.subscribers.insert(consumer, notify);
                 debug!(%peer, ?consumer, "BFD subscription added to existing session");
                 return;
             }
+            // A per-session key wins over the global `[bfd]` default.
+            let effective_auth = auth.or_else(|| auth_cfg.cloned());
             let tx = match build_tx_socket(peer, scope_id).await {
                 Ok(s) => s,
                 Err(e) => {
@@ -281,12 +300,13 @@ async fn handle_command(
             *next_discr += 1;
             let mut subscribers = HashMap::new();
             subscribers.insert(consumer, notify);
-            info!(%peer, ?consumer, "BFD session started");
+            info!(%peer, ?consumer, auth = effective_auth.is_some(), "BFD session started");
             sessions.insert(
                 key,
                 PeerSession {
                     peer,
                     sess: Session::new(discr, session_cfg),
+                    auth: effective_auth.map(|a| a.new_state(session_cfg.detect_mult)),
                     tx,
                     next_tx: Instant::now(), // begin the handshake immediately
                     detect_deadline: None,
@@ -382,8 +402,24 @@ fn notify_down(s: &PeerSession) {
 /// matching session, fold it into the FSM, and (re)arm that session's detection
 /// timer. A transition out of Up to Down notifies the subscribers.
 fn on_receive(sessions: &mut HashMap<PeerKey, PeerSession>, buf: &[u8], key: PeerKey) {
-    let Some(pkt) = ControlPacket::decode(buf) else { return };
     let Some(s) = sessions.get_mut(&key) else { return };
+    let Some(pkt) = ControlPacket::decode(buf) else { return };
+    // Authentication policy (RFC 5880 §6.8.6): a session configured for auth requires
+    // a present, valid Authentication Section; an unauthenticated session rejects any
+    // packet that carries one.
+    match &mut s.auth {
+        Some(st) => {
+            if !pkt.auth_present || !st.verify(buf) {
+                debug!(peer = %s.peer, "BFD packet failed authentication; discarded");
+                return;
+            }
+        }
+        None => {
+            if pkt.auth_present {
+                return;
+            }
+        }
+    }
     if let Some(t) = s.sess.on_packet(&pkt) {
         info!(peer = %s.peer, from = t.from.label(), to = t.to.label(), "BFD session state change");
         if t.from == State::Up && t.to == State::Down {
@@ -416,8 +452,17 @@ fn service(sessions: &mut HashMap<PeerKey, PeerSession>) {
             }
         }
         if now >= s.next_tx {
-            let pkt = s.sess.build_control();
-            let _ = s.tx.try_send(&pkt.encode());
+            let mand = s.sess.build_control().encode();
+            // Append the Authentication Section (and set the A bit) when configured;
+            // otherwise the bare 24-octet mandatory packet goes on the wire.
+            match &mut s.auth {
+                Some(st) => {
+                    let _ = s.tx.try_send(&st.append(&mand));
+                }
+                None => {
+                    let _ = s.tx.try_send(&mand);
+                }
+            }
             let iv = s.sess.transmit_interval_us();
             s.next_tx = now + Duration::from_micros(iv);
         }

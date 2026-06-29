@@ -1835,6 +1835,7 @@ impl Ospf {
                     scope_id: 0,
                     consumer: crate::bfd::BfdConsumer::Ospf,
                     notify: self.bfd_notify.clone(),
+                    auth: None, // OSPF uses the global [bfd] key
                 })
                 .await;
         }

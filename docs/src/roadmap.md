@@ -245,16 +245,23 @@ tracked but not yet scheduled, grouped by area:
   §6.8.6 session FSM) and a dual-stack UDP runner driving it on port 3784 with
   TTL/hop-limit-255 single-hop packets, keyed by `(source, scope)` so IPv6
   link-local peers stay distinct. Sessions are dynamic and multi-consumer. **BGP**
-  (a neighbour with `bfd = true`), **OSPFv2** (`[ospf] bfd = true`) and **OSPFv3**
-  (`[ospf3] bfd = true`) all use it — a session per Full neighbour: a BFD-down tears
-  the BGP session down (instead of the Hold Timer) or the OSPF/OSPFv3 adjacency down
-  (instead of the dead interval, RFC 5882 §4.4). `[bfd]` sets the timing and
+  (a neighbour with `bfd = true`), **OSPFv2** (`[ospf] bfd = true`), **OSPFv3**
+  (`[ospf3] bfd = true`) and **IS-IS** (`[isis] bfd = true`) all use it — a session
+  per adjacent neighbour: a BFD-down tears the BGP session down (instead of the Hold
+  Timer) or the OSPF/OSPFv3/IS-IS adjacency down (instead of the dead/holding timer,
+  RFC 5882 §4.4). IS-IS runs over SNPA/MAC, so the neighbour's IP for BFD is taken
+  from the IP Interface Address TLV in its Hellos. `[bfd]` sets the timing and
   `show bfd` lists the sessions. Live-verified by `scripts/bgp-bfd-smoke.sh` (a
   blackholed path drops BGP in ~0.6 s against a 180 s hold time),
-  `scripts/ospf-bfd-smoke.sh` and `scripts/ospf3-bfd-smoke.sh` (drop the OSPF /
-  OSPFv3 adjacency in ~0.65 s against a 40 s dead interval). BFD for IS-IS,
-  authentication and the Echo function are future extensions. See
-  [BFD](protocols/bfd.md).)
+  `scripts/ospf-bfd-smoke.sh`, `scripts/ospf3-bfd-smoke.sh` and
+  `scripts/isis-bfd-smoke.sh` (drop the OSPF / OSPFv3 / IS-IS adjacency in ~0.5–0.65 s
+  against a 9–40 s dead/holding timer). **Authentication** (RFC 5880 §6.7) is
+  implemented — Simple Password and Keyed/Meticulous MD5 & SHA-1 (the hashes
+  hand-rolled to keep `wren-bfd` dependency-free), configured per `[bfd]`
+  (`auth-type`/`auth-key`) and verified including the replay window, live-tested by
+  `scripts/bfd-auth-smoke.sh` (matching keys form the session, a mismatched key is
+  rejected). The Echo function and Demand mode are the remaining future extensions.
+  See [BFD](protocols/bfd.md).)
 - **Forwarding & policy:** VRFs, policy-based routing, route maps, prefix lists,
   route policies, max-AS-path. (Per-neighbour BGP `max-prefix` prefix-limiting with a
   Cease teardown (RFC 4486) is **done**. **Per-neighbour import *and* export filters**

@@ -119,6 +119,9 @@ pub struct IsisConfig {
     pub holding_multiplier: u16,
     /// The interfaces IS-IS runs on.
     pub interfaces: Vec<IsisIfaceCfg>,
+    /// Run BFD (RFC 5880) to each neighbour with an up adjacency and tear the
+    /// adjacency down at once when BFD reports the path failed (RFC 5882).
+    pub bfd: bool,
 }
 
 /// Map a single level to its database / per-neighbour-array index.
@@ -157,6 +160,11 @@ struct Nbr {
     adj: [Option<Adjacency>; 2],
     /// The LAN ID (DIS System ID + pseudonode) the neighbour advertised, per level.
     lan_id: [Option<(SystemId, u8)>; 2],
+    /// The neighbour's IP address for BFD, learned from the IP Interface Address TLV
+    /// in its Hellos (TLV 132 for IPv4, 232 for IPv6), and the interface scope for an
+    /// IPv6 link-local one. `None` until a usable address is heard. IS-IS adjacencies
+    /// are over SNPA/MAC, so this is the only place a neighbour IP appears.
+    bfd_addr: Option<(IpAddr, u32)>,
 }
 
 impl Nbr {
@@ -168,11 +176,17 @@ impl Nbr {
             holding,
             adj: [None, None],
             lan_id: [None, None],
+            bfd_addr: None,
         }
     }
 
     fn up(&self, lidx: usize) -> bool {
         self.adj[lidx].as_ref().is_some_and(|a| a.is_up())
+    }
+
+    /// Whether this neighbour has an up adjacency at any level.
+    fn up_any(&self) -> bool {
+        self.up(0) || self.up(1)
     }
 }
 
@@ -215,6 +229,14 @@ struct Isis {
     /// The prefixes currently announced to the router, for withdraw reconciliation.
     announced: HashSet<Prefix>,
     updates: mpsc::Sender<RouteUpdate>,
+    /// BFD (RFC 5880): the channel to the BFD engine to register/deregister
+    /// per-neighbour sessions, the notify sender included in each registration (the
+    /// engine reports a session going down on it), and the set of `(address, scope)`
+    /// pairs currently registered (the neighbours with an up adjacency that advertise
+    /// an IP). Unused when `cfg.bfd` is false.
+    bfd_register: mpsc::Sender<crate::bfd::BfdCommand>,
+    bfd_notify: mpsc::Sender<IpAddr>,
+    bfd_registered: HashSet<(IpAddr, u32)>,
 }
 
 /// A frame received on one interface, handed to the central task.
@@ -398,6 +420,9 @@ pub async fn run(
     updates: mpsc::Sender<RouteUpdate>,
     mut redist: mpsc::Receiver<Redistribution>,
     mut queries: mpsc::Receiver<IsisQueryRequest>,
+    bfd_register: mpsc::Sender<crate::bfd::BfdCommand>,
+    bfd_notify: mpsc::Sender<IpAddr>,
+    mut bfd_down: mpsc::Receiver<IpAddr>,
 ) -> Result<()> {
     let mut ifaces = Vec::with_capacity(cfg.interfaces.len());
     for (i, ic) in cfg.interfaces.iter().enumerate() {
@@ -465,6 +490,9 @@ pub async fn run(
         ext_v6: BTreeMap::new(),
         announced: HashSet::new(),
         updates,
+        bfd_register,
+        bfd_notify,
+        bfd_registered: HashSet::new(),
     };
 
     // Originate our initial LSP(s) and send the first Hellos.
@@ -502,7 +530,14 @@ pub async fn run(
                 };
                 let _ = req.respond.send(answer);
             }
+            // BFD (RFC 5880) reported a neighbour's forwarding path down: tear that
+            // adjacency down at once (RFC 5882 §4.4), exactly as a holding-time
+            // expiry would, instead of waiting for the holding time.
+            Some(peer) = bfd_down.recv() => isis.force_neighbor_down(peer).await,
         }
+        // Keep the set of registered BFD sessions in step with the up adjacencies
+        // (a no-op when `[isis] bfd` is off).
+        isis.reconcile_bfd().await;
     }
 }
 
@@ -636,6 +671,7 @@ impl Isis {
         };
 
         let holding = h.holding_time;
+        let bfd_addr = neighbor_bfd_addr(&h.tlvs, self.ifaces[idx].ifindex);
         let changed = {
             let iface = &mut self.ifaces[idx];
             let nbr = iface
@@ -646,6 +682,9 @@ impl Isis {
             nbr.priority = h.priority;
             nbr.last_seen = now;
             nbr.holding = holding;
+            if bfd_addr.is_some() {
+                nbr.bfd_addr = bfd_addr;
+            }
             nbr.lan_id[li] = Some((h.lan_id.0, h.lan_id.1));
             let adj = nbr.adj[li].get_or_insert_with(|| Adjacency::new(h.source_id, level));
             let was_up = adj.is_up();
@@ -661,6 +700,7 @@ impl Isis {
 
     async fn process_p2p_hello(&mut self, idx: usize, h: P2pHello, src: [u8; 6], now: u64) {
         let holding = h.holding_time;
+        let bfd_addr = neighbor_bfd_addr(&h.tlvs, self.ifaces[idx].ifindex);
         let mut changed_levels = Vec::new();
         for level in self.active_levels() {
             if !h.circuit_type.level_active(level) {
@@ -678,6 +718,9 @@ impl Isis {
             nbr.snpa = src;
             nbr.last_seen = now;
             nbr.holding = holding;
+            if bfd_addr.is_some() {
+                nbr.bfd_addr = bfd_addr;
+            }
             // A point-to-point link comes up classic two-way (the RFC 5303 three-way
             // TLV is a later refinement).
             let adj = nbr.adj[li].get_or_insert_with(|| Adjacency::new(h.source_id, level));
@@ -1244,6 +1287,91 @@ impl Isis {
         }
     }
 
+    /// Keep the BFD (RFC 5880) registrations in step with the set of neighbours that
+    /// have an up adjacency *and* advertise an IP: register a session as such a
+    /// neighbour appears, deregister it as the neighbour goes down or disappears. A
+    /// no-op unless `[isis] bfd` is set. The BFD engine reports a session going down
+    /// on [`Self::bfd_notify`], which the run loop turns into
+    /// [`Self::force_neighbor_down`].
+    async fn reconcile_bfd(&mut self) {
+        if !self.cfg.bfd {
+            return;
+        }
+        let mut want: HashSet<(IpAddr, u32)> = HashSet::new();
+        for iface in &self.ifaces {
+            for n in iface.neighbors.values() {
+                if n.up_any() {
+                    if let Some(addr) = n.bfd_addr {
+                        want.insert(addr);
+                    }
+                }
+            }
+        }
+        let added: Vec<(IpAddr, u32)> = want.difference(&self.bfd_registered).copied().collect();
+        for (addr, scope) in added {
+            let _ = self
+                .bfd_register
+                .send(crate::bfd::BfdCommand::Register {
+                    peer: addr,
+                    scope_id: scope,
+                    consumer: crate::bfd::BfdConsumer::Isis,
+                    notify: self.bfd_notify.clone(),
+                    auth: None, // IS-IS uses the global [bfd] key
+                })
+                .await;
+        }
+        let removed: Vec<(IpAddr, u32)> = self.bfd_registered.difference(&want).copied().collect();
+        for (addr, scope) in removed {
+            let _ = self
+                .bfd_register
+                .send(crate::bfd::BfdCommand::Deregister {
+                    peer: addr,
+                    scope_id: scope,
+                    consumer: crate::bfd::BfdConsumer::Isis,
+                })
+                .await;
+        }
+        self.bfd_registered = want;
+    }
+
+    /// Tear down the adjacency to the neighbour at `peer` (a BFD-reported path
+    /// failure), mirroring the holding-time expiry in [`Self::housekeeping`]: remove
+    /// the neighbour, re-run any affected DIS election, re-originate the LSP and
+    /// re-run SPF. The BFD reconcile then drops the stale session.
+    async fn force_neighbor_down(&mut self, peer: IpAddr) {
+        let mut dead_levels: Vec<IsLevel> = Vec::new();
+        let mut redo_dis: Vec<(usize, IsLevel)> = Vec::new();
+        for idx in 0..self.ifaces.len() {
+            let sys = self.ifaces[idx]
+                .neighbors
+                .iter()
+                .find(|(_, n)| n.bfd_addr.map(|(a, _)| a) == Some(peer))
+                .map(|(s, _)| *s);
+            let Some(sys) = sys else { continue };
+            if let Some(nbr) = self.ifaces[idx].neighbors.remove(&sys) {
+                for level in self.active_levels() {
+                    if nbr.up(lidx(level)) {
+                        if !dead_levels.contains(&level) {
+                            dead_levels.push(level);
+                        }
+                        redo_dis.push((idx, level));
+                    }
+                }
+                info!(neighbor = %sys, interface = %self.ifaces[idx].name, %peer, "IS-IS adjacency down (BFD)");
+            }
+        }
+        for (idx, level) in redo_dis {
+            self.run_dis(idx, level).await;
+        }
+        let any_dead = !dead_levels.is_empty();
+        for level in dead_levels {
+            self.reoriginate(level).await;
+        }
+        if any_dead {
+            self.run_spf_and_announce().await;
+        }
+    }
+
     // --- SPF → RIB ---------------------------------------------------------
 
     async fn run_spf_and_announce(&mut self) {
@@ -1336,6 +1464,30 @@ fn lan_neighbors(tlvs: &[Tlv]) -> Vec<[u8; 6]> {
             _ => None,
         })
         .unwrap_or_default()
+}
+
+/// The neighbour's IP address for a BFD session, from the IP Interface Address TLVs
+/// of its Hello: prefer an IPv4 address (TLV 132, unscoped); otherwise an IPv6 one
+/// (TLV 232) — a link-local needs the interface scope, a global is unscoped. IS-IS
+/// runs over SNPA/MAC, so these TLVs are the only place a neighbour IP appears.
+fn neighbor_bfd_addr(tlvs: &[Tlv], ifindex: u32) -> Option<(IpAddr, u32)> {
+    for t in tlvs {
+        if let Tlv::Ipv4InterfaceAddresses(addrs) = t {
+            if let Some(a) = addrs.first() {
+                return Some((IpAddr::V4(*a), 0));
+            }
+        }
+    }
+    for t in tlvs {
+        if let Tlv::Ipv6InterfaceAddresses(addrs) = t {
+            if let Some(a) = addrs.first() {
+                let o = a.octets();
+                let link_local = o[0] == 0xfe && (o[1] & 0xc0) == 0x80;
+                return Some((IpAddr::V6(*a), if link_local { ifindex } else { 0 }));
+            }
+        }
+    }
+    None
 }
 
 fn lsp_entries(tlvs: &[Tlv]) -> Vec<LspEntry> {

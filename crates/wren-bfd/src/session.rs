@@ -202,6 +202,7 @@ impl Session {
             desired_min_tx: self.effective_desired_tx_us(),
             required_min_rx: self.cfg.required_min_rx_us,
             required_min_echo_rx: 0,
+            auth_present: false,
         }
     }
 
@@ -302,6 +303,7 @@ mod tests {
             desired_min_tx: 300_000,
             required_min_rx: 300_000,
             required_min_echo_rx: 0,
+            auth_present: false,
         };
         let t = a.on_packet(&down).expect("transition");
         assert_eq!(t, Transition { from: State::Up, to: State::Down });

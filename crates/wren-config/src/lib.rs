@@ -95,6 +95,19 @@ pub struct Bfd {
     /// Defaults to 3 (so detection ≈ `min-rx × 3`, e.g. 900 ms at the defaults).
     #[serde(rename = "detect-mult")]
     pub detect_mult: Option<u8>,
+    /// Authentication type (RFC 5880 §6.7): `"simple"` (Simple Password),
+    /// `"keyed-md5"`, `"meticulous-md5"`, `"keyed-sha1"` or `"meticulous-sha1"`.
+    /// Unset (the default) runs sessions without authentication. Requires `auth-key`;
+    /// the peer must use the same type and key.
+    #[serde(rename = "auth-type")]
+    pub auth_type: Option<String>,
+    /// The authentication key id advertised on the wire (0–255). Defaults to 1.
+    #[serde(rename = "auth-key-id")]
+    pub auth_key_id: Option<u8>,
+    /// The shared secret: the password (Simple) or keying material (digest types).
+    /// Required when `auth-type` is set.
+    #[serde(rename = "auth-key")]
+    pub auth_key: Option<String>,
 }
 
 /// Export filter attachments (`[export]`): which named filter gates routes on
@@ -574,9 +587,22 @@ pub struct BgpNeighbor {
     /// Run a BFD (RFC 5880) session to this neighbour for fast failure detection.
     /// When the BFD session goes down, the BGP session to this peer is torn down at
     /// once instead of waiting for the Hold Timer. Timing comes from the global
-    /// `[bfd]` defaults. IPv4 transport only for now. Defaults to false.
+    /// `[bfd]` defaults. Defaults to false.
     #[serde(default)]
     pub bfd: bool,
+    /// Per-neighbour BFD authentication type, overriding the global `[bfd]` key for
+    /// this peer's session (so different peers can use different passwords). One of
+    /// `simple`, `keyed-md5`, `meticulous-md5`, `keyed-sha1`, `meticulous-sha1`.
+    /// Unset inherits the global `[bfd]` authentication (if any).
+    #[serde(rename = "bfd-auth-type")]
+    pub bfd_auth_type: Option<String>,
+    /// The wire key id for this neighbour's BFD authentication (default 1).
+    #[serde(rename = "bfd-auth-key-id")]
+    pub bfd_auth_key_id: Option<u8>,
+    /// The shared secret for this neighbour's BFD authentication. Required when
+    /// `bfd-auth-type` is set on the neighbour.
+    #[serde(rename = "bfd-auth-key")]
+    pub bfd_auth_key: Option<String>,
 }
 
 /// Babel protocol configuration (`[babel]`, RFC 8966).
@@ -651,6 +677,12 @@ pub struct Isis {
     /// `metric`.
     #[serde(rename = "redistribute-metric")]
     pub redistribute_metric: Option<u32>,
+    /// Run BFD (RFC 5880) to each neighbour with an up adjacency and tear the
+    /// adjacency down at once when BFD reports the path failed (RFC 5882), rather
+    /// than waiting for the holding time. The neighbour's IP comes from the IP
+    /// Interface Address TLV in its Hellos; timing comes from `[bfd]`.
+    #[serde(default)]
+    pub bfd: bool,
 }
 
 /// A named route filter (`[[filter]]`): an ordered list of rules plus a default
@@ -1000,6 +1032,29 @@ mod tests {
         let bgp = cfg.bgp.expect("bgp present");
         assert!(bgp.neighbor[0].bfd);
         assert!(!bgp.neighbor[1].bfd); // defaults to false
+    }
+
+    #[test]
+    fn parses_bfd_authentication() {
+        let cfg = Config::from_toml(
+            r#"
+            router-id = "10.0.0.1"
+            [bfd]
+            auth-type   = "meticulous-sha1"
+            auth-key-id = 7
+            auth-key    = "s3cret"
+            "#,
+        )
+        .expect("valid config");
+        let bfd = cfg.bfd.expect("bfd present");
+        assert_eq!(bfd.auth_type.as_deref(), Some("meticulous-sha1"));
+        assert_eq!(bfd.auth_key_id, Some(7));
+        assert_eq!(bfd.auth_key.as_deref(), Some("s3cret"));
+        // All three default to unset (no authentication).
+        let cfg = Config::from_toml("router-id = \"10.0.0.1\"\n[bfd]\nmin-tx = 200\n")
+            .expect("valid config");
+        let bfd = cfg.bfd.expect("bfd present");
+        assert!(bfd.auth_type.is_none() && bfd.auth_key.is_none() && bfd.auth_key_id.is_none());
     }
 
     #[test]
@@ -1455,6 +1510,27 @@ mod tests {
         )
         .expect("valid config");
         assert!(!cfg.ospf3.expect("ospf3 present").bfd);
+    }
+
+    #[test]
+    fn parses_isis_bfd() {
+        let cfg = Config::from_toml(
+            r#"
+            router-id = "10.0.0.1"
+            [isis]
+            enabled = true
+            interfaces = ["eth1"]
+            bfd = true
+            "#,
+        )
+        .expect("valid config");
+        assert!(cfg.isis.expect("isis present").bfd);
+        // Defaults to false when unset.
+        let cfg = Config::from_toml(
+            "router-id = \"10.0.0.1\"\n[isis]\nenabled = true\ninterfaces = [\"eth1\"]\n",
+        )
+        .expect("valid config");
+        assert!(!cfg.isis.expect("isis present").bfd);
     }
 
     #[test]

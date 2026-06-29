@@ -247,6 +247,10 @@ async fn main() -> Result<()> {
     let (ospf3_bfd_tx, ospf3_bfd_rx) = mpsc::channel::<std::net::IpAddr>(QUERY_QUEUE);
     #[cfg(feature = "ospf3")]
     let mut ospf3_bfd_rx = Some(ospf3_bfd_rx);
+    #[cfg(feature = "isis")]
+    let (isis_bfd_tx, isis_bfd_rx) = mpsc::channel::<std::net::IpAddr>(QUERY_QUEUE);
+    #[cfg(feature = "isis")]
+    let mut isis_bfd_rx = Some(isis_bfd_rx);
     let bgp_bfd = cfg
         .bgp
         .as_ref()
@@ -259,16 +263,27 @@ async fn main() -> Result<()> {
     let ospf3_bfd = cfg.ospf3.as_ref().is_some_and(|o| o.enabled && o.bfd);
     #[cfg(not(feature = "ospf3"))]
     let ospf3_bfd = false;
-    let bfd_enabled = bgp_bfd || ospf_bfd || ospf3_bfd;
+    #[cfg(feature = "isis")]
+    let isis_bfd = cfg.isis.as_ref().is_some_and(|i| i.enabled && i.bfd);
+    #[cfg(not(feature = "isis"))]
+    let isis_bfd = false;
+    let bfd_enabled = bgp_bfd || ospf_bfd || ospf3_bfd || isis_bfd;
     // Spawn the single BFD engine if any protocol enables it; protocols register
     // their peers over `bfd_register` once their sessions warrant it.
     if bfd_enabled {
         let session = bfd_session_config(cfg.bfd.as_ref());
+        let auth = match bfd_auth_config(cfg.bfd.as_ref()) {
+            Ok(a) => a,
+            Err(e) => {
+                error!(error = %e, "BFD authentication misconfigured; running without it");
+                None
+            }
+        };
         let rrx = bfd_register_rx.take().expect("bfd register rx taken once");
         let bqrx = bfd_queries_rx.take().expect("bfd queries rx taken once");
-        info!("BFD engine starting");
+        info!(auth = auth.is_some(), "BFD engine starting");
         tokio::spawn(async move {
-            if let Err(e) = bfd::run(bfd::BfdConfig { session }, rrx, bqrx).await {
+            if let Err(e) = bfd::run(bfd::BfdConfig { session, auth }, rrx, bqrx).await {
                 error!(error = %e, "BFD engine stopped");
             }
         });
@@ -580,6 +595,20 @@ async fn main() -> Result<()> {
                     if !n.bfd {
                         continue;
                     }
+                    // A per-neighbour key overrides the global `[bfd]` one, so distinct
+                    // peers can authenticate with distinct passwords; `None` inherits
+                    // the global key (applied in the BFD engine).
+                    let auth = match resolve_bfd_auth(
+                        n.bfd_auth_type.as_deref(),
+                        n.bfd_auth_key_id,
+                        n.bfd_auth_key.as_deref(),
+                    ) {
+                        Ok(a) => a,
+                        Err(e) => {
+                            warn!(neighbor = %n.address, error = %e, "ignoring per-neighbour BFD auth; using the global key");
+                            None
+                        }
+                    };
                     match parse_neighbor_addr(&n.address) {
                         Ok((peer, scope)) => {
                             let _ = bfd_register_tx
@@ -588,6 +617,7 @@ async fn main() -> Result<()> {
                                     scope_id: scope.unwrap_or(0),
                                     consumer: bfd::BfdConsumer::Bgp,
                                     notify: bfd_down_tx.clone(),
+                                    auth,
                                 })
                                 .await;
                         }
@@ -667,8 +697,14 @@ async fn main() -> Result<()> {
                 }
                 let tx = updates_tx.clone();
                 let qrx = isis_queries_rx.take().expect("isis queries rx taken once");
+                // BFD (RFC 5880) plumbing: the engine registration channel, IS-IS's
+                // own notify channel, and the down channel the engine reports failures
+                // on. Inert unless `[isis] bfd` is set.
+                let breg = bfd_register_tx.clone();
+                let bnotify = isis_bfd_tx.clone();
+                let bdrx = isis_bfd_rx.take().expect("isis bfd rx taken once");
                 tokio::spawn(async move {
-                    if let Err(e) = isis::run(run_cfg, tx, redist_rx, qrx).await {
+                    if let Err(e) = isis::run(run_cfg, tx, redist_rx, qrx, breg, bnotify, bdrx).await {
                         error!(error = %e, "IS-IS engine stopped");
                     }
                 });
@@ -969,6 +1005,50 @@ fn bfd_session_config(bfd: Option<&wren_config::Bfd>) -> wren_bfd::SessionConfig
         required_min_rx_us: min_rx_ms.saturating_mul(1000),
         detect_mult,
     }
+}
+
+/// Resolve the shared BFD authentication (RFC 5880 §6.7) from the `[bfd]` block:
+/// `auth-type` selects the algorithm and `auth-key` is the shared secret (`auth-key-id`
+/// the wire key id, default 1). Returns `None` when `auth-type` is unset (no
+/// authentication), or an error when it is set without a key or names an unknown type.
+fn bfd_auth_config(bfd: Option<&wren_config::Bfd>) -> Result<Option<wren_bfd::AuthConfig>> {
+    let Some(bfd) = bfd else { return Ok(None) };
+    resolve_bfd_auth(bfd.auth_type.as_deref(), bfd.auth_key_id, bfd.auth_key.as_deref())
+}
+
+/// Resolve a BFD authentication block from its three fields, shared by the global
+/// `[bfd]` key and any per-neighbour override (so different sessions can use different
+/// keys). `None` type → no authentication; a type without a key, or an unknown type,
+/// is an error.
+fn resolve_bfd_auth(
+    auth_type: Option<&str>,
+    key_id: Option<u8>,
+    key: Option<&str>,
+) -> Result<Option<wren_bfd::AuthConfig>> {
+    let Some(ty) = auth_type else { return Ok(None) };
+    let auth_type = match ty {
+        "simple" => wren_bfd::AuthType::SimplePassword,
+        "keyed-md5" => wren_bfd::AuthType::KeyedMd5,
+        "meticulous-md5" => wren_bfd::AuthType::MeticulousKeyedMd5,
+        "keyed-sha1" => wren_bfd::AuthType::KeyedSha1,
+        "meticulous-sha1" => wren_bfd::AuthType::MeticulousKeyedSha1,
+        other => anyhow::bail!(
+            "bfd auth-type {other:?} (expected one of simple, keyed-md5, meticulous-md5, keyed-sha1, meticulous-sha1)"
+        ),
+    };
+    let key = key.context("bfd auth-type is set but auth-key is missing")?;
+    if key.is_empty() {
+        anyhow::bail!("bfd auth-key must not be empty");
+    }
+    // The Simple Password section caps the key at 16 octets (RFC 5880 §4.2).
+    if matches!(auth_type, wren_bfd::AuthType::SimplePassword) && key.len() > 16 {
+        anyhow::bail!("bfd simple-password auth-key must be at most 16 bytes");
+    }
+    Ok(Some(wren_bfd::AuthConfig {
+        auth_type,
+        key_id: key_id.unwrap_or(1),
+        secret: key.as_bytes().to_vec(),
+    }))
 }
 
 fn build_bgp_config(
@@ -1448,5 +1528,6 @@ fn build_isis_config(
         hello_interval: isis.hello_interval.unwrap_or(10),
         holding_multiplier: 3,
         interfaces,
+        bfd: isis.bfd,
     })
 }

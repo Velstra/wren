@@ -143,6 +143,12 @@ pub struct ControlPacket {
     pub required_min_rx: u32,
     /// Required Min Echo RX Interval (microseconds); 0 disables Echo (Wren sets 0).
     pub required_min_echo_rx: u32,
+    /// Authentication Present (`A`): a decoded packet carried an Authentication
+    /// Section. Whether to accept or reject it is the caller's policy (it depends on
+    /// whether the session is configured for authentication); the verification of the
+    /// section itself is [`crate::auth`]. `encode` always clears it — the runner adds
+    /// the auth section (and sets the bit) on the raw bytes.
+    pub auth_present: bool,
 }
 
 impl ControlPacket {
@@ -182,9 +188,12 @@ impl ControlPacket {
     /// can be made on the packet alone: version 1, a Length of at least 24 that does
     /// not exceed the datagram, a non-zero Detect Mult, the Multipoint bit clear, a
     /// non-zero My Discriminator, and a Your Discriminator that may only be zero when
-    /// the sender's state is Down or AdminDown. Authenticated packets (the `A` bit
-    /// set) are rejected — Wren does not implement BFD authentication. Returns `None`
-    /// for a malformed or unsupported packet, which the caller silently discards.
+    /// the sender's state is Down or AdminDown. The `A` (Authentication Present) bit is
+    /// recorded in [`ControlPacket::auth_present`] but not acted on here — accepting or
+    /// rejecting an authenticated packet, and verifying its Authentication Section, is
+    /// the caller's job ([`crate::auth`]), since it depends on the session's
+    /// configuration. Returns `None` for a malformed or unsupported packet, which the
+    /// caller silently discards.
     pub fn decode(buf: &[u8]) -> Option<ControlPacket> {
         if buf.len() < MANDATORY_LEN {
             return None;
@@ -204,8 +213,9 @@ impl ControlPacket {
         let detect_mult = buf[2];
         let length = buf[3] as usize;
 
-        // RFC 5880 §6.8.6 reception rules enforceable on the packet alone.
-        if auth_present || multipoint || detect_mult == 0 {
+        // RFC 5880 §6.8.6 reception rules enforceable on the packet alone. The `A`
+        // bit is not a rejection cause here — see the doc comment.
+        if multipoint || detect_mult == 0 {
             return None;
         }
         if length < MANDATORY_LEN || length > buf.len() {
@@ -236,6 +246,7 @@ impl ControlPacket {
             desired_min_tx,
             required_min_rx,
             required_min_echo_rx,
+            auth_present,
         })
     }
 }
@@ -258,6 +269,7 @@ mod tests {
             desired_min_tx: 300_000,
             required_min_rx: 300_000,
             required_min_echo_rx: 0,
+            auth_present: false,
         }
     }
 
@@ -306,14 +318,19 @@ mod tests {
     }
 
     #[test]
-    fn rejects_authenticated_and_multipoint_packets() {
-        let mut b = sample().encode();
-        b[1] |= 1 << 2; // A bit — we do not implement auth
-        assert!(ControlPacket::decode(&b).is_none());
-
+    fn rejects_multipoint_but_records_auth_present() {
+        // The Multipoint bit is always illegal.
         let mut b = sample().encode();
         b[1] |= 1; // M bit — must be zero
         assert!(ControlPacket::decode(&b).is_none());
+
+        // The A bit is recorded, not rejected — the auth policy is the caller's.
+        let mut b = sample().encode();
+        b[1] |= 1 << 2; // A bit
+        let p = ControlPacket::decode(&b).expect("auth-present packets still decode");
+        assert!(p.auth_present);
+        // A plain (unauthenticated) packet records the bit as clear.
+        assert!(!ControlPacket::decode(&sample().encode()).unwrap().auth_present);
     }
 
     #[test]

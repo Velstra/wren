@@ -14,12 +14,12 @@ protocol-independent hello mechanism that detects a forwarding-path failure in
 Two systems exchange small UDP Control packets at a sub-second rate. When a system
 stops hearing its neighbour for `detect-mult` receive intervals it declares the
 session **Down**, and the protocols riding that path drop their adjacency
-immediately rather than waiting for the hold / dead timer. **BGP**, **OSPFv2** and
-**OSPFv3** all use it.
+immediately rather than waiting for the hold / dead timer. **BGP**, **OSPFv2**,
+**OSPFv3** and **IS-IS** all use it.
 
-Scope: **single-hop asynchronous mode**, **IPv4 and IPv6**, no authentication and no
-Echo — the configuration that drives routing-protocol failover. The Demand and Echo
-modes, authentication (§6.7), and BFD for IS-IS are future extensions.
+Scope: **single-hop asynchronous mode**, **IPv4 and IPv6**, with **authentication**
+(§6.7) and no Echo — the configuration that drives routing-protocol failover. The
+Demand and Echo modes are future extensions.
 
 ## What is implemented
 
@@ -28,9 +28,11 @@ Version, Diagnostic, State, the P/F/C/A/D/M flags, Detect Mult, the My/Your
 Discriminators and the three microsecond interval fields. The reception checks that
 can be made on a packet alone are enforced on decode (version 1, a sane Length, a
 non-zero Detect Mult and My Discriminator, the Multipoint bit clear, and a Your
-Discriminator that may only be zero while the sender is Down/AdminDown).
-Authenticated packets are rejected. This lives in the dependency-free `wren-bfd`
-crate and is unit-tested with no I/O.
+Discriminator that may only be zero while the sender is Down/AdminDown). The
+**Authentication Section** (§6.7) — Simple Password and Keyed/Meticulous MD5 & SHA-1,
+with the MD5 and SHA-1 hashes implemented from scratch so the crate stays dependency
+free — is appended on transmit and verified on receive, including the replay window.
+This all lives in the dependency-free `wren-bfd` crate and is unit-tested with no I/O.
 
 **The session state machine** (§6.8.6) — the `Down → Init → Up` handshake, with a
 neighbour signalling Down or a detection timeout taking an Up session back to Down
@@ -70,6 +72,62 @@ detect-mult = 3     # session fails after this many missed intervals (default 3)
 At the defaults the Detection Time is `300 ms × 3 = 900 ms`. The peer must also be
 configured to run BFD.
 
+### Authentication (RFC 5880 §6.7)
+
+A session can authenticate every Control packet so a forged or replayed packet can
+not drive a neighbour down. Authentication is configured once in `[bfd]` and applies
+to every session; **both ends must use the same type and key**.
+
+```toml
+[bfd]
+auth-type   = "meticulous-sha1"  # simple | keyed-md5 | meticulous-md5 |
+                                 # keyed-sha1 | meticulous-sha1
+auth-key-id = 1                  # the key id sent on the wire (default 1)
+auth-key    = "a shared secret"  # the password / keying material
+```
+
+* **`simple`** — Simple Password (§4.2): the key is sent in the clear (at most 16
+  bytes). Use only where the link itself is trusted.
+* **`keyed-md5` / `keyed-sha1`** (§4.3/§4.4) — an MD5 or SHA-1 digest over the whole
+  packet keyed by the shared secret, with a sequence number that advances
+  occasionally.
+* **`meticulous-md5` / `meticulous-sha1`** — the same, but the sequence number
+  advances on **every** packet, which is the strongest replay resistance and the
+  recommended choice. (The hashes are for BFD's keyed integrity check, not
+  confidentiality.)
+
+A packet that arrives without a valid Authentication Section for the configured key —
+wrong type, wrong key, a tampered digest, or a replayed sequence number — is silently
+discarded, so a session whose ends disagree on the key never comes up.
+
+#### Per-neighbour keys
+
+The `[bfd]` block is the default for every session, but a **BGP neighbour can override
+it with its own key**, so different peers authenticate with different passwords (and
+even different algorithms):
+
+```toml
+[bfd]
+auth-type = "meticulous-sha1"      # the default for sessions without an override
+auth-key  = "the shared default"
+
+[[bgp.neighbor]]
+address       = "10.0.1.2"
+remote-as     = 65002
+bfd           = true
+bfd-auth-type = "meticulous-sha1"  # this peer's own key …
+bfd-auth-key  = "key-for-this-peer"
+[[bgp.neighbor]]
+address       = "10.0.2.2"
+remote-as     = 65003
+bfd           = true
+bfd-auth-type = "keyed-md5"        # … another peer, a different type and key
+bfd-auth-key  = "key-for-that-peer"
+```
+
+A neighbour without a `bfd-auth-*` block inherits the global `[bfd]` key. (The IGP
+sessions — OSPFv2/OSPFv3/IS-IS — currently all use the global key.)
+
 **BGP** — enable it per neighbour. A BFD-down tears the BGP session down (rather
 than waiting for the Hold Timer); the connector re-establishes when the path
 recovers:
@@ -99,6 +157,18 @@ interface scope); nothing else differs:
 
 ```toml
 [ospf3]
+enabled    = true
+interfaces = ["eth1"]
+bfd        = true
+```
+
+**IS-IS** — the same, with `[isis] bfd = true`. IS-IS adjacencies run over the
+link-layer (SNPA/MAC), not IP, so the neighbour's IP for the BFD session is taken
+from the IP Interface Address TLV in its Hellos (IPv4 if present, otherwise IPv6); a
+session is brought up to each neighbour with an up adjacency that advertises one:
+
+```toml
+[isis]
 enabled    = true
 interfaces = ["eth1"]
 bfd        = true

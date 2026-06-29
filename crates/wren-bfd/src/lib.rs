@@ -16,14 +16,17 @@
 //! [`Session`]. Keeping it pure makes the FSM and the codec unit-testable with no
 //! network, the same split every other Wren protocol crate uses.
 //!
-//! Scope: single-hop asynchronous mode (RFC 5881), no authentication and no Echo
-//! function — the common case that drives BGP failover. The Demand and Echo modes
-//! and authentication are future extensions.
+//! Scope: single-hop asynchronous mode (RFC 5881), with **authentication** (RFC 5880
+//! §6.7 — Simple Password and Keyed/Meticulous MD5 & SHA1, in [`auth`]); no Echo
+//! function — the common case that drives routing-protocol failover. The Demand and
+//! Echo modes are future extensions.
 
 #![forbid(unsafe_code)]
 
+pub mod auth;
 pub mod packet;
 pub mod session;
 
+pub use auth::{AuthConfig, AuthState, AuthType};
 pub use packet::{ControlPacket, Diag, State, MANDATORY_LEN, VERSION};
 pub use session::{Session, SessionConfig, Transition};
