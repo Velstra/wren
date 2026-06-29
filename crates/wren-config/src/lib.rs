@@ -457,6 +457,14 @@ pub struct BgpNeighbor {
     /// peer (rather than only the single best). Defaults to false.
     #[serde(default, rename = "add-path")]
     pub add_path: bool,
+    /// Negotiate Extended Next Hop Encoding (RFC 5549 / RFC 8950) with this neighbour:
+    /// advertise the ability to exchange IPv4 unicast routes with an IPv6 next hop.
+    /// When set (and the peer agrees) and a `[bgp] next-hop6` is configured, IPv4
+    /// routes are advertised to this peer with that IPv6 next hop, and received IPv4
+    /// routes with an IPv6 next hop are installed via that gateway (kernel RTA_VIA).
+    /// Defaults to false.
+    #[serde(default, rename = "extended-nexthop")]
+    pub extended_nexthop: bool,
     /// Inbound route policy: the name of a `[[filter]]` applied to every route received
     /// from this neighbour before it enters the RIB (an import route-map). Reject drops
     /// the route; accept admits it, with any set-metric (→MED), set-preference
@@ -917,6 +925,7 @@ mod tests {
         .expect("valid config");
         let bgp = cfg.bgp.expect("bgp present");
         assert!(bgp.neighbor[0].add_path);
+        assert!(!bgp.neighbor[0].extended_nexthop); // unrelated, defaults false
         // Defaults to false when unset.
         let cfg2 = Config::from_toml(
             r#"
@@ -931,6 +940,24 @@ mod tests {
         )
         .expect("valid config");
         assert!(!cfg2.bgp.expect("bgp present").neighbor[0].add_path);
+    }
+
+    #[test]
+    fn parses_bgp_extended_nexthop() {
+        let cfg = Config::from_toml(
+            r#"
+            router-id = "10.0.0.1"
+            [bgp]
+            enabled = true
+            local-as = 65001
+            [[bgp.neighbor]]
+            address = "10.0.0.2"
+            remote-as = 65002
+            extended-nexthop = true
+            "#,
+        )
+        .expect("valid config");
+        assert!(cfg.bgp.expect("bgp present").neighbor[0].extended_nexthop);
     }
 
     #[test]

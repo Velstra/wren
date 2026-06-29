@@ -122,6 +122,17 @@ impl Open {
         })
     }
 
+    /// Whether this OPEN advertised the Extended Next Hop Encoding capability
+    /// (RFC 5549 / RFC 8950 §3) for the given `(NLRI AFI, NLRI SAFI, Nexthop AFI)` —
+    /// i.e. the peer can receive that NLRI family with the named next-hop family
+    /// (e.g. IPv4 unicast reachable through an IPv6 next hop).
+    pub fn supports_extended_next_hop(&self, afi: u16, safi: u8, nh_afi: u16) -> bool {
+        self.capabilities.iter().any(|c| {
+            matches!(c, Capability::ExtendedNextHop(ts)
+                if ts.iter().any(|(a, s, n)| *a == afi && *s == safi as u16 && *n == nh_afi))
+        })
+    }
+
     /// Whether this OPEN advertised the Graceful Restart capability (RFC 4724 §3).
     pub fn supports_graceful_restart(&self) -> bool {
         self.gr_restart_time().is_some()

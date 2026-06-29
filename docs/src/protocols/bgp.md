@@ -458,6 +458,42 @@ Without ADD-PATH, D learns one path; with `add-path = true` on the A–D session
 learns **both** paths under distinct Path Identifiers — impossible from a single
 iBGP peer otherwise.
 
+## Extended Next Hop / IPv4-over-IPv6 (RFC 5549)
+
+Normally an IPv4 route is advertised with an IPv4 next hop and an IPv6 route with an
+IPv6 one. RFC 5549 (clarified by RFC 8950) lets a speaker advertise **IPv4** NLRI
+with an **IPv6** next hop — the basis of *BGP unnumbered*, where peers exchange IPv4
+routes over a link that has only IPv6 addressing. The kernel installs such a route
+through its IPv6 gateway using `RTA_VIA` (`ip route` shows `via inet6 …`).
+
+Enable it per neighbour:
+
+```toml
+[bgp]
+next-hop6 = "2001:db8::2"   # the IPv6 next-hop-self for advertised IPv4 routes
+
+[[bgp.neighbor]]
+address          = "10.0.0.2"
+remote-as        = 65002
+extended-nexthop = true     # negotiate Extended Next Hop Encoding (RFC 5549)
+```
+
+`extended-nexthop = true` advertises the Extended Next Hop Encoding capability for
+`(IPv4 unicast, IPv6 next hop)`. When the peer agrees and a `[bgp] next-hop6` is
+configured, Wren advertises its IPv4 routes to that peer in MP_REACH_NLRI (AFI IPv4)
+with that IPv6 next-hop-self instead of the usual IPv4 NEXT_HOP. In the other
+direction it always accepts a received IPv4-with-IPv6-next-hop UPDATE (the encoding
+is self-describing) and installs each IPv4 prefix via the IPv6 gateway — over the
+peer's link-local pinned to the ingress interface on a shared link (RFC 2545), or the
+global next hop otherwise.
+
+`scripts/bgp-extended-nexthop-smoke.sh` exercises it live (rootless): two routers
+peer over a dual-stack link; one originates `10.99.0.0/24` and advertises it with its
+IPv6 next hop, and the other installs `10.99.0.0/24 via inet6 fe80::… dev veth0` in
+the kernel — verified against the real kernel FIB. (The genuinely-missing data-plane
+piece, the kernel `RTA_VIA` encoding for a cross-family gateway, lives in
+`wren-netlink` and has its own kernel-acceptance test.)
+
 ## Propagation (transit)
 
 Beyond originating its own `network`s and redistributed routes, Wren **propagates**

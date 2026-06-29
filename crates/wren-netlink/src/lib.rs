@@ -54,6 +54,11 @@ const RTA_OIF: u16 = 4;
 const RTA_GATEWAY: u16 = 5;
 const RTA_PRIORITY: u16 = 6;
 const RTA_MULTIPATH: u16 = 9;
+/// `RTA_VIA` (RFC 5549 in the kernel): a next-hop gateway in a *different* address
+/// family from the route's destination — an IPv4 route reached via an IPv6 gateway.
+/// Its payload is a `struct rtvia` = a 2-octet family followed by the gateway octets,
+/// where a same-family `RTA_GATEWAY` would carry the bare octets.
+const RTA_VIA: u16 = 18;
 
 /// Length of the fixed `struct rtnexthop` header inside an `RTA_MULTIPATH`
 /// attribute (`rtnh_len` u16 + `rtnh_flags` u8 + `rtnh_hops` u8 + `rtnh_ifindex`
@@ -137,12 +142,19 @@ fn ip_from_octets(family: u8, octets: Option<&[u8]>) -> Option<IpAddr> {
     }
 }
 
-/// Build a [`NextHop`] from a route's gateway and/or out-interface; `None` if it
-/// has neither (a route Wren cannot represent or did not install with a next-hop).
-fn nexthop_from(family: u8, gw: Option<&[u8]>, oif: Option<u32>) -> Option<NextHop> {
-    let gateway = match gw {
-        Some(g) => Some(ip_from_octets(family, Some(g))?),
-        None => None,
+/// Build a [`NextHop`] from a route's same-family gateway octets (`gw`, in `family`),
+/// an already-decoded cross-family gateway (`cross_gw`, from RTA_VIA, RFC 5549),
+/// and/or an out-interface; `None` if it has none of them.
+fn nexthop_from_gw(
+    family: u8,
+    gw: Option<&[u8]>,
+    cross_gw: Option<IpAddr>,
+    oif: Option<u32>,
+) -> Option<NextHop> {
+    let gateway = match (cross_gw, gw) {
+        (Some(g), _) => Some(g),
+        (None, Some(g)) => Some(ip_from_octets(family, Some(g))?),
+        (None, None) => None,
     };
     let iface = oif.and_then(if_name);
     if gateway.is_none() && iface.is_none() {
@@ -179,6 +191,7 @@ fn parse_route(msg: &[u8]) -> Option<Route> {
     let end = total.min(msg.len());
     let mut dst: Option<&[u8]> = None;
     let mut gw: Option<&[u8]> = None;
+    let mut via: Option<&[u8]> = None;
     let mut oif: Option<u32> = None;
     let mut mp: Option<&[u8]> = None;
     let mut metric: u32 = 0;
@@ -193,6 +206,7 @@ fn parse_route(msg: &[u8]) -> Option<Route> {
         match ty {
             RTA_DST => dst = Some(data),
             RTA_GATEWAY => gw = Some(data),
+            RTA_VIA => via = Some(data),
             RTA_MULTIPATH => mp = Some(data),
             RTA_OIF if data.len() == 4 => {
                 oif = Some(u32::from_ne_bytes([data[0], data[1], data[2], data[3]]))
@@ -211,10 +225,15 @@ fn parse_route(msg: &[u8]) -> Option<Route> {
     // single top-level gateway/oif.
     let nexthops = match mp {
         Some(buf) => parse_multipath(family, buf),
-        None => match nexthop_from(family, gw, oif) {
-            Some(nh) => vec![nh],
-            None => Vec::new(),
-        },
+        None => {
+            // A cross-family gateway (RFC 5549) arrives in RTA_VIA, decoded by its own
+            // embedded family; an ordinary same-family gateway is in RTA_GATEWAY.
+            let cross_gw = via.and_then(via_addr);
+            match nexthop_from_gw(family, gw, cross_gw, oif) {
+                Some(nh) => vec![nh],
+                None => Vec::new(),
+            }
+        }
     };
     if nexthops.is_empty() {
         return None;
@@ -246,6 +265,7 @@ fn parse_multipath(family: u8, mut buf: &[u8]) -> Vec<NextHop> {
         let ifindex = i32::from_ne_bytes([buf[4], buf[5], buf[6], buf[7]]);
         // Nested attributes live between the header and rtnh_len.
         let mut gw: Option<&[u8]> = None;
+        let mut via: Option<&[u8]> = None;
         let mut off = RTNH_HDR_LEN;
         while off + 4 <= rtnh_len {
             let alen = u16::from_ne_bytes([buf[off], buf[off + 1]]) as usize;
@@ -253,12 +273,18 @@ fn parse_multipath(family: u8, mut buf: &[u8]) -> Vec<NextHop> {
             if alen < 4 || off + alen > rtnh_len {
                 break;
             }
-            if aty == RTA_GATEWAY {
-                gw = Some(&buf[off + 4..off + alen]);
+            match aty {
+                RTA_GATEWAY => gw = Some(&buf[off + 4..off + alen]),
+                RTA_VIA => via = Some(&buf[off + 4..off + alen]),
+                _ => {}
             }
             off += align4(alen);
         }
-        let gateway = gw.and_then(|g| ip_from_octets(family, Some(g)));
+        // A cross-family gateway (RFC 5549) is in RTA_VIA; else the same-family
+        // gateway octets in RTA_GATEWAY.
+        let gateway = via
+            .and_then(via_addr)
+            .or_else(|| gw.and_then(|g| ip_from_octets(family, Some(g))));
         let iface = if ifindex > 0 {
             if_name(ifindex as u32)
         } else {
@@ -294,6 +320,32 @@ fn addr_octets(addr: &IpAddr) -> Vec<u8> {
     }
 }
 
+/// Append a next-hop gateway attribute to `buf` for a route whose destination is in
+/// `dst_family`: an ordinary `RTA_GATEWAY` (bare octets) when the gateway is the same
+/// family, or an `RTA_VIA` (`struct rtvia`: 2-octet family + octets) when it differs —
+/// the kernel's RFC 5549 encoding for, e.g., an IPv4 route via an IPv6 gateway.
+fn push_gateway(buf: &mut Vec<u8>, dst_family: u8, gw: &IpAddr) {
+    let gw_family = af(gw);
+    if gw_family == dst_family {
+        push_attr(buf, RTA_GATEWAY, &addr_octets(gw));
+    } else {
+        let mut via = Vec::with_capacity(2 + 16);
+        via.extend_from_slice(&(gw_family as u16).to_ne_bytes());
+        via.extend_from_slice(&addr_octets(gw));
+        push_attr(buf, RTA_VIA, &via);
+    }
+}
+
+/// Decode an `RTA_VIA` payload (`struct rtvia`: 2-octet family + gateway octets) into
+/// an [`IpAddr`] — the cross-family gateway of an RFC 5549 route.
+fn via_addr(data: &[u8]) -> Option<IpAddr> {
+    if data.len() < 2 {
+        return None;
+    }
+    let family = u16::from_ne_bytes([data[0], data[1]]) as u8;
+    ip_from_octets(family, Some(&data[2..]))
+}
+
 /// Round `n` up to the next multiple of 4 (netlink alignment).
 fn align4(n: usize) -> usize {
     (n + 3) & !3
@@ -326,7 +378,7 @@ fn if_index(name: &str) -> Option<u32> {
 /// next-hop, each carrying its weight (`rtnh_hops` = weight − 1) and out-interface,
 /// followed by a nested `RTA_GATEWAY` when it has a gateway. Each entry is padded
 /// to a 4-byte boundary, as the kernel's `RTNH_ALIGN` requires.
-fn build_multipath(nexthops: &[NextHop]) -> Vec<u8> {
+fn build_multipath(dst_family: u8, nexthops: &[NextHop]) -> Vec<u8> {
     let mut payload = Vec::new();
     for nh in nexthops {
         let start = payload.len();
@@ -336,7 +388,7 @@ fn build_multipath(nexthops: &[NextHop]) -> Vec<u8> {
         let ifindex = nh.iface.as_deref().and_then(if_index).unwrap_or(0) as i32;
         payload.extend_from_slice(&ifindex.to_ne_bytes()); // rtnh_ifindex
         if let Some(gw) = nh.gateway {
-            push_attr(&mut payload, RTA_GATEWAY, &addr_octets(&gw));
+            push_gateway(&mut payload, dst_family, &gw);
         }
         // rtnh_len covers the header + nested (4-aligned) attrs, not trailing pad.
         let len = (payload.len() - start) as u16;
@@ -394,14 +446,14 @@ fn build_route_msg(
             [] => {}
             [nh] => {
                 if let Some(gw) = nh.gateway {
-                    push_attr(&mut buf, RTA_GATEWAY, &addr_octets(&gw));
+                    push_gateway(&mut buf, af(&dst), &gw);
                 }
                 if let Some(idx) = nh.iface.as_deref().and_then(if_index) {
                     push_attr(&mut buf, RTA_OIF, &idx.to_ne_bytes());
                 }
             }
             nexthops => {
-                let mp = build_multipath(nexthops);
+                let mp = build_multipath(af(&dst), nexthops);
                 push_attr(&mut buf, RTA_MULTIPATH, &mp);
             }
         }
@@ -759,6 +811,61 @@ mod tests {
         );
         let msg = build_route_msg(RTM_NEWROUTE, 0, 1, &route.prefix, Some(&route));
         assert_eq!(parse_route(&msg), Some(route));
+    }
+
+    #[test]
+    fn ipv4_route_via_ipv6_gateway_uses_rta_via() {
+        // RFC 5549: an IPv4 prefix with an IPv6 gateway must encode the gateway as
+        // RTA_VIA (struct rtvia: family + octets), not a same-family RTA_GATEWAY, and
+        // round-trip back to the same IPv6 gateway.
+        let route = Route::new(
+            p("10.99.0.0/24"),
+            Protocol::Bgp,
+            vec![NextHop::via("2001:db8::2".parse().unwrap())],
+            0,
+        );
+        let msg = build_route_msg(RTM_NEWROUTE, 0, 1, &route.prefix, Some(&route));
+        // The cross-family gateway is in RTA_VIA, and there is no top-level RTA_GATEWAY.
+        assert!(has_attr(&msg, RTA_VIA, &[]));
+        assert!(!has_attr(&msg, RTA_GATEWAY, &[]));
+        // The RTA_VIA payload is the family (AF_INET6) followed by the 16 octets.
+        let mut via = (libc::AF_INET6 as u16).to_ne_bytes().to_vec();
+        via.extend_from_slice(&[0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2]);
+        assert!(has_attr(&msg, RTA_VIA, &via));
+        assert_eq!(parse_route(&msg), Some(route));
+    }
+
+    /// Kernel-acceptance for the RFC 5549 case the round-trip test can't prove: that
+    /// the real kernel accepts an IPv4 route with an IPv6 gateway via RTA_VIA. Needs
+    /// `CAP_NET_ADMIN` and an interface carrying `2001:db8::1/64`, so it is `#[ignore]`d:
+    ///
+    /// ```sh
+    /// unshare -Urn sh -c '
+    ///   ip link add d0 type dummy; ip addr add 2001:db8::1/64 dev d0; ip link set d0 up
+    ///   cargo test -p wren-netlink --ignored ipv4_via_ipv6_kernel_acceptance -- --nocapture'
+    /// ```
+    #[test]
+    #[ignore = "needs CAP_NET_ADMIN + 2001:db8::/64 on an iface; run under unshare -Urn"]
+    fn ipv4_via_ipv6_kernel_acceptance() {
+        let mut fib = KernelFib::new().expect("open kernel fib");
+        let route = Route::new(
+            p("10.123.0.0/16"),
+            Protocol::Bgp,
+            vec![NextHop::via("2001:db8::2".parse().unwrap())],
+            0,
+        );
+        fib.apply(&FibChange::Install(route.clone()))
+            .expect("kernel accepts the IPv4-via-IPv6 (RTA_VIA) route");
+        let back = fib.owned_routes().expect("dump routes");
+        let got = back
+            .iter()
+            .find(|r| r.prefix == route.prefix)
+            .expect("the IPv4-via-IPv6 route is present in the kernel");
+        assert_eq!(
+            got.nexthops[0].gateway,
+            Some("2001:db8::2".parse().unwrap()),
+            "the IPv6 gateway survives the kernel round trip"
+        );
     }
 
     /// Kernel-acceptance smoke for ECMP — the one thing the round-trip test can't

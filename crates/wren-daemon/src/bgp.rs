@@ -202,6 +202,9 @@ pub struct BgpPeerCfg {
     /// Negotiate ADD-PATH (RFC 7911) with this peer for IPv4 unicast — keep every
     /// path the peer sends and advertise all candidate paths back to it.
     pub add_path: bool,
+    /// Negotiate Extended Next Hop Encoding (RFC 5549) with this peer — exchange IPv4
+    /// routes with an IPv6 next hop.
+    pub ext_nexthop: bool,
 }
 
 impl BgpPeerCfg {
@@ -284,6 +287,8 @@ struct PeerProps {
     max_prefix: Option<u32>,
     /// Whether ADD-PATH (RFC 7911) is configured for this peer (IPv4 unicast).
     add_path: bool,
+    /// Whether Extended Next Hop Encoding (RFC 5549) is configured for this peer.
+    ext_nexthop: bool,
 }
 
 /// One prefix this speaker originates, with the COMMUNITIES to attach. The central
@@ -383,6 +388,8 @@ struct PeerInfo {
     ttl_security: Option<u8>,
     /// Whether ADD-PATH (RFC 7911) is configured for this peer (IPv4 unicast).
     add_path: bool,
+    /// Whether Extended Next Hop Encoding (RFC 5549) is configured for this peer.
+    ext_nexthop: bool,
 }
 
 /// A message from a per-peer session task to the central RIB task.
@@ -779,6 +786,7 @@ pub async fn run(
                         ttl_security: p.ttl_security,
                         max_prefix: p.max_prefix,
                         add_path: p.add_path,
+                        ext_nexthop: p.ext_nexthop,
                     },
                 )
             })
@@ -824,6 +832,7 @@ pub async fn run(
             peer_type: classify(cfg.local_as, &members, peer.remote_as),
             ttl_security: peer.ttl_security,
             add_path: peer.add_path,
+            ext_nexthop: peer.ext_nexthop,
         };
         let auth = peer.tcp_auth();
         let local = local.clone();
@@ -1196,6 +1205,18 @@ pub async fn run(
                 // IPv6 reachability: MP_REACH_NLRI carries its own next hop (RFC 4760).
                 // A link-local next hop (RFC 2545) is pinned to the ingress interface.
                 if let Some((nh6, nlri, is_link_local)) = mp_reach_v6(&update) {
+                    let iface = if is_link_local { ingress_iface.clone() } else { None };
+                    let path = build_path(&update, IpAddr::V6(nh6), iface, facts);
+                    for p in nlri {
+                        import_and_install(import, peer, 0, *p, &path, &mut rib, &updates, &sessions)
+                            .await;
+                    }
+                }
+                // IPv4-over-IPv6 reachability (RFC 5549): MP_REACH_NLRI with IPv4 NLRI
+                // and an IPv6 next hop. The IPv4 prefix is installed via the IPv6
+                // gateway (the kernel uses RTA_VIA). A link-local next hop is pinned to
+                // the ingress interface, like the IPv6-unicast case.
+                if let Some((nh6, nlri, is_link_local)) = mp_reach_v4_over_v6(&update) {
                     let iface = if is_link_local { ingress_iface.clone() } else { None };
                     let path = build_path(&update, IpAddr::V6(nh6), iface, facts);
                     for p in nlri {
@@ -1690,6 +1711,26 @@ fn mp_reach_v6(update: &Update) -> Option<(Ipv6Addr, &[Prefix], bool)> {
     })
 }
 
+/// The MP_REACH_NLRI carrying **IPv4** NLRI with an **IPv6** next hop (RFC 5549 /
+/// RFC 8950): the IPv6 next hop to install, the reachable IPv4 prefixes, and whether
+/// the next hop is a link-local (a 32-octet next hop carries the link-local after the
+/// global; we forward over the link-local pinned to the ingress interface). The
+/// kernel installs each IPv4 prefix via this IPv6 gateway (RTA_VIA).
+fn mp_reach_v4_over_v6(update: &Update) -> Option<(Ipv6Addr, &[Prefix], bool)> {
+    update.attributes.iter().find_map(|a| match a {
+        PathAttribute::MpReachNlri { afi, safi, next_hop, nlri }
+            if *afi == AFI_IPV4 && *safi == SAFI_UNICAST && next_hop.len() >= 16 =>
+        {
+            let (global, link_local) = wren_bgp::decode_v6_next_hop(next_hop)?;
+            match link_local {
+                Some(ll) => Some((ll, nlri.as_slice(), true)),
+                None => Some((global, nlri.as_slice(), false)),
+            }
+        }
+        _ => None,
+    })
+}
+
 /// The MP_UNREACH_NLRI (IPv6 unicast) withdrawals of an UPDATE (RFC 4760 §4).
 fn mp_unreach_v6(update: &Update) -> &[Prefix] {
     update
@@ -1829,6 +1870,7 @@ async fn accept_loop(listener: TcpListener, local: Arc<Local>, tx: mpsc::Sender<
                     peer_type: props.peer_type,
                     ttl_security: props.ttl_security,
                     add_path: props.add_path,
+                    ext_nexthop: props.ext_nexthop,
                 };
                 let local = local.clone();
                 let tx = tx.clone();
@@ -2162,6 +2204,8 @@ async fn drive_session(
         add_path_cfg: peer.add_path,
         add_path_send: false,
         add_path_recv: false,
+        ext_nexthop_cfg: peer.ext_nexthop,
+        ext_nexthop_send: false,
         peer_route_refresh: false,
         peer_gr: None,
         established: false,
@@ -2211,6 +2255,12 @@ async fn drive_session(
                             let peer_can_send = matches!(peer_sr, Some(ADD_PATH_SEND | ADD_PATH_BOTH));
                             sess.add_path_send = sess.add_path_cfg && peer_can_recv;
                             sess.add_path_recv = sess.add_path_cfg && peer_can_send;
+                            // Extended Next Hop (RFC 5549): we may send IPv4-over-IPv6
+                            // only if we offered it and the peer can receive it. (We
+                            // always accept a received IPv4-over-IPv6 UPDATE regardless,
+                            // since the encoding is self-describing in MP_REACH_NLRI.)
+                            sess.ext_nexthop_send = sess.ext_nexthop_cfg
+                                && o.supports_extended_next_hop(AFI_IPV4, SAFI_UNICAST, AFI_IPV6);
                             // Send a ROUTE-REFRESH only if the peer can honour it (RFC 2918).
                             sess.peer_route_refresh = o.supports_route_refresh();
                             // Graceful Restart (RFC 4724): help this peer through a
@@ -2444,6 +2494,12 @@ struct Session<'a> {
     /// Whether ADD-PATH (RFC 7911) is configured for this peer — we then advertise
     /// the ADD-PATH capability (Send+Receive, IPv4 unicast) in our OPEN.
     add_path_cfg: bool,
+    /// Whether Extended Next Hop Encoding (RFC 5549) is configured for this peer —
+    /// we then advertise the capability in our OPEN.
+    ext_nexthop_cfg: bool,
+    /// Negotiated: we may advertise IPv4 routes to this peer with an IPv6 next hop
+    /// (we offered the capability and the peer can receive it). Set on OPEN receipt.
+    ext_nexthop_send: bool,
     /// Negotiated: we may SEND multiple paths to this peer (we offered it and the
     /// peer can receive). Every IPv4 NLRI we encode then carries a Path Identifier.
     add_path_send: bool,
@@ -2491,6 +2547,15 @@ impl Session<'_> {
                             AFI_IPV4,
                             SAFI_UNICAST,
                             ADD_PATH_BOTH,
+                        )]));
+                    }
+                    // Extended Next Hop Encoding (RFC 5549 / RFC 8950): when configured,
+                    // advertise that we can receive IPv4 unicast with an IPv6 next hop.
+                    if self.ext_nexthop_cfg {
+                        open.capabilities.push(Capability::ExtendedNextHop(vec![(
+                            AFI_IPV4,
+                            SAFI_UNICAST as u16,
+                            AFI_IPV6,
                         )]));
                     }
                     self.send(&Message::Open(open)).await?;
@@ -2710,12 +2775,31 @@ impl Session<'_> {
         v4: Vec<Prefix>,
         v6: Vec<Prefix>,
     ) -> Result<()> {
-        // IPv4 unicast: base NLRI with the IPv4 NEXT_HOP (next-hop-self).
+        // IPv4 unicast. Normally base NLRI with the IPv4 NEXT_HOP (next-hop-self).
+        // With Extended Next Hop (RFC 5549) negotiated and a next-hop6 configured,
+        // advertise the IPv4 prefixes in MP_REACH_NLRI (AFI IPv4) with our IPv6
+        // next-hop-self instead, so the peer installs them via that IPv6 gateway.
         if !v4.is_empty() {
-            let mut attributes = base.clone();
-            attributes.push(PathAttribute::NextHop(self.local_ip));
-            self.send(&Message::Update(Update { withdrawn: vec![], attributes, nlri: v4, ..Default::default() }))
-                .await?;
+            match (self.ext_nexthop_send, self.local.next_hop6) {
+                (true, Some(nh6)) => {
+                    let mut attributes = base.clone();
+                    attributes.push(PathAttribute::MpReachNlri {
+                        afi: AFI_IPV4,
+                        safi: SAFI_UNICAST,
+                        // We originate, so this is always next-hop-self.
+                        next_hop: self.v6_next_hop_field(nh6, true),
+                        nlri: v4,
+                    });
+                    self.send(&Message::Update(Update { withdrawn: vec![], attributes, nlri: vec![], ..Default::default() }))
+                        .await?;
+                }
+                _ => {
+                    let mut attributes = base.clone();
+                    attributes.push(PathAttribute::NextHop(self.local_ip));
+                    self.send(&Message::Update(Update { withdrawn: vec![], attributes, nlri: v4, ..Default::default() }))
+                        .await?;
+                }
+            }
         }
 
         // IPv6 unicast: MP_REACH_NLRI, only if the peer negotiated it and we have a

@@ -58,7 +58,13 @@ implemented to its RFC.
   destination (keyed by `(peer, path-id)`), and a send-side peer is advertised every
   candidate path (not just the best) under a stable Path Identifier — `show bgp
   paths` lists them, live-verified by `scripts/bgp-add-path-smoke.sh` (a peer learns
-  two paths for one prefix from a single iBGP neighbour)
+  two paths for one prefix from a single iBGP neighbour) — and **Extended Next Hop /
+  IPv4-over-IPv6** (RFC 5549 / RFC 8950): the Extended Next Hop Encoding capability is
+  negotiated per neighbour (`extended-nexthop = true`), IPv4 routes are advertised in
+  MP_REACH_NLRI (AFI IPv4) with an IPv6 next-hop-self, and a received IPv4 route with
+  an IPv6 next hop is installed via that gateway using the kernel's `RTA_VIA`
+  (`via inet6 …`) — live-verified by `scripts/bgp-extended-nexthop-smoke.sh` against
+  the real kernel FIB
 - [x] **Babel** (RFC 8966) — loop-avoiding distance-vector over IPv6 (UDP 6696,
   `ff02::1:6`), with the feasibility condition and Hello/IHU link costing
 - [x] **OSPFv3** (RFC 5340) — OSPF for IPv6, end to end. The `wren-ospfv3` library
@@ -201,9 +207,13 @@ tracked but not yet scheduled, grouped by area:
 - **IGPs & link-state:** OSPFv3 NSSA + address families (RFC 5838), IS-IS
   refinements (the RFC 5303 p2p three-way TLV, L1↔L2 route leaking), RIFT, EIGRP;
   IGMP/MLD for multicast group membership.
-- **BGP breadth:** unnumbered (RFC 5549), EVPN (RFC 7432), long-lived graceful
-  restart (RFC 9494), BMP (RFC 7854), FlowSpec (RFC 8955), RPKI origin validation,
-  RTC (RFC 4684). (**ADD-PATH** (RFC 7911) — advertising and keeping several paths
+- **BGP breadth:** EVPN (RFC 7432), long-lived graceful restart (RFC 9494), BMP
+  (RFC 7854), FlowSpec (RFC 8955), RPKI origin validation, RTC (RFC 4684).
+  (**Extended Next Hop / IPv4-over-IPv6** (RFC 5549 / RFC 8950) — advertising IPv4
+  routes with an IPv6 next hop and installing them via the kernel's `RTA_VIA`,
+  negotiated per neighbour with `extended-nexthop = true` — is **done** (the BGP
+  transport itself is still IPv4; full unnumbered over an IPv6-only session is a
+  future extension). **ADD-PATH** (RFC 7911) — advertising and keeping several paths
   per prefix, each under a 4-octet Path Identifier, negotiated per neighbour with
   `add-path = true` for IPv4 unicast — is **done** (IPv6/MP add-path is a future
   extension). Per-peer `default-originate` — advertising `0.0.0.0/0` to a neighbour —

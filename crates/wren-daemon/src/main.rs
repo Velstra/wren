@@ -790,6 +790,7 @@ fn build_bgp_config(
             max_prefix: n.max_prefix.filter(|&m| m > 0),
             default_originate: n.default_originate,
             add_path: n.add_path,
+            ext_nexthop: n.extended_nexthop,
             import,
             export,
         });

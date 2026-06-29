@@ -23,6 +23,11 @@ pub const CAP_GRACEFUL_RESTART: u8 = 64;
 /// The 4-octet AS Number capability code (RFC 6793 §4).
 pub const CAP_FOUR_OCTET_AS: u8 = 65;
 
+/// The Extended Next Hop Encoding capability code (RFC 5549 / RFC 8950 §3): the
+/// speaker can receive a next hop of a different address family from the NLRI — an
+/// IPv4 prefix with an IPv6 next hop.
+pub const CAP_EXTENDED_NEXT_HOP: u8 = 5;
+
 /// The ADD-PATH capability code (RFC 7911 §4).
 pub const CAP_ADD_PATH: u8 = 69;
 
@@ -67,6 +72,12 @@ pub enum Capability {
     /// `(AFI, SAFI, Send/Receive)` tuple per family, where the Send/Receive byte is
     /// [`ADD_PATH_RECEIVE`] / [`ADD_PATH_SEND`] / [`ADD_PATH_BOTH`].
     AddPath(Vec<(u16, u8, u8)>),
+    /// The Extended Next Hop Encoding capability (code 5, RFC 5549 / RFC 8950 §3):
+    /// the speaker can receive, for each listed `(NLRI AFI, NLRI SAFI, Nexthop AFI)`
+    /// tuple, NLRI of one family with a next hop of another — e.g. IPv4 unicast
+    /// (AFI 1, SAFI 1) reachable through an IPv6 next hop (Nexthop AFI 2). Note SAFI
+    /// is a 2-octet field here (unlike the 1-octet SAFI elsewhere).
+    ExtendedNextHop(Vec<(u16, u16, u16)>),
     /// A capability this implementation does not model, kept verbatim.
     Unknown {
         /// The capability code.
@@ -85,6 +96,7 @@ impl Capability {
             Capability::GracefulRestart { .. } => CAP_GRACEFUL_RESTART,
             Capability::FourOctetAs(_) => CAP_FOUR_OCTET_AS,
             Capability::AddPath(_) => CAP_ADD_PATH,
+            Capability::ExtendedNextHop(_) => CAP_EXTENDED_NEXT_HOP,
             Capability::Unknown { code, .. } => *code,
         }
     }
@@ -127,6 +139,15 @@ impl Capability {
                     out.extend_from_slice(&afi.to_be_bytes());
                     out.push(*safi);
                     out.push(*sr);
+                }
+            }
+            Capability::ExtendedNextHop(tuples) => {
+                // One 6-octet (NLRI AFI(2) · NLRI SAFI(2) · Nexthop AFI(2)) tuple each.
+                out.push(6 * tuples.len() as u8);
+                for (afi, safi, nh_afi) in tuples {
+                    out.extend_from_slice(&afi.to_be_bytes());
+                    out.extend_from_slice(&safi.to_be_bytes());
+                    out.extend_from_slice(&nh_afi.to_be_bytes());
                 }
             }
             Capability::Unknown { value, .. } => {
@@ -187,6 +208,19 @@ impl Capability {
                     o += 4;
                 }
                 Capability::AddPath(families)
+            }
+            CAP_EXTENDED_NEXT_HOP if value.len() % 6 == 0 => {
+                let mut tuples = Vec::new();
+                let mut o = 0;
+                while o + 6 <= value.len() {
+                    tuples.push((
+                        u16::from_be_bytes([value[o], value[o + 1]]),
+                        u16::from_be_bytes([value[o + 2], value[o + 3]]),
+                        u16::from_be_bytes([value[o + 4], value[o + 5]]),
+                    ));
+                    o += 6;
+                }
+                Capability::ExtendedNextHop(tuples)
             }
             _ => Capability::Unknown {
                 code,
@@ -321,6 +355,23 @@ mod tests {
         assert_eq!(opt[3], 8);
         // First family: AFI 1, SAFI 1, Send/Receive 3 (both).
         assert_eq!(&opt[4..8], &[0x00, 0x01, 0x01, ADD_PATH_BOTH]);
+        assert_eq!(parse_optional_parameters(&opt), caps);
+    }
+
+    #[test]
+    fn extended_next_hop_capability_roundtrips() {
+        use crate::{AFI_IPV4, AFI_IPV6, SAFI_UNICAST};
+        let caps = vec![Capability::ExtendedNextHop(vec![(
+            AFI_IPV4,
+            SAFI_UNICAST as u16,
+            AFI_IPV6,
+        )])];
+        let opt = encode_optional_parameters(&caps);
+        // type 2 (capabilities param), then [cap 5, len 6, AFI 1, SAFI 1, NH-AFI 2].
+        assert_eq!(opt[0], OPT_PARAM_CAPABILITIES);
+        assert_eq!(opt[2], CAP_EXTENDED_NEXT_HOP);
+        assert_eq!(opt[3], 6);
+        assert_eq!(&opt[4..10], &[0x00, 0x01, 0x00, 0x01, 0x00, 0x02]);
         assert_eq!(parse_optional_parameters(&opt), caps);
     }
 
