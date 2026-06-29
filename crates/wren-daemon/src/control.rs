@@ -439,10 +439,15 @@ mod tests {
 
     #[test]
     fn parse_bgp_query_understands_refresh() {
-        use std::net::Ipv4Addr;
+        use std::net::{IpAddr, Ipv4Addr};
         assert_eq!(
             parse_bgp_query("bgp refresh 10.0.0.2"),
-            Some(BgpQuery::Refresh(Ipv4Addr::new(10, 0, 0, 2)))
+            Some(BgpQuery::Refresh(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2))))
+        );
+        // An IPv6 (unnumbered) peer address parses too.
+        assert_eq!(
+            parse_bgp_query("bgp refresh 2001:db8::1"),
+            Some(BgpQuery::Refresh("2001:db8::1".parse().unwrap()))
         );
         // A missing, malformed or extra-token address is rejected.
         assert!(parse_bgp_query("bgp refresh").is_none());

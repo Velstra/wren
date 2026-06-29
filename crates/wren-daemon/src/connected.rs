@@ -118,6 +118,54 @@ pub fn resolve_link(local_ip: Ipv4Addr) -> Option<(String, Ipv6Addr)> {
     link_locals.into_iter().find(|(n, _)| *n == ifname)
 }
 
+/// Resolve the local interface facing a BGP transport whose local IPv6 address is
+/// `local_v6` (an unnumbered / RFC 5549 session): its name and that interface's IPv6
+/// link-local (`fe80::/10`), if any. `local_v6` may itself be the link-local.
+///
+/// Used for RFC 2545 next hops the same way [`resolve_link`] is, but keyed on the
+/// IPv6 transport address. Returns `None` if the address can't be matched or the
+/// interface has no link-local.
+pub fn resolve_link6(local_v6: Ipv6Addr) -> Option<(String, Ipv6Addr)> {
+    let mut head: *mut libc::ifaddrs = ptr::null_mut();
+    // SAFETY: getifaddrs allocates a linked list into `head`; checked and freed.
+    if unsafe { libc::getifaddrs(&mut head) } != 0 {
+        return None;
+    }
+
+    let mut matched: Option<String> = None;
+    let mut link_locals: Vec<(String, Ipv6Addr)> = Vec::new();
+    let mut cur = head;
+    while !cur.is_null() {
+        // SAFETY: `cur` is a non-null node in the kernel-provided list.
+        let ifa = unsafe { &*cur };
+        cur = ifa.ifa_next;
+        if ifa.ifa_addr.is_null() {
+            continue;
+        }
+        // SAFETY: `ifa_name` is a valid NUL-terminated C string.
+        let name = unsafe { CStr::from_ptr(ifa.ifa_name) }
+            .to_string_lossy()
+            .into_owned();
+        // SAFETY: reading sa_family from a valid sockaddr is always sound.
+        if unsafe { (*ifa.ifa_addr).sa_family } as i32 == libc::AF_INET6 {
+            let a = read_sin6_addr(ifa.ifa_addr);
+            if (a.segments()[0] & 0xffc0) == 0xfe80 {
+                link_locals.push((name.clone(), a));
+            }
+            // Match on either the global or the link-local local address.
+            if a == local_v6 {
+                matched = Some(name);
+            }
+        }
+    }
+
+    // SAFETY: freeing exactly the list getifaddrs allocated above.
+    unsafe { libc::freeifaddrs(head) };
+
+    let ifname = matched?;
+    link_locals.into_iter().find(|(n, _)| *n == ifname)
+}
+
 /// Build the attached [`Prefix`] from an interface's address + netmask sockaddrs,
 /// for AF_INET / AF_INET6. Returns `None` for other families, a non-contiguous
 /// mask, or an IPv6 link-local address.

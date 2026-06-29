@@ -161,8 +161,12 @@ fn classify(local_as: u32, members: &[u32], remote_as: u32) -> PeerType {
 
 /// One configured BGP peer.
 pub struct BgpPeerCfg {
-    /// The peer's address.
-    pub addr: Ipv4Addr,
+    /// The peer's transport address — IPv4, or IPv6 for an unnumbered/RFC 5549
+    /// session (the BGP TCP connection itself rides over IPv6).
+    pub addr: IpAddr,
+    /// The IPv6 scope id (interface index) for a link-local peer address
+    /// (`fe80::…%iface`), needed to dial it. `None` for global or IPv4 addresses.
+    pub scope_id: Option<u32>,
     /// The peer's AS (eBGP if it differs from [`BgpConfig::local_as`]).
     pub remote_as: u32,
     /// Whether to wait for the peer to connect rather than dialling it.
@@ -209,7 +213,13 @@ pub struct BgpPeerCfg {
 
 impl BgpPeerCfg {
     /// The transport authentication this peer's session uses (at most one scheme).
+    /// TCP-MD5 (RFC 2385) and TCP-AO (RFC 5925) are wired for IPv4 transport only
+    /// here, so an IPv6 (unnumbered) peer is always unauthenticated — `main.rs` warns
+    /// when a key is configured on such a peer.
     fn tcp_auth(&self) -> TcpAuth {
+        if !self.addr.is_ipv4() {
+            return TcpAuth::None;
+        }
         if let Some(pw) = &self.password {
             TcpAuth::Md5(pw.clone())
         } else if let Some(key) = &self.ao_key {
@@ -261,10 +271,10 @@ struct Local {
     /// peers. `None` means no confederation (`local_as` is the external AS).
     confed_id: Option<u32>,
     /// peer address → its properties, for matching inbound connections.
-    peers: HashMap<Ipv4Addr, PeerProps>,
+    peers: HashMap<IpAddr, PeerProps>,
     /// peer address → its outbound export filter (RFC-style export route-map), applied
     /// to every route this speaker advertises to that peer. Absent means advertise all.
-    exports: HashMap<Ipv4Addr, Filter>,
+    exports: HashMap<IpAddr, Filter>,
 }
 
 impl Local {
@@ -378,7 +388,9 @@ struct AddPathRoute {
 /// One peer's identity as a session task sees it.
 #[derive(Clone, Copy)]
 struct PeerInfo {
-    addr: Ipv4Addr,
+    addr: IpAddr,
+    /// IPv6 scope id for a link-local peer address (`fe80::…%iface`); `None` otherwise.
+    scope_id: Option<u32>,
     remote_as: u32,
     /// Whether this iBGP peer is a route-reflector client (RFC 4456).
     rr_client: bool,
@@ -399,7 +411,7 @@ enum PeerMsg {
     /// peer's BGP Identifier and whether this connection was inbound (accepted) or
     /// outbound (dialled), for §6.8 connection-collision detection.
     Established {
-        peer: Ipv4Addr,
+        peer: IpAddr,
         peer_id: Ipv4Addr,
         inbound: bool,
         conn_id: u64,
@@ -416,18 +428,18 @@ enum PeerMsg {
     /// The session left Established / went down — flush the peer's routes, but only
     /// if `conn_id` is still the current connection (a stale loser's Down is
     /// ignored, so it can't evict the surviving session).
-    Down { peer: Ipv4Addr, conn_id: u64 },
+    Down { peer: IpAddr, conn_id: u64 },
     /// The peer sent a ROUTE-REFRESH (RFC 2918): re-advertise our Adj-RIB-Out to it.
     /// `conn_id` guards against a stale connection (like [`PeerMsg::Down`]).
-    RefreshRequest { peer: Ipv4Addr, conn_id: u64 },
+    RefreshRequest { peer: IpAddr, conn_id: u64 },
     /// The peer sent an End-of-RIB marker (RFC 4724 §2): it has finished
     /// re-advertising after a graceful restart, so any of its routes we retained as
     /// stale but it did not re-advertise can now be flushed. `conn_id` guards
     /// against a stale connection.
-    EndOfRib { peer: Ipv4Addr, conn_id: u64 },
+    EndOfRib { peer: IpAddr, conn_id: u64 },
     /// The peer sent an UPDATE.
     Update {
-        peer: Ipv4Addr,
+        peer: IpAddr,
         peer_as: u32,
         peer_id: Ipv4Addr,
         from_ebgp: bool,
@@ -455,7 +467,7 @@ pub enum BgpQuery {
     Neighbors,
     /// Send a ROUTE-REFRESH to this peer (RFC 2918) — `bgp refresh <addr>`. Not a
     /// read-only query, but answered the same way (with a status line).
-    Refresh(Ipv4Addr),
+    Refresh(IpAddr),
 }
 
 /// A control-socket query plus the channel to answer it on.
@@ -479,7 +491,7 @@ struct NeighborState {
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct NeighborSummary {
     /// The peer's address.
-    pub addr: Ipv4Addr,
+    pub addr: IpAddr,
     /// The peer's AS.
     pub remote_as: u32,
     /// Whether the session is currently Established.
@@ -559,7 +571,7 @@ fn effective_origination(
     out
 }
 
-fn neighbor_summaries(neighbors: &BTreeMap<Ipv4Addr, NeighborState>) -> Vec<NeighborSummary> {
+fn neighbor_summaries(neighbors: &BTreeMap<IpAddr, NeighborState>) -> Vec<NeighborSummary> {
     neighbors
         .iter()
         .map(|(addr, n)| NeighborSummary {
@@ -699,7 +711,7 @@ pub async fn run(
 ) -> Result<()> {
     // The neighbour table: every configured peer, its AS and whether the session
     // is currently Established. Sorted for stable `show bgp neighbors` output.
-    let mut neighbors: BTreeMap<Ipv4Addr, NeighborState> = cfg
+    let mut neighbors: BTreeMap<IpAddr, NeighborState> = cfg
         .peers
         .iter()
         .map(|p| {
@@ -734,35 +746,35 @@ pub async fn run(
     let aggregates = cfg.aggregates.clone();
     let mut advertised = effective_origination(&originated, &aggregates);
     // Established sessions we can push origination changes to, keyed by peer.
-    let mut sessions: HashMap<Ipv4Addr, mpsc::Sender<SessionCmd>> = HashMap::new();
+    let mut sessions: HashMap<IpAddr, mpsc::Sender<SessionCmd>> = HashMap::new();
     // Whether each established session's connection was inbound, for §6.8 collision
     // detection (which of two racing connections to keep).
-    let mut est_inbound: HashMap<Ipv4Addr, bool> = HashMap::new();
+    let mut est_inbound: HashMap<IpAddr, bool> = HashMap::new();
     // The id of the current connection per peer, so a stale loser connection's Down
     // (e.g. after it was Ceased) can't evict the surviving session.
-    let mut current_conn: HashMap<Ipv4Addr, u64> = HashMap::new();
+    let mut current_conn: HashMap<IpAddr, u64> = HashMap::new();
     // Graceful Restart (RFC 4724): peers that negotiated GR with the forwarding
     // state preserved for IPv4 unicast, mapped to their Restart Time — when such a
     // peer drops we retain its routes for that long instead of withdrawing.
-    let mut gr_helper: HashMap<Ipv4Addr, u16> = HashMap::new();
+    let mut gr_helper: HashMap<IpAddr, u16> = HashMap::new();
     // The routes currently retained as stale per restarting peer, with the deadline
     // by which the peer must return (its Restart Timer).
-    let mut stale: HashMap<Ipv4Addr, StalePeer> = HashMap::new();
+    let mut stale: HashMap<IpAddr, StalePeer> = HashMap::new();
     // Peers that exceeded their max-prefix limit (RFC 4486 §4): their session is torn
     // down and kept down — any reconnection is shut down again and their UPDATEs are
     // ignored — until the daemon is reconfigured (no auto-restart timer yet).
-    let mut damped: HashSet<Ipv4Addr> = HashSet::new();
+    let mut damped: HashSet<IpAddr> = HashSet::new();
     // Peers to which we advertise a default route (`0.0.0.0/0`) on Established.
-    let default_originate: HashSet<Ipv4Addr> =
+    let default_originate: HashSet<IpAddr> =
         cfg.peers.iter().filter(|p| p.default_originate).map(|p| p.addr).collect();
     // Per-peer inbound import filters (RFC-style import route-maps), applied to every
     // route received from the peer before it enters the RIB.
-    let imports: HashMap<Ipv4Addr, Filter> =
+    let imports: HashMap<IpAddr, Filter> =
         cfg.peers.iter().filter_map(|p| p.import.clone().map(|f| (p.addr, f))).collect();
     // ADD-PATH (RFC 7911): the established sessions for which send was negotiated (we
     // advertise every candidate path, not just the best), and the per-peer Adj-RIB-Out
     // state tracking which Path Identifiers we have advertised for each prefix.
-    let mut addpath_send: HashSet<Ipv4Addr> = HashSet::new();
+    let mut addpath_send: HashSet<IpAddr> = HashSet::new();
     let mut addpath = AddPathState::default();
 
     let members = cfg.confederation_members.clone();
@@ -805,10 +817,15 @@ pub async fn run(
     // authenticated (TCP-MD5 or TCP-AO) we build the socket by hand to install each
     // peer's key before listening, so the kernel verifies their inbound SYNs;
     // otherwise the ordinary async bind is used unchanged.
+    // Without authentication we bind a dual-stack IPv6 listener (`[::]:179`,
+    // `IPV6_V6ONLY` off) so it accepts both IPv4 (as v4-mapped) and IPv6 (unnumbered,
+    // RFC 5549) inbound connections. With any TCP-MD5/TCP-AO peer we fall back to the
+    // hand-built IPv4 listener that installs each peer's key before `listen` (those
+    // schemes are wired for IPv4 transport only here).
     let bound = if cfg.peers.iter().any(|p| p.tcp_auth().is_enabled()) {
         bind_listener_authed(&cfg.peers)
     } else {
-        TcpListener::bind((Ipv4Addr::UNSPECIFIED, PORT)).await
+        bind_listener_dualstack()
     };
     match bound {
         Ok(listener) => {
@@ -827,6 +844,7 @@ pub async fn run(
         }
         let info = PeerInfo {
             addr: peer.addr,
+            scope_id: peer.scope_id,
             remote_as: peer.remote_as,
             rr_client: peer.rr_client,
             peer_type: classify(cfg.local_as, &members, peer.remote_as),
@@ -864,7 +882,7 @@ pub async fn run(
             () = &mut restart_timer => {
                 // A restarting peer did not return in time: flush its stale routes.
                 let now = Instant::now();
-                let expired: Vec<Ipv4Addr> =
+                let expired: Vec<IpAddr> =
                     stale.iter().filter(|(_, s)| s.deadline <= now).map(|(p, _)| *p).collect();
                 for p in expired {
                     if let Some(s) = stale.remove(&p) {
@@ -1259,7 +1277,7 @@ async fn apply_redistribution(
     originated: &mut BTreeMap<Prefix, OriginEntry>,
     aggregates: &[Aggregate],
     advertised: &mut BTreeMap<Prefix, OriginRoute>,
-    sessions: &HashMap<Ipv4Addr, mpsc::Sender<SessionCmd>>,
+    sessions: &HashMap<IpAddr, mpsc::Sender<SessionCmd>>,
 ) {
     // Fold the change into the raw origination set; bail if nothing changed so an
     // idempotent re-announce produces no churn.
@@ -1335,7 +1353,7 @@ async fn apply_redistribution(
 async fn apply_event(
     ev: RibEvent,
     updates: &mpsc::Sender<RouteUpdate>,
-    sessions: &HashMap<Ipv4Addr, mpsc::Sender<SessionCmd>>,
+    sessions: &HashMap<IpAddr, mpsc::Sender<SessionCmd>>,
 ) {
     propagate(&ev, sessions).await;
     emit(ev, updates).await;
@@ -1400,13 +1418,13 @@ fn filter_origin(filter: Option<&Filter>, r: &OriginRoute) -> Option<OriginRoute
 #[allow(clippy::too_many_arguments)] // a cohesive install helper: filter, RIB keying and fan-out
 async fn import_and_install(
     import: Option<&Filter>,
-    peer: Ipv4Addr,
+    peer: IpAddr,
     path_id: u32,
     prefix: Prefix,
     path: &Path,
     rib: &mut BgpRib,
     updates: &mpsc::Sender<RouteUpdate>,
-    sessions: &HashMap<Ipv4Addr, mpsc::Sender<SessionCmd>>,
+    sessions: &HashMap<IpAddr, mpsc::Sender<SessionCmd>>,
 ) {
     // ADD-PATH (RFC 7911): `path_id` distinguishes several paths the same peer
     // offers for one prefix (0 without ADD-PATH), so they coexist in the Adj-RIB-In.
@@ -1423,7 +1441,7 @@ async fn import_and_install(
 /// fan-out), IPv4 or IPv6. This broadcasts unconditionally; each session applies
 /// the eBGP/iBGP propagation rules (and the IPv6 multiprotocol gating) itself, and
 /// the session that taught us the route drops it (split horizon).
-async fn propagate(ev: &RibEvent, sessions: &HashMap<Ipv4Addr, mpsc::Sender<SessionCmd>>) {
+async fn propagate(ev: &RibEvent, sessions: &HashMap<IpAddr, mpsc::Sender<SessionCmd>>) {
     match ev {
         RibEvent::Best { prefix, path, .. } => {
             let pr = PropRoute { prefix: *prefix, path: path.clone() };
@@ -1446,18 +1464,18 @@ struct AddPathState {
     /// Source path `(learned-from peer, received path-id)` → the Path Identifier we
     /// advertise it under. Stable for the life of the speaker, so a later withdrawal
     /// names the same id. Ids start at 1; 0 is reserved for non-ADD-PATH NLRI.
-    ids: HashMap<(Ipv4Addr, u32), u32>,
+    ids: HashMap<(IpAddr, u32), u32>,
     /// The last id handed out.
     next: u32,
     /// Per out-peer, the set of Path Identifiers currently advertised for each prefix
     /// (the ADD-PATH Adj-RIB-Out), used to compute incremental withdrawals.
-    out: HashMap<Ipv4Addr, HashMap<Prefix, std::collections::BTreeSet<u32>>>,
+    out: HashMap<IpAddr, HashMap<Prefix, std::collections::BTreeSet<u32>>>,
 }
 
 impl AddPathState {
     /// The stable send Path Identifier for a source path, assigning a fresh one
     /// (≥ 1) the first time that source is seen.
-    fn id_for(&mut self, src: (Ipv4Addr, u32)) -> u32 {
+    fn id_for(&mut self, src: (IpAddr, u32)) -> u32 {
         if let Some(id) = self.ids.get(&src) {
             return *id;
         }
@@ -1467,7 +1485,7 @@ impl AddPathState {
     }
 
     /// Forget everything advertised to `peer` (its session went down).
-    fn drop_peer(&mut self, peer: Ipv4Addr) {
+    fn drop_peer(&mut self, peer: IpAddr) {
         self.out.remove(&peer);
     }
 }
@@ -1482,8 +1500,8 @@ async fn propagate_addpath(
     rib: &BgpRib,
     local: &Local,
     state: &mut AddPathState,
-    addpath_send: &HashSet<Ipv4Addr>,
-    sessions: &HashMap<Ipv4Addr, mpsc::Sender<SessionCmd>>,
+    addpath_send: &HashSet<IpAddr>,
+    sessions: &HashMap<IpAddr, mpsc::Sender<SessionCmd>>,
 ) {
     if !prefix.is_ipv4() {
         return;
@@ -1563,11 +1581,11 @@ struct StalePeer {
 /// complete in time, or the peer's End-of-RIB showed they are gone): withdraw each,
 /// propagating and updating the kernel FIB.
 async fn flush_stale(
-    peer: Ipv4Addr,
+    peer: IpAddr,
     prefixes: impl IntoIterator<Item = Prefix>,
     rib: &mut BgpRib,
     updates: &mpsc::Sender<RouteUpdate>,
-    sessions: &HashMap<Ipv4Addr, mpsc::Sender<SessionCmd>>,
+    sessions: &HashMap<IpAddr, mpsc::Sender<SessionCmd>>,
 ) {
     for prefix in prefixes {
         if let Some(ev) = rib.withdraw(peer, prefix) {
@@ -1580,7 +1598,7 @@ async fn flush_stale(
 /// built from it.
 #[derive(Clone, Copy)]
 struct PeerFacts {
-    addr: Ipv4Addr,
+    addr: IpAddr,
     as_: u32,
     id: Ipv4Addr,
     from_ebgp: bool,
@@ -1759,7 +1777,7 @@ fn mp_unreach_v6(update: &Update) -> &[Prefix] {
 /// With no clients configured this collapses to plain iBGP split horizon. A
 /// confed-eBGP peer counts as non-iBGP here (RFC 5065): an iBGP-learned route may
 /// cross into another Member-AS, and a confed-learned route propagates freely.
-fn should_propagate(path: &Path, to_type: PeerType, to_rr_client: bool, to_peer: Ipv4Addr) -> bool {
+fn should_propagate(path: &Path, to_type: PeerType, to_rr_client: bool, to_peer: IpAddr) -> bool {
     if path.peer_addr == to_peer {
         return false; // don't echo a route back to where we learned it
     }
@@ -1832,10 +1850,13 @@ async fn connector(
         // An authenticated peer needs its key installed on the socket before the
         // handshake, so it gets a hand-built connect; an ordinary peer uses tokio's.
         let dial = async {
-            if auth.is_enabled() {
-                connect_authed(peer.addr, &auth).await
-            } else {
-                TcpStream::connect((peer.addr, PORT)).await
+            match peer.addr {
+                // An authenticated (TCP-MD5/AO) IPv4 peer needs its key installed on the
+                // socket before the SYN, so it gets a hand-built connect.
+                IpAddr::V4(v4) if auth.is_enabled() => connect_authed(v4, &auth).await,
+                // Everything else — plain IPv4, or an IPv6 (unnumbered) peer, whose
+                // link-local address carries a scope id (interface) to dial it on.
+                _ => TcpStream::connect(peer_sockaddr(peer.addr, peer.scope_id)).await,
             }
         };
         match timeout(CONNECT_TIMEOUT, dial).await {
@@ -1856,15 +1877,17 @@ async fn accept_loop(listener: TcpListener, local: Arc<Local>, tx: mpsc::Sender<
     loop {
         match listener.accept().await {
             Ok((stream, addr)) => {
-                let IpAddr::V4(ip) = addr.ip() else {
-                    continue; // IPv4 transport only here
-                };
+                // The dual-stack listener delivers IPv4 peers as v4-mapped IPv6
+                // (`::ffff:a.b.c.d`); normalise back to a plain IPv4 address so it
+                // matches the configured peer key. IPv6 (unnumbered) peers pass through.
+                let ip = normalize_ip(addr.ip());
                 let Some(&props) = local.peers.get(&ip) else {
                     debug!(peer = %ip, "inbound BGP from unconfigured peer; dropping");
                     continue;
                 };
                 let peer = PeerInfo {
                     addr: ip,
+                    scope_id: None,
                     remote_as: props.remote_as,
                     rr_client: props.rr_client,
                     peer_type: props.peer_type,
@@ -2104,7 +2127,10 @@ fn bind_listener_authed(peers: &[BgpPeerCfg]) -> std::io::Result<TcpListener> {
             return Err(std::io::Error::last_os_error());
         }
         for p in peers {
-            p.tcp_auth().install(fd, p.addr)?;
+            // TCP-MD5/AO is IPv4 transport only here; an IPv6 peer has no key to install.
+            if let IpAddr::V4(v4) = p.addr {
+                p.tcp_auth().install(fd, v4)?;
+            }
         }
         let sin = sockaddr_in_v4(Ipv4Addr::UNSPECIFIED, PORT);
         if unsafe {
@@ -2112,6 +2138,95 @@ fn bind_listener_authed(peers: &[BgpPeerCfg]) -> std::io::Result<TcpListener> {
                 fd,
                 std::ptr::addr_of!(sin) as *const libc::sockaddr,
                 std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+            )
+        } < 0
+        {
+            return Err(std::io::Error::last_os_error());
+        }
+        if unsafe { libc::listen(fd, 1024) } < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        set_nonblocking(fd)?;
+        Ok(())
+    })();
+    if let Err(e) = prepared {
+        unsafe { libc::close(fd) };
+        return Err(e);
+    }
+    let std_listener = unsafe { std::net::TcpListener::from_raw_fd(fd) };
+    TcpListener::from_std(std_listener)
+}
+
+/// Canonicalise an accepted/local socket address: an IPv4-mapped IPv6 address
+/// (`::ffff:a.b.c.d`, how the dual-stack listener reports an IPv4 peer) folds back to
+/// the plain IPv4 address, so it matches the configured peer key; everything else is
+/// returned unchanged.
+fn normalize_ip(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+            Some(v4) => IpAddr::V4(v4),
+            None => IpAddr::V6(v6),
+        },
+        v4 => v4,
+    }
+}
+
+/// The socket address to dial a peer on, at the BGP port. An IPv6 link-local peer
+/// carries a `scope_id` (interface index) without which the kernel cannot route to
+/// `fe80::/10`; a global IPv6 or any IPv4 address needs none.
+fn peer_sockaddr(addr: IpAddr, scope_id: Option<u32>) -> std::net::SocketAddr {
+    match addr {
+        IpAddr::V4(v4) => std::net::SocketAddr::from((v4, PORT)),
+        IpAddr::V6(v6) => {
+            std::net::SocketAddr::V6(std::net::SocketAddrV6::new(v6, PORT, 0, scope_id.unwrap_or(0)))
+        }
+    }
+}
+
+/// Set an integer socket option, returning an `io::Error` on failure (the
+/// `bind_listener_*` helpers thread `std::io::Result`, unlike `rip::setsockopt_int`).
+fn setsockopt_i32(fd: i32, level: i32, name: i32, value: i32) -> std::io::Result<()> {
+    let rc = unsafe {
+        libc::setsockopt(
+            fd,
+            level,
+            name,
+            std::ptr::addr_of!(value) as *const libc::c_void,
+            std::mem::size_of::<i32>() as libc::socklen_t,
+        )
+    };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// Bind the BGP listener as a dual-stack IPv6 socket (`[::]:179`, `IPV6_V6ONLY` off)
+/// so a single listener accepts both IPv4 (delivered as v4-mapped) and IPv6
+/// (unnumbered, RFC 5549) inbound connections. Built by hand because `IPV6_V6ONLY`
+/// must be cleared before `bind` and tokio's `TcpListener::bind` does not expose it.
+fn bind_listener_dualstack() -> std::io::Result<TcpListener> {
+    use std::os::fd::FromRawFd;
+    let fd = unsafe { libc::socket(libc::AF_INET6, libc::SOCK_STREAM, 0) };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let prepared = (|| -> std::io::Result<()> {
+        setsockopt_i32(fd, libc::SOL_SOCKET, libc::SO_REUSEADDR, 1)?;
+        // Clear IPV6_V6ONLY so the socket also accepts IPv4 (as v4-mapped).
+        setsockopt_i32(fd, libc::IPPROTO_IPV6, libc::IPV6_V6ONLY, 0)?;
+        let sin6 = libc::sockaddr_in6 {
+            sin6_family: libc::AF_INET6 as libc::sa_family_t,
+            sin6_port: PORT.to_be(),
+            sin6_flowinfo: 0,
+            sin6_addr: libc::in6_addr { s6_addr: [0u8; 16] }, // in6addr_any
+            sin6_scope_id: 0,
+        };
+        if unsafe {
+            libc::bind(
+                fd,
+                std::ptr::addr_of!(sin6) as *const libc::sockaddr,
+                std::mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t,
             )
         } < 0
         {
@@ -2168,12 +2283,21 @@ async fn drive_session(
     if let Some(hops) = peer.ttl_security {
         apply_gtsm(&stream, hops);
     }
-    let local_ip = match stream.local_addr()?.ip() {
+    let local_full = normalize_ip(stream.local_addr()?.ip());
+    // The IPv4 next-hop-self for numbered v4 advertisements; for an unnumbered (IPv6)
+    // session there is no local IPv4, so fall back to the router id (IPv4 routes ride
+    // MP_REACH with an IPv6 next hop via Extended Next Hop, RFC 5549).
+    let local_ip = match local_full {
         IpAddr::V4(a) => a,
         IpAddr::V6(_) => local.router_id,
     };
-    // Resolve the interface facing this peer for RFC 2545 link-local next hops.
-    let link = crate::connected::resolve_link(local_ip);
+    // Resolve the interface facing this peer for RFC 2545 link-local next hops — from
+    // the local IPv4 address for a numbered session, or the local IPv6 address for an
+    // unnumbered (RFC 5549) one.
+    let link = match local_full {
+        IpAddr::V4(a) => crate::connected::resolve_link(a),
+        IpAddr::V6(a) => crate::connected::resolve_link6(a),
+    };
     let (mut rd, wr) = stream.into_split();
 
     // The central task pushes origination commands (advertise/withdraw) down this
@@ -2198,7 +2322,8 @@ async fn drive_session(
         conn_id: NEXT_CONN_ID.fetch_add(1, Ordering::Relaxed),
         neg_hold: local.hold_time,
         keepalive_int: (local.hold_time / 3).max(1),
-        peer_id: peer.addr,
+        // A placeholder until the peer's OPEN supplies its real BGP Identifier.
+        peer_id: Ipv4Addr::UNSPECIFIED,
         four_octet: false,
         mp_ipv6: false,
         add_path_cfg: peer.add_path,
@@ -3082,7 +3207,12 @@ mod tests {
     use wren_bgp::decision::Path;
     use wren_core::Prefix;
 
-    fn ip(o: [u8; 4]) -> Ipv4Addr {
+    /// A transport peer address (IPv4, typed as `IpAddr` for the RIB / session keys).
+    fn ip(o: [u8; 4]) -> IpAddr {
+        IpAddr::V4(Ipv4Addr::from(o))
+    }
+    /// A 32-bit BGP identifier (router id) — stays `Ipv4Addr` even for IPv6 sessions.
+    fn id(o: [u8; 4]) -> Ipv4Addr {
         Ipv4Addr::from(o)
     }
 
@@ -3092,7 +3222,7 @@ mod tests {
         let path = Path {
             origin: Origin::Igp,
             as_path: vec![AsPathSegment::Sequence(vec![65001, 196_618])],
-            next_hop: IpAddr::V4(ip([192, 0, 2, 1])),
+            next_hop: ip([192, 0, 2, 1]),
             next_hop_iface: None,
             local_pref: 100,
             med: 0,
@@ -3100,7 +3230,7 @@ mod tests {
             from_confed: false,
             peer_as: 65001,
             igp_metric: 0,
-            peer_id: ip([10, 0, 0, 1]),
+            peer_id: id([10, 0, 0, 1]),
             peer_addr: ip([10, 0, 0, 1]),
             from_client: false,
             originator_id: None,
@@ -3143,7 +3273,7 @@ mod tests {
         Path {
             origin: Origin::Igp,
             as_path: vec![AsPathSegment::Sequence(vec![65001])],
-            next_hop: IpAddr::V4(ip(from_peer)),
+            next_hop: ip(from_peer),
             next_hop_iface: None,
             local_pref: 100,
             med: 0,
@@ -3151,7 +3281,7 @@ mod tests {
             from_confed: false,
             peer_as: 65001,
             igp_metric: 0,
-            peer_id: ip(from_peer),
+            peer_id: id(from_peer),
             peer_addr: ip(from_peer),
             from_client: false,
             originator_id: None,
@@ -3242,11 +3372,11 @@ mod tests {
     #[test]
     fn collision_keeps_the_higher_identifier_connection() {
         // We have the lower id -> keep the inbound (peer-initiated) connection.
-        assert!(collision_keeps_inbound(ip([10, 0, 0, 1]), ip([10, 0, 0, 2])));
+        assert!(collision_keeps_inbound(id([10, 0, 0, 1]), id([10, 0, 0, 2])));
         // We have the higher id -> keep our own outbound connection.
-        assert!(!collision_keeps_inbound(ip([10, 0, 0, 2]), ip([10, 0, 0, 1])));
+        assert!(!collision_keeps_inbound(id([10, 0, 0, 2]), id([10, 0, 0, 1])));
         // Equal ids (a misconfiguration) -> keep the outbound.
-        assert!(!collision_keeps_inbound(ip([10, 0, 0, 1]), ip([10, 0, 0, 1])));
+        assert!(!collision_keeps_inbound(id([10, 0, 0, 1]), id([10, 0, 0, 1])));
     }
 
     #[test]
@@ -3327,19 +3457,19 @@ mod tests {
     #[test]
     fn reflection_loop_check_drops_own_originator_or_cluster() {
         let upd = |attrs: Vec<PathAttribute>| Update { withdrawn: vec![], attributes: attrs, nlri: vec![], ..Default::default() };
-        let rid = ip([10, 0, 0, 1]);
-        let cid = ip([1, 1, 1, 1]);
+        let rid = id([10, 0, 0, 1]);
+        let cid = id([1, 1, 1, 1]);
         // Our own ORIGINATOR_ID → loop.
         assert!(is_reflection_loop(&upd(vec![PathAttribute::OriginatorId(rid)]), rid, cid));
         // Our CLUSTER_ID in the CLUSTER_LIST → loop.
         assert!(is_reflection_loop(
-            &upd(vec![PathAttribute::ClusterList(vec![ip([9, 9, 9, 9]), cid])]),
+            &upd(vec![PathAttribute::ClusterList(vec![id([9, 9, 9, 9]), cid])]),
             rid,
             cid
         ));
         // Neither → fine.
         assert!(!is_reflection_loop(
-            &upd(vec![PathAttribute::OriginatorId(ip([7, 7, 7, 7]))]),
+            &upd(vec![PathAttribute::OriginatorId(id([7, 7, 7, 7]))]),
             rid,
             cid
         ));
@@ -3522,7 +3652,7 @@ mod tests {
             from_confed: false,
             peer_as: 65002,
             igp_metric: 0,
-            peer_id: ip([10, 0, 0, 2]),
+            peer_id: id([10, 0, 0, 2]),
             peer_addr: ip([10, 0, 0, 2]),
             from_client: false,
             originator_id: None,

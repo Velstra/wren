@@ -730,6 +730,33 @@ fn build_ospf3_config(
 /// Resolve the textual `[bgp]` config into the runner's [`bgp::BgpConfig`],
 /// parsing the local AS (required), the Router ID (from `[bgp]` or the top-level),
 /// the peers and the originated networks.
+/// Parse a BGP neighbour address: an IPv4 or IPv6 address, optionally with an IPv6
+/// link-local interface scope (`fe80::1%eth0`). Returns the address and, for a scoped
+/// link-local, the interface's index (so the connector can dial `fe80::/10`).
+fn parse_neighbor_addr(s: &str) -> Result<(std::net::IpAddr, Option<u32>)> {
+    let (addr_part, scope) = match s.split_once('%') {
+        Some((a, ifname)) => (a, Some(ifname)),
+        None => (s, None),
+    };
+    let addr: std::net::IpAddr = addr_part
+        .parse()
+        .with_context(|| format!("bgp neighbor address {s:?} must be an IP address"))?;
+    let scope_id = match scope {
+        Some(ifname) => {
+            let cstr = std::ffi::CString::new(ifname)
+                .with_context(|| format!("bgp neighbor interface {ifname:?} is not a valid name"))?;
+            // SAFETY: `cstr` is a valid NUL-terminated C string; if_nametoindex reads it.
+            let idx = unsafe { libc::if_nametoindex(cstr.as_ptr()) };
+            if idx == 0 {
+                anyhow::bail!("bgp neighbor interface {ifname:?} not found (for address {s:?})");
+            }
+            Some(idx)
+        }
+        None => None,
+    };
+    Ok((addr, scope_id))
+}
+
 fn build_bgp_config(
     cfg: &wren_config::Config,
     bgp: &wren_config::Bgp,
@@ -749,23 +776,32 @@ fn build_bgp_config(
 
     let mut peers = Vec::with_capacity(bgp.neighbor.len());
     for n in &bgp.neighbor {
-        let addr: Ipv4Addr = n
-            .address
-            .parse()
-            .with_context(|| format!("bgp neighbor address {:?} must be IPv4", n.address))?;
-        if let Some(pw) = &n.password {
+        // The transport address: IPv4, or IPv6 for an unnumbered/RFC 5549 session. An
+        // IPv6 link-local may carry an interface scope (`fe80::1%eth0`) to dial it on.
+        let (addr, scope_id) = parse_neighbor_addr(&n.address)?;
+        // TCP-MD5 (RFC 2385) and TCP-AO (RFC 5925) are wired for IPv4 transport only
+        // here; on an IPv6 peer a configured key is ignored (with a warning).
+        let (password, ao_key) = if addr.is_ipv4() {
+            (n.password.clone(), n.ao_key.clone())
+        } else {
+            if n.password.is_some() || n.ao_key.is_some() {
+                tracing::warn!(peer = %addr, "TCP-MD5/AO is IPv4-only; ignoring the key on this IPv6 (unnumbered) BGP peer");
+            }
+            (None, None)
+        };
+        if let Some(pw) = &password {
             if pw.is_empty() || pw.len() > 80 {
                 anyhow::bail!(
                     "bgp neighbor {addr} password must be 1..=80 bytes (TCP-MD5, RFC 2385)"
                 );
             }
         }
-        if let Some(key) = &n.ao_key {
+        if let Some(key) = &ao_key {
             if key.is_empty() || key.len() > 80 {
                 anyhow::bail!("bgp neighbor {addr} ao-key must be 1..=80 bytes (TCP-AO, RFC 5925)");
             }
         }
-        if n.password.is_some() && n.ao_key.is_some() {
+        if password.is_some() && ao_key.is_some() {
             anyhow::bail!(
                 "bgp neighbor {addr} cannot use both password (TCP-MD5) and ao-key (TCP-AO)"
             );
@@ -780,12 +816,13 @@ fn build_bgp_config(
         };
         peers.push(bgp::BgpPeerCfg {
             addr,
+            scope_id,
             remote_as: n.remote_as,
             passive: n.passive,
             rr_client: n.route_reflector_client,
             ttl_security: n.ttl_security,
-            password: n.password.clone(),
-            ao_key: n.ao_key.clone(),
+            password,
+            ao_key,
             ao_key_id: n.ao_key_id.unwrap_or(100),
             max_prefix: n.max_prefix.filter(|&m| m > 0),
             default_originate: n.default_originate,

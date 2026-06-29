@@ -55,8 +55,9 @@ pub struct Path {
     pub igp_metric: u32,
     /// The peer's BGP identifier (router id), a tie-break.
     pub peer_id: Ipv4Addr,
-    /// The peer's address, the final tie-break.
-    pub peer_addr: Ipv4Addr,
+    /// The peer's transport address (IPv4 or IPv6, RFC 5549 unnumbered), the final
+    /// tie-break.
+    pub peer_addr: IpAddr,
     /// Whether this path was learned from a route-reflector client (RFC 4456). Set
     /// by the reflector to decide reflection; not part of the comparison.
     pub from_client: bool,
@@ -172,8 +173,8 @@ pub fn is_better(a: &Path, b: &Path) -> bool {
     if a.peer_id != b.peer_id {
         return u32::from(a.peer_id) < u32::from(b.peer_id);
     }
-    // 9. Lowest peer address.
-    u32::from(a.peer_addr) < u32::from(b.peer_addr)
+    // 9. Lowest peer address (IPv4 sorts before IPv6, then numerically).
+    a.peer_addr < b.peer_addr
 }
 
 /// The index of the best path in `paths`, or `None` if it is empty.
@@ -212,7 +213,7 @@ mod tests {
             peer_as: 65001,
             igp_metric: 10,
             peer_id: ip([10, 0, 0, 1]),
-            peer_addr: ip([10, 0, 0, 1]),
+            peer_addr: IpAddr::V4(ip([10, 0, 0, 1])),
             from_client: false,
             originator_id: None,
             cluster_list: vec![],

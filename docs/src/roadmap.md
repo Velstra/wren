@@ -64,7 +64,11 @@ implemented to its RFC.
   MP_REACH_NLRI (AFI IPv4) with an IPv6 next-hop-self, and a received IPv4 route with
   an IPv6 next hop is installed via that gateway using the kernel's `RTA_VIA`
   (`via inet6 …`) — live-verified by `scripts/bgp-extended-nexthop-smoke.sh` against
-  the real kernel FIB
+  the real kernel FIB — and **full unnumbered (IPv6 transport)**: the BGP TCP session
+  itself rides IPv6 (a neighbour `address` may be an IPv6 literal, or a link-local
+  `fe80::1%eth0` with an interface scope), bound on a single dual-stack listener, with
+  the BGP Identifier still a 32-bit `router-id` — live-verified over an IPv6-only veth
+  (no IPv4 on the link) by `scripts/bgp-unnumbered-smoke.sh`
 - [x] **Babel** (RFC 8966) — loop-avoiding distance-vector over IPv6 (UDP 6696,
   `ff02::1:6`), with the feasibility condition and Hello/IHU link costing
 - [x] **OSPFv3** (RFC 5340) — OSPF for IPv6, end to end. The `wren-ospfv3` library
@@ -211,9 +215,9 @@ tracked but not yet scheduled, grouped by area:
   (RFC 7854), FlowSpec (RFC 8955), RPKI origin validation, RTC (RFC 4684).
   (**Extended Next Hop / IPv4-over-IPv6** (RFC 5549 / RFC 8950) — advertising IPv4
   routes with an IPv6 next hop and installing them via the kernel's `RTA_VIA`,
-  negotiated per neighbour with `extended-nexthop = true` — is **done** (the BGP
-  transport itself is still IPv4; full unnumbered over an IPv6-only session is a
-  future extension). **ADD-PATH** (RFC 7911) — advertising and keeping several paths
+  negotiated per neighbour with `extended-nexthop = true` — is **done**, including
+  **full unnumbered**: the BGP session may run over an IPv6 (or link-local
+  `fe80::…%iface`) transport on an IPv6-only link. **ADD-PATH** (RFC 7911) — advertising and keeping several paths
   per prefix, each under a 4-octet Path Identifier, negotiated per neighbour with
   `add-path = true` for IPv4 unicast — is **done** (IPv6/MP add-path is a future
   extension). Per-peer `default-originate` — advertising `0.0.0.0/0` to a neighbour —

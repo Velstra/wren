@@ -12,7 +12,7 @@
 //! whole select-and-diff cycle is unit-testable without sockets.
 
 use std::collections::BTreeMap;
-use std::net::Ipv4Addr;
+use std::net::IpAddr;
 
 use wren_core::{NextHop, Prefix};
 
@@ -49,7 +49,7 @@ pub struct BgpRib {
     /// Without ADD-PATH a peer offers one path per destination (`path_id` 0); with
     /// ADD-PATH (RFC 7911) it can offer several, each under a distinct received Path
     /// Identifier, and all of them coexist here as candidates for selection.
-    entries: BTreeMap<Prefix, BTreeMap<(Ipv4Addr, u32), Path>>,
+    entries: BTreeMap<Prefix, BTreeMap<(IpAddr, u32), Path>>,
     /// Loc-RIB: the selected best path per destination (for change detection).
     best: BTreeMap<Prefix, Path>,
     /// The equal-cost next-hop set last emitted per destination — tracked so a
@@ -86,7 +86,7 @@ impl BgpRib {
 
     /// Record (or replace) the path `peer` offers for `prefix` (with no ADD-PATH
     /// Path Identifier), re-select the best, and return the resulting change.
-    pub fn update(&mut self, peer: Ipv4Addr, prefix: Prefix, path: Path) -> Option<RibEvent> {
+    pub fn update(&mut self, peer: IpAddr, prefix: Prefix, path: Path) -> Option<RibEvent> {
         self.update_with_id(peer, 0, prefix, path)
     }
 
@@ -96,7 +96,7 @@ impl BgpRib {
     /// resulting change.
     pub fn update_with_id(
         &mut self,
-        peer: Ipv4Addr,
+        peer: IpAddr,
         path_id: u32,
         prefix: Prefix,
         path: Path,
@@ -107,7 +107,7 @@ impl BgpRib {
 
     /// Withdraw the path `peer` offered for `prefix` (Path Identifier 0), re-select
     /// the best, and return the resulting change, if any.
-    pub fn withdraw(&mut self, peer: Ipv4Addr, prefix: Prefix) -> Option<RibEvent> {
+    pub fn withdraw(&mut self, peer: IpAddr, prefix: Prefix) -> Option<RibEvent> {
         self.withdraw_with_id(peer, 0, prefix)
     }
 
@@ -115,7 +115,7 @@ impl BgpRib {
     /// `path_id` (RFC 7911), re-select the best, and return the resulting change.
     pub fn withdraw_with_id(
         &mut self,
-        peer: Ipv4Addr,
+        peer: IpAddr,
         path_id: u32,
         prefix: Prefix,
     ) -> Option<RibEvent> {
@@ -130,7 +130,7 @@ impl BgpRib {
 
     /// Drop every path learned from `peer` (a session went down), returning the
     /// changes for each affected prefix.
-    pub fn withdraw_peer(&mut self, peer: Ipv4Addr) -> Vec<RibEvent> {
+    pub fn withdraw_peer(&mut self, peer: IpAddr) -> Vec<RibEvent> {
         let affected: Vec<Prefix> = self
             .entries
             .iter()
@@ -155,7 +155,7 @@ impl BgpRib {
     /// Every destination for which `peer` currently offers a path (its Adj-RIB-In
     /// entries). Used by a graceful-restart helper to mark a peer's routes stale
     /// when its session drops, without removing them (RFC 4724).
-    pub fn prefixes_from(&self, peer: Ipv4Addr) -> Vec<Prefix> {
+    pub fn prefixes_from(&self, peer: IpAddr) -> Vec<Prefix> {
         self.entries
             .iter()
             .filter(|(_, peers)| peers.keys().any(|(p, _)| *p == peer))
@@ -167,7 +167,7 @@ impl BgpRib {
     /// selected best), in deterministic `(peer, path_id)` order. The ADD-PATH send
     /// side advertises all of these — each under a Path Identifier it assigns — so a
     /// peer learns more than the single best path (RFC 7911).
-    pub fn paths(&self, prefix: &Prefix) -> Vec<((Ipv4Addr, u32), &Path)> {
+    pub fn paths(&self, prefix: &Prefix) -> Vec<((IpAddr, u32), &Path)> {
         self.entries
             .get(prefix)
             .map(|peers| peers.iter().map(|(k, v)| (*k, v)).collect())
@@ -183,7 +183,7 @@ impl BgpRib {
     /// `(prefix, peer, received-path-id, path)`, in `(prefix, peer, path-id)` order.
     /// With ADD-PATH (RFC 7911) a destination can have several — used by
     /// `show bgp paths` to list them.
-    pub fn iter_paths(&self) -> impl Iterator<Item = (&Prefix, Ipv4Addr, u32, &Path)> {
+    pub fn iter_paths(&self) -> impl Iterator<Item = (&Prefix, IpAddr, u32, &Path)> {
         self.entries
             .iter()
             .flat_map(|(pfx, peers)| peers.iter().map(move |(&(peer, id), path)| (pfx, peer, id, path)))
@@ -264,8 +264,14 @@ mod tests {
     use super::*;
     use crate::attr::{AsPathSegment, Origin};
     use crate::decision::DEFAULT_LOCAL_PREF;
+    use std::net::Ipv4Addr;
 
-    fn ip(o: [u8; 4]) -> Ipv4Addr {
+    /// A transport peer address (IPv4, but typed as `IpAddr` for the RIB keys).
+    fn ip(o: [u8; 4]) -> IpAddr {
+        IpAddr::V4(Ipv4Addr::from(o))
+    }
+    /// A 32-bit BGP identifier (router id).
+    fn id(o: [u8; 4]) -> Ipv4Addr {
         Ipv4Addr::from(o)
     }
     fn pfx(s: &str) -> Prefix {
@@ -276,7 +282,7 @@ mod tests {
         Path {
             origin: Origin::Igp,
             as_path: vec![AsPathSegment::Sequence(vec![65001])],
-            next_hop: std::net::IpAddr::V4(ip(peer)),
+            next_hop: ip(peer),
             next_hop_iface: None,
             local_pref,
             med: 0,
@@ -284,7 +290,7 @@ mod tests {
             from_confed: false,
             peer_as: 65001,
             igp_metric: 10,
-            peer_id: ip(peer),
+            peer_id: id(peer),
             peer_addr: ip(peer),
             from_client: false,
             originator_id: None,
@@ -362,7 +368,7 @@ mod tests {
     }
 
     fn hop(o: [u8; 4]) -> NextHop {
-        NextHop::via(std::net::IpAddr::V4(ip(o)))
+        NextHop::via(ip(o))
     }
 
     #[test]

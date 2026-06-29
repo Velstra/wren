@@ -494,6 +494,40 @@ the kernel — verified against the real kernel FIB. (The genuinely-missing data
 piece, the kernel `RTA_VIA` encoding for a cross-family gateway, lives in
 `wren-netlink` and has its own kernel-acceptance test.)
 
+### IPv6 transport (true unnumbered)
+
+The same neighbour can be reached over an **IPv6** transport — the BGP TCP session
+itself rides IPv6, on a link that need not have any IPv4 address at all. Give the
+neighbour an IPv6 `address`; combined with `extended-nexthop` and `next-hop6`, IPv4
+routes still flow across the link (carried in MP_REACH_NLRI as above):
+
+```toml
+[[bgp.neighbor]]
+address          = "2001:db8::2"     # IPv6 transport — the session rides IPv6
+remote-as        = 65002
+extended-nexthop = true
+```
+
+A **link-local** peer address needs the egress interface as a scope, written with the
+usual `%iface` suffix:
+
+```toml
+address = "fe80::1%eth0"
+```
+
+The `router-id` stays a 32-bit value (a dotted quad) even for an IPv6 session — it is
+the BGP Identifier, not a transport address. Wren binds a single dual-stack listener
+(`[::]:179`, accepting both IPv4-mapped and IPv6 inbound), and the §6.8
+connection-collision logic still keys on the BGP Identifier, so a mixed v4/v6 peering
+set behaves identically. **TCP-MD5 / TCP-AO** (below) are wired for IPv4 transport only
+here; a key configured on an IPv6 peer is ignored with a warning (IPv6 transport
+authentication is future work).
+
+`scripts/bgp-unnumbered-smoke.sh` exercises it live (rootless): two routers peer over
+an **IPv6-only** veth — no IPv4 on the link whatsoever — the session reaches
+Established over IPv6, and one router still installs the other's IPv4 prefix
+`10.99.0.0/24 via inet6 fe80::… dev veth0` in the kernel.
+
 ## Propagation (transit)
 
 Beyond originating its own `network`s and redistributed routes, Wren **propagates**
