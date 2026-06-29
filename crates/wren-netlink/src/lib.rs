@@ -44,7 +44,13 @@ const NLM_F_DUMP: u16 = 0x0100 | 0x0200;
 const NLMSG_ERROR: u16 = 2;
 const NLMSG_DONE: u16 = 3;
 
+// The main table id (254); now only referenced by tests (routes carry their own
+// table), but kept named for clarity at the call sites.
+#[allow(dead_code)]
 const RT_TABLE_MAIN: u8 = 254;
+/// The "unspecified" table (0): set in `rtm_table` when the real id is carried in the
+/// `RTA_TABLE` attribute, for table ids that do not fit the one-octet field (> 255).
+const RT_TABLE_UNSPEC: u8 = 0;
 const RTN_UNICAST: u8 = 1;
 const RT_SCOPE_UNIVERSE: u8 = 0;
 const RT_SCOPE_LINK: u8 = 253;
@@ -54,6 +60,9 @@ const RTA_OIF: u16 = 4;
 const RTA_GATEWAY: u16 = 5;
 const RTA_PRIORITY: u16 = 6;
 const RTA_MULTIPATH: u16 = 9;
+/// `RTA_TABLE`: the 32-bit routing-table id, for VRF tables that exceed the one-octet
+/// `rtm_table` field (and read back to learn which VRF a dumped route is in).
+const RTA_TABLE: u16 = 15;
 /// `RTA_VIA` (RFC 5549 in the kernel): a next-hop gateway in a *different* address
 /// family from the route's destination — an IPv4 route reached via an IPv6 gateway.
 /// Its payload is a `struct rtvia` = a 2-octet family followed by the gateway octets,
@@ -168,9 +177,10 @@ fn nexthop_from_gw(
 }
 
 /// Parse one `RTM_NEWROUTE` message (header + rtmsg + rtattrs) into a [`Route`],
-/// keeping only **main-table unicast** routes tagged with a protocol id Wren owns
-/// ([`owned_protocol`]). Returns `None` for anything else — a foreign route, a
-/// route in another table, or one we cannot represent.
+/// keeping only **unicast** routes tagged with a protocol id Wren owns
+/// ([`owned_protocol`]) — in any table, so a VRF's routes are reconciled too. The
+/// route's table (VRF) is recorded in [`Route::table`]. Returns `None` for anything
+/// else — a foreign route, or one we cannot represent.
 fn parse_route(msg: &[u8]) -> Option<Route> {
     if msg.len() < NLMSGHDR_LEN + RTMSG_LEN {
         return None;
@@ -180,10 +190,11 @@ fn parse_route(msg: &[u8]) -> Option<Route> {
     }
     let family = msg[16];
     let dst_len = msg[17];
-    let table = msg[20];
+    // The one-octet table id; a larger one (a VRF) overrides it from RTA_TABLE below.
+    let mut table = msg[20] as u32;
     let protocol = owned_protocol(msg[21])?;
     let rtn_type = msg[23];
-    if table != RT_TABLE_MAIN || rtn_type != RTN_UNICAST {
+    if rtn_type != RTN_UNICAST {
         return None;
     }
 
@@ -208,6 +219,9 @@ fn parse_route(msg: &[u8]) -> Option<Route> {
             RTA_GATEWAY => gw = Some(data),
             RTA_VIA => via = Some(data),
             RTA_MULTIPATH => mp = Some(data),
+            RTA_TABLE if data.len() == 4 => {
+                table = u32::from_ne_bytes([data[0], data[1], data[2], data[3]])
+            }
             RTA_OIF if data.len() == 4 => {
                 oif = Some(u32::from_ne_bytes([data[0], data[1], data[2], data[3]]))
             }
@@ -240,6 +254,7 @@ fn parse_route(msg: &[u8]) -> Option<Route> {
     }
     Some(Route {
         prefix,
+        table,
         nexthops,
         protocol,
         preference: protocol.default_preference(),
@@ -410,6 +425,7 @@ fn build_route_msg(
     flags: u16,
     seq: u32,
     prefix: &Prefix,
+    table: u32,
     route: Option<&Route>,
 ) -> Vec<u8> {
     let mut buf = vec![0u8; NLMSGHDR_LEN + RTMSG_LEN];
@@ -419,7 +435,13 @@ fn build_route_msg(
     buf[16] = af(&dst); // rtm_family
     buf[17] = prefix.len(); // rtm_dst_len
                             // 18 rtm_src_len, 19 rtm_tos = 0
-    buf[20] = RT_TABLE_MAIN; // rtm_table
+    // The VRF's table id: it fits the one-octet rtm_table field up to 255; a larger
+    // id sets rtm_table to "unspecified" and travels in the RTA_TABLE attribute below.
+    buf[20] = if table <= u8::MAX as u32 {
+        table as u8
+    } else {
+        RT_TABLE_UNSPEC
+    };
     buf[21] = route.map(|r| rtprot(r.protocol)).unwrap_or(RTPROT_STATIC); // rtm_protocol
                                                                           // Universe scope if any next-hop has a gateway; link scope for purely
                                                                           // on-link routes (a connected/dev route the kernel forwards directly).
@@ -438,6 +460,10 @@ fn build_route_msg(
     // Destination (omitted for the default route, where dst_len == 0).
     if prefix.len() > 0 {
         push_attr(&mut buf, RTA_DST, &addr_octets(&dst));
+    }
+    // A VRF table id that did not fit rtm_table travels here.
+    if table > u8::MAX as u32 {
+        push_attr(&mut buf, RTA_TABLE, &table.to_ne_bytes());
     }
     if let Some(r) = route {
         // A single next-hop goes in the top-level RTA_GATEWAY/RTA_OIF; several
@@ -583,9 +609,10 @@ impl KernelFib {
         s
     }
 
-    /// Dump the main routing table and return the routes tagged with one of Wren's
-    /// own protocol ids (see [`owned_protocol`]) — the routes a previous Wren
-    /// instance installed. Foreign routes (kernel, DHCP, …) are skipped.
+    /// Dump every routing table and return the routes tagged with one of Wren's own
+    /// protocol ids (see [`owned_protocol`]) — the routes a previous Wren instance
+    /// installed, in the main table or any VRF table (each route carries its table).
+    /// Foreign routes (kernel, DHCP, …) are skipped.
     fn dump_owned(&mut self) -> Result<Vec<Route>, FibError> {
         // An `RTM_GETROUTE` dump request: an rtmsg with `AF_UNSPEC` so the kernel
         // walks both address families.
@@ -663,11 +690,17 @@ impl Fib for KernelFib {
                 NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_REPLACE,
                 seq,
                 &route.prefix,
+                route.table,
                 Some(route),
             ),
-            FibChange::Remove(prefix) => {
-                build_route_msg(RTM_DELROUTE, NLM_F_REQUEST | NLM_F_ACK, seq, prefix, None)
-            }
+            FibChange::Remove { table, prefix } => build_route_msg(
+                RTM_DELROUTE,
+                NLM_F_REQUEST | NLM_F_ACK,
+                seq,
+                prefix,
+                *table,
+                None,
+            ),
         };
         self.request(&msg)
     }
@@ -710,6 +743,7 @@ mod tests {
             NLM_F_REQUEST | NLM_F_ACK,
             42,
             &route.prefix,
+            route.table,
             Some(&route),
         );
 
@@ -744,7 +778,7 @@ mod tests {
             vec![NextHop::via("192.0.2.1".parse().unwrap())],
             0,
         );
-        let msg = build_route_msg(RTM_NEWROUTE, 0, 1, &def.prefix, Some(&def));
+        let msg = build_route_msg(RTM_NEWROUTE, 0, 1, &def.prefix, def.table, Some(&def));
         assert_eq!(msg[17], 0); // dst_len 0
         assert!(!has_attr(&msg, RTA_DST, &[])); // no RTA_DST for the default route
 
@@ -754,7 +788,7 @@ mod tests {
             vec![NextHop::dev("eth0")],
             0,
         );
-        let msg = build_route_msg(RTM_NEWROUTE, 0, 2, &onlink.prefix, Some(&onlink));
+        let msg = build_route_msg(RTM_NEWROUTE, 0, 2, &onlink.prefix, onlink.table, Some(&onlink));
         assert_eq!(msg[22], RT_SCOPE_LINK); // no gateway → link scope
         assert_eq!(msg[21], RTPROT_KERNEL); // connected → kernel proto
     }
@@ -766,11 +800,30 @@ mod tests {
             NLM_F_REQUEST | NLM_F_ACK,
             1,
             &p("10.0.0.0/24"),
+            RT_TABLE_MAIN as u32,
             None,
         );
         assert_eq!(u16::from_ne_bytes([msg[4], msg[5]]), RTM_DELROUTE);
         assert!(has_attr(&msg, RTA_DST, &[10, 0, 0, 0]));
         assert!(!has_attr(&msg, RTA_GATEWAY, &[])); // no next-hop on a delete
+    }
+
+    #[test]
+    fn vrf_table_in_rtm_table_byte_and_rta_table_attr() {
+        let nh = || vec![NextHop::via("192.0.2.1".parse().unwrap())];
+        // A small VRF table fits the one-octet rtm_table field, no RTA_TABLE.
+        let r = Route::new(p("10.0.0.0/24"), Protocol::Static, nh(), 0).with_table(100);
+        let msg = build_route_msg(RTM_NEWROUTE, 0, 1, &r.prefix, r.table, Some(&r));
+        assert_eq!(msg[20], 100);
+        assert!(!has_attr(&msg, RTA_TABLE, &100u32.to_ne_bytes()));
+        assert_eq!(parse_route(&msg), Some(r));
+
+        // A large VRF table travels in RTA_TABLE with rtm_table = unspecified.
+        let r = Route::new(p("10.0.0.0/24"), Protocol::Static, nh(), 0).with_table(100_000);
+        let msg = build_route_msg(RTM_NEWROUTE, 0, 1, &r.prefix, r.table, Some(&r));
+        assert_eq!(msg[20], RT_TABLE_UNSPEC);
+        assert!(has_attr(&msg, RTA_TABLE, &100_000u32.to_ne_bytes()));
+        assert_eq!(parse_route(&msg), Some(r));
     }
 
     #[test]
@@ -781,7 +834,7 @@ mod tests {
             vec![NextHop::via("192.0.2.1".parse().unwrap())],
             7,
         );
-        let msg = build_route_msg(RTM_NEWROUTE, 0, 1, &route.prefix, Some(&route));
+        let msg = build_route_msg(RTM_NEWROUTE, 0, 1, &route.prefix, route.table, Some(&route));
         // A built message parses straight back to the same route (proto, prefix,
         // gateway, metric all preserved).
         assert_eq!(parse_route(&msg), Some(route));
@@ -795,7 +848,7 @@ mod tests {
             vec![NextHop::via("192.0.2.1".parse().unwrap())],
             0,
         );
-        let msg = build_route_msg(RTM_NEWROUTE, 0, 1, &def.prefix, Some(&def));
+        let msg = build_route_msg(RTM_NEWROUTE, 0, 1, &def.prefix, def.table, Some(&def));
         let got = parse_route(&msg).expect("default route parses");
         assert!(got.prefix.is_default());
         assert_eq!(got.protocol, Protocol::Bgp);
@@ -809,7 +862,7 @@ mod tests {
             vec![NextHop::via("fe80::1".parse().unwrap())],
             3,
         );
-        let msg = build_route_msg(RTM_NEWROUTE, 0, 1, &route.prefix, Some(&route));
+        let msg = build_route_msg(RTM_NEWROUTE, 0, 1, &route.prefix, route.table, Some(&route));
         assert_eq!(parse_route(&msg), Some(route));
     }
 
@@ -824,7 +877,7 @@ mod tests {
             vec![NextHop::via("2001:db8::2".parse().unwrap())],
             0,
         );
-        let msg = build_route_msg(RTM_NEWROUTE, 0, 1, &route.prefix, Some(&route));
+        let msg = build_route_msg(RTM_NEWROUTE, 0, 1, &route.prefix, route.table, Some(&route));
         // The cross-family gateway is in RTA_VIA, and there is no top-level RTA_GATEWAY.
         assert!(has_attr(&msg, RTA_VIA, &[]));
         assert!(!has_attr(&msg, RTA_GATEWAY, &[]));
@@ -951,7 +1004,7 @@ mod tests {
             ],
             20,
         );
-        let msg = build_route_msg(RTM_NEWROUTE, 0, 1, &route.prefix, Some(&route));
+        let msg = build_route_msg(RTM_NEWROUTE, 0, 1, &route.prefix, route.table, Some(&route));
         // Two next-hops are encoded as RTA_MULTIPATH, not a top-level RTA_GATEWAY.
         assert!(has_attr(&msg, RTA_MULTIPATH, &[]));
         assert!(!has_attr(&msg, RTA_GATEWAY, &[]));
@@ -971,7 +1024,7 @@ mod tests {
             vec![NextHop::via("192.0.2.1".parse().unwrap())],
             0,
         );
-        let msg = build_route_msg(RTM_NEWROUTE, 0, 1, &connected.prefix, Some(&connected));
+        let msg = build_route_msg(RTM_NEWROUTE, 0, 1, &connected.prefix, connected.table, Some(&connected));
         assert_eq!(parse_route(&msg), None);
     }
 

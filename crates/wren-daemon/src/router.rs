@@ -89,6 +89,20 @@ pub enum Query {
     /// Render the RIB's Prometheus metrics (`show metrics`): best-route counts by
     /// origin protocol.
     Metrics,
+    /// List the configured VRFs and the number of best routes in each (`show vrf`).
+    Vrfs,
+}
+
+/// A configured VRF, as the router needs it to answer `show vrf`: its name, kernel
+/// routing table and (optional) Route Distinguisher identity.
+#[derive(Debug, Clone)]
+pub struct VrfInfo {
+    /// The VRF's name.
+    pub name: String,
+    /// Its kernel routing table.
+    pub table: u32,
+    /// Its Route Distinguisher, rendered (RFC 4364), if configured.
+    pub rd: Option<String>,
 }
 
 /// A [`Query`] paired with the channel to deliver its rendered answer on.
@@ -106,6 +120,7 @@ pub struct QueryRequest {
 /// against a shutdown signal in `tokio::select!`). Besides protocol `updates`, the
 /// loop also answers read-only `queries` from the control socket out of the RIB it
 /// owns — keeping best-path, FIB programming and `show` all single-threaded.
+#[allow(clippy::too_many_arguments)] // the router wires together every cross-cutting input
 pub async fn run(
     rib: &mut Rib,
     fib: &mut dyn Fib,
@@ -113,11 +128,12 @@ pub async fn run(
     imports: &ImportFilters,
     fib_export: Option<&Filter>,
     redist: &[RedistTarget],
+    vrfs: &[VrfInfo],
     mut queries: mpsc::Receiver<QueryRequest>,
 ) {
     // The prefixes we have actually programmed into the FIB, so the export filter's
     // accept→reject transition can withdraw a previously-installed route.
-    let mut programmed: HashSet<Prefix> = HashSet::new();
+    let mut programmed: HashSet<(u32, Prefix)> = HashSet::new();
     loop {
         tokio::select! {
             update = updates.recv() => match update {
@@ -131,7 +147,7 @@ pub async fn run(
                 None => break, // every protocol sender dropped — shut the router down
             },
             Some(req) = queries.recv() => {
-                let _ = req.respond.send(answer_query(rib, &req.query));
+                let _ = req.respond.send(answer_query(rib, vrfs, &req.query));
             }
         }
     }
@@ -182,11 +198,34 @@ async fn redistribute(targets: &[RedistTarget], event: &RedistEvent) {
 }
 
 /// Render the answer to a [`Query`] as the text the control client prints.
-fn answer_query(rib: &Rib, query: &Query) -> String {
+fn answer_query(rib: &Rib, vrfs: &[VrfInfo], query: &Query) -> String {
     match query {
         Query::Routes { protocol } => render_routes(rib, *protocol),
         Query::Metrics => render_router_metrics(rib),
+        Query::Vrfs => render_vrfs(rib, vrfs),
     }
+}
+
+/// Render `show vrf`: every configured VRF with its table, Route Distinguisher and
+/// the number of best routes the RIB currently holds in its table.
+pub fn render_vrfs(rib: &Rib, vrfs: &[VrfInfo]) -> String {
+    if vrfs.is_empty() {
+        return "no vrfs configured\n".to_string();
+    }
+    let mut out = String::new();
+    let _ = writeln!(out, "{:<16} {:>8} {:<20} {:>6}", "vrf", "table", "rd", "routes");
+    for v in vrfs {
+        let count = rib.iter_best().filter(|r| r.table == v.table).count();
+        let _ = writeln!(
+            out,
+            "{:<16} {:>8} {:<20} {:>6}",
+            v.name,
+            v.table,
+            v.rd.as_deref().unwrap_or("-"),
+            count,
+        );
+    }
+    out
 }
 
 /// Render the RIB as Prometheus metrics: the number of best routes by origin
@@ -232,6 +271,9 @@ pub fn render_routes(rib: &Rib, protocol: Option<Protocol>) -> String {
                 let _ = write!(out, " dev {dev}");
             }
         }
+        if route.table != wren_core::RT_TABLE_MAIN {
+            let _ = write!(out, " table {}", route.table);
+        }
         let _ = writeln!(
             out,
             " proto {} metric {}",
@@ -261,24 +303,27 @@ fn apply(
     update: RouteUpdate,
     imports: &ImportFilters,
     fib_export: Option<&Filter>,
-    programmed: &mut HashSet<Prefix>,
+    programmed: &mut HashSet<(u32, Prefix)>,
 ) -> Option<RedistEvent> {
     let change = match update {
         RouteUpdate::Announce(route) => {
-            let (prefix, protocol, source) = (route.prefix, route.protocol, route.source);
+            let (table, prefix, protocol, source) =
+                (route.table, route.prefix, route.protocol, route.source);
             match apply_import(imports, route) {
                 Decision::Accept(route) => rib.update(route),
                 Decision::Reject => {
                     debug!(%prefix, protocol = protocol.name(), "route rejected by import filter");
-                    rib.withdraw(prefix, protocol, source)
+                    rib.withdraw(table, prefix, protocol, source)
                 }
             }
         }
+        // A dynamic protocol's withdraw is for the default VRF (the main table); VRF
+        // routes are static-seeded and not withdrawn at runtime.
         RouteUpdate::Withdraw {
             prefix,
             protocol,
             source,
-        } => rib.withdraw(prefix, protocol, source),
+        } => rib.withdraw(wren_core::RT_TABLE_MAIN, prefix, protocol, source),
     };
 
     let change = change?; // the installed best route did not change
@@ -288,7 +333,7 @@ fn apply(
     // even though they are not programmed into the kernel here).
     let event = match &change {
         FibChange::Install(route) => RedistEvent::Changed(route.clone()),
-        FibChange::Remove(prefix) => RedistEvent::Gone(*prefix),
+        FibChange::Remove { prefix, .. } => RedistEvent::Gone(*prefix),
     };
     program_fib(fib, change, fib_export, programmed);
     Some(event)
@@ -301,7 +346,7 @@ fn program_fib(
     fib: &mut dyn Fib,
     change: FibChange,
     fib_export: Option<&Filter>,
-    programmed: &mut HashSet<Prefix>,
+    programmed: &mut HashSet<(u32, Prefix)>,
 ) {
     match change {
         FibChange::Install(route) => {
@@ -318,20 +363,22 @@ fn program_fib(
                     Decision::Accept(r) => r,
                     Decision::Reject => {
                         debug!(prefix = %route.prefix, "route rejected by FIB export filter");
-                        // If we had programmed this prefix, withdraw it now.
-                        if programmed.remove(&route.prefix) {
-                            remove_from_fib(fib, route.prefix);
+                        // If we had programmed this (vrf, prefix), withdraw it now.
+                        if programmed.remove(&(route.table, route.prefix)) {
+                            remove_from_fib(fib, route.table, route.prefix);
                         }
                         return;
                     }
                 },
                 None => route,
             };
+            let key = (route.table, route.prefix);
             match fib.apply(&FibChange::Install(route.clone())) {
                 Ok(()) => {
-                    programmed.insert(route.prefix);
+                    programmed.insert(key);
                     info!(
                         prefix = %route.prefix,
+                        table = route.table,
                         protocol = route.protocol.name(),
                         metric = route.metric,
                         "route installed",
@@ -340,22 +387,22 @@ fn program_fib(
                 Err(e) => warn!(error = %e, "applying FIB change"),
             }
         }
-        FibChange::Remove(prefix) => {
+        FibChange::Remove { table, prefix } => {
             // Skip prefixes we never programmed (e.g. export-rejected ones), so we
             // don't issue spurious kernel deletes.
-            if fib_export.is_some() && !programmed.contains(&prefix) {
+            if fib_export.is_some() && !programmed.contains(&(table, prefix)) {
                 return;
             }
-            programmed.remove(&prefix);
-            remove_from_fib(fib, prefix);
+            programmed.remove(&(table, prefix));
+            remove_from_fib(fib, table, prefix);
         }
     }
 }
 
-/// Remove `prefix` from the forwarding plane, logging the outcome.
-fn remove_from_fib(fib: &mut dyn Fib, prefix: Prefix) {
-    match fib.apply(&FibChange::Remove(prefix)) {
-        Ok(()) => info!(%prefix, "route removed"),
+/// Remove `(table, prefix)` from the forwarding plane, logging the outcome.
+fn remove_from_fib(fib: &mut dyn Fib, table: u32, prefix: Prefix) {
+    match fib.apply(&FibChange::Remove { table, prefix }) {
+        Ok(()) => info!(%prefix, table, "route removed"),
         Err(e) => warn!(error = %e, "applying FIB change"),
     }
 }
@@ -375,13 +422,13 @@ fn apply_import(imports: &ImportFilters, route: Route) -> Decision {
 /// route behind. `keep` is the set of prefixes the daemon installs up front (its
 /// static routes); dynamic protocols re-install theirs as they reconverge. Returns
 /// the number of routes removed.
-pub fn reconcile_owned(fib: &mut dyn Fib, owned: Vec<Route>, keep: &HashSet<Prefix>) -> usize {
+pub fn reconcile_owned(fib: &mut dyn Fib, owned: Vec<Route>, keep: &HashSet<(u32, Prefix)>) -> usize {
     let mut removed = 0;
     for route in owned {
-        if keep.contains(&route.prefix) {
+        if keep.contains(&(route.table, route.prefix)) {
             continue;
         }
-        match fib.apply(&FibChange::Remove(route.prefix)) {
+        match fib.apply(&FibChange::Remove { table: route.table, prefix: route.prefix }) {
             Ok(()) => {
                 info!(
                     prefix = %route.prefix,
@@ -408,7 +455,7 @@ mod tests {
         fib: MemoryFib,
         imports: ImportFilters,
         export: Option<Filter>,
-        programmed: HashSet<Prefix>,
+        programmed: HashSet<(u32, Prefix)>,
     }
 
     impl Harness {
@@ -438,7 +485,9 @@ mod tests {
         }
 
         fn installed(&self, prefix: &str) -> Option<&Route> {
-            self.fib.installed.get(&prefix.parse().unwrap())
+            self.fib
+                .installed
+                .get(&(wren_core::RT_TABLE_MAIN, prefix.parse().unwrap()))
         }
     }
 
@@ -604,12 +653,13 @@ mod tests {
         .unwrap();
 
         let owned = fib.owned_routes().unwrap();
-        let keep: HashSet<Prefix> = [still_wanted].into_iter().collect();
+        let keep: HashSet<(u32, Prefix)> =
+            [(wren_core::RT_TABLE_MAIN, still_wanted)].into_iter().collect();
         let removed = reconcile_owned(&mut fib, owned, &keep);
 
         assert_eq!(removed, 1);
-        assert!(fib.installed.contains_key(&still_wanted));
-        assert!(!fib.installed.contains_key(&stale));
+        assert!(fib.installed.contains_key(&(wren_core::RT_TABLE_MAIN, still_wanted)));
+        assert!(!fib.installed.contains_key(&(wren_core::RT_TABLE_MAIN, stale)));
     }
 
     fn static_route(prefix: &str) -> Route {

@@ -22,6 +22,9 @@
 
 #![forbid(unsafe_code)]
 
+pub mod rd;
+pub use rd::RouteDistinguisher;
+
 use std::collections::BTreeMap;
 use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
@@ -296,6 +299,10 @@ impl NextHop {
     }
 }
 
+/// The Linux **main** routing table id (the default VRF). A route without an explicit
+/// VRF lives here, matching the kernel's `RT_TABLE_MAIN`.
+pub const RT_TABLE_MAIN: u32 = 254;
+
 /// A candidate route to a [`Prefix`], as offered by one protocol instance.
 ///
 /// Within the RIB, a route is identified by `(prefix, protocol, source)`:
@@ -306,6 +313,11 @@ impl NextHop {
 pub struct Route {
     /// Destination network.
     pub prefix: Prefix,
+    /// The kernel routing table the route lives in — its **VRF**. Defaults to
+    /// [`RT_TABLE_MAIN`] (the global/default VRF); a route placed in a named VRF
+    /// carries that VRF's table id, so the same prefix can exist in several VRFs at
+    /// once. Part of the route's identity (RIB and FIB are keyed by `(table, prefix)`).
+    pub table: u32,
     /// One or more next-hops (multipath when more than one).
     pub nexthops: Vec<NextHop>,
     /// The protocol that produced this route.
@@ -331,10 +343,12 @@ pub struct Route {
 }
 
 impl Route {
-    /// A route using the protocol's default preference and `source = 0`.
+    /// A route using the protocol's default preference and `source = 0`, in the
+    /// default VRF ([`RT_TABLE_MAIN`]).
     pub fn new(prefix: Prefix, protocol: Protocol, nexthops: Vec<NextHop>, metric: u32) -> Self {
         Self {
             prefix,
+            table: RT_TABLE_MAIN,
             nexthops,
             protocol,
             preference: protocol.default_preference(),
@@ -344,6 +358,12 @@ impl Route {
             large_communities: Vec::new(),
             ext_communities: Vec::new(),
         }
+    }
+
+    /// Place this route in the VRF whose kernel routing table is `table` (builder).
+    pub fn with_table(mut self, table: u32) -> Self {
+        self.table = table;
+        self
     }
 
     /// The identity used to replace/withdraw this route in the RIB.
@@ -369,10 +389,16 @@ impl Route {
 /// A change the RIB wants reflected in the forwarding plane.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum FibChange {
-    /// Install (or replace) the best route for a prefix.
+    /// Install (or replace) the best route for a `(table, prefix)` — the route
+    /// carries its own table (VRF).
     Install(Route),
-    /// Remove a prefix entirely (its last route was withdrawn).
-    Remove(Prefix),
+    /// Remove a prefix entirely from a VRF's table (its last route was withdrawn).
+    Remove {
+        /// The VRF's kernel routing table.
+        table: u32,
+        /// The prefix removed.
+        prefix: Prefix,
+    },
 }
 
 /// Per-prefix set of candidate routes from the various protocols.
@@ -401,7 +427,7 @@ impl RibEntry {
 /// to keep a [`Fib`] in sync — the caller applies them.
 #[derive(Clone, Default)]
 pub struct Rib {
-    entries: BTreeMap<Prefix, RibEntry>,
+    entries: BTreeMap<(u32, Prefix), RibEntry>,
 }
 
 impl Rib {
@@ -411,10 +437,10 @@ impl Rib {
     }
 
     /// Announce (add or replace) `route`. Returns the resulting FIB change, if
-    /// the best route for the prefix changed.
+    /// the best route for the route's `(table, prefix)` changed.
     pub fn update(&mut self, route: Route) -> Option<FibChange> {
-        let prefix = route.prefix;
-        let entry = self.entries.entry(prefix).or_default();
+        let (table, prefix) = (route.table, route.prefix);
+        let entry = self.entries.entry((table, prefix)).or_default();
         let before = entry.best().cloned();
 
         // Replace any existing candidate with the same (protocol, source).
@@ -426,25 +452,36 @@ impl Rib {
         }
 
         let after = entry.best().cloned();
-        Self::diff(prefix, before, after)
+        Self::diff(table, prefix, before, after)
     }
 
-    /// Withdraw the route for `prefix` owned by `(protocol, source)`. Returns the
-    /// resulting FIB change, if the best route changed (or the prefix emptied).
-    pub fn withdraw(&mut self, prefix: Prefix, protocol: Protocol, source: u64) -> Option<FibChange> {
-        let entry = self.entries.get_mut(&prefix)?;
+    /// Withdraw the route for `(table, prefix)` owned by `(protocol, source)`. Returns
+    /// the resulting FIB change, if the best route changed (or the prefix emptied).
+    pub fn withdraw(
+        &mut self,
+        table: u32,
+        prefix: Prefix,
+        protocol: Protocol,
+        source: u64,
+    ) -> Option<FibChange> {
+        let entry = self.entries.get_mut(&(table, prefix))?;
         let before = entry.best().cloned();
         entry.candidates.retain(|c| c.key() != (protocol, source));
         let after = entry.best().cloned();
         if entry.candidates.is_empty() {
-            self.entries.remove(&prefix);
+            self.entries.remove(&(table, prefix));
         }
-        Self::diff(prefix, before, after)
+        Self::diff(table, prefix, before, after)
     }
 
-    /// The current best route for `prefix`, if any.
+    /// The current best route for `prefix` in the default VRF, if any.
     pub fn best(&self, prefix: &Prefix) -> Option<&Route> {
-        self.entries.get(prefix).and_then(RibEntry::best)
+        self.best_in(RT_TABLE_MAIN, prefix)
+    }
+
+    /// The current best route for `prefix` in the VRF whose table is `table`.
+    pub fn best_in(&self, table: u32, prefix: &Prefix) -> Option<&Route> {
+        self.entries.get(&(table, *prefix)).and_then(RibEntry::best)
     }
 
     /// Iterate every prefix's best route, in prefix order.
@@ -465,7 +502,12 @@ impl Rib {
     /// Turn a (before, after) best-route pair into the FIB change it implies:
     /// install the new best when it differs, remove when the prefix emptied,
     /// nothing when the installed route is unchanged.
-    fn diff(prefix: Prefix, before: Option<Route>, after: Option<Route>) -> Option<FibChange> {
+    fn diff(
+        table: u32,
+        prefix: Prefix,
+        before: Option<Route>,
+        after: Option<Route>,
+    ) -> Option<FibChange> {
         match after {
             Some(best) => {
                 if before.as_ref() == Some(&best) {
@@ -474,7 +516,7 @@ impl Rib {
                     Some(FibChange::Install(best))
                 }
             }
-            None => before.map(|_| FibChange::Remove(prefix)),
+            None => before.map(|_| FibChange::Remove { table, prefix }),
         }
     }
 }
@@ -524,18 +566,19 @@ pub trait Fib {
 /// per prefix. Useful for `--dry-run` and as the assertion target in tests.
 #[derive(Clone, Default)]
 pub struct MemoryFib {
-    /// The installed route per prefix.
-    pub installed: BTreeMap<Prefix, Route>,
+    /// The installed route per `(table, prefix)` — so the same prefix in two VRFs is
+    /// tracked independently.
+    pub installed: BTreeMap<(u32, Prefix), Route>,
 }
 
 impl Fib for MemoryFib {
     fn apply(&mut self, change: &FibChange) -> Result<(), FibError> {
         match change {
             FibChange::Install(r) => {
-                self.installed.insert(r.prefix, r.clone());
+                self.installed.insert((r.table, r.prefix), r.clone());
             }
-            FibChange::Remove(p) => {
-                self.installed.remove(p);
+            FibChange::Remove { table, prefix } => {
+                self.installed.remove(&(*table, *prefix));
             }
         }
         Ok(())
@@ -638,11 +681,11 @@ mod tests {
         rib.update(Route::new(dst, Protocol::Rip, vec![NextHop::via(gw("192.0.2.2"))], 5));
 
         // Withdraw the static → RIP becomes best (install change).
-        let change = rib.withdraw(dst, Protocol::Static, 0).unwrap();
+        let change = rib.withdraw(RT_TABLE_MAIN, dst, Protocol::Static, 0).unwrap();
         assert!(matches!(change, FibChange::Install(ref r) if r.protocol == Protocol::Rip));
 
         // Withdraw the last route → remove.
-        assert_eq!(rib.withdraw(dst, Protocol::Rip, 0).unwrap(), FibChange::Remove(dst));
+        assert_eq!(rib.withdraw(RT_TABLE_MAIN, dst, Protocol::Rip, 0).unwrap(), FibChange::Remove { table: RT_TABLE_MAIN, prefix: dst });
         assert!(rib.is_empty());
     }
 
@@ -656,7 +699,7 @@ mod tests {
             fib.apply(&c).unwrap();
         }
         assert_eq!(fib.installed.len(), 1);
-        if let Some(c) = rib.withdraw(dst, Protocol::Static, 0) {
+        if let Some(c) = rib.withdraw(RT_TABLE_MAIN, dst, Protocol::Static, 0) {
             fib.apply(&c).unwrap();
         }
         assert!(fib.installed.is_empty());

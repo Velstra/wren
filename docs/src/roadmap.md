@@ -176,7 +176,15 @@ implemented to its RFC.
   routes redistributed into BGP **per-prefix communities** (RFC 1997), beyond the
   global all-or-nothing `[bgp] community`, honouring the well-known `no-export` /
   `no-advertise` rules per prefix.
-- [ ] Multiple routing tables / **VRFs**
+- [~] Multiple routing tables / **VRFs** — the foundation is **done**: the RIB and
+  forwarding plane are keyed by `(table, prefix)` so overlapping prefixes coexist;
+  `[[vrf]]` defines a named VRF (kernel `table`, RFC 4364 **Route Distinguisher**, a
+  per-VRF `import`/`export` **route-map**); `[[static]] vrf = "…"` installs a static
+  into the VRF's kernel table (via rtnetlink `RTA_TABLE`); `show vrf` reports them and
+  startup reconciliation runs per table. Live-verified by `scripts/vrf-smoke.sh`
+  (static into table 100, overlapping prefix isolated per table, route-map rejection,
+  `show vrf`). Dynamic-protocol VRFs and BGP/MPLS L3VPN are the remaining work. See
+  [VRFs & Route Distinguishers](vrf.md).
 - [~] A **management interface** and operational `show` commands — the daemon
   serves a Unix-domain control socket (`--socket`, default `/run/wren/wren.sock`).
   `wren show routes [protocol]` renders the central RIB's best routes à la `ip

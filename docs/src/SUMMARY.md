@@ -20,6 +20,10 @@
 - [IS-IS](protocols/isis.md)
 - [BFD](protocols/bfd.md)
 
+# Features
+
+- [VRFs & Route Distinguishers](vrf.md)
+
 # Internals
 
 - [The Core: RIB, FIB & Embedding](core.md)

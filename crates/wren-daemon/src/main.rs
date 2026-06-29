@@ -44,8 +44,8 @@ use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
-use wren_core::{Fib, MemoryFib, Protocol, Rib};
-use wren_filter::{parse_action, Action, Filter, Match, Modify, PrefixList, Rule};
+use wren_core::{Fib, FibChange, MemoryFib, Protocol, Rib, RouteDistinguisher};
+use wren_filter::{parse_action, Action, Decision, Filter, Match, Modify, PrefixList, Rule};
 use wren_netlink::KernelFib;
 
 /// Which forwarding plane to drive.
@@ -166,7 +166,7 @@ async fn main() -> Result<()> {
     // Resolve the static routes once: their prefixes are the set we keep when
     // reconciling away a previous instance's leftover forwarding-plane routes.
     let statics = cfg.static_routes().context("resolving static routes")?;
-    let keep: HashSet<_> = statics.iter().map(|r| r.prefix).collect();
+    let keep: HashSet<_> = statics.iter().map(|r| (r.table, r.prefix)).collect();
 
     // Reconcile at startup: drop routes a previous wren instance left in the
     // forwarding plane that the current config no longer programs, so a restart
@@ -183,32 +183,52 @@ async fn main() -> Result<()> {
         Err(e) => warn!(error = %e, "reading existing routes for reconciliation failed"),
     }
 
-    // Seed the RIB with the configured static routes, programming each best-path
-    // change into the forwarding plane as it happens.
-    let mut rib = Rib::new();
-    let mut installed = 0usize;
-    for route in statics {
-        if let Some(change) = rib.update(route) {
-            fib.apply(&change).map_err(|e| anyhow::anyhow!(e))?;
-            installed += 1;
-        }
-    }
-    for r in rib.iter_best() {
-        info!(prefix = %r.prefix, protocol = r.protocol.name(), metric = r.metric, "best route");
-    }
-    info!(prefixes = installed, backend = ?backend, "static routes programmed");
-
     // Compile the configured filters and resolve the import (per-protocol, into the
-    // RIB) and export (RIB → FIB) attachments. A bad filter fails startup.
+    // RIB) and export (RIB → FIB) attachments. A bad filter fails startup. Done before
+    // seeding the statics so a VRF's route-map can be applied to its static routes.
     let by_name = compile_named_filters(&cfg).context("compiling filters")?;
     let imports = resolve_import_filters(&cfg, &by_name).context("resolving import filters")?;
     let fib_export = resolve_fib_export(&cfg, &by_name).context("resolving export filters")?;
+    let (vrf_imports, vrf_exports) =
+        build_vrf_routemaps(&cfg, &by_name).context("resolving vrf route-maps")?;
+    let vrfs = build_vrf_infos(&cfg).context("resolving vrfs")?;
     if !imports.is_empty() {
         info!(protocols = imports.len(), "import filters active");
     }
     if fib_export.is_some() {
         info!("FIB export filter active");
     }
+    if !vrfs.is_empty() {
+        info!(vrfs = vrfs.len(), "VRFs configured");
+    }
+
+    // Seed the RIB with the configured static routes, programming each best-path
+    // change into the forwarding plane as it happens. A static route in a VRF is run
+    // through that VRF's import route-map (entering the VRF) and, when programmed,
+    // its export route-map (VRF → kernel); either may drop or rewrite it.
+    let mut rib = Rib::new();
+    let mut installed = 0usize;
+    for route in statics {
+        let route = match vrf_routemap(&vrf_imports, route) {
+            Some(r) => r,
+            None => continue, // import route-map rejected it
+        };
+        if let Some(change) = rib.update(route) {
+            if let FibChange::Install(best) = &change {
+                // The export route-map may drop it (kept in the RIB, off the FIB).
+                if let Some(best) = vrf_routemap(&vrf_exports, best.clone()) {
+                    fib.apply(&FibChange::Install(best)).map_err(|e| anyhow::anyhow!(e))?;
+                    installed += 1;
+                }
+            } else {
+                fib.apply(&change).map_err(|e| anyhow::anyhow!(e))?;
+            }
+        }
+    }
+    for r in rib.iter_best() {
+        info!(prefix = %r.prefix, table = r.table, protocol = r.protocol.name(), metric = r.metric, "best route");
+    }
+    info!(prefixes = installed, backend = ?backend, "static routes programmed");
 
     // The router receives updates from every protocol engine. Keep a sender in
     // hand so the channel never closes just because no protocol is enabled — the
@@ -719,7 +739,7 @@ async fn main() -> Result<()> {
 
     info!("wren is running; press Ctrl-C to stop");
     tokio::select! {
-        _ = router::run(&mut rib, fib.as_mut(), updates_rx, &imports, fib_export.as_ref(), &redist_targets, queries_rx) => {
+        _ = router::run(&mut rib, fib.as_mut(), updates_rx, &imports, fib_export.as_ref(), &redist_targets, &vrfs, queries_rx) => {
             warn!("router loop ended (all protocol senders dropped)");
         }
         r = tokio::signal::ctrl_c() => {
@@ -1011,6 +1031,61 @@ fn bfd_session_config(bfd: Option<&wren_config::Bfd>) -> wren_bfd::SessionConfig
 /// `auth-type` selects the algorithm and `auth-key` is the shared secret (`auth-key-id`
 /// the wire key id, default 1). Returns `None` when `auth-type` is unset (no
 /// authentication), or an error when it is set without a key or names an unknown type.
+/// Run a route through a VRF route-map: `None` if the route is in the default VRF or
+/// the VRF has no such route-map; otherwise the filter's verdict (rewritten route on
+/// accept, dropped on reject). Returns `Some(route)` to keep it, `None` to drop it.
+fn vrf_routemap(maps: &std::collections::HashMap<u32, Filter>, route: wren_core::Route) -> Option<wren_core::Route> {
+    match maps.get(&route.table) {
+        Some(filter) => match filter.apply(&route) {
+            Decision::Accept(r) => Some(r),
+            Decision::Reject => None,
+        },
+        None => Some(route),
+    }
+}
+
+/// Resolve each VRF's `import` / `export` route-maps to compiled filters, keyed by the
+/// VRF's kernel table (so they can be looked up by a route's table). An unknown filter
+/// name fails startup.
+fn build_vrf_routemaps(
+    cfg: &wren_config::Config,
+    by_name: &std::collections::HashMap<String, Filter>,
+) -> Result<(std::collections::HashMap<u32, Filter>, std::collections::HashMap<u32, Filter>)> {
+    let mut imports = std::collections::HashMap::new();
+    let mut exports = std::collections::HashMap::new();
+    for v in &cfg.vrfs {
+        if let Some(name) = &v.import {
+            imports.insert(v.table, named_filter(by_name, name, "vrf import")?);
+        }
+        if let Some(name) = &v.export {
+            exports.insert(v.table, named_filter(by_name, name, "vrf export")?);
+        }
+    }
+    Ok((imports, exports))
+}
+
+/// Resolve the configured VRFs into the router's [`router::VrfInfo`] view, validating
+/// each Route Distinguisher and rejecting a duplicate table id.
+fn build_vrf_infos(cfg: &wren_config::Config) -> Result<Vec<router::VrfInfo>> {
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::with_capacity(cfg.vrfs.len());
+    for v in &cfg.vrfs {
+        if !seen.insert(v.table) {
+            anyhow::bail!("vrf {:?}: table {} is used by more than one vrf", v.name, v.table);
+        }
+        let rd = match &v.rd {
+            Some(s) => Some(
+                RouteDistinguisher::parse(s)
+                    .with_context(|| format!("vrf {:?}: invalid route distinguisher {s:?}", v.name))?
+                    .to_string(),
+            ),
+            None => None,
+        };
+        out.push(router::VrfInfo { name: v.name.clone(), table: v.table, rd });
+    }
+    Ok(out)
+}
+
 fn bfd_auth_config(bfd: Option<&wren_config::Bfd>) -> Result<Option<wren_bfd::AuthConfig>> {
     let Some(bfd) = bfd else { return Ok(None) };
     resolve_bfd_auth(bfd.auth_type.as_deref(), bfd.auth_key_id, bfd.auth_key.as_deref())

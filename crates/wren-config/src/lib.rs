@@ -40,6 +40,9 @@ pub struct Config {
     /// Operator-configured static routes.
     #[serde(default, rename = "static")]
     pub statics: Vec<StaticRoute>,
+    /// VRF (Virtual Routing and Forwarding) instances — named isolated routing tables.
+    #[serde(default, rename = "vrf")]
+    pub vrfs: Vec<VrfDef>,
     /// RIP (IPv4) configuration, if the protocol is used.
     #[serde(default)]
     pub rip: Option<Rip>,
@@ -152,6 +155,32 @@ pub struct StaticRoute {
     /// Route metric (lower wins). Defaults to 0.
     #[serde(default)]
     pub metric: u32,
+    /// The VRF this route belongs to (a `[[vrf]]` name). Unset means the default VRF
+    /// (the main table); a named VRF installs the route into that VRF's table.
+    pub vrf: Option<String>,
+}
+
+/// A Virtual Routing and Forwarding instance (`[[vrf]]`): a named, isolated routing
+/// table. Routes and interfaces placed in the VRF use its kernel routing `table`, so
+/// overlapping address space in different VRFs stays separate.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VrfDef {
+    /// The VRF's name, referenced by `[[static]] vrf` and the VRF's interface list.
+    pub name: String,
+    /// The kernel routing table id this VRF programs its routes into.
+    pub table: u32,
+    /// The VRF's Route Distinguisher (RFC 4364, e.g. `"65000:1"`) — its identity.
+    /// Optional; shown by `show vrf`.
+    pub rd: Option<String>,
+    /// Interfaces bound to this VRF: their connected routes go into the VRF's table.
+    #[serde(default)]
+    pub interfaces: Vec<String>,
+    /// A named route filter (route-map) applied to routes as they enter this VRF.
+    pub import: Option<String>,
+    /// A named route filter (route-map) applied to routes leaving this VRF towards
+    /// the kernel forwarding plane.
+    pub export: Option<String>,
 }
 
 /// RIP protocol configuration.
@@ -817,14 +846,25 @@ impl Config {
                     )))
                 }
             };
-            out.push(Route::new(
-                prefix,
-                Protocol::Static,
-                vec![nexthop],
-                s.metric,
-            ));
+            let mut route = Route::new(prefix, Protocol::Static, vec![nexthop], s.metric);
+            // Place the route in its VRF's table, if it names one.
+            if let Some(vrf) = &s.vrf {
+                let table = self.vrf_table(vrf).ok_or_else(|| {
+                    ConfigError::Invalid(format!(
+                        "static route {prefix} references unknown vrf {vrf:?}"
+                    ))
+                })?;
+                route = route.with_table(table);
+            }
+            out.push(route);
         }
         Ok(out)
+    }
+
+    /// The kernel routing table of the VRF named `name`, or `None` if no such VRF is
+    /// configured.
+    pub fn vrf_table(&self, name: &str) -> Option<u32> {
+        self.vrfs.iter().find(|v| v.name == name).map(|v| v.table)
     }
 }
 
@@ -1510,6 +1550,47 @@ mod tests {
         )
         .expect("valid config");
         assert!(!cfg.ospf3.expect("ospf3 present").bfd);
+    }
+
+    #[test]
+    fn parses_vrf_and_static_in_vrf() {
+        let cfg = Config::from_toml(
+            r#"
+            router-id = "10.0.0.1"
+            [[vrf]]
+            name = "blue"
+            table = 100
+            rd = "65000:1"
+            interfaces = ["eth1"]
+            [[static]]
+            prefix = "10.9.0.0/24"
+            via    = "10.0.0.2"
+            vrf    = "blue"
+            [[static]]
+            prefix = "10.8.0.0/24"
+            via    = "10.0.0.3"
+            "#,
+        )
+        .expect("valid config");
+        assert_eq!(cfg.vrf_table("blue"), Some(100));
+        assert_eq!(cfg.vrf_table("nope"), None);
+        let routes = cfg.static_routes().expect("static routes");
+        // The VRF static lands in table 100; the plain one stays in the main table.
+        let in_vrf = routes.iter().find(|r| r.prefix.to_string() == "10.9.0.0/24").unwrap();
+        assert_eq!(in_vrf.table, 100);
+        let in_main = routes.iter().find(|r| r.prefix.to_string() == "10.8.0.0/24").unwrap();
+        assert_eq!(in_main.table, wren_core::RT_TABLE_MAIN);
+    }
+
+    #[test]
+    fn rejects_static_in_unknown_vrf() {
+        // Loading validates the statics, so an unknown VRF reference fails at load.
+        let err = Config::from_toml(
+            "router-id = \"10.0.0.1\"\n[[static]]\nprefix = \"10.9.0.0/24\"\nvia = \"10.0.0.2\"\nvrf = \"ghost\"\n",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("unknown vrf"), "got {err:?}");
     }
 
     #[test]

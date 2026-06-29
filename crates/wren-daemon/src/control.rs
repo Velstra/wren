@@ -239,7 +239,7 @@ async fn handle_conn(stream: UnixStream, channels: Channels) -> Result<()> {
              bgp refresh <peer> | \
              show ospf [neighbors|interfaces|database] | show ospf3 [neighbors|interfaces] | \
              show isis [neighbors|interfaces|database] | show babel [neighbors|routes] | \
-             show bfd | show rip | show ripng | show metrics\n"
+             show bfd | show rip | show ripng | show vrf | show metrics\n"
         )
     });
 
@@ -304,6 +304,12 @@ pub fn parse_query(line: &str) -> Option<Query> {
                     return None;
                 }
                 Some(Query::Routes { protocol })
+            }
+            "vrf" | "vrfs" => {
+                if tokens.next().is_some() {
+                    return None;
+                }
+                Some(Query::Vrfs)
             }
             _ => None,
         },
