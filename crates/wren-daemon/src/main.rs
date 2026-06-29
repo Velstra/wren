@@ -15,6 +15,7 @@ mod babel;
 mod bgp;
 mod connected;
 mod control;
+mod metrics;
 #[cfg(feature = "isis")]
 mod isis;
 #[cfg(feature = "ospf")]

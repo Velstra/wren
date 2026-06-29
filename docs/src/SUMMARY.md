@@ -7,6 +7,7 @@
 - [Getting Started](getting-started.md)
 - [Architecture](architecture.md)
 - [Configuration](configuration.md)
+- [Monitoring](monitoring.md)
 
 # Protocols
 

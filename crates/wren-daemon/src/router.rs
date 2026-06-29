@@ -7,7 +7,7 @@
 //! resulting [`FibChange`]s into the [`Fib`]. That keeps best-path selection and
 //! FIB programming single-threaded and serialized, however many protocols feed it.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt::Write as _;
 
 use tokio::sync::{mpsc, oneshot};
@@ -86,6 +86,9 @@ pub enum Query {
         /// Restrict to this protocol, or `None` for every route.
         protocol: Option<Protocol>,
     },
+    /// Render the RIB's Prometheus metrics (`show metrics`): best-route counts by
+    /// origin protocol.
+    Metrics,
 }
 
 /// A [`Query`] paired with the channel to deliver its rendered answer on.
@@ -182,7 +185,31 @@ async fn redistribute(targets: &[RedistTarget], event: &RedistEvent) {
 fn answer_query(rib: &Rib, query: &Query) -> String {
     match query {
         Query::Routes { protocol } => render_routes(rib, *protocol),
+        Query::Metrics => render_router_metrics(rib),
     }
+}
+
+/// Render the RIB as Prometheus metrics: the number of best routes by origin
+/// protocol (`wren_rib_routes{protocol="…"}`). Because every installed route
+/// carries its origin protocol, this single family gives per-protocol visibility
+/// for all of them (bgp, ospf, isis, babel, rip, static, connected) from the one
+/// task that owns the merged RIB.
+pub fn render_router_metrics(rib: &Rib) -> String {
+    let mut counts: BTreeMap<&'static str, usize> = BTreeMap::new();
+    for route in rib.iter_best() {
+        *counts.entry(route.protocol.name()).or_default() += 1;
+    }
+    let mut out = String::new();
+    crate::metrics::family(
+        &mut out,
+        "wren_rib_routes",
+        "Best routes in the RIB by origin protocol.",
+        "gauge",
+    );
+    for (proto, n) in &counts {
+        crate::metrics::sample(&mut out, "wren_rib_routes", &[("protocol", proto)], n);
+    }
+    out
 }
 
 /// Format the RIB's best routes one per line, à la `ip route`, optionally filtered
@@ -592,6 +619,22 @@ mod tests {
             vec![NextHop::via("192.0.2.1".parse().unwrap())],
             0,
         )
+    }
+
+    #[test]
+    fn render_router_metrics_counts_routes_by_protocol() {
+        let mut h = Harness::new();
+        h.announce(bgp_route("10.1.0.0/24", 0));
+        h.announce(bgp_route("10.2.0.0/24", 0));
+        h.announce(static_route("10.3.0.0/24"));
+        let out = render_router_metrics(&h.rib);
+        assert!(out.contains("# TYPE wren_rib_routes gauge"));
+        assert!(out.contains("wren_rib_routes{protocol=\"bgp\"} 2"));
+        assert!(out.contains("wren_rib_routes{protocol=\"static\"} 1"));
+        // An empty RIB still emits the family header, with no samples.
+        let empty = render_router_metrics(&Rib::new());
+        assert!(empty.contains("# TYPE wren_rib_routes gauge"));
+        assert!(!empty.contains("wren_rib_routes{"));
     }
 
     #[tokio::test]

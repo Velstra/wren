@@ -165,8 +165,21 @@ async fn handle_conn(stream: UnixStream, channels: Channels) -> Result<()> {
     // protocol's arm is compiled out with its feature, so the unknown-command fallback
     // simply takes over. BGP and `show routes` are always present.
     let mut response: Option<String> = None;
-    if let Some(query) = parse_bgp_query(line) {
-        response = Some(ask_opt(&channels.bgp, query, "bgp").await);
+    // `show metrics` is the one command that aggregates across tasks: it concatenates
+    // the router's RIB metrics with the BGP task's session metrics into one Prometheus
+    // exposition. Each task owns distinct metric families, so the families never
+    // collide. Handled before the per-protocol parsers (none of which match it).
+    if is_metrics_command(line) {
+        let mut out = ask(&channels.router, Query::Metrics, "router").await;
+        if let Some(bgp) = &channels.bgp {
+            out.push_str(&ask(bgp, BgpQuery::Metrics, "bgp").await);
+        }
+        response = Some(out);
+    }
+    if response.is_none() {
+        if let Some(query) = parse_bgp_query(line) {
+            response = Some(ask_opt(&channels.bgp, query, "bgp").await);
+        }
     }
     #[cfg(feature = "ospf3")]
     if response.is_none() {
@@ -212,7 +225,7 @@ async fn handle_conn(stream: UnixStream, channels: Channels) -> Result<()> {
              bgp refresh <peer> | \
              show ospf [neighbors|interfaces|database] | show ospf3 [neighbors|interfaces] | \
              show isis [neighbors|interfaces|database] | show babel [neighbors|routes] | \
-             show rip | show ripng\n"
+             show rip | show ripng | show metrics\n"
         )
     });
 
@@ -246,6 +259,18 @@ async fn ask_opt<R: OwnedQuery>(
     match queries {
         Some(q) => ask(q, query, name).await,
         None => format!("{name} is not enabled\n"),
+    }
+}
+
+/// Whether `line` is the `show metrics` command (or the bare `metrics`). This is
+/// the one command answered by aggregating several tasks rather than a single typed
+/// query, so it is recognised here instead of in a per-protocol parser.
+pub fn is_metrics_command(line: &str) -> bool {
+    let mut tokens = line.split_whitespace();
+    match tokens.next() {
+        Some("metrics") => tokens.next().is_none(),
+        Some("show") => tokens.next() == Some("metrics") && tokens.next().is_none(),
+        _ => false,
     }
 }
 
@@ -458,6 +483,20 @@ mod tests {
                 protocol: Some(Protocol::Ospf)
             })
         ));
+    }
+
+    #[test]
+    fn recognises_the_metrics_command() {
+        assert!(is_metrics_command("show metrics"));
+        assert!(is_metrics_command("metrics"));
+        // Not a metrics command.
+        assert!(!is_metrics_command("show routes"));
+        assert!(!is_metrics_command("show metrics extra"));
+        assert!(!is_metrics_command("metrics bgp"));
+        assert!(!is_metrics_command(""));
+        // And it does not collide with the other parsers.
+        assert!(parse_query("show metrics").is_none());
+        assert!(parse_bgp_query("show metrics").is_none());
     }
 
     #[test]

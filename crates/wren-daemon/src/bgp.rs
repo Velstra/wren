@@ -473,6 +473,10 @@ pub enum BgpQuery {
     Roa,
     /// The configured neighbours and their session state.
     Neighbors,
+    /// Render the BGP task's Prometheus metrics (`show metrics`): per-neighbour
+    /// session state, established/configured counts, ROUTE-REFRESH counters and the
+    /// Loc-RIB best-path count.
+    Metrics,
     /// Send a ROUTE-REFRESH to this peer (RFC 2918) — `bgp refresh <addr>`. Not a
     /// read-only query, but answered the same way (with a status line).
     Refresh(IpAddr),
@@ -699,6 +703,78 @@ pub fn render_bgp_neighbors(neighbors: &[NeighborSummary]) -> String {
         }
         out.push('\n');
     }
+    out
+}
+
+/// Render the BGP task's Prometheus metrics: per-neighbour session state, the
+/// established/configured neighbour counts, the ROUTE-REFRESH-received counters and
+/// the Loc-RIB best-path count. Pure (snapshot in, text out) so it is unit-testable
+/// like the other renderers.
+pub fn render_bgp_metrics(neighbors: &[NeighborSummary], rib_routes: usize) -> String {
+    let mut out = String::new();
+
+    // Per-neighbour session up/down — the series an operator alerts on.
+    crate::metrics::family(
+        &mut out,
+        "wren_bgp_neighbor_up",
+        "Whether the BGP session to a neighbour is Established (1) or not (0).",
+        "gauge",
+    );
+    for n in neighbors {
+        let addr = n.addr.to_string();
+        let asn = n.remote_as.to_string();
+        crate::metrics::sample(
+            &mut out,
+            "wren_bgp_neighbor_up",
+            &[("neighbor", &addr), ("asn", &asn)],
+            u8::from(n.established),
+        );
+    }
+
+    // Aggregate counts (always present, even with no neighbours, so a dashboard has
+    // a stable series).
+    let established = neighbors.iter().filter(|n| n.established).count();
+    crate::metrics::family(
+        &mut out,
+        "wren_bgp_neighbors_configured",
+        "Configured BGP neighbours.",
+        "gauge",
+    );
+    crate::metrics::sample(&mut out, "wren_bgp_neighbors_configured", &[], neighbors.len());
+    crate::metrics::family(
+        &mut out,
+        "wren_bgp_neighbors_established",
+        "BGP neighbours whose session is currently Established.",
+        "gauge",
+    );
+    crate::metrics::sample(&mut out, "wren_bgp_neighbors_established", &[], established);
+
+    // ROUTE-REFRESH requests received, per neighbour (RFC 2918) — a counter.
+    crate::metrics::family(
+        &mut out,
+        "wren_bgp_route_refresh_received_total",
+        "ROUTE-REFRESH requests received from a neighbour (RFC 2918).",
+        "counter",
+    );
+    for n in neighbors {
+        let addr = n.addr.to_string();
+        crate::metrics::sample(
+            &mut out,
+            "wren_bgp_route_refresh_received_total",
+            &[("neighbor", &addr)],
+            n.refreshes_received,
+        );
+    }
+
+    // Loc-RIB best paths.
+    crate::metrics::family(
+        &mut out,
+        "wren_bgp_rib_routes",
+        "Best paths in the BGP Loc-RIB.",
+        "gauge",
+    );
+    crate::metrics::sample(&mut out, "wren_bgp_rib_routes", &[], rib_routes);
+
     out
 }
 
@@ -945,6 +1021,9 @@ pub async fn run(
                     BgpQuery::Paths => render_bgp_paths(&rib),
                     BgpQuery::Roa => render_roa_table(&roa),
                     BgpQuery::Neighbors => render_bgp_neighbors(&neighbor_summaries(&neighbors)),
+                    BgpQuery::Metrics => {
+                        render_bgp_metrics(&neighbor_summaries(&neighbors), rib.iter_best().count())
+                    }
                     BgpQuery::Refresh(addr) => match sessions.get(&addr) {
                         Some(cmd_tx) => {
                             let _ = cmd_tx.send(SessionCmd::SendRefresh).await;
@@ -3418,6 +3497,36 @@ mod tests {
         // A peer with no refreshes does not show the counter.
         assert!(!out.lines().find(|l| l.contains("10.0.0.3")).unwrap().contains("refreshes"));
         assert_eq!(render_bgp_neighbors(&[]), "no bgp neighbors configured\n");
+    }
+
+    #[test]
+    fn render_metrics_emits_prometheus_families() {
+        let n = vec![
+            NeighborSummary { addr: ip([10, 0, 0, 2]), remote_as: 65002, established: true, refreshes_received: 3 },
+            NeighborSummary { addr: ip([10, 0, 0, 3]), remote_as: 65003, established: false, refreshes_received: 0 },
+        ];
+        let out = render_bgp_metrics(&n, 4);
+        // Per-neighbour up/down gauge with neighbor + asn labels.
+        assert!(out.contains("# TYPE wren_bgp_neighbor_up gauge"));
+        assert!(out.contains("wren_bgp_neighbor_up{neighbor=\"10.0.0.2\",asn=\"65002\"} 1"));
+        assert!(out.contains("wren_bgp_neighbor_up{neighbor=\"10.0.0.3\",asn=\"65003\"} 0"));
+        // Aggregate counts.
+        assert!(out.contains("wren_bgp_neighbors_configured 2"));
+        assert!(out.contains("wren_bgp_neighbors_established 1"));
+        // ROUTE-REFRESH counter (RFC 2918).
+        assert!(out.contains("# TYPE wren_bgp_route_refresh_received_total counter"));
+        assert!(out.contains("wren_bgp_route_refresh_received_total{neighbor=\"10.0.0.2\"} 3"));
+        // Loc-RIB best-path count.
+        assert!(out.contains("wren_bgp_rib_routes 4"));
+    }
+
+    #[test]
+    fn render_metrics_with_no_neighbours_keeps_aggregate_series() {
+        let out = render_bgp_metrics(&[], 0);
+        // The aggregate gauges are always present even with nothing to show.
+        assert!(out.contains("wren_bgp_neighbors_configured 0"));
+        assert!(out.contains("wren_bgp_neighbors_established 0"));
+        assert!(out.contains("wren_bgp_rib_routes 0"));
     }
 
     fn learned_path(from_ebgp: bool, from_peer: [u8; 4]) -> Path {
