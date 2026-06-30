@@ -111,6 +111,44 @@ pub struct VrfInfo {
 /// A [`Query`] paired with the channel to deliver its rendered answer on.
 pub type QueryRequest = crate::query::QueryRequest<Query>;
 
+/// A change to the routes Wren is forwarding, streamed to a route-export
+/// subscriber over the control socket (`wren monitor routes`). The stream mirrors
+/// the FIB: a subscriber sees exactly the best-path routes the router programs
+/// into the forwarding plane — first a snapshot of every current route (one
+/// [`Update`](RouteEvent::Update) each, terminated by
+/// [`EndOfDump`](RouteEvent::EndOfDump)), then live
+/// [`Update`](RouteEvent::Update)/[`Withdraw`](RouteEvent::Withdraw) events as the
+/// RIB changes. This is the model an external forwarding plane (e.g. the Velstra
+/// eBPF datapath) consumes to mirror Wren's routing decisions — Wren's equivalent
+/// of FRR zebra's Forwarding Plane Manager (FPM).
+#[derive(Debug, Clone)]
+pub enum RouteEvent {
+    /// A best-path route appeared or changed — forward to this destination.
+    Update(Route),
+    /// A route was withdrawn — stop forwarding this `(table, prefix)`.
+    Withdraw {
+        /// The VRF (kernel table) the route was in.
+        table: u32,
+        /// The destination whose route is gone.
+        prefix: Prefix,
+    },
+    /// Marks the end of the initial snapshot: every route that existed when the
+    /// subscription opened has now been sent; subsequent events are live.
+    EndOfDump,
+}
+
+/// A request to subscribe to the route-export stream, carrying the channel the
+/// router pushes [`RouteEvent`]s down. The router replays the current forwarding
+/// table as [`Update`](RouteEvent::Update)s followed by an
+/// [`EndOfDump`](RouteEvent::EndOfDump), then retains the sender to deliver live
+/// changes until the subscriber disconnects.
+#[derive(Debug)]
+pub struct RouteSubscribe {
+    /// Where to deliver the snapshot and subsequent live events. Unbounded so the
+    /// single-threaded router never blocks fanning out to a slow subscriber.
+    pub events: mpsc::UnboundedSender<RouteEvent>,
+}
+
 /// Run the router until the update channel closes (every sender dropped).
 ///
 /// Borrows the `rib` and `fib` so the caller can keep them (e.g. to race this
@@ -127,17 +165,25 @@ pub async fn run(
     redist: &[RedistTarget],
     vrfs: &[VrfInfo],
     mut queries: mpsc::Receiver<QueryRequest>,
+    mut subscribes: mpsc::Receiver<RouteSubscribe>,
 ) {
-    // The prefixes we have actually programmed into the FIB, so the export filter's
-    // accept→reject transition can withdraw a previously-installed route.
-    let mut programmed: HashSet<(u32, Prefix)> = HashSet::new();
+    // The best-path routes we have actually programmed into the FIB, keyed by
+    // (vrf, prefix). Doubles as the route-export snapshot source, and lets the
+    // export filter's accept→reject transition withdraw a previously-installed
+    // route.
+    let mut exported: BTreeMap<(u32, Prefix), Route> = BTreeMap::new();
+    // Open route-export subscriptions (`wren monitor routes`); each receives live
+    // RouteEvents. Closed ones are pruned lazily on the next fan-out.
+    let mut subscribers: Vec<mpsc::UnboundedSender<RouteEvent>> = Vec::new();
     loop {
         tokio::select! {
             update = updates.recv() => match update {
                 Some(update) => {
                     // Apply the update to the RIB/FIB; if the best path changed,
                     // fan that change out to the redistribution targets.
-                    if let Some(event) = apply(rib, fib, update, imports, fib_export, &mut programmed) {
+                    if let Some(event) =
+                        apply(rib, fib, update, imports, fib_export, &mut exported, &mut subscribers)
+                    {
                         redistribute(redist, &event).await;
                     }
                 }
@@ -146,8 +192,38 @@ pub async fn run(
             Some(req) = queries.recv() => {
                 let _ = req.respond.send(answer_query(rib, vrfs, &req.query));
             }
+            Some(sub) = subscribes.recv() => {
+                subscribe_routes(&exported, &mut subscribers, sub);
+            }
         }
     }
+}
+
+/// Register a new route-export subscriber: replay the current forwarding table as
+/// [`RouteEvent::Update`]s — a consistent snapshot, since the single-threaded
+/// router processes no route change while this runs — then a terminating
+/// [`RouteEvent::EndOfDump`], and finally retain the sender for live events. A
+/// subscriber that has already disconnected is simply dropped.
+fn subscribe_routes(
+    exported: &BTreeMap<(u32, Prefix), Route>,
+    subscribers: &mut Vec<mpsc::UnboundedSender<RouteEvent>>,
+    sub: RouteSubscribe,
+) {
+    for route in exported.values() {
+        if sub.events.send(RouteEvent::Update(route.clone())).is_err() {
+            return;
+        }
+    }
+    if sub.events.send(RouteEvent::EndOfDump).is_err() {
+        return;
+    }
+    subscribers.push(sub.events);
+}
+
+/// Fan a route-export event out to every open subscriber, pruning closed ones.
+/// Sends are non-blocking (the channel is unbounded), so the router never stalls.
+fn fanout(subscribers: &mut Vec<mpsc::UnboundedSender<RouteEvent>>, event: RouteEvent) {
+    subscribers.retain(|s| s.send(event.clone()).is_ok());
 }
 
 /// Push the RIB's current best routes to the redistribution targets once at
@@ -300,7 +376,8 @@ fn apply(
     update: RouteUpdate,
     imports: &ImportFilters,
     fib_export: Option<&Filter>,
-    programmed: &mut HashSet<(u32, Prefix)>,
+    exported: &mut BTreeMap<(u32, Prefix), Route>,
+    subscribers: &mut Vec<mpsc::UnboundedSender<RouteEvent>>,
 ) -> Option<RedistEvent> {
     let change = match update {
         RouteUpdate::Announce(route) => {
@@ -333,7 +410,7 @@ fn apply(
         FibChange::Install(route) => RedistEvent::Changed(route.clone()),
         FibChange::Remove { prefix, .. } => RedistEvent::Gone(*prefix),
     };
-    program_fib(fib, change, fib_export, programmed);
+    program_fib(fib, change, fib_export, exported, subscribers);
     Some(event)
 }
 
@@ -344,13 +421,15 @@ fn program_fib(
     fib: &mut dyn Fib,
     change: FibChange,
     fib_export: Option<&Filter>,
-    programmed: &mut HashSet<(u32, Prefix)>,
+    exported: &mut BTreeMap<(u32, Prefix), Route>,
+    subscribers: &mut Vec<mpsc::UnboundedSender<RouteEvent>>,
 ) {
     match change {
         FibChange::Install(route) => {
             // Directly-connected networks are created in the kernel FIB by the
             // interface configuration itself; track them in the RIB but never
-            // reprogram them, which would fight the kernel.
+            // reprogram them, which would fight the kernel. They are likewise not
+            // route-exported (the consumer owns its own interface routes).
             if route.protocol == Protocol::Connected {
                 info!(prefix = %route.prefix, "connected route (kernel-owned; tracked, not reinstalled)");
                 return;
@@ -361,9 +440,14 @@ fn program_fib(
                     Decision::Accept(r) => r,
                     Decision::Reject => {
                         debug!(prefix = %route.prefix, "route rejected by FIB export filter");
-                        // If we had programmed this (vrf, prefix), withdraw it now.
-                        if programmed.remove(&(route.table, route.prefix)) {
+                        // If we had programmed this (vrf, prefix), withdraw it now —
+                        // from the FIB and from every route-export subscriber.
+                        if exported.remove(&(route.table, route.prefix)).is_some() {
                             remove_from_fib(fib, route.table, route.prefix);
+                            fanout(
+                                subscribers,
+                                RouteEvent::Withdraw { table: route.table, prefix: route.prefix },
+                            );
                         }
                         return;
                     }
@@ -373,7 +457,7 @@ fn program_fib(
             let key = (route.table, route.prefix);
             match fib.apply(&FibChange::Install(route.clone())) {
                 Ok(()) => {
-                    programmed.insert(key);
+                    exported.insert(key, route.clone());
                     info!(
                         prefix = %route.prefix,
                         table = route.table,
@@ -381,18 +465,23 @@ fn program_fib(
                         metric = route.metric,
                         "route installed",
                     );
+                    // Mirror the install to the route-export stream.
+                    fanout(subscribers, RouteEvent::Update(route));
                 }
                 Err(e) => warn!(error = %e, "applying FIB change"),
             }
         }
         FibChange::Remove { table, prefix } => {
+            let was_exported = exported.remove(&(table, prefix)).is_some();
             // Skip prefixes we never programmed (e.g. export-rejected ones), so we
-            // don't issue spurious kernel deletes.
-            if fib_export.is_some() && !programmed.contains(&(table, prefix)) {
+            // don't issue spurious kernel deletes or export withdrawals.
+            if fib_export.is_some() && !was_exported {
                 return;
             }
-            programmed.remove(&(table, prefix));
             remove_from_fib(fib, table, prefix);
+            if was_exported {
+                fanout(subscribers, RouteEvent::Withdraw { table, prefix });
+            }
         }
     }
 }
@@ -453,7 +542,7 @@ mod tests {
         fib: MemoryFib,
         imports: ImportFilters,
         export: Option<Filter>,
-        programmed: HashSet<(u32, Prefix)>,
+        exported: BTreeMap<(u32, Prefix), Route>,
     }
 
     impl Harness {
@@ -463,7 +552,7 @@ mod tests {
                 fib: MemoryFib::default(),
                 imports: ImportFilters::new(),
                 export: None,
-                programmed: HashSet::new(),
+                exported: BTreeMap::new(),
             }
         }
 
@@ -474,7 +563,8 @@ mod tests {
                 update,
                 &self.imports,
                 self.export.as_ref(),
-                &mut self.programmed,
+                &mut self.exported,
+                &mut Vec::new(),
             );
         }
 
@@ -765,5 +855,93 @@ mod tests {
         h.announce(bgp_route("8.8.8.0/24", 200));
         assert!(h.rib.best(&"8.8.8.0/24".parse().unwrap()).is_some());
         assert!(h.installed("8.8.8.0/24").is_none());
+    }
+
+    #[tokio::test]
+    async fn route_export_snapshots_then_streams_live_updates_and_withdraws() {
+        use std::time::Duration;
+        use tokio::time::timeout;
+
+        let (utx, urx) = mpsc::channel(16);
+        let (qtx, qrx) = mpsc::channel::<QueryRequest>(16);
+        let (stx, srx) = mpsc::channel::<RouteSubscribe>(16);
+
+        // `&mut dyn Fib` is not `Send`, so the router can't be `tokio::spawn`ed
+        // (production runs it in `select!`, not spawned). Drive it and the test
+        // interactions concurrently on one task with `join!` instead. The router
+        // owns a RIB + MemoryFib and ends when the driver drops every update sender.
+        let router = async move {
+            let mut rib = Rib::new();
+            let mut fib = MemoryFib::default();
+            let imports = ImportFilters::new();
+            run(&mut rib, &mut fib, urx, &imports, None, &[], &[], qrx, srx).await;
+        };
+
+        let driver = async move {
+            // Hold the query/subscribe `_tx` ends so those select arms never see a
+            // closed channel while the test runs.
+            let _qtx = qtx;
+            // A short timeout turns a hang (a missing event) into a test failure.
+            async fn next(rx: &mut mpsc::UnboundedReceiver<RouteEvent>) -> RouteEvent {
+                timeout(Duration::from_secs(1), rx.recv())
+                    .await
+                    .unwrap()
+                    .unwrap()
+            }
+
+            // Subscribe before any route exists: the snapshot is empty — just
+            // EndOfDump.
+            let (etx, mut erx) = mpsc::unbounded_channel();
+            stx.send(RouteSubscribe { events: etx }).await.unwrap();
+            assert!(matches!(next(&mut erx).await, RouteEvent::EndOfDump));
+
+            // A new best route streams live as an Update…
+            utx.send(RouteUpdate::Announce(bgp_route("203.0.113.0/24", 10)))
+                .await
+                .unwrap();
+            match next(&mut erx).await {
+                RouteEvent::Update(r) => assert_eq!(r.prefix.to_string(), "203.0.113.0/24"),
+                other => panic!("expected update, got {other:?}"),
+            }
+
+            // …and withdrawing it streams a Withdraw for the same prefix.
+            utx.send(RouteUpdate::Withdraw {
+                table: wren_core::RT_TABLE_MAIN,
+                prefix: "203.0.113.0/24".parse().unwrap(),
+                protocol: Protocol::Bgp,
+                source: 0,
+            })
+            .await
+            .unwrap();
+            match next(&mut erx).await {
+                RouteEvent::Withdraw { prefix, .. } => {
+                    assert_eq!(prefix.to_string(), "203.0.113.0/24")
+                }
+                other => panic!("expected withdraw, got {other:?}"),
+            }
+
+            // A late subscriber sees the now-current table replayed in its
+            // snapshot. Re-announce a route and wait until subscriber #1 sees it
+            // live — that confirms the router has processed the announce (so it is
+            // in `exported`) before subscriber #2 subscribes, avoiding an
+            // announce-vs-subscribe race.
+            utx.send(RouteUpdate::Announce(bgp_route("198.51.100.0/24", 5)))
+                .await
+                .unwrap();
+            match next(&mut erx).await {
+                RouteEvent::Update(r) => assert_eq!(r.prefix.to_string(), "198.51.100.0/24"),
+                other => panic!("expected live update on subscriber #1, got {other:?}"),
+            }
+            let (etx2, mut erx2) = mpsc::unbounded_channel();
+            stx.send(RouteSubscribe { events: etx2 }).await.unwrap();
+            match next(&mut erx2).await {
+                RouteEvent::Update(r) => assert_eq!(r.prefix.to_string(), "198.51.100.0/24"),
+                other => panic!("expected snapshot update, got {other:?}"),
+            }
+            assert!(matches!(next(&mut erx2).await, RouteEvent::EndOfDump));
+            // Dropping utx/stx/_qtx here closes every router input → the loop ends.
+        };
+
+        tokio::join!(router, driver);
     }
 }

@@ -22,6 +22,38 @@ wren show rip   |  wren show ripng
 Each is answered by the task that owns the state, so a `show` never blocks the
 forwarding plane or races a RIB update.
 
+## Streaming the forwarding table — `wren monitor routes`
+
+Where `show routes` is a one-shot snapshot, `monitor routes` opens a **long-lived
+subscription** and streams the forwarding table as it changes — an initial
+snapshot of every current route, then live install/withdraw events as the RIB
+moves:
+
+```sh
+$ wren monitor routes
+% end-of-dump                                                  # snapshot complete
++ 10.20.0.0/24 table 254 via 10.0.0.2 proto bgp metric 1       # a route appeared
+- 10.20.0.0/24 table 254                                       # …and was withdrawn
+```
+
+The format is deliberately line-based and stable so an external program can parse
+it:
+
+* `+ <prefix> table <t> [via <gw>] [dev <dev>] … proto <p> metric <m>` — a route
+  was installed or changed (each next-hop carries its gateway and/or egress
+  interface; `table` is always printed, so the VRF is unambiguous);
+* `- <prefix> table <t>` — a route was withdrawn;
+* `% end-of-dump` — the initial snapshot is complete; everything after is live.
+
+The stream mirrors exactly what the router programs into the FIB (best-path,
+post-export-filter; directly-connected routes are omitted, as the consumer owns
+its own interface routes). This is Wren's equivalent of FRR zebra's **Forwarding
+Plane Manager (FPM)**: the feed an external forwarding plane consumes to mirror
+Wren's routing decisions — for example the [Velstra](https://github.com/Velstra)
+eBPF/XDP data plane, which subscribes, resolves each next-hop's L2 address, and
+programs its own route map. Keeping the contract a generic stream (rather than a
+Velstra-specific `Fib` backend) leaves Wren free of any consumer coupling.
+
 ## Prometheus metrics
 
 `wren show metrics` renders the [Prometheus text exposition format][fmt]:

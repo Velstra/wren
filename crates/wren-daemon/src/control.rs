@@ -11,6 +11,7 @@
 //! the [BGP task](crate::bgp). Best-path selection, FIB programming and `show` all
 //! stay single-threaded on the one task that owns each RIB.
 
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -32,7 +33,7 @@ use crate::ospf3::{Ospf3Query, Ospf3QueryRequest};
 #[cfg(feature = "rip")]
 use crate::rip::{RipQuery, RipQueryRequest};
 use crate::query::OwnedQuery;
-use crate::router::{Query, QueryRequest};
+use crate::router::{Query, QueryRequest, RouteEvent, RouteSubscribe};
 
 /// The query channels the control socket forwards to. Every per-protocol channel
 /// is `None` when that protocol is not configured, so `show <proto>` can report
@@ -41,6 +42,9 @@ use crate::router::{Query, QueryRequest};
 pub struct Channels {
     /// To the central router loop (`show routes`).
     pub router: mpsc::Sender<QueryRequest>,
+    /// To the central router loop to open a route-export stream (`monitor
+    /// routes`). Always present — the router always runs.
+    pub subscribe: mpsc::Sender<RouteSubscribe>,
     /// To the BGP task (`show bgp`), if BGP is running.
     pub bgp: Option<mpsc::Sender<BgpQueryRequest>>,
     /// To the BFD task (`show bfd`), if any BFD session is configured.
@@ -104,6 +108,12 @@ async fn handle_conn(stream: UnixStream, channels: Channels) -> Result<()> {
         .await
         .context("reading command")?;
     let line = line.trim();
+
+    // A subscribe command opens a long-lived route-export stream rather than a
+    // one-shot query/response, so handle it before the per-protocol parsers.
+    if is_subscribe_command(line) {
+        return stream_routes(reader, &channels.subscribe).await;
+    }
 
     // Dispatch the command to the first protocol that recognises it. Each disabled
     // protocol's arm is compiled out with its feature, so the unknown-command fallback
@@ -174,7 +184,8 @@ async fn handle_conn(stream: UnixStream, channels: Channels) -> Result<()> {
              bgp refresh <peer> | \
              show ospf [neighbors|interfaces|database] | show ospf3 [neighbors|interfaces] | \
              show isis [neighbors|interfaces|database] | show babel [neighbors|routes] | \
-             show bfd | show rip | show ripng | show vrf | show metrics\n"
+             show bfd | show rip | show ripng | show vrf | show metrics | \
+             monitor routes\n"
         )
     });
 
@@ -221,6 +232,59 @@ pub fn is_metrics_command(line: &str) -> bool {
         Some("show") => tokens.next() == Some("metrics") && tokens.next().is_none(),
         _ => false,
     }
+}
+
+/// Whether `line` opens a route-export subscription. The verb is `monitor` (à la
+/// `ip monitor route`) or `subscribe`; the object is `routes`/`route`. This stream
+/// is the FPM-style feed an external forwarding plane consumes, so it is
+/// recognised before the one-shot `show` parsers.
+pub fn is_subscribe_command(line: &str) -> bool {
+    let mut tokens = line.split_whitespace();
+    match tokens.next() {
+        Some("monitor") | Some("subscribe") => {
+            matches!(tokens.next(), Some("routes") | Some("route")) && tokens.next().is_none()
+        }
+        _ => false,
+    }
+}
+
+/// Render one [`RouteEvent`] as a single line of the route-export stream:
+///
+/// ```text
+/// + <prefix> table <t> [via <gw>] [dev <dev>] … proto <p> metric <m>   (update)
+/// - <prefix> table <t>                                                 (withdraw)
+/// % end-of-dump                                                        (snapshot done)
+/// ```
+///
+/// The format is line-based and stable so an external forwarding plane (the
+/// Velstra eBPF datapath) can parse it; `table` is always printed so the VRF is
+/// unambiguous, and each next-hop carries its gateway and/or egress interface.
+fn format_route_event(event: &RouteEvent) -> String {
+    let mut out = String::new();
+    match event {
+        RouteEvent::Update(route) => {
+            let _ = write!(out, "+ {} table {}", route.prefix, route.table);
+            for nh in &route.nexthops {
+                if let Some(gw) = nh.gateway {
+                    let _ = write!(out, " via {gw}");
+                }
+                if let Some(dev) = &nh.iface {
+                    let _ = write!(out, " dev {dev}");
+                }
+            }
+            let _ = writeln!(
+                out,
+                " proto {} metric {}",
+                route.protocol.name(),
+                route.metric
+            );
+        }
+        RouteEvent::Withdraw { table, prefix } => {
+            let _ = writeln!(out, "- {prefix} table {table}");
+        }
+        RouteEvent::EndOfDump => out.push_str("% end-of-dump\n"),
+    }
+    out
 }
 
 /// Parse one control command line into a [`Query`]. Returns `None` for anything
@@ -443,6 +507,64 @@ pub async fn run_client(path: &Path, command: &str) -> Result<()> {
     Ok(())
 }
 
+/// Serve a route-export subscription: register with the router, then stream each
+/// [`RouteEvent`] to the client as a line until the channel ends or the client
+/// disconnects. Long-lived, unlike the one-shot query path. A dropped client is
+/// noticed on the next write and the router prunes the (now-closed) sender on its
+/// next fan-out.
+async fn stream_routes(
+    mut reader: BufReader<UnixStream>,
+    subscribe: &mpsc::Sender<RouteSubscribe>,
+) -> Result<()> {
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    if subscribe.send(RouteSubscribe { events: tx }).await.is_err() {
+        reader
+            .get_mut()
+            .write_all(b"error: router unavailable\n")
+            .await
+            .ok();
+        return Ok(());
+    }
+    let stream = reader.get_mut();
+    while let Some(event) = rx.recv().await {
+        if stream
+            .write_all(format_route_event(&event).as_bytes())
+            .await
+            .is_err()
+        {
+            break; // client gone
+        }
+    }
+    Ok(())
+}
+
+/// Connect to a running daemon, open a route-export stream (`wren monitor
+/// routes`), and print each event line as it arrives until the daemon closes the
+/// stream or the client is interrupted. Each line is flushed immediately so the
+/// feed is usable live (and survives a `timeout`/SIGTERM in tests, which would
+/// otherwise lose block-buffered output).
+pub async fn run_monitor_client(path: &Path, command: &str) -> Result<()> {
+    use std::io::Write as _;
+    let stream = UnixStream::connect(path).await.with_context(|| {
+        format!("connecting to control socket {path:?} (is wren running with --socket {path:?}?)")
+    })?;
+    let (read_half, mut write_half) = stream.into_split();
+    write_half.write_all(command.as_bytes()).await?;
+    write_half.write_all(b"\n").await?;
+
+    let mut lines = BufReader::new(read_half).lines();
+    let mut out = std::io::stdout();
+    while let Some(line) = lines
+        .next_line()
+        .await
+        .context("reading route-export stream")?
+    {
+        writeln!(out, "{line}").ok();
+        out.flush().ok();
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -652,5 +774,41 @@ mod tests {
         assert!(parse_rip_query("show rip nonsense", "rip").is_none());
         assert!(parse_rip_query("show rip routes extra", "rip").is_none());
         assert!(parse_rip_query("", "rip").is_none());
+    }
+
+    #[test]
+    fn is_subscribe_command_matches_monitor_and_subscribe() {
+        assert!(is_subscribe_command("monitor routes"));
+        assert!(is_subscribe_command("monitor route"));
+        assert!(is_subscribe_command("subscribe routes"));
+        // Not a subscribe command / malformed.
+        assert!(!is_subscribe_command("monitor"));
+        assert!(!is_subscribe_command("monitor routes extra"));
+        assert!(!is_subscribe_command("show routes"));
+        assert!(!is_subscribe_command(""));
+    }
+
+    #[test]
+    fn format_route_event_renders_update_withdraw_and_end_of_dump() {
+        use wren_core::{NextHop, Route};
+        let route = Route::new(
+            "10.0.0.0/24".parse().unwrap(),
+            Protocol::Ospf,
+            vec![NextHop::via_dev("192.0.2.1".parse().unwrap(), "eth0")],
+            20,
+        );
+        // table 254 is RT_TABLE_MAIN, always printed for unambiguous VRF parsing.
+        assert_eq!(
+            format_route_event(&RouteEvent::Update(route)),
+            "+ 10.0.0.0/24 table 254 via 192.0.2.1 dev eth0 proto ospf metric 20\n"
+        );
+        assert_eq!(
+            format_route_event(&RouteEvent::Withdraw {
+                table: 254,
+                prefix: "10.0.0.0/24".parse().unwrap(),
+            }),
+            "- 10.0.0.0/24 table 254\n"
+        );
+        assert_eq!(format_route_event(&RouteEvent::EndOfDump), "% end-of-dump\n");
     }
 }

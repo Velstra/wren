@@ -227,8 +227,17 @@ implemented to its RFC.
   itself a helper for restarting peers (see the BGP entry). Signalling the Restart
   State (R) flag in the first OPEN after our own restart, and graceful restart for
   the IGPs, are still to come.
-- [ ] A `Fib` backend that writes routes into an **eBPF map** for the Sentinel
-  XDP data plane
+- **Route export to an external forwarding plane** — *the control-socket half is
+  done.* `wren monitor routes` opens a long-lived subscription on the control
+  socket and streams the forwarding table as it changes: an initial snapshot (one
+  `+ <prefix> …` line per route, terminated by `% end-of-dump`) followed by live
+  `+`/`-` events, mirroring exactly what the router programs into the FIB. This is
+  Wren's equivalent of FRR zebra's **Forwarding Plane Manager (FPM)** — the feed an
+  external data plane consumes to mirror Wren's routing decisions, keeping Wren
+  itself free of any consumer-specific (e.g. eBPF) coupling. Next, on the **Velstra**
+  side: a client that consumes this stream, resolves each next-hop's L2 address, and
+  programs Velstra's `ROUTES` BPF map — so the XDP data plane forwards by
+  Wren-computed routes. (Wren stays the routing brain; Velstra owns the datapath.)
 
 ## On the radar (longer-term)
 

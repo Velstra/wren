@@ -104,6 +104,15 @@ enum Command {
         #[arg(trailing_var_arg = true)]
         args: Vec<String>,
     },
+    /// Stream the forwarding table from a running wren daemon as it changes
+    /// (`wren monitor routes`): an initial snapshot followed by live route
+    /// install/withdraw events. The FPM-style feed an external forwarding plane
+    /// consumes; runs until interrupted.
+    Monitor {
+        /// What to monitor, e.g. `routes`.
+        #[arg(trailing_var_arg = true)]
+        args: Vec<String>,
+    },
 }
 
 /// The mpsc capacity for protocol → router updates.
@@ -140,6 +149,12 @@ async fn main() -> Result<()> {
     if let Some(Command::Bgp { args: words }) = &args.command {
         let command = format!("bgp {}", words.join(" "));
         return control::run_client(&args.socket, command.trim()).await;
+    }
+    // Monitor mode: open a long-lived route-export stream and print events as they
+    // arrive, until interrupted.
+    if let Some(Command::Monitor { args: words }) = &args.command {
+        let command = format!("monitor {}", words.join(" "));
+        return control::run_monitor_client(&args.socket, command.trim()).await;
     }
 
     tracing_subscriber::fmt()
@@ -246,6 +261,10 @@ async fn main() -> Result<()> {
     // held for the whole run so the owning task's query branch never sees a closed
     // channel (which would busy-loop the select).
     let (queries_tx, queries_rx) = mpsc::channel(QUERY_QUEUE);
+    // Route-export subscriptions (`wren monitor routes`) → the router loop. The
+    // `_tx` end is held for the whole run so the router's subscribe select arm
+    // never sees a closed channel.
+    let (subscribe_tx, subscribe_rx) = mpsc::channel(QUERY_QUEUE);
     let (bgp_queries_tx, bgp_queries_rx) = mpsc::channel(QUERY_QUEUE);
     let mut bgp_queries_rx = Some(bgp_queries_rx);
     let bgp_enabled = cfg.bgp.as_ref().is_some_and(|b| b.enabled);
@@ -364,6 +383,7 @@ async fn main() -> Result<()> {
         let socket = args.socket.clone();
         let channels = control::Channels {
             router: queries_tx.clone(),
+            subscribe: subscribe_tx.clone(),
             bgp: bgp_enabled.then(|| bgp_queries_tx.clone()),
             bfd: bfd_enabled.then(|| bfd_queries_tx.clone()),
             #[cfg(feature = "ospf")]
@@ -751,7 +771,7 @@ async fn main() -> Result<()> {
 
     info!("wren is running; press Ctrl-C to stop");
     tokio::select! {
-        _ = router::run(&mut rib, fib.as_mut(), updates_rx, &imports, fib_export.as_ref(), &redist_targets, &vrfs, queries_rx) => {
+        _ = router::run(&mut rib, fib.as_mut(), updates_rx, &imports, fib_export.as_ref(), &redist_targets, &vrfs, queries_rx, subscribe_rx) => {
             warn!("router loop ended (all protocol senders dropped)");
         }
         r = tokio::signal::ctrl_c() => {
