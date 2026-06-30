@@ -11,10 +11,12 @@ VRF is the main table, `254`), best-path selection runs per `(table, prefix)`, a
 kernel backend programs each route into its table via the rtnetlink `RTA_TABLE`
 attribute. Overlapping address space therefore stays separate end to end.
 
-> **Scope.** This is the VRF foundation: **static** routes can be placed in a VRF, with
-> a per-VRF route-map and the VRF's Route Distinguisher, and they install into the
-> VRF's kernel table. The dynamic protocols (OSPF, BGP, …) currently run in the default
-> VRF; per-VRF dynamic routing and BGP/MPLS L3VPN are future work.
+> **Scope.** **Static** routes and **RIP** can be placed in a VRF today: a static with
+> `vrf = "…"` and a RIP instance with `[rip] vrf = "…"` install their routes into the
+> VRF's kernel table, with the VRF's Route Distinguisher and route-maps. The other
+> dynamic protocols (OSPF, BGP, IS-IS, …) still run in the default VRF — they reuse the
+> same per-runner mechanism (a VRF table stamped on every route a runner produces), so
+> wiring them up is incremental. BGP/MPLS L3VPN is future work.
 
 ## Configuration
 
@@ -37,6 +39,17 @@ A static route joins a VRF by naming it:
 prefix = "10.99.0.0/24"
 via    = "10.9.0.2"
 vrf    = "blue"              # installs into table 100, not the main table
+```
+
+A **dynamic protocol** joins a VRF the same way. A RIP instance bound to a VRF runs
+its sockets over the VRF's (enslaved) interfaces and installs every route it learns —
+and its connected routes — into the VRF's table:
+
+```toml
+[rip]
+enabled    = true
+interfaces = ["eth1"]
+vrf        = "blue"          # learned + connected routes go into table 100
 ```
 
 For the VRF to be a real forwarding context, create the Linux VRF device and enslave

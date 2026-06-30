@@ -323,6 +323,7 @@ async fn forward_event(ev: RipEvent, updates: &mpsc::Sender<RouteUpdate>) {
     let update = match ev {
         RipEvent::Learned(route) => RouteUpdate::Announce(route),
         RipEvent::Lost(prefix) => RouteUpdate::Withdraw {
+            table: wren_core::RT_TABLE_MAIN,
             prefix,
             protocol: Protocol::Rip,
             source: 0,

@@ -632,6 +632,7 @@ async fn forward_event_pinned(
             relayed.remove(&prefix);
             let _ = updates
                 .send(RouteUpdate::Withdraw {
+                    table: wren_core::RT_TABLE_MAIN,
                     prefix,
                     protocol: Protocol::Babel,
                     source: 0,
@@ -663,6 +664,7 @@ async fn forward_event(
             relayed.remove(&prefix);
             let _ = updates
                 .send(RouteUpdate::Withdraw {
+                    table: wren_core::RT_TABLE_MAIN,
                     prefix,
                     protocol: Protocol::Babel,
                     source: 0,

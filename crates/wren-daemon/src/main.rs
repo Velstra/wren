@@ -410,10 +410,19 @@ async fn main() -> Result<()> {
         }
         let redistribute_metric = ripcfg.redistribute_metric.unwrap_or(1);
         let interfaces = ripcfg.interfaces.clone();
+        // The VRF this RIP instance runs in (its routes go into that VRF's table).
+        let rip_table = match &ripcfg.vrf {
+            Some(name) => cfg
+                .vrf_table(name)
+                .with_context(|| format!("rip references unknown vrf {name:?}"))?,
+            None => wren_core::RT_TABLE_MAIN,
+        };
         let tx = updates_tx.clone();
         let qrx = rip_queries_rx.take().expect("rip queries rx taken once");
         tokio::spawn(async move {
-            if let Err(e) = rip::run(interfaces, tx, redist_rx, redistribute_metric, qrx).await {
+            if let Err(e) =
+                rip::run(interfaces, rip_table, tx, redist_rx, redistribute_metric, qrx).await
+            {
                 error!(error = %e, "RIP engine stopped");
             }
         });

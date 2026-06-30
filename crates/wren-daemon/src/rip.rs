@@ -126,6 +126,7 @@ pub fn render_rip_routes(
 /// 1..=15) and poisons it again when its best path goes away.
 pub async fn run(
     interfaces: Vec<String>,
+    vrf_table: u32,
     updates: mpsc::Sender<RouteUpdate>,
     mut redist: mpsc::Receiver<Redistribution>,
     redistribute_metric: u32,
@@ -184,7 +185,8 @@ pub async fn run(
             Protocol::Connected,
             vec![NextHop::dev(net.ifname)],
             0,
-        );
+        )
+        .with_table(vrf_table);
         let _ = updates.send(RouteUpdate::Announce(route)).await;
     }
 
@@ -204,13 +206,13 @@ pub async fn run(
                     break;
                 };
                 let now = start.elapsed().as_secs();
-                handle_packet(&mut table, &ifaces, &pkt, now, &updates).await;
+                handle_packet(&mut table, vrf_table, &ifaces, &pkt, now, &updates).await;
                 flush_triggered(&mut table, &ifaces).await;
             }
             _ = periodic.tick() => {
                 let now = start.elapsed().as_secs();
                 for ev in table.tick(now) {
-                    forward_event(ev, &updates).await;
+                    forward_event(ev, vrf_table, &updates).await;
                 }
                 send_full_update(&table, &ifaces).await;
                 table.clear_changed();
@@ -218,7 +220,7 @@ pub async fn run(
             _ = housekeeping.tick() => {
                 let now = start.elapsed().as_secs();
                 for ev in table.tick(now) {
-                    forward_event(ev, &updates).await;
+                    forward_event(ev, vrf_table, &updates).await;
                 }
                 flush_triggered(&mut table, &ifaces).await;
             }
@@ -287,6 +289,7 @@ fn spawn_receiver(sock: Arc<UdpSocket>, ifindex: u32, pkt_tx: mpsc::Sender<Packe
 /// Requests, forwarding any resulting RIB events.
 async fn handle_packet(
     table: &mut RipTable,
+    vrf_table: u32,
     ifaces: &[Iface],
     pkt: &Packet,
     now: u64,
@@ -316,7 +319,7 @@ async fn handle_packet(
         Command::Response => {
             for entry in &msg.entries {
                 if let Some(ev) = table.process(entry, from, pkt.ifindex, now) {
-                    forward_event(ev, updates).await;
+                    forward_event(ev, vrf_table, updates).await;
                 }
             }
         }
@@ -361,10 +364,13 @@ async fn send_response(sock: &UdpSocket, dst: SocketAddr, entries: &[Entry]) {
 
 /// Translate a table event into the router's protocol-agnostic update. RIP
 /// presents exactly one route per prefix, so its RIB source is a constant.
-async fn forward_event(ev: RipEvent, updates: &mpsc::Sender<RouteUpdate>) {
+async fn forward_event(ev: RipEvent, vrf_table: u32, updates: &mpsc::Sender<RouteUpdate>) {
     let update = match ev {
-        RipEvent::Learned(route) => RouteUpdate::Announce(route),
+        // Stamp the runner's VRF on every route it learns, so it lands in that VRF's
+        // table (the default VRF / main table when not bound to one).
+        RipEvent::Learned(route) => RouteUpdate::Announce(route.with_table(vrf_table)),
         RipEvent::Lost(prefix) => RouteUpdate::Withdraw {
+            table: vrf_table,
             prefix,
             protocol: Protocol::Rip,
             source: 0,

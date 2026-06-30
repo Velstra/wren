@@ -67,6 +67,9 @@ pub enum RouteUpdate {
     Announce(Route),
     /// A protocol withdrew its route to a prefix — remove that candidate.
     Withdraw {
+        /// The VRF (kernel table) the route was in — [`wren_core::RT_TABLE_MAIN`] for
+        /// a protocol in the default VRF.
+        table: u32,
         /// The destination whose route is gone.
         prefix: Prefix,
         /// The protocol that owned it.
@@ -317,13 +320,14 @@ fn apply(
                 }
             }
         }
-        // A dynamic protocol's withdraw is for the default VRF (the main table); VRF
-        // routes are static-seeded and not withdrawn at runtime.
+        // The withdraw names its VRF (the default VRF / main table for a protocol not
+        // bound to a VRF).
         RouteUpdate::Withdraw {
+            table,
             prefix,
             protocol,
             source,
-        } => rib.withdraw(wren_core::RT_TABLE_MAIN, prefix, protocol, source),
+        } => rib.withdraw(table, prefix, protocol, source),
     };
 
     let change = change?; // the installed best route did not change

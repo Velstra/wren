@@ -1798,6 +1798,7 @@ async fn emit(ev: RibEvent, updates: &mpsc::Sender<RouteUpdate>) {
             RouteUpdate::Announce(path.to_route_multipath(prefix, hops))
         }
         RibEvent::Withdrawn(prefix) => RouteUpdate::Withdraw {
+            table: wren_core::RT_TABLE_MAIN,
             prefix,
             protocol: Protocol::Bgp,
             source: 0,

@@ -203,6 +203,10 @@ pub struct Rip {
     /// The RIP metric (1..=15) advertised for redistributed routes. Defaults to 1.
     #[serde(rename = "redistribute-metric")]
     pub redistribute_metric: Option<u32>,
+    /// The VRF this RIP instance runs in (a `[[vrf]]` name). Its learned and connected
+    /// routes are installed into that VRF's kernel table; the interfaces should be
+    /// enslaved to the VRF device. Unset runs RIP in the default VRF (main table).
+    pub vrf: Option<String>,
 }
 
 /// RIPng (IPv6) protocol configuration.

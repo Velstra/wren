@@ -183,7 +183,12 @@ implemented to its RFC.
   into the VRF's kernel table (via rtnetlink `RTA_TABLE`); `show vrf` reports them and
   startup reconciliation runs per table. Live-verified by `scripts/vrf-smoke.sh`
   (static into table 100, overlapping prefix isolated per table, route-map rejection,
-  `show vrf`). Dynamic-protocol VRFs and BGP/MPLS L3VPN are the remaining work. See
+  `show vrf`). **Dynamic routing in a VRF** has its first consumer: a **RIP** instance
+  with `[rip] vrf = "…"` stamps the VRF's table on every route it learns and on its
+  connected routes (`RouteUpdate` carries the table end to end), live-verified by
+  `scripts/vrf-dynamic-smoke.sh` (B learns A's route over RIP into table 100, not the
+  main table). The other dynamic protocols reuse the same per-runner mechanism;
+  BGP/MPLS L3VPN is the remaining big piece. See
   [VRFs & Route Distinguishers](vrf.md).
 - [~] A **management interface** and operational `show` commands — the daemon
   serves a Unix-domain control socket (`--socket`, default `/run/wren/wren.sock`).

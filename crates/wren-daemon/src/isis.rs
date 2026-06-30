@@ -1413,6 +1413,7 @@ impl Isis {
             let _ = self
                 .updates
                 .send(RouteUpdate::Withdraw {
+                    table: wren_core::RT_TABLE_MAIN,
                     prefix,
                     protocol: Protocol::Isis,
                     source: 0,
