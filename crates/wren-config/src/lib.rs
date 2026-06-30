@@ -101,12 +101,13 @@ pub struct VrrpDef {
     /// Whether to preempt a lower-priority master once we are available.
     #[serde(default = "default_true")]
     pub preempt: bool,
-    /// The virtual IPv4 address(es) this router backs.
+    /// The virtual IP address(es) this router backs (all IPv4 *or* all IPv6).
     #[serde(rename = "virtual-address")]
     pub virtual_addresses: Vec<String>,
-    /// The prefix length to assign each virtual address with (default 24).
-    #[serde(default = "default_vrrp_prefix", rename = "prefix-length")]
-    pub prefix_length: u8,
+    /// The prefix length to assign each virtual address with. Defaults per family
+    /// (24 for IPv4, 64 for IPv6) when unset.
+    #[serde(default, rename = "prefix-length")]
+    pub prefix_length: Option<u8>,
 }
 
 fn default_vrrp_priority() -> u8 {
@@ -114,9 +115,6 @@ fn default_vrrp_priority() -> u8 {
 }
 fn default_vrrp_advert_ms() -> u32 {
     1000
-}
-fn default_vrrp_prefix() -> u8 {
-    24
 }
 fn default_true() -> bool {
     true

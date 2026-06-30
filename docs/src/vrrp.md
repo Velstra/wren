@@ -20,8 +20,13 @@ with higher priority — and promotes itself if it lapses without hearing from t
 master.
 
 On becoming master Wren **assigns the virtual IP** to the interface (via netlink)
-and **announces it with a gratuitous ARP**, so switches and hosts immediately
-relearn the address at the new router. On becoming backup it removes the address.
+and **announces it** so switches and hosts immediately relearn the address at the
+new router — a gratuitous ARP for IPv4, an unsolicited neighbor advertisement for
+IPv6. On becoming backup it removes the address.
+
+VRRP is **dual-stack**: a virtual router backs either IPv4 or IPv6 addresses (one
+family per `[[vrrp]]` block). IPv6 advertisements go to `ff02::12`, sourced from
+the interface's link-local address.
 
 ## Configuration
 
@@ -32,9 +37,12 @@ vrid            = 51              # 1–255, shared by both routers
 priority        = 200            # 1–254; highest wins (255 = address owner)
 advert-interval = 1000           # milliseconds (default 1000)
 preempt         = true           # take over from a lower-priority master
-virtual-address = ["10.0.0.254"] # the shared IP(s)
-prefix-length   = 24             # assigned with the VIP (default 24)
+virtual-address = ["10.0.0.254"] # the shared IP(s); all IPv4 or all IPv6
+prefix-length   = 24             # assigned with the VIP (default 24 v4 / 64 v6)
 ```
+
+For an IPv6 virtual router, give IPv6 `virtual-address`es (e.g.
+`["2001:db8::ff"]`); the prefix length defaults to 64.
 
 The backup is identical but with a lower `priority` (e.g. `100`) on its own
 interface. Set `priority = 255` on the router that natively owns the address to
@@ -57,8 +65,7 @@ current master (this router itself when it is master).
 
 ## Scope
 
-The current runner is IPv4. The advertisement codec and the state machine are
-already dual-stack; the IPv6 runner (multicast `ff02::12`, unsolicited neighbor
-advertisement in place of gratuitous ARP) is the natural follow-on. Optional
-extensions — a dedicated virtual MAC (`00-00-5E-00-01-{vrid}`) and tracking a
-WAN interface/route to lower priority on failure — are future work.
+The runner is dual-stack (IPv4 and IPv6). Optional extensions — a dedicated
+virtual MAC (`00-00-5E-00-01-{vrid}`) instead of announcing the real interface
+MAC, and tracking a WAN interface or route to lower priority on failure — are
+future work.

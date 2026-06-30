@@ -1732,11 +1732,17 @@ fn build_vrrp_instances(cfg: &wren_config::Config) -> Result<Vec<vrrp::InstanceC
         }
         let mut addresses = Vec::new();
         for a in &def.virtual_addresses {
-            let ip: Ipv4Addr = a.parse().with_context(|| {
-                format!("vrrp vrid {}: virtual-address {a:?} is not an IPv4 address", def.vrid)
+            let ip: std::net::IpAddr = a.parse().with_context(|| {
+                format!("vrrp vrid {}: virtual-address {a:?} is not an IP address", def.vrid)
             })?;
             addresses.push(ip);
         }
+        // Every virtual address of one router must be of the same family.
+        let ipv6 = addresses[0].is_ipv6();
+        if addresses.iter().any(|a| a.is_ipv6() != ipv6) {
+            anyhow::bail!("vrrp vrid {}: virtual-addresses mix IPv4 and IPv6", def.vrid);
+        }
+        let prefix_len = def.prefix_length.unwrap_or(if ipv6 { 64 } else { 24 });
         // Round the interval to centiseconds, clamped to the 12-bit wire field.
         let advert_int_cs = (def.advert_interval_ms / 10).clamp(1, 0x0fff) as u16;
         out.push(vrrp::InstanceConfig {
@@ -1746,7 +1752,7 @@ fn build_vrrp_instances(cfg: &wren_config::Config) -> Result<Vec<vrrp::InstanceC
             advert_int_cs,
             preempt: def.preempt,
             addresses,
-            prefix_len: def.prefix_length,
+            prefix_len,
         });
     }
     Ok(out)
