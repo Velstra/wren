@@ -11,13 +11,13 @@ VRF is the main table, `254`), best-path selection runs per `(table, prefix)`, a
 kernel backend programs each route into its table via the rtnetlink `RTA_TABLE`
 attribute. Overlapping address space therefore stays separate end to end.
 
-> **Scope.** **Static** routes and the **RIP**, **OSPF** and **IS-IS** IGPs can be
-> placed in a VRF today: a static with `vrf = "…"`, or an instance with `[rip] vrf =
-> "…"`, `[ospf] vrf = "…"` or `[isis] vrf = "…"` installs its routes into the VRF's
-> kernel table, with the VRF's Route Distinguisher and route-maps. The remaining
-> dynamic protocols (BGP, Babel) still run in the default VRF — they reuse the same
-> per-runner mechanism (a VRF table stamped on every route a runner produces), so
-> wiring them up is incremental. BGP/MPLS L3VPN is future work.
+> **Scope.** **Static** routes and every IGP — **RIP**, **OSPF**, **IS-IS** and
+> **Babel** — can be placed in a VRF today: a static with `vrf = "…"`, or an instance
+> with `[rip] vrf = "…"`, `[ospf] vrf = "…"`, `[isis] vrf = "…"` or `[babel] vrf =
+> "…"` installs its routes into the VRF's kernel table, with the VRF's Route
+> Distinguisher and route-maps. **BGP** still runs in the default VRF — it reuses the
+> same per-runner mechanism (a VRF table stamped on every route a runner produces), so
+> wiring it up is incremental. BGP/MPLS L3VPN is future work.
 
 ## Configuration
 
@@ -73,6 +73,16 @@ enabled      = true
 interfaces   = ["eth1"]
 network-type = "point-to-point"
 vrf          = "blue"        # SPF results go into table 100
+```
+
+Babel joins a VRF identically — its connected reachability and every route it selects,
+in both address families, go into the VRF's table:
+
+```toml
+[babel]
+enabled    = true
+interfaces = ["eth1"]
+vrf        = "blue"          # selected routes go into table 100
 ```
 
 For the VRF to be a real forwarding context, create the Linux VRF device and enslave

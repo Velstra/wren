@@ -88,6 +88,12 @@ pub struct BabelConfig {
     /// The metric advertised for routes redistributed from the RIB (the metric
     /// "at the source"). 0 means "as good as a directly-originated network".
     pub redistribute_metric: u16,
+    /// The VRF (kernel routing table) this Babel instance installs into. Every route
+    /// it produces — its connected reachability and selected routes, both address
+    /// families — is stamped with this table, so a Babel instance bound to a VRF
+    /// (`[babel] vrf = "…"`) keeps its routes in the VRF's table instead of the main
+    /// table. Defaults to [`wren_core::RT_TABLE_MAIN`] for the default VRF.
+    pub vrf_table: u32,
 }
 
 /// One Babel-speaking interface.
@@ -244,6 +250,7 @@ pub async fn run(
     drop(pkt_tx);
 
     let redistribute_metric = cfg.redistribute_metric;
+    let vrf_table = cfg.vrf_table;
     let mut state = State {
         router_id: cfg.router_id,
         neighbours: NeighbourTable::new(),
@@ -268,7 +275,8 @@ pub async fn run(
             Protocol::Connected,
             vec![NextHop::dev(net.ifname)],
             0,
-        );
+        )
+        .with_table(vrf_table);
         let _ = updates.send(RouteUpdate::Announce(route)).await;
     }
     for prefix in cfg.originate {
@@ -300,7 +308,7 @@ pub async fn run(
                     break;
                 };
                 let now = start.elapsed().as_secs();
-                let changed = handle_datagram(&mut state, &ifaces, &dg, now, &updates).await;
+                let changed = handle_datagram(&mut state, &ifaces, &dg, now, vrf_table, &updates).await;
                 if changed {
                     // A selection changed — flush a triggered Update promptly.
                     send_updates(&mut state, &ifaces).await;
@@ -318,7 +326,7 @@ pub async fn run(
                 for addr in dead {
                     info!(neighbour = %addr, "Babel neighbour lost");
                     for ev in state.table.neighbour_lost(addr) {
-                        forward_event(&mut state.relayed, ev, &updates).await;
+                        forward_event(&mut state.relayed, ev, vrf_table, &updates).await;
                     }
                 }
             }
@@ -402,6 +410,7 @@ async fn handle_datagram(
     ifaces: &[Iface],
     dg: &Datagram,
     now: u64,
+    vrf_table: u32,
     updates: &mpsc::Sender<RouteUpdate>,
 ) -> bool {
     let pkt = match Packet::decode(&dg.data) {
@@ -462,7 +471,7 @@ async fn handle_datagram(
                                 .insert(*prefix, (router_id, *seqno, route_metric(&ev)));
                         }
                     }
-                    forward_event_pinned(&mut state.relayed, ev, &iface.name, updates).await;
+                    forward_event_pinned(&mut state.relayed, ev, &iface.name, vrf_table, updates).await;
                     changed = true;
                 }
             }
@@ -617,6 +626,7 @@ async fn forward_event_pinned(
     relayed: &mut std::collections::BTreeMap<Prefix, ([u8; 8], u16, u16)>,
     ev: BabelEvent,
     ifname: &str,
+    vrf_table: u32,
     updates: &mpsc::Sender<RouteUpdate>,
 ) {
     match ev {
@@ -625,14 +635,14 @@ async fn forward_event_pinned(
             next_hop,
             metric,
         } => {
-            let route = babel_route(prefix, next_hop, metric, ifname);
+            let route = babel_route(prefix, next_hop, metric, ifname).with_table(vrf_table);
             let _ = updates.send(RouteUpdate::Announce(route)).await;
         }
         BabelEvent::Retract(prefix) => {
             relayed.remove(&prefix);
             let _ = updates
                 .send(RouteUpdate::Withdraw {
-                    table: wren_core::RT_TABLE_MAIN,
+                    table: vrf_table,
                     prefix,
                     protocol: Protocol::Babel,
                     source: 0,
@@ -648,6 +658,7 @@ async fn forward_event_pinned(
 async fn forward_event(
     relayed: &mut std::collections::BTreeMap<Prefix, ([u8; 8], u16, u16)>,
     ev: BabelEvent,
+    vrf_table: u32,
     updates: &mpsc::Sender<RouteUpdate>,
 ) {
     match ev {
@@ -657,14 +668,15 @@ async fn forward_event(
             metric,
         } => {
             let nh = nexthop_for(next_hop, None);
-            let route = Route::new(prefix, Protocol::Babel, vec![nh], metric as u32);
+            let route =
+                Route::new(prefix, Protocol::Babel, vec![nh], metric as u32).with_table(vrf_table);
             let _ = updates.send(RouteUpdate::Announce(route)).await;
         }
         BabelEvent::Retract(prefix) => {
             relayed.remove(&prefix);
             let _ = updates
                 .send(RouteUpdate::Withdraw {
-                    table: wren_core::RT_TABLE_MAIN,
+                    table: vrf_table,
                     prefix,
                     protocol: Protocol::Babel,
                     source: 0,

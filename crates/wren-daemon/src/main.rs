@@ -1378,11 +1378,18 @@ fn build_babel_config(
         );
     }
 
+    let vrf_table = match &babel.vrf {
+        Some(name) => cfg
+            .vrf_table(name)
+            .with_context(|| format!("babel references unknown vrf {name:?}"))?,
+        None => wren_core::RT_TABLE_MAIN,
+    };
     Ok(babel::BabelConfig {
         router_id: babel::router_id_from_ipv4(router_id_v4),
         interfaces: babel.interfaces.clone(),
         originate,
         redistribute_metric: babel.redistribute_metric.unwrap_or(0),
+        vrf_table,
     })
 }
 

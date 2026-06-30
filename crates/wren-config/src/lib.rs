@@ -672,6 +672,11 @@ pub struct Babel {
     /// source"). Defaults to 0, like a directly-originated network.
     #[serde(rename = "redistribute-metric")]
     pub redistribute_metric: Option<u16>,
+    /// The VRF this Babel instance runs in, named by a `[[vrf]]` block. Its sockets
+    /// operate over the VRF's (enslaved) interfaces and every route it computes is
+    /// installed into the VRF's kernel table instead of the main table. Unset runs
+    /// Babel in the default VRF (main table).
+    pub vrf: Option<String>,
 }
 
 /// IS-IS protocol configuration (`[isis]`, ISO/IEC 10589 + RFC 1195).
