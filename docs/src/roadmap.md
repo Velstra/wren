@@ -239,7 +239,12 @@ tracked but not yet scheduled, grouped by area:
   refinements (the RFC 5303 p2p three-way TLV, L1↔L2 route leaking), RIFT, EIGRP;
   IGMP/MLD for multicast group membership.
 - **BGP breadth:** EVPN (RFC 7432), long-lived graceful restart (RFC 9494),
-  FlowSpec (RFC 8955), RTC (RFC 4684). (**BMP** (RFC 7854) — streaming BGP state
+  RTC (RFC 4684). (**FlowSpec** (RFC 8955) is **in progress** — the flow-specification
+  NLRI codec (the §4.2 components with their numeric/bitmask operators, the §4 length
+  prefix) and the §7 traffic-filtering action extended communities (rate-limit /
+  discard, marking) are **done** and unit-tested in `wren-bgp::flowspec`; the MP-BGP
+  SAFI 133 exchange, a FlowSpec RIB, `show bgp flowspec` and kernel application via
+  nftables are the next steps.) (**BMP** (RFC 7854) — streaming BGP state
   (Initiation, Peer Up, Route Monitoring, Peer Down) to a monitoring station via
   `[bgp.bmp]` — is **done**; see [Monitoring](monitoring.md).)
   (**Extended Next Hop / IPv4-over-IPv6** (RFC 5549 / RFC 8950) — advertising IPv4
