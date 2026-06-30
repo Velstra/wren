@@ -855,6 +855,12 @@ fn build_ospf_config(
         anyhow::bail!("area {a} cannot be both a stub and an NSSA area");
     }
     let auth = build_ospf_auth(ospf)?;
+    let vrf_table = match &ospf.vrf {
+        Some(name) => cfg
+            .vrf_table(name)
+            .with_context(|| format!("ospf references unknown vrf {name:?}"))?,
+        None => wren_core::RT_TABLE_MAIN,
+    };
     Ok(ospf::OspfConfig {
         router_id,
         iface_type,
@@ -873,6 +879,7 @@ fn build_ospf_config(
         nssa_default_areas,
         auth,
         bfd: ospf.bfd,
+        vrf_table,
     })
 }
 

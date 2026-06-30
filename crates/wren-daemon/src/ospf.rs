@@ -124,6 +124,11 @@ pub struct OspfConfig {
     /// when a neighbour reaches Full a session is registered, and a BFD-down tears
     /// the adjacency down at once instead of waiting for the dead interval.
     pub bfd: bool,
+    /// The VRF (kernel routing table) this OSPF instance installs into. Every route
+    /// it computes is stamped with this table, so an OSPF instance bound to a VRF
+    /// (`[ospf] vrf = "…"`) keeps its routes in the VRF's table instead of the main
+    /// table. Defaults to [`wren_core::RT_TABLE_MAIN`] for the default VRF.
+    pub vrf_table: u32,
 }
 
 /// One configured OSPF interface and the area it is in.
@@ -1762,15 +1767,19 @@ impl Ospf {
         }
 
         let new_prefixes: HashSet<Prefix> = chosen.keys().copied().collect();
+        let vrf_table = self.cfg.vrf_table;
         for r in chosen.values() {
-            let _ = self.updates.send(RouteUpdate::Announce(r.to_route())).await;
+            let _ = self
+                .updates
+                .send(RouteUpdate::Announce(r.to_route().with_table(vrf_table)))
+                .await;
         }
         let gone: Vec<Prefix> = self.announced.difference(&new_prefixes).copied().collect();
         for prefix in gone {
             let _ = self
                 .updates
                 .send(RouteUpdate::Withdraw {
-                    table: wren_core::RT_TABLE_MAIN,
+                    table: vrf_table,
                     prefix,
                     protocol: wren_core::Protocol::Ospf,
                     source: 0,
