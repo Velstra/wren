@@ -721,6 +721,11 @@ pub struct Isis {
     /// Interface Address TLV in its Hellos; timing comes from `[bfd]`.
     #[serde(default)]
     pub bfd: bool,
+    /// The VRF this IS-IS instance runs in, named by a `[[vrf]]` block. Its sockets
+    /// operate over the VRF's (enslaved) interfaces and every route it computes is
+    /// installed into the VRF's kernel table instead of the main table. Unset runs
+    /// IS-IS in the default VRF (main table).
+    pub vrf: Option<String>,
 }
 
 /// A named route filter (`[[filter]]`): an ordered list of rules plus a default

@@ -1609,6 +1609,12 @@ fn build_isis_config(
         .collect();
 
     let metric = isis.metric.unwrap_or(10);
+    let vrf_table = match &isis.vrf {
+        Some(name) => cfg
+            .vrf_table(name)
+            .with_context(|| format!("isis references unknown vrf {name:?}"))?,
+        None => wren_core::RT_TABLE_MAIN,
+    };
     Ok(isis::IsisConfig {
         system_id,
         area,
@@ -1620,5 +1626,6 @@ fn build_isis_config(
         holding_multiplier: 3,
         interfaces,
         bfd: isis.bfd,
+        vrf_table,
     })
 }

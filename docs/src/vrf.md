@@ -11,13 +11,13 @@ VRF is the main table, `254`), best-path selection runs per `(table, prefix)`, a
 kernel backend programs each route into its table via the rtnetlink `RTA_TABLE`
 attribute. Overlapping address space therefore stays separate end to end.
 
-> **Scope.** **Static** routes, **RIP** and **OSPF** can be placed in a VRF today: a
-> static with `vrf = "…"`, a RIP instance with `[rip] vrf = "…"`, or an OSPF instance
-> with `[ospf] vrf = "…"` install their routes into the VRF's kernel table, with the
-> VRF's Route Distinguisher and route-maps. The remaining dynamic protocols (BGP,
-> IS-IS, …) still run in the default VRF — they reuse the same per-runner mechanism (a
-> VRF table stamped on every route a runner produces), so wiring them up is
-> incremental. BGP/MPLS L3VPN is future work.
+> **Scope.** **Static** routes and the **RIP**, **OSPF** and **IS-IS** IGPs can be
+> placed in a VRF today: a static with `vrf = "…"`, or an instance with `[rip] vrf =
+> "…"`, `[ospf] vrf = "…"` or `[isis] vrf = "…"` installs its routes into the VRF's
+> kernel table, with the VRF's Route Distinguisher and route-maps. The remaining
+> dynamic protocols (BGP, Babel) still run in the default VRF — they reuse the same
+> per-runner mechanism (a VRF table stamped on every route a runner produces), so
+> wiring them up is incremental. BGP/MPLS L3VPN is future work.
 
 ## Configuration
 
@@ -58,6 +58,17 @@ and AS-external) is installed into the VRF's table:
 
 ```toml
 [ospf]
+enabled      = true
+interfaces   = ["eth1"]
+network-type = "point-to-point"
+vrf          = "blue"        # SPF results go into table 100
+```
+
+IS-IS joins a VRF the same way — its connected reachability and every SPF result, in
+both address families, go into the VRF's table:
+
+```toml
+[isis]
 enabled      = true
 interfaces   = ["eth1"]
 network-type = "point-to-point"

@@ -122,6 +122,12 @@ pub struct IsisConfig {
     /// Run BFD (RFC 5880) to each neighbour with an up adjacency and tear the
     /// adjacency down at once when BFD reports the path failed (RFC 5882).
     pub bfd: bool,
+    /// The VRF (kernel routing table) this IS-IS instance installs into. Every route
+    /// it computes — its connected reachability and SPF results, both address
+    /// families — is stamped with this table, so an IS-IS instance bound to a VRF
+    /// (`[isis] vrf = "…"`) keeps its routes in the VRF's table instead of the main
+    /// table. Defaults to [`wren_core::RT_TABLE_MAIN`] for the default VRF.
+    pub vrf_table: u32,
 }
 
 /// Map a single level to its database / per-neighbour-array index.
@@ -461,6 +467,7 @@ pub async fn run(
     // Discover our connected networks: advertise them as IP reachability and
     // register them in the RIB as Connected (the kernel already owns them).
     let names: Vec<String> = cfg.interfaces.iter().map(|i| i.name.clone()).collect();
+    let vrf_table = cfg.vrf_table;
     let mut v4_reach = Vec::new();
     let mut v6_reach = Vec::new();
     for net in connected::discover(&names) {
@@ -470,7 +477,8 @@ pub async fn run(
             Protocol::Connected,
             vec![NextHop::dev(net.ifname)],
             0,
-        );
+        )
+        .with_table(vrf_table);
         let _ = updates.send(RouteUpdate::Announce(route)).await;
         if net.prefix.is_ipv4() {
             v4_reach.push(net.prefix);
@@ -1400,8 +1408,12 @@ impl Isis {
         }
 
         let current: HashSet<Prefix> = chosen.keys().copied().collect();
+        let vrf_table = self.cfg.vrf_table;
         for route in chosen.into_values() {
-            let _ = self.updates.send(RouteUpdate::Announce(route)).await;
+            let _ = self
+                .updates
+                .send(RouteUpdate::Announce(route.with_table(vrf_table)))
+                .await;
         }
         let gone: Vec<Prefix> = self
             .announced
@@ -1413,7 +1425,7 @@ impl Isis {
             let _ = self
                 .updates
                 .send(RouteUpdate::Withdraw {
-                    table: wren_core::RT_TABLE_MAIN,
+                    table: vrf_table,
                     prefix,
                     protocol: Protocol::Isis,
                     source: 0,
