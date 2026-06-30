@@ -13,7 +13,9 @@
 # 2001:db8:99::/64 with `next-hop6 = 2001:db8::1`. The test asserts:
 #   * both speakers negotiate the IPv6 multiprotocol capability and reach
 #     Established (so A actually sends MP_REACH_NLRI);
-#   * B learns 2001:db8:99::/64 via 2001:db8::1 in its BGP Loc-RIB; and
+#   * B learns 2001:db8:99::/64 in its BGP Loc-RIB via A's link-local next hop —
+#     A and B share the subnet, so A advertises a 32-octet next hop (global +
+#     link-local) per RFC 2545 §3 and B forwards over the `fe80::` link-local; and
 #   * B installs it into the kernel IPv6 table `proto bgp`.
 #
 # This exercises the whole MP-BGP path: capability negotiation in the OPEN, the
@@ -93,10 +95,12 @@ unshare -Urn bash -c '
   cat "$WORK/out.txt"
 
   grep -q "10.0.0.1 AS 65001 Established"            "$WORK/out.txt" || { echo "FAIL: session not Established"; ok=0; }
-  grep -q "2001:db8:99::/64 via 2001:db8::1"         "$WORK/out.txt" || { echo "FAIL: B missing IPv6 route in BGP Loc-RIB"; ok=0; }
+  # A and B share the subnet, so A sends a 32-octet next hop and B forwards over the
+  # advertiser link-local (RFC 2545 §3), pinned to the ingress interface — not the global.
+  grep -q "2001:db8:99::/64 via fe80:"               "$WORK/out.txt" || { echo "FAIL: B missing IPv6 route in BGP Loc-RIB"; ok=0; }
   # `ip -6 route show proto bgp` already filters to proto bgp, so the kernel line
   # (with the dev) appearing under it proves the v6 FIB install.
-  grep -q "2001:db8:99::/64 via 2001:db8::1 dev"     "$WORK/out.txt" || { echo "FAIL: IPv6 route not installed proto bgp on B"; ok=0; }
+  grep -q "2001:db8:99::/64 via fe80:[0-9a-f:]* dev" "$WORK/out.txt" || { echo "FAIL: IPv6 route not installed proto bgp on B"; ok=0; }
 
   if [[ $ok -ne 1 ]]; then echo "--- A log ---"; cat "$WORK/a.log"; echo "--- B log ---"; cat "$WORK/b.log"; fi
   kill $BPID 2>/dev/null || true

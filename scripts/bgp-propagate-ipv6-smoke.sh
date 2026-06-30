@@ -16,9 +16,11 @@
 #
 # A originates the IPv6 network 2001:db8:99::/64 (next-hop-self 2001:db8:1::1). B
 # originates nothing — it learns the route over MP-BGP and must *propagate* it
-# onward to C with its own AS prepended and next-hop-self6 (2001:db8:2::1, its
-# address on link2, so C can resolve it on-link). The test asserts:
-#   * C learns 2001:db8:99::/64 via 2001:db8:2::1 with as-path "65002 65001"; and
+# onward to C with its own AS prepended and next-hop-self6 (global 2001:db8:2::1,
+# its address on link2). B and C share link2, so B advertises a 32-octet next hop
+# (global + link-local) per RFC 2545 §3 and C forwards over B's `fe80::`
+# link-local pinned to link2. The test asserts:
+#   * C learns 2001:db8:99::/64 via B's link-local with as-path "65002 65001"; and
 #   * C installs it into the kernel IPv6 table `proto bgp`.
 #
 # Usage:  bash scripts/bgp-propagate-ipv6-smoke.sh
@@ -123,9 +125,11 @@ unshare -Urn bash -c '
   } > "$WORK/out.txt" 2>&1
   cat "$WORK/out.txt"
 
-  grep -q "2001:db8:99::/64 via 2001:db8:2::1"     "$WORK/out.txt" || { echo "FAIL: C did not learn the propagated IPv6 route via B"; ok=0; }
-  grep -q "as-path 65002 65001"                    "$WORK/out.txt" || { echo "FAIL: propagated route missing as-path 65002 65001"; ok=0; }
-  grep -q "2001:db8:99::/64 via 2001:db8:2::1 dev" "$WORK/out.txt" || { echo "FAIL: propagated IPv6 route not installed proto bgp on C"; ok=0; }
+  # B and C share link2, so C forwards over the advertiser link-local (RFC 2545 §3),
+  # pinned to the ingress interface — not the global next hop.
+  grep -q "2001:db8:99::/64 via fe80:"               "$WORK/out.txt" || { echo "FAIL: C did not learn the propagated IPv6 route via B"; ok=0; }
+  grep -q "as-path 65002 65001"                      "$WORK/out.txt" || { echo "FAIL: propagated route missing as-path 65002 65001"; ok=0; }
+  grep -q "2001:db8:99::/64 via fe80:[0-9a-f:]* dev" "$WORK/out.txt" || { echo "FAIL: propagated IPv6 route not installed proto bgp on C"; ok=0; }
 
   if [[ $ok -ne 1 ]]; then
     echo "--- A log ---"; cat "$WORK/a.log"
