@@ -39,8 +39,9 @@ use tokio::sync::mpsc;
 use tokio::time::{sleep_until, Duration, Instant};
 use tracing::{debug, info, warn};
 
-use wren_bfd::{AuthConfig, AuthState, ControlPacket, Session, SessionConfig, State};
+use wren_bfd::{AuthConfig, AuthState, ControlPacket, Diag, Session, SessionConfig, State};
 
+use crate::bfd_echo::{self, EchoSock, ECHO_PORT};
 use crate::sockopt::setsockopt_int;
 
 /// The well-known UDP port for single-hop BFD Control packets (RFC 5881 §4).
@@ -65,6 +66,20 @@ pub struct BfdConfig {
     /// set, every packet carries an Authentication Section and a received packet must
     /// pass verification; the peer must be configured with the same type and key.
     pub auth: Option<AuthConfig>,
+    /// Optional Echo function (RFC 5880 §6.4): when set, every IPv4 session also runs
+    /// looped-back Echo packets through the neighbour's forwarding plane, declaring the
+    /// session down (with diagnostic Echo Function Failed) if they stop returning.
+    pub echo: Option<EchoParams>,
+}
+
+/// The BFD Echo timing (RFC 5880 §6.4), shared by every session.
+#[derive(Clone, Copy)]
+pub struct EchoParams {
+    /// The interval between transmitted Echo packets, in microseconds.
+    pub interval_us: u64,
+    /// The detect multiplier: the session fails if no Echo returns for this many
+    /// Echo intervals.
+    pub detect_mult: u8,
 }
 
 /// Which protocol a BFD subscription belongs to, so one peer can be tracked by
@@ -150,6 +165,40 @@ struct PeerSession {
     detect_deadline: Option<Instant>,
     /// The protocols to notify when this session goes down, by consumer.
     subscribers: HashMap<BfdConsumer, mpsc::Sender<IpAddr>>,
+    /// The Echo function state (RFC 5880 §6.4), `None` unless Echo is enabled and the
+    /// peer is IPv4 with a resolvable egress interface.
+    echo: Option<EchoState>,
+}
+
+/// Per-session BFD Echo state: where to send the looped packets, the sequence, and
+/// when the last one returned. Echo runs only while the session is Up.
+struct EchoState {
+    /// The egress interface index (for the AF_PACKET send).
+    ifindex: u32,
+    /// The egress interface name (for the ARP-table neighbour-MAC lookup).
+    ifname: String,
+    /// Our IPv4 address on that interface — the Echo packet's source and destination,
+    /// so the neighbour loops it back to us.
+    our_ip: Ipv4Addr,
+    /// The neighbour's MAC, resolved lazily from the kernel ARP table once known.
+    dst_mac: Option<[u8; 6]>,
+    /// The next Echo sequence number to send.
+    seq: u64,
+    /// When to transmit the next Echo packet.
+    next_tx: Instant,
+    /// When an Echo last returned. `None` until the first one loops back; detection is
+    /// not armed before then (so an Echo path that never works does not tear a
+    /// Control-healthy session down).
+    last_rx: Option<Instant>,
+    /// The Echo timing parameters.
+    params: EchoParams,
+}
+
+impl EchoState {
+    /// The Echo detection time: no return within this window fails the session.
+    fn detect_us(&self) -> u64 {
+        self.params.interval_us * self.params.detect_mult as u64
+    }
 }
 
 /// A flat snapshot of one session for the (pure) `show bfd` renderer.
@@ -160,6 +209,10 @@ struct SessionInfo {
     remote_discr: u32,
     tx_ms: u64,
     detect_ms: u64,
+    /// The local diagnostic (the reason for the last state change, RFC 5880 §4.1).
+    diag: Diag,
+    /// Whether the Echo function is running for this session.
+    echo: bool,
 }
 
 /// Run the BFD engine until the daemon shuts down: create a session per registered
@@ -197,6 +250,22 @@ pub async fn run(
     let mut sessions: HashMap<PeerKey, PeerSession> = HashMap::new();
     let mut next_discr: u32 = 1;
 
+    // The shared Echo socket (RFC 5880 §6.4), opened only when Echo is configured. A
+    // failure to open (e.g. no CAP_NET_RAW) disables Echo but leaves Control running.
+    let echo_sock = match cfg.echo {
+        Some(_) => match bfd_echo::EchoSock::open() {
+            Ok(s) => {
+                info!("BFD Echo enabled (UDP {ECHO_PORT})");
+                Some(s)
+            }
+            Err(e) => {
+                warn!(error = %e, "BFD Echo could not open its socket; Echo disabled");
+                None
+            }
+        },
+        None => None,
+    };
+
     let mut buf4 = [0u8; 128];
     let mut buf6 = [0u8; 128];
     loop {
@@ -221,9 +290,14 @@ pub async fn run(
                     on_receive(&mut sessions, &buf6[..n], key_of(src));
                 }
             }
+            r = echo_recv_opt(&echo_sock) => {
+                if let Some(pkt) = r {
+                    on_echo_receive(&mut sessions, &pkt);
+                }
+            }
             () = &mut timer => {}
             Some(cmd) = register.recv() => {
-                handle_command(&mut sessions, &mut next_discr, cfg.session, cfg.auth.as_ref(), cmd).await;
+                handle_command(&mut sessions, &mut next_discr, cfg.session, cfg.auth.as_ref(), cfg.echo, cmd).await;
             }
             Some(req) = queries.recv() => {
                 let resp = match req.query {
@@ -235,6 +309,9 @@ pub async fn run(
 
         // Service every session: fire detection timeouts, then due transmits.
         service(&mut sessions);
+        // Then the Echo function: transmit due Echo packets and fail any session whose
+        // looped-back Echo stopped returning.
+        service_echo(&mut sessions, &echo_sock).await;
     }
 }
 
@@ -244,6 +321,98 @@ async fn recv_from_opt(sock: &Option<UdpSocket>, buf: &mut [u8]) -> Option<(usiz
     match sock {
         Some(s) => s.recv_from(buf).await.ok(),
         None => std::future::pending().await,
+    }
+}
+
+/// Receive a looped-back Echo packet, or block forever when Echo is not enabled (so
+/// its `select!` branch simply never fires).
+async fn echo_recv_opt(sock: &Option<EchoSock>) -> Option<Vec<u8>> {
+    match sock {
+        Some(s) => s.recv().await.ok(),
+        None => std::future::pending().await,
+    }
+}
+
+/// Fold a looped-back Echo packet into the session that sent it: match it to the
+/// session by the local discriminator carried in the payload and (re)arm its Echo
+/// detection by recording the receipt time.
+fn on_echo_receive(sessions: &mut HashMap<PeerKey, PeerSession>, pkt: &[u8]) {
+    let Some((discr, _seq)) = bfd_echo::parse_echo(pkt) else { return };
+    for s in sessions.values_mut() {
+        if s.sess.local_discr() == discr {
+            if let Some(echo) = s.echo.as_mut() {
+                echo.last_rx = Some(Instant::now());
+                debug!(peer = %s.peer, discr, "BFD Echo returned");
+            }
+            return;
+        }
+    }
+}
+
+/// The Echo half of the service loop: for every Up session with Echo enabled, fail it
+/// if the looped Echo stopped returning, otherwise transmit a due Echo packet. Echo
+/// runs only while Up; a session not Up has its Echo detection reset.
+async fn service_echo(sessions: &mut HashMap<PeerKey, PeerSession>, echo_sock: &Option<EchoSock>) {
+    let Some(sock) = echo_sock else { return };
+    let now = Instant::now();
+    for s in sessions.values_mut() {
+        if s.echo.is_none() {
+            continue;
+        }
+        let up = s.sess.state() == State::Up;
+        // Detection (read/reset the Echo state without touching the FSM yet).
+        let failed = {
+            let echo = s.echo.as_mut().expect("checked is_some above");
+            if !up {
+                echo.last_rx = None;
+                false
+            } else if let Some(last) = echo.last_rx {
+                if now.duration_since(last) > Duration::from_micros(echo.detect_us()) {
+                    echo.last_rx = None;
+                    true
+                } else {
+                    false
+                }
+            } else {
+                false
+            }
+        };
+        if failed {
+            if let Some(t) = s.sess.on_echo_timeout() {
+                warn!(peer = %s.peer, "BFD Echo failed; session down");
+                s.detect_deadline = None;
+                s.next_tx = now; // advertise the Down state at once
+                if t.from == State::Up {
+                    notify_down(s);
+                }
+            }
+            continue;
+        }
+        if !up {
+            continue;
+        }
+        // Transmit a due Echo packet, resolving the neighbour MAC lazily.
+        let discr = s.sess.local_discr();
+        let IpAddr::V4(peer_v4) = s.peer else { continue };
+        let echo = s.echo.as_mut().expect("checked is_some above");
+        if now < echo.next_tx {
+            continue;
+        }
+        if echo.dst_mac.is_none() {
+            echo.dst_mac = bfd_echo::neighbor_mac(&echo.ifname, peer_v4);
+        }
+        let Some(dst) = echo.dst_mac else {
+            // The ARP entry is not yet complete; retry on the next interval.
+            debug!(peer = %peer_v4, ifname = %echo.ifname, "BFD Echo: neighbour MAC not yet resolved");
+            echo.next_tx = now + Duration::from_micros(echo.params.interval_us);
+            continue;
+        };
+        let pkt = bfd_echo::build_echo(echo.our_ip, discr, echo.seq);
+        let ifindex = echo.ifindex;
+        echo.seq = echo.seq.wrapping_add(1);
+        echo.next_tx = now + Duration::from_micros(echo.params.interval_us);
+        let r = sock.send(&pkt, dst, ifindex).await;
+        debug!(peer = %peer_v4, ifindex, ok = r.is_ok(), "BFD Echo sent");
     }
 }
 
@@ -272,6 +441,7 @@ async fn handle_command(
     next_discr: &mut u32,
     session_cfg: SessionConfig,
     auth_cfg: Option<&AuthConfig>,
+    echo_cfg: Option<EchoParams>,
     cmd: BfdCommand,
 ) {
     match cmd {
@@ -295,7 +465,22 @@ async fn handle_command(
             *next_discr += 1;
             let mut subscribers = HashMap::new();
             subscribers.insert(consumer, notify);
-            info!(%peer, ?consumer, auth = effective_auth.is_some(), "BFD session started");
+            // Set up Echo (RFC 5880 §6.4) for an IPv4 peer with a resolvable egress
+            // interface; the neighbour MAC is resolved lazily once Echo starts.
+            let echo = echo_cfg.and_then(|params| match peer {
+                IpAddr::V4(v4) => bfd_echo::egress_for(v4).map(|e| EchoState {
+                    ifindex: e.ifindex,
+                    ifname: e.ifname,
+                    our_ip: e.our_ip,
+                    dst_mac: None,
+                    seq: 0,
+                    next_tx: Instant::now(),
+                    last_rx: None,
+                    params,
+                }),
+                IpAddr::V6(_) => None,
+            });
+            info!(%peer, ?consumer, auth = effective_auth.is_some(), echo = echo.is_some(), "BFD session started");
             sessions.insert(
                 key,
                 PeerSession {
@@ -306,6 +491,7 @@ async fn handle_command(
                     next_tx: Instant::now(), // begin the handshake immediately
                     detect_deadline: None,
                     subscribers,
+                    echo,
                 },
             );
         }
@@ -473,6 +659,16 @@ fn next_wakeup(sessions: &HashMap<PeerKey, PeerSession>) -> Option<Instant> {
         if let Some(d) = s.detect_deadline {
             wake = Some(wake.map_or(d, |w: Instant| w.min(d)));
         }
+        // Echo transmit and detection deadlines, while the session is Up.
+        if let Some(echo) = &s.echo {
+            if s.sess.state() == State::Up {
+                wake = Some(wake.map_or(echo.next_tx, |w: Instant| w.min(echo.next_tx)));
+                if let Some(last) = echo.last_rx {
+                    let d = last + Duration::from_micros(echo.detect_us());
+                    wake = Some(wake.map_or(d, |w: Instant| w.min(d)));
+                }
+            }
+        }
     }
     wake
 }
@@ -489,6 +685,8 @@ fn snapshot(sessions: &HashMap<PeerKey, PeerSession>) -> Vec<SessionInfo> {
             remote_discr: s.sess.remote_discr(),
             tx_ms: s.sess.transmit_interval_us() / 1000,
             detect_ms: s.sess.detection_time_us() / 1000,
+            diag: s.sess.local_diag(),
+            echo: s.echo.is_some(),
         })
         .collect();
     out.sort_by_key(|a| a.peer);
@@ -503,22 +701,36 @@ fn render_bfd_sessions(rows: &[SessionInfo]) -> String {
     let mut out = String::new();
     let _ = writeln!(
         out,
-        "{:<28} {:<10} {:>11} {:>12} {:>8} {:>8}",
-        "peer", "state", "local-discr", "remote-discr", "tx", "detect"
+        "{:<28} {:<10} {:>11} {:>12} {:>8} {:>8} {:<22} {:<5}",
+        "peer", "state", "local-discr", "remote-discr", "tx", "detect", "diag", "echo"
     );
     for r in rows {
         let _ = writeln!(
             out,
-            "{:<28} {:<10} {:>11} {:>12} {:>6}ms {:>6}ms",
+            "{:<28} {:<10} {:>11} {:>12} {:>6}ms {:>6}ms {:<22} {:<5}",
             r.peer.to_string(),
             r.state.label(),
             r.local_discr,
             r.remote_discr,
             r.tx_ms,
             r.detect_ms,
+            diag_label(r.diag),
+            if r.echo { "yes" } else { "no" },
         );
     }
     out
+}
+
+/// A short label for a BFD diagnostic code (RFC 5880 §4.1) for `show bfd`.
+fn diag_label(d: Diag) -> &'static str {
+    match d {
+        Diag::None => "none",
+        Diag::ControlDetectionTimeExpired => "control-detect-expired",
+        Diag::EchoFunctionFailed => "echo-failed",
+        Diag::NeighborSignaledDown => "neighbor-down",
+        Diag::AdministrativelyDown => "admin-down",
+        Diag::Other(_) => "other",
+    }
 }
 
 #[cfg(test)]
@@ -535,11 +747,14 @@ mod tests {
             remote_discr: 2,
             tx_ms: 270,
             detect_ms: 900,
+            diag: Diag::EchoFunctionFailed,
+            echo: true,
         }];
         let out = render_bfd_sessions(&rows);
         assert!(out.contains("10.0.0.2"));
         assert!(out.contains("Up"));
         assert!(out.contains("900ms"));
+        assert!(out.contains("echo-failed"));
     }
 
     #[test]
@@ -551,6 +766,8 @@ mod tests {
             remote_discr: 4,
             tx_ms: 180,
             detect_ms: 600,
+            diag: Diag::None,
+            echo: false,
         }];
         let out = render_bfd_sessions(&rows);
         assert!(out.contains("fe80::1"));

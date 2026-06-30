@@ -111,6 +111,16 @@ pub struct Bfd {
     /// Required when `auth-type` is set.
     #[serde(rename = "auth-key")]
     pub auth_key: Option<String>,
+    /// Enable the Echo function (RFC 5880 §6.4) on every IPv4 session: looped-back Echo
+    /// packets test the neighbour's forwarding plane directly, failing the session (with
+    /// diagnostic Echo Function Failed) if they stop returning. The neighbour must have
+    /// IP forwarding enabled. Defaults to false.
+    #[serde(default)]
+    pub echo: bool,
+    /// The interval between transmitted Echo packets, in milliseconds (Echo detection
+    /// ≈ `echo-interval × detect-mult`). Defaults to 100.
+    #[serde(rename = "echo-interval")]
+    pub echo_interval: Option<u32>,
 }
 
 /// Export filter attachments (`[export]`): which named filter gates routes on

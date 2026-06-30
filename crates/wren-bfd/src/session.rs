@@ -183,6 +183,28 @@ impl Session {
         }
     }
 
+    /// Declare the session down because the Echo function failed (RFC 5880 §6.4): the
+    /// looped-back Echo packets stopped returning within the Echo detection time, even
+    /// though Control packets may still be arriving. Mirrors [`Self::on_detect_timeout`]
+    /// but with diagnostic [`Diag::EchoFunctionFailed`]; only an Up/Init session falls.
+    pub fn on_echo_timeout(&mut self) -> Option<Transition> {
+        if matches!(self.state, State::Up | State::Init) {
+            let from = self.state;
+            self.local_diag = Diag::EchoFunctionFailed;
+            self.state = State::Down;
+            self.remote_state = State::Down;
+            self.remote_discr = 0;
+            Some(Transition { from, to: State::Down })
+        } else {
+            None
+        }
+    }
+
+    /// This session's current local diagnostic (the reason for the last state change).
+    pub fn local_diag(&self) -> Diag {
+        self.local_diag
+    }
+
     /// Build the next Control packet to transmit, reflecting the current state and
     /// our (possibly floored) Desired Min TX Interval. Consumes any pending Final
     /// obligation from a received Poll.

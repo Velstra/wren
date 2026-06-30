@@ -18,8 +18,7 @@ immediately rather than waiting for the hold / dead timer. **BGP**, **OSPFv2**,
 **OSPFv3** and **IS-IS** all use it.
 
 Scope: **single-hop asynchronous mode**, **IPv4 and IPv6**, with **authentication**
-(§6.7) and no Echo — the configuration that drives routing-protocol failover. The
-Demand and Echo modes are future extensions.
+(§6.7) and the **Echo function** (§6.4, IPv4). Demand mode is a future extension.
 
 ## What is implemented
 
@@ -173,6 +172,33 @@ enabled    = true
 interfaces = ["eth1"]
 bfd        = true
 ```
+
+### Echo (RFC 5880 §6.4)
+
+The **Echo function** adds a second, faster liveness check that exercises the
+neighbour's *forwarding plane* directly, without involving its BFD software. Each
+side sends Echo packets addressed to **its own** IP but out to the neighbour's MAC, so
+the neighbour's data plane loops them straight back. When the looped packets stop
+returning the session fails with the diagnostic **Echo Function Failed** — typically
+well before the Control detection time, since Echo can run at a much faster interval.
+
+```toml
+[bfd]
+echo          = true   # run Echo on every IPv4 session (default false)
+echo-interval = 100    # milliseconds between Echo packets (default 100)
+# Echo detection ≈ echo-interval × detect-mult, e.g. 100 ms × 3 = 300 ms
+```
+
+Echo runs alongside the Control session (it does not replace it) and only while the
+session is **Up**. It is **IPv4, single-hop** only. Because the looped packet carries
+the local system's own address as both source and destination, the kernel's
+martian-source filtering would drop it on the way in, so Wren transmits and receives
+Echo over a raw `AF_PACKET` socket (needing `CAP_NET_RAW`) — the payload format is a
+local matter, here a magic plus the session's discriminator and a sequence number.
+**The neighbour must have IP forwarding enabled** for the loopback to occur; if it
+never returns an Echo, detection simply never arms and the Control session is
+unaffected. `wren show bfd` shows whether Echo is running for a session and the last
+diagnostic.
 
 ## Operational view
 

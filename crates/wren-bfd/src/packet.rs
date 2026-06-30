@@ -84,6 +84,8 @@ pub enum Diag {
     None,
     /// 1 — Control Detection Time Expired (we stopped hearing the neighbour).
     ControlDetectionTimeExpired,
+    /// 2 — Echo Function Failed (looped-back Echo packets stopped returning).
+    EchoFunctionFailed,
     /// 3 — Neighbor Signaled Session Down.
     NeighborSignaledDown,
     /// 7 — Administratively Down.
@@ -98,6 +100,7 @@ impl Diag {
         match self {
             Diag::None => 0,
             Diag::ControlDetectionTimeExpired => 1,
+            Diag::EchoFunctionFailed => 2,
             Diag::NeighborSignaledDown => 3,
             Diag::AdministrativelyDown => 7,
             Diag::Other(c) => c & 0x1f,
@@ -109,6 +112,7 @@ impl Diag {
         match code & 0x1f {
             0 => Diag::None,
             1 => Diag::ControlDetectionTimeExpired,
+            2 => Diag::EchoFunctionFailed,
             3 => Diag::NeighborSignaledDown,
             7 => Diag::AdministrativelyDown,
             c => Diag::Other(c),

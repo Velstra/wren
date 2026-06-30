@@ -277,8 +277,14 @@ tracked but not yet scheduled, grouped by area:
   hand-rolled to keep `wren-bfd` dependency-free), configured per `[bfd]`
   (`auth-type`/`auth-key`) and verified including the replay window, live-tested by
   `scripts/bfd-auth-smoke.sh` (matching keys form the session, a mismatched key is
-  rejected). The Echo function and Demand mode are the remaining future extensions.
-  See [BFD](protocols/bfd.md).)
+  rejected). The **Echo function** (RFC 5880 §6.4, IPv4) is implemented — `[bfd] echo
+  = true` runs looped-back Echo packets (over a raw `AF_PACKET` socket, since the
+  loop carries the local address as source and destination) through the neighbour's
+  forwarding plane at a fast `echo-interval`, failing the session with diagnostic Echo
+  Function Failed when they stop returning, well before Control detection; live-tested
+  by `scripts/bfd-echo-smoke.sh` (a path break is caught via Echo in ~0.3 s against a
+  6 s Control detection). Demand mode is the remaining future extension. See
+  [BFD](protocols/bfd.md).)
 - **Forwarding & policy:** VRFs, policy-based routing, route maps, prefix lists,
   route policies, max-AS-path. (Per-neighbour BGP `max-prefix` prefix-limiting with a
   Cease teardown (RFC 4486) is **done**. **Per-neighbour import *and* export filters**

@@ -13,6 +13,7 @@
 #[cfg(feature = "babel")]
 mod babel;
 mod bfd;
+mod bfd_echo;
 mod bgp;
 mod bmp;
 mod connected;
@@ -300,11 +301,12 @@ async fn main() -> Result<()> {
                 None
             }
         };
+        let echo = bfd_echo_config(cfg.bfd.as_ref());
         let rrx = bfd_register_rx.take().expect("bfd register rx taken once");
         let bqrx = bfd_queries_rx.take().expect("bfd queries rx taken once");
-        info!(auth = auth.is_some(), "BFD engine starting");
+        info!(auth = auth.is_some(), echo = echo.is_some(), "BFD engine starting");
         tokio::spawn(async move {
-            if let Err(e) = bfd::run(bfd::BfdConfig { session, auth }, rrx, bqrx).await {
+            if let Err(e) = bfd::run(bfd::BfdConfig { session, auth, echo }, rrx, bqrx).await {
                 error!(error = %e, "BFD engine stopped");
             }
         });
@@ -1042,6 +1044,22 @@ fn bfd_session_config(bfd: Option<&wren_config::Bfd>) -> wren_bfd::SessionConfig
         required_min_rx_us: min_rx_ms.saturating_mul(1000),
         detect_mult,
     }
+}
+
+/// Resolve the BFD Echo timing (RFC 5880 §6.4) from the `[bfd]` block: `echo = true`
+/// enables it, `echo-interval` (ms, default 100) sets the transmit interval, and the
+/// shared `detect-mult` sets the Echo detection multiplier. `None` when Echo is off.
+fn bfd_echo_config(bfd: Option<&wren_config::Bfd>) -> Option<bfd::EchoParams> {
+    let b = bfd?;
+    if !b.echo {
+        return None;
+    }
+    let interval_ms = b.echo_interval.unwrap_or(100).max(1);
+    let detect_mult = b.detect_mult.unwrap_or(3).max(1);
+    Some(bfd::EchoParams {
+        interval_us: (interval_ms as u64).saturating_mul(1000),
+        detect_mult,
+    })
 }
 
 /// Resolve the shared BFD authentication (RFC 5880 §6.7) from the `[bfd]` block:
