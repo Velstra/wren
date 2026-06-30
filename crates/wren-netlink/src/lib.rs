@@ -389,6 +389,68 @@ fn if_index(name: &str) -> Option<u32> {
     }
 }
 
+/// rtnetlink message types for interface-address changes.
+const RTM_NEWADDR: u16 = 20;
+const RTM_DELADDR: u16 = 21;
+/// rtattr types inside an `ifaddrmsg`.
+const IFA_ADDRESS: u16 = 1;
+const IFA_LOCAL: u16 = 2;
+
+/// Add `addr/prefix_len` to interface `ifname` (`RTM_NEWADDR`). Idempotent: an
+/// identical existing address is replaced rather than rejected. Needs
+/// `CAP_NET_ADMIN`. Used by the VRRP runner to assume a virtual IP on becoming
+/// master.
+pub fn add_address(ifname: &str, addr: IpAddr, prefix_len: u8) -> Result<(), FibError> {
+    address_op(
+        RTM_NEWADDR,
+        NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_REPLACE,
+        ifname,
+        addr,
+        prefix_len,
+    )
+}
+
+/// Remove `addr/prefix_len` from interface `ifname` (`RTM_DELADDR`). Needs
+/// `CAP_NET_ADMIN`. Used by the VRRP runner to release a virtual IP on becoming
+/// backup. Deleting an absent address returns an error the caller may ignore.
+pub fn del_address(ifname: &str, addr: IpAddr, prefix_len: u8) -> Result<(), FibError> {
+    address_op(RTM_DELADDR, NLM_F_REQUEST | NLM_F_ACK, ifname, addr, prefix_len)
+}
+
+/// Build and send one `ifaddrmsg` (with `IFA_LOCAL` + `IFA_ADDRESS`) to the kernel
+/// over a transient netlink socket, and wait for its ACK.
+fn address_op(
+    msg_type: u16,
+    flags: u16,
+    ifname: &str,
+    addr: IpAddr,
+    prefix_len: u8,
+) -> Result<(), FibError> {
+    let ifindex = if_index(ifname).ok_or_else(|| FibError(format!("unknown interface {ifname:?}")))?;
+    let octets = addr_octets(&addr);
+    // struct ifaddrmsg { family, prefixlen, flags, scope, index }
+    let mut payload = Vec::with_capacity(8 + 2 * (4 + octets.len()));
+    payload.push(af(&addr));
+    payload.push(prefix_len);
+    payload.push(0); // ifa_flags
+    payload.push(RT_SCOPE_UNIVERSE);
+    payload.extend_from_slice(&ifindex.to_ne_bytes());
+    push_attr(&mut payload, IFA_LOCAL, &octets);
+    push_attr(&mut payload, IFA_ADDRESS, &octets);
+
+    let mut sock = KernelFib::new()?;
+    let seq = sock.next_seq();
+    let total = NLMSGHDR_LEN + payload.len();
+    let mut buf = Vec::with_capacity(total);
+    buf.extend_from_slice(&(total as u32).to_ne_bytes()); // nlmsg_len
+    buf.extend_from_slice(&msg_type.to_ne_bytes()); // nlmsg_type
+    buf.extend_from_slice(&flags.to_ne_bytes()); // nlmsg_flags
+    buf.extend_from_slice(&seq.to_ne_bytes()); // nlmsg_seq
+    buf.extend_from_slice(&0u32.to_ne_bytes()); // nlmsg_pid
+    buf.extend_from_slice(&payload);
+    sock.request(&buf)
+}
+
 /// Build the payload of an `RTA_MULTIPATH` attribute: one `struct rtnexthop` per
 /// next-hop, each carrying its weight (`rtnh_hops` = weight − 1) and out-interface,
 /// followed by a nested `RTA_GATEWAY` when it has a gateway. Each entry is padded

@@ -1,0 +1,17 @@
+[package]
+name = "wren-vrrp"
+description = "Wren routing daemon — VRRP version 3 (RFC 5798) advertisement codec and virtual-router state machine."
+keywords = ["routing", "vrrp", "networking", "high-availability"]
+categories = ["network-programming"]
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+# Dependency-free `std`: the advertisement wire codec (with the IPv4/IPv6
+# pseudo-header checksum) and the virtual-router state machine carry no
+# dependencies, so they unit-test with no I/O and embed anywhere. The async raw
+# socket runner lives in the daemon (`vrrp.rs`), behind tokio, not here.
+[dependencies]

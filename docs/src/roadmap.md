@@ -238,6 +238,11 @@ implemented to its RFC.
   side: a client that consumes this stream, resolves each next-hop's L2 address, and
   programs Velstra's `ROUTES` BPF map — so the XDP data plane forwards by
   Wren-computed routes. (Wren stays the routing brain; Velstra owns the datapath.)
+- **VRRP (RFC 5798) — done (IPv4).** Virtual-router redundancy for first-hop /
+  firewall HA: master election, virtual-IP assignment and gratuitous ARP, and
+  `show vrrp` (see [VRRP](vrrp.md)). The codec and state machine are dual-stack;
+  the IPv6 runner (`ff02::12`, unsolicited NA) and a dedicated virtual MAC are the
+  remaining pieces.
 
 ## On the radar (longer-term)
 

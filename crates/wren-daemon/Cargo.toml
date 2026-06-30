@@ -19,8 +19,11 @@ path = "src/main.rs"
 # needs a subset — e.g. Sentinel wanting just BGP — can disable the others with
 # `default-features = false, features = ["ospf"]`, so unused protocol crates are not
 # compiled at all. BGP + the core (RIB/FIB/filter/config/netlink) are always present.
-default = ["ospf", "ospf3", "rip", "babel", "isis"]
+default = ["ospf", "ospf3", "rip", "babel", "isis", "vrrp"]
 ospf = ["dep:wren-ospf", "_rawsock"]
+# VRRP (RFC 5798) virtual-router redundancy — first-hop HA, used by the Sentinel
+# firewall. Raw IPPROTO_VRRP socket + netlink virtual-IP assignment.
+vrrp = ["dep:wren-vrrp", "_rawsock"]
 ospf3 = ["dep:wren-ospfv3", "_rawsock"]
 # `rip` covers both RIPv2 and RIPng (they share the `wren-rip` crate).
 rip = ["dep:wren-rip", "_connected", "_rawsock"]
@@ -45,6 +48,7 @@ wren-ospf = { workspace = true, optional = true }
 wren-ospfv3 = { workspace = true, optional = true }
 wren-babel = { workspace = true, optional = true }
 wren-isis = { workspace = true, optional = true }
+wren-vrrp = { workspace = true, optional = true }
 anyhow.workspace = true
 clap.workspace = true
 tokio.workspace = true

@@ -28,6 +28,7 @@ wren-ospfv3 = { path = "crates/wren-ospfv3", version = "0.1.0" }
 wren-isis = { path = "crates/wren-isis", version = "0.1.0" }
 wren-bgp = { path = "crates/wren-bgp", version = "0.1.0" }
 wren-bfd = { path = "crates/wren-bfd", version = "0.1.0" }
+wren-vrrp = { path = "crates/wren-vrrp", version = "0.1.0" }
 wren-babel = { path = "crates/wren-babel", version = "0.1.0" }
 wren-filter = { path = "crates/wren-filter", version = "0.1.0" }
 wren-config = { path = "crates/wren-config", version = "0.1.0" }

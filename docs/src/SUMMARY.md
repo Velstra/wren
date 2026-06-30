@@ -23,6 +23,7 @@
 # Features
 
 - [VRFs & Route Distinguishers](vrf.md)
+- [VRRP — First-Hop Redundancy](vrrp.md)
 
 # Internals
 

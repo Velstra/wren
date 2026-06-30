@@ -32,6 +32,8 @@ use crate::ospf::{OspfQuery, OspfQueryRequest};
 use crate::ospf3::{Ospf3Query, Ospf3QueryRequest};
 #[cfg(feature = "rip")]
 use crate::rip::{RipQuery, RipQueryRequest};
+#[cfg(feature = "vrrp")]
+use crate::vrrp::VrrpQueryRequest;
 use crate::query::OwnedQuery;
 use crate::router::{Query, QueryRequest, RouteEvent, RouteSubscribe};
 
@@ -67,6 +69,9 @@ pub struct Channels {
     /// To the RIPng task (`show ripng`), if RIPng is running.
     #[cfg(feature = "rip")]
     pub ripng: Option<mpsc::Sender<RipQueryRequest>>,
+    /// To the VRRP task (`show vrrp`), if any virtual router is configured.
+    #[cfg(feature = "vrrp")]
+    pub vrrp: Option<mpsc::Sender<VrrpQueryRequest>>,
 }
 
 /// Serve the control socket at `path`, forwarding queries to the owning tasks.
@@ -172,6 +177,12 @@ async fn handle_conn(stream: UnixStream, channels: Channels) -> Result<()> {
             response = Some(ask_opt(&channels.rip, query, "rip").await);
         }
     }
+    #[cfg(feature = "vrrp")]
+    if response.is_none() {
+        if let Some(query) = crate::vrrp::parse_vrrp_query(line) {
+            response = Some(ask_opt(&channels.vrrp, query, "vrrp").await);
+        }
+    }
     if response.is_none() {
         if let Some(query) = parse_query(line) {
             response = Some(ask(&channels.router, query, "router").await);
@@ -184,8 +195,8 @@ async fn handle_conn(stream: UnixStream, channels: Channels) -> Result<()> {
              bgp refresh <peer> | \
              show ospf [neighbors|interfaces|database] | show ospf3 [neighbors|interfaces] | \
              show isis [neighbors|interfaces|database] | show babel [neighbors|routes] | \
-             show bfd | show rip | show ripng | show vrf | show metrics | \
-             monitor routes\n"
+             show bfd | show rip | show ripng | show vrrp | show vrf | \
+             show metrics | monitor routes\n"
         )
     });
 

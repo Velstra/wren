@@ -599,6 +599,7 @@ dependencies = [
  "wren-ospf",
  "wren-ospfv3",
  "wren-rip",
+ "wren-vrrp",
 ]
 
 [[package]]
@@ -643,3 +644,7 @@ version = "0.1.0"
 dependencies = [
  "wren-core",
 ]
+
+[[package]]
+name = "wren-vrrp"
+version = "0.1.0"

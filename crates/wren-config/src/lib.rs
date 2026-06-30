@@ -78,6 +78,48 @@ pub struct Config {
     /// (currently the per-neighbour BGP sessions enabled with `bfd = true`).
     #[serde(default)]
     pub bfd: Option<Bfd>,
+    /// VRRP (RFC 5798) virtual routers — first-hop redundancy / firewall HA.
+    #[serde(default, rename = "vrrp")]
+    pub vrrp: Vec<VrrpDef>,
+}
+
+/// One VRRP virtual router (`[[vrrp]]`). Two or more routers sharing a `vrid` on a
+/// link back the same `virtual-address`; the highest-priority one is master.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct VrrpDef {
+    /// The interface the virtual router runs on.
+    pub interface: String,
+    /// Virtual Router ID (1–255), shared by every router backing this address.
+    pub vrid: u8,
+    /// This router's priority (1–254; 255 means it owns the address). Highest wins.
+    #[serde(default = "default_vrrp_priority")]
+    pub priority: u8,
+    /// Advertisement interval in milliseconds (rounded to centiseconds on the wire).
+    #[serde(default = "default_vrrp_advert_ms", rename = "advert-interval")]
+    pub advert_interval_ms: u32,
+    /// Whether to preempt a lower-priority master once we are available.
+    #[serde(default = "default_true")]
+    pub preempt: bool,
+    /// The virtual IPv4 address(es) this router backs.
+    #[serde(rename = "virtual-address")]
+    pub virtual_addresses: Vec<String>,
+    /// The prefix length to assign each virtual address with (default 24).
+    #[serde(default = "default_vrrp_prefix", rename = "prefix-length")]
+    pub prefix_length: u8,
+}
+
+fn default_vrrp_priority() -> u8 {
+    100
+}
+fn default_vrrp_advert_ms() -> u32 {
+    1000
+}
+fn default_vrrp_prefix() -> u8 {
+    24
+}
+fn default_true() -> bool {
+    true
 }
 
 /// BFD (RFC 5880) global timing defaults (`[bfd]`). These apply to every BFD

@@ -17,6 +17,7 @@ wren show ospf3 [neighbors|interfaces]
 wren show isis  [neighbors|interfaces|database]
 wren show babel [neighbors|routes]
 wren show rip   |  wren show ripng
+wren show vrrp                   # VRRP virtual routers (first-hop HA)
 ```
 
 Each is answered by the task that owns the state, so a `show` never blocks the

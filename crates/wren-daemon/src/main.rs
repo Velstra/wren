@@ -32,6 +32,8 @@ mod rip;
 mod ripng;
 mod router;
 mod rtr;
+#[cfg(feature = "vrrp")]
+mod vrrp;
 // Always compiled: BFD (always-on) uses `setsockopt_int` for IPv6 hop limit /
 // `IPV6_V6ONLY`, on top of every `_rawsock` protocol runner.
 mod sockopt;
@@ -379,6 +381,12 @@ async fn main() -> Result<()> {
     let mut ripng_queries_rx = Some(ripng_queries_rx);
     #[cfg(feature = "rip")]
     let ripng_enabled = cfg.ripng.as_ref().is_some_and(|r| r.enabled);
+    #[cfg(feature = "vrrp")]
+    let (vrrp_queries_tx, vrrp_queries_rx) = mpsc::channel(QUERY_QUEUE);
+    #[cfg(feature = "vrrp")]
+    let mut vrrp_queries_rx = Some(vrrp_queries_rx);
+    #[cfg(feature = "vrrp")]
+    let vrrp_enabled = !cfg.vrrp.is_empty();
     {
         let socket = args.socket.clone();
         let channels = control::Channels {
@@ -398,12 +406,30 @@ async fn main() -> Result<()> {
             rip: rip_enabled.then(|| rip_queries_tx.clone()),
             #[cfg(feature = "rip")]
             ripng: ripng_enabled.then(|| ripng_queries_tx.clone()),
+            #[cfg(feature = "vrrp")]
+            vrrp: vrrp_enabled.then(|| vrrp_queries_tx.clone()),
         };
         tokio::spawn(async move {
             if let Err(e) = control::serve(socket, channels).await {
                 warn!(error = %e, "control socket disabled");
             }
         });
+    }
+
+    // Spawn the VRRP engine if any virtual router is configured.
+    #[cfg(feature = "vrrp")]
+    if vrrp_enabled {
+        match build_vrrp_instances(&cfg) {
+            Ok(instances) => {
+                let qrx = vrrp_queries_rx.take().expect("vrrp queries rx taken once");
+                tokio::spawn(async move {
+                    if let Err(e) = vrrp::run(instances, qrx).await {
+                        error!(error = %e, "VRRP engine stopped");
+                    }
+                });
+            }
+            Err(e) => error!(error = %e, "VRRP not started"),
+        }
     }
 
     // Spawn the RIP engine if it is configured.
@@ -1684,4 +1710,44 @@ fn build_isis_config(
         bfd: isis.bfd,
         vrf_table,
     })
+}
+
+/// Resolve the `[[vrrp]]` definitions into the VRRP runner's instance configs,
+/// parsing the virtual addresses and validating the VRID, priority and interval.
+#[cfg(feature = "vrrp")]
+fn build_vrrp_instances(cfg: &wren_config::Config) -> Result<Vec<vrrp::InstanceConfig>> {
+    let mut out = Vec::new();
+    for def in &cfg.vrrp {
+        if def.vrid == 0 {
+            anyhow::bail!("vrrp on {:?}: vrid must be 1–255", def.interface);
+        }
+        if def.priority == 0 {
+            anyhow::bail!("vrrp vrid {}: priority must be 1–255", def.vrid);
+        }
+        if def.virtual_addresses.is_empty() {
+            anyhow::bail!(
+                "vrrp vrid {}: at least one virtual-address is required",
+                def.vrid
+            );
+        }
+        let mut addresses = Vec::new();
+        for a in &def.virtual_addresses {
+            let ip: Ipv4Addr = a.parse().with_context(|| {
+                format!("vrrp vrid {}: virtual-address {a:?} is not an IPv4 address", def.vrid)
+            })?;
+            addresses.push(ip);
+        }
+        // Round the interval to centiseconds, clamped to the 12-bit wire field.
+        let advert_int_cs = (def.advert_interval_ms / 10).clamp(1, 0x0fff) as u16;
+        out.push(vrrp::InstanceConfig {
+            interface: def.interface.clone(),
+            vrid: def.vrid,
+            priority: def.priority,
+            advert_int_cs,
+            preempt: def.preempt,
+            addresses,
+            prefix_len: def.prefix_length,
+        });
+    }
+    Ok(out)
 }
