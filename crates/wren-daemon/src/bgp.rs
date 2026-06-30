@@ -32,7 +32,7 @@ use anyhow::{Context, Result};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::mpsc;
 use tokio::time::{sleep, sleep_until, timeout, Instant};
 use tracing::{debug, info, warn};
 
@@ -508,12 +508,7 @@ pub enum BgpQuery {
 }
 
 /// A control-socket query plus the channel to answer it on.
-pub struct BgpQueryRequest {
-    /// What to report.
-    pub query: BgpQuery,
-    /// Where to send the rendered answer.
-    pub respond: oneshot::Sender<String>,
-}
+pub type BgpQueryRequest = crate::query::QueryRequest<BgpQuery>;
 
 /// One neighbour's tracked state in the BGP task.
 struct NeighborState {

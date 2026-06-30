@@ -18,6 +18,7 @@ mod bmp;
 mod connected;
 mod control;
 mod metrics;
+mod query;
 #[cfg(feature = "isis")]
 mod isis;
 #[cfg(feature = "ospf")]

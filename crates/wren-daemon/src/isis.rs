@@ -45,7 +45,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use tokio::io::unix::AsyncFd;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::mpsc;
 use tokio::time::MissedTickBehavior;
 use tracing::{debug, info, warn};
 
@@ -265,12 +265,7 @@ pub enum IsisQuery {
 }
 
 /// A control-socket query plus the channel to answer it on.
-pub struct IsisQueryRequest {
-    /// What to report.
-    pub query: IsisQuery,
-    /// Where to send the rendered answer.
-    pub respond: oneshot::Sender<String>,
-}
+pub type IsisQueryRequest = crate::query::QueryRequest<IsisQuery>;
 
 /// One adjacency (a neighbour at one level), snapshotted for the (pure) renderer.
 #[derive(Clone, PartialEq, Eq, Debug)]

@@ -31,6 +31,7 @@ use crate::ospf::{OspfQuery, OspfQueryRequest};
 use crate::ospf3::{Ospf3Query, Ospf3QueryRequest};
 #[cfg(feature = "rip")]
 use crate::rip::{RipQuery, RipQueryRequest};
+use crate::query::OwnedQuery;
 use crate::router::{Query, QueryRequest};
 
 /// The query channels the control socket forwards to. Every per-protocol channel
@@ -62,72 +63,6 @@ pub struct Channels {
     /// To the RIPng task (`show ripng`), if RIPng is running.
     #[cfg(feature = "rip")]
     pub ripng: Option<mpsc::Sender<RipQueryRequest>>,
-}
-
-/// A per-protocol query channel's request type: it pairs a typed query with the
-/// oneshot the owning task answers on. Implementing this for each protocol's
-/// `*QueryRequest` lets the control socket's send/await/fallback logic live once
-/// in the generic [`ask`] / [`ask_opt`], instead of a near-identical `ask_*` per
-/// protocol.
-trait OwnedQuery: Send + 'static {
-    /// The query enum this request carries.
-    type Query: Send;
-    /// Build the request from a query and the responder the task replies on.
-    fn build(query: Self::Query, respond: oneshot::Sender<String>) -> Self;
-}
-
-impl OwnedQuery for QueryRequest {
-    type Query = Query;
-    fn build(query: Query, respond: oneshot::Sender<String>) -> Self {
-        QueryRequest { query, respond }
-    }
-}
-impl OwnedQuery for BgpQueryRequest {
-    type Query = BgpQuery;
-    fn build(query: BgpQuery, respond: oneshot::Sender<String>) -> Self {
-        BgpQueryRequest { query, respond }
-    }
-}
-impl OwnedQuery for BfdQueryRequest {
-    type Query = BfdQuery;
-    fn build(query: BfdQuery, respond: oneshot::Sender<String>) -> Self {
-        BfdQueryRequest { query, respond }
-    }
-}
-#[cfg(feature = "ospf")]
-impl OwnedQuery for OspfQueryRequest {
-    type Query = OspfQuery;
-    fn build(query: OspfQuery, respond: oneshot::Sender<String>) -> Self {
-        OspfQueryRequest { query, respond }
-    }
-}
-#[cfg(feature = "ospf3")]
-impl OwnedQuery for Ospf3QueryRequest {
-    type Query = Ospf3Query;
-    fn build(query: Ospf3Query, respond: oneshot::Sender<String>) -> Self {
-        Ospf3QueryRequest { query, respond }
-    }
-}
-#[cfg(feature = "isis")]
-impl OwnedQuery for IsisQueryRequest {
-    type Query = IsisQuery;
-    fn build(query: IsisQuery, respond: oneshot::Sender<String>) -> Self {
-        IsisQueryRequest { query, respond }
-    }
-}
-#[cfg(feature = "babel")]
-impl OwnedQuery for BabelQueryRequest {
-    type Query = BabelQuery;
-    fn build(query: BabelQuery, respond: oneshot::Sender<String>) -> Self {
-        BabelQueryRequest { query, respond }
-    }
-}
-#[cfg(feature = "rip")]
-impl OwnedQuery for RipQueryRequest {
-    type Query = RipQuery;
-    fn build(query: RipQuery, respond: oneshot::Sender<String>) -> Self {
-        RipQueryRequest { query, respond }
-    }
 }
 
 /// Serve the control socket at `path`, forwarding queries to the owning tasks.

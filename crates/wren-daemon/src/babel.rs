@@ -38,7 +38,7 @@ use std::fmt::Write as _;
 
 use anyhow::{Context, Result};
 use tokio::net::UdpSocket;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::mpsc;
 use tokio::time::MissedTickBehavior;
 use tracing::{debug, info, warn};
 
@@ -151,12 +151,7 @@ pub enum BabelQuery {
 }
 
 /// A control-socket query plus the channel to answer it on.
-pub struct BabelQueryRequest {
-    /// What to report.
-    pub query: BabelQuery,
-    /// Where to send the rendered answer.
-    pub respond: oneshot::Sender<String>,
-}
+pub type BabelQueryRequest = crate::query::QueryRequest<BabelQuery>;
 
 /// One neighbour, snapshotted for the (pure) renderer.
 #[derive(Clone, PartialEq, Eq, Debug)]

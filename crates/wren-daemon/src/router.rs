@@ -10,7 +10,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt::Write as _;
 
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
 use wren_core::{Fib, FibChange, Prefix, Protocol, Rib, Route};
@@ -109,13 +109,7 @@ pub struct VrfInfo {
 }
 
 /// A [`Query`] paired with the channel to deliver its rendered answer on.
-#[derive(Debug)]
-pub struct QueryRequest {
-    /// What is being asked.
-    pub query: Query,
-    /// Where to send the rendered text answer.
-    pub respond: oneshot::Sender<String>,
-}
+pub type QueryRequest = crate::query::QueryRequest<Query>;
 
 /// Run the router until the update channel closes (every sender dropped).
 ///

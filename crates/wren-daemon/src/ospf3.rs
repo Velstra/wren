@@ -36,7 +36,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use tokio::net::UdpSocket;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::mpsc;
 use tokio::time::MissedTickBehavior;
 use tracing::{debug, info, warn};
 
@@ -254,12 +254,7 @@ pub enum Ospf3Query {
 }
 
 /// A control-socket query plus the channel to answer it on.
-pub struct Ospf3QueryRequest {
-    /// What to report.
-    pub query: Ospf3Query,
-    /// Where to send the rendered answer.
-    pub respond: oneshot::Sender<String>,
-}
+pub type Ospf3QueryRequest = crate::query::QueryRequest<Ospf3Query>;
 
 /// One neighbour, snapshotted for the (pure) renderer. The neighbour address is an
 /// IPv6 link-local (the next hop neighbours route through), unlike OSPFv2.

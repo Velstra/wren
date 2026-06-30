@@ -32,7 +32,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use tokio::net::UdpSocket;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::mpsc;
 use tokio::time::MissedTickBehavior;
 use tracing::{debug, info, warn};
 
@@ -279,12 +279,7 @@ pub enum OspfQuery {
 }
 
 /// A control-socket query plus the channel to answer it on.
-pub struct OspfQueryRequest {
-    /// What to report.
-    pub query: OspfQuery,
-    /// Where to send the rendered answer.
-    pub respond: oneshot::Sender<String>,
-}
+pub type OspfQueryRequest = crate::query::QueryRequest<OspfQuery>;
 
 /// One neighbour, snapshotted for the (pure) renderer.
 #[derive(Clone, PartialEq, Eq, Debug)]

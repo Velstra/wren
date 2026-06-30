@@ -33,7 +33,7 @@ use anyhow::{Context, Result};
 
 use crate::sockopt::{setsockopt_int, setsockopt_struct};
 use tokio::net::UdpSocket;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::mpsc;
 use tokio::time::MissedTickBehavior;
 use tracing::{debug, info, warn};
 
@@ -77,12 +77,7 @@ pub enum RipQuery {
 
 /// A control-socket query plus the channel to answer it on. Shared by RIPv2 and
 /// RIPng — both run the same address-neutral [`RipTable`].
-pub struct RipQueryRequest {
-    /// What to report.
-    pub query: RipQuery,
-    /// Where to send the rendered answer.
-    pub respond: oneshot::Sender<String>,
-}
+pub type RipQueryRequest = crate::query::QueryRequest<RipQuery>;
 
 /// Render RIP's routing table (à la `show ip rip`), one route per line, resolving
 /// each route's interface index to a name via `iface_name`. Shared by RIPv2 and

@@ -35,7 +35,7 @@ use std::{io, mem};
 
 use anyhow::{Context, Result};
 use tokio::net::UdpSocket;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::mpsc;
 use tokio::time::{sleep_until, Duration, Instant};
 use tracing::{debug, info, warn};
 
@@ -132,12 +132,7 @@ pub enum BfdQuery {
 }
 
 /// A control-socket query plus the channel to answer it on.
-pub struct BfdQueryRequest {
-    /// What to report.
-    pub query: BfdQuery,
-    /// Where to send the rendered answer.
-    pub respond: oneshot::Sender<String>,
-}
+pub type BfdQueryRequest = crate::query::QueryRequest<BfdQuery>;
 
 /// One peer's live session: the FSM, its transmit socket, the timer deadlines the
 /// runner maintains, and the protocols subscribed to its down notifications.
