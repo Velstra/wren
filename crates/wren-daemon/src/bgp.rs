@@ -121,6 +121,13 @@ pub struct BgpConfig {
     /// Drop received routes that RPKI origin validation classifies as Invalid
     /// (RFC 6811); `Valid` and `NotFound` are always accepted.
     pub rpki_reject_invalid: bool,
+    /// The VRF (kernel routing table) this BGP instance installs its routes into.
+    /// Defaults to [`wren_core::RT_TABLE_MAIN`] for the default VRF.
+    pub vrf_table: u32,
+    /// The VRF (L3 master) device name to bind every session socket to via
+    /// `SO_BINDTODEVICE`, so the TCP connections to peers — and the inbound listener —
+    /// use the VRF's routing table. `None` runs BGP in the default VRF (no bind).
+    pub vrf_device: Option<String>,
 }
 
 /// A configured address aggregate (RFC 4271 §9.2.2.2). The `prefix` is advertised
@@ -281,6 +288,9 @@ struct Local {
     /// peer address → its outbound export filter (RFC-style export route-map), applied
     /// to every route this speaker advertises to that peer. Absent means advertise all.
     exports: HashMap<IpAddr, Filter>,
+    /// The VRF (L3 master) device name to bind session sockets to (`SO_BINDTODEVICE`),
+    /// or `None` for the default VRF. Connectors and the accept loop read it.
+    vrf_device: Option<String>,
 }
 
 impl Local {
@@ -922,6 +932,7 @@ pub async fn run(
     let mut addpath = AddPathState::default();
 
     let members = cfg.confederation_members.clone();
+    let vrf_table = cfg.vrf_table;
     let local = Arc::new(Local {
         local_as: cfg.local_as,
         router_id: cfg.router_id,
@@ -952,6 +963,7 @@ pub async fn run(
             .iter()
             .filter_map(|p| p.export.clone().map(|f| (p.addr, f)))
             .collect(),
+        vrf_device: cfg.vrf_device.clone(),
     });
 
     let (tx, mut rx) = mpsc::channel::<PeerMsg>(PEER_QUEUE);
@@ -966,10 +978,11 @@ pub async fn run(
     // RFC 5549) inbound connections. With any TCP-MD5/TCP-AO peer we fall back to the
     // hand-built IPv4 listener that installs each peer's key before `listen` (those
     // schemes are wired for IPv4 transport only here).
+    let vrf_dev = cfg.vrf_device.as_deref();
     let bound = if cfg.peers.iter().any(|p| p.tcp_auth().is_enabled()) {
-        bind_listener_authed(&cfg.peers)
+        bind_listener_authed(&cfg.peers, vrf_dev)
     } else {
-        bind_listener_dualstack()
+        bind_listener_dualstack(vrf_dev)
     };
     match bound {
         Ok(listener) => {
@@ -1031,7 +1044,7 @@ pub async fn run(
                 for p in expired {
                     if let Some(s) = stale.remove(&p) {
                         warn!(peer = %p, count = s.prefixes.len(), "BGP graceful restart timer expired; flushing stale routes");
-                        flush_stale(p, s.prefixes, &mut rib, &updates, &sessions).await;
+                        flush_stale(p, s.prefixes, &mut rib, vrf_table, &updates, &sessions).await;
                     }
                 }
                 continue;
@@ -1082,7 +1095,7 @@ pub async fn run(
                     for (peer, pfx) in now_invalid {
                         debug!(%pfx, "RPKI: route became invalid after RTR update; withdrawing");
                         if let Some(ev) = rib.withdraw(peer, pfx) {
-                            apply_event(ev, &updates, &sessions).await;
+                            apply_event(ev, vrf_table, &updates, &sessions).await;
                         }
                     }
                 }
@@ -1270,7 +1283,7 @@ pub async fn run(
                 };
                 if !retained {
                     for ev in rib.withdraw_peer(p) {
-                        apply_event(ev, &updates, &sessions).await;
+                        apply_event(ev, vrf_table, &updates, &sessions).await;
                     }
                 }
                 for pfx in addpath_affected {
@@ -1319,7 +1332,7 @@ pub async fn run(
                     } else {
                         info!(peer = %p, count = s.prefixes.len(), "BGP graceful restart complete; flushing un-refreshed routes");
                     }
-                    flush_stale(p, s.prefixes, &mut rib, &updates, &sessions).await;
+                    flush_stale(p, s.prefixes, &mut rib, vrf_table, &updates, &sessions).await;
                 }
             }
             PeerMsg::Update {
@@ -1377,12 +1390,12 @@ pub async fn run(
                 for (i, w) in update.withdrawn.iter().enumerate() {
                     let path_id = update.withdrawn_path_ids.get(i).copied().unwrap_or(0);
                     if let Some(ev) = rib.withdraw_with_id(peer, path_id, *w) {
-                        apply_event(ev, &updates, &sessions).await;
+                        apply_event(ev, vrf_table, &updates, &sessions).await;
                     }
                 }
                 for w in mp_unreach_v6(&update) {
                     if let Some(ev) = rib.withdraw(peer, *w) {
-                        apply_event(ev, &updates, &sessions).await;
+                        apply_event(ev, vrf_table, &updates, &sessions).await;
                     }
                 }
                 // Confederation loop avoidance (RFC 5065 §5.4): drop reachability
@@ -1415,7 +1428,7 @@ pub async fn run(
                     if prospective.len() as u32 > limit {
                         warn!(peer = %peer, count = prospective.len(), limit, "BGP peer exceeded max-prefix; tearing down");
                         for ev in rib.withdraw_peer(peer) {
-                            apply_event(ev, &updates, &sessions).await;
+                            apply_event(ev, vrf_table, &updates, &sessions).await;
                         }
                         if let Some(cmd_tx) = sessions.remove(&peer) {
                             let _ = cmd_tx.send(SessionCmd::CeaseOverLimit).await;
@@ -1437,7 +1450,7 @@ pub async fn run(
                             let path = build_path(&update, IpAddr::V4(nh), None, facts);
                             for (i, p) in update.nlri.iter().enumerate() {
                                 let path_id = update.nlri_path_ids.get(i).copied().unwrap_or(0);
-                                import_and_install(import, peer, path_id, *p, &path, &roa, rpki_reject, &mut rib, &updates, &sessions)
+                                import_and_install(import, peer, path_id, *p, &path, &roa, rpki_reject, &mut rib, vrf_table, &updates, &sessions)
                                     .await;
                             }
                         }
@@ -1450,7 +1463,7 @@ pub async fn run(
                     let iface = if is_link_local { ingress_iface.clone() } else { None };
                     let path = build_path(&update, IpAddr::V6(nh6), iface, facts);
                     for p in nlri {
-                        import_and_install(import, peer, 0, *p, &path, &roa, rpki_reject, &mut rib, &updates, &sessions)
+                        import_and_install(import, peer, 0, *p, &path, &roa, rpki_reject, &mut rib, vrf_table, &updates, &sessions)
                             .await;
                     }
                 }
@@ -1462,7 +1475,7 @@ pub async fn run(
                     let iface = if is_link_local { ingress_iface.clone() } else { None };
                     let path = build_path(&update, IpAddr::V6(nh6), iface, facts);
                     for p in nlri {
-                        import_and_install(import, peer, 0, *p, &path, &roa, rpki_reject, &mut rib, &updates, &sessions)
+                        import_and_install(import, peer, 0, *p, &path, &roa, rpki_reject, &mut rib, vrf_table, &updates, &sessions)
                             .await;
                     }
                 }
@@ -1576,11 +1589,12 @@ async fn apply_redistribution(
 /// and hand it to the central router (the kernel FIB).
 async fn apply_event(
     ev: RibEvent,
+    vrf_table: u32,
     updates: &mpsc::Sender<RouteUpdate>,
     sessions: &HashMap<IpAddr, mpsc::Sender<SessionCmd>>,
 ) {
     propagate(&ev, sessions).await;
-    emit(ev, updates).await;
+    emit(ev, vrf_table, updates).await;
 }
 
 /// A view of a received BGP path as a [`Route`] for the inbound import filter: the
@@ -1649,6 +1663,7 @@ async fn import_and_install(
     roa: &RoaTable,
     reject_invalid: bool,
     rib: &mut BgpRib,
+    vrf_table: u32,
     updates: &mpsc::Sender<RouteUpdate>,
     sessions: &HashMap<IpAddr, mpsc::Sender<SessionCmd>>,
 ) {
@@ -1661,7 +1676,7 @@ async fn import_and_install(
         if roa.validate(&prefix, origin) == Validity::Invalid {
             debug!(%prefix, origin, "RPKI invalid; rejecting route");
             if let Some(ev) = rib.withdraw_with_id(peer, path_id, prefix) {
-                apply_event(ev, updates, sessions).await;
+                apply_event(ev, vrf_table, updates, sessions).await;
             }
             return;
         }
@@ -1673,7 +1688,7 @@ async fn import_and_install(
         None => rib.withdraw_with_id(peer, path_id, prefix),
     };
     if let Some(ev) = ev {
-        apply_event(ev, updates, sessions).await;
+        apply_event(ev, vrf_table, updates, sessions).await;
     }
 }
 
@@ -1791,14 +1806,15 @@ async fn propagate_addpath(
     }
 }
 
-/// Turn a Loc-RIB change into a router update.
-async fn emit(ev: RibEvent, updates: &mpsc::Sender<RouteUpdate>) {
+/// Turn a Loc-RIB change into a router update, stamped with the BGP instance's VRF
+/// table so its routes install into that VRF (the main table for the default VRF).
+async fn emit(ev: RibEvent, vrf_table: u32, updates: &mpsc::Sender<RouteUpdate>) {
     let upd = match ev {
         RibEvent::Best { prefix, path, hops } => {
-            RouteUpdate::Announce(path.to_route_multipath(prefix, hops))
+            RouteUpdate::Announce(path.to_route_multipath(prefix, hops).with_table(vrf_table))
         }
         RibEvent::Withdrawn(prefix) => RouteUpdate::Withdraw {
-            table: wren_core::RT_TABLE_MAIN,
+            table: vrf_table,
             prefix,
             protocol: Protocol::Bgp,
             source: 0,
@@ -1825,12 +1841,13 @@ async fn flush_stale(
     peer: IpAddr,
     prefixes: impl IntoIterator<Item = Prefix>,
     rib: &mut BgpRib,
+    vrf_table: u32,
     updates: &mpsc::Sender<RouteUpdate>,
     sessions: &HashMap<IpAddr, mpsc::Sender<SessionCmd>>,
 ) {
     for prefix in prefixes {
         if let Some(ev) = rib.withdraw(peer, prefix) {
-            apply_event(ev, updates, sessions).await;
+            apply_event(ev, vrf_table, updates, sessions).await;
         }
     }
 }
@@ -2090,14 +2107,17 @@ async fn connector(
     loop {
         // An authenticated peer needs its key installed on the socket before the
         // handshake, so it gets a hand-built connect; an ordinary peer uses tokio's.
+        // Bind every dial to the VRF (L3 master) device, if any, so the connection
+        // uses the VRF's routing table to reach the peer.
+        let vrf = local.vrf_device.as_deref();
         let dial = async {
             match peer.addr {
                 // An authenticated (TCP-MD5/AO) IPv4 peer needs its key installed on the
                 // socket before the SYN, so it gets a hand-built connect.
-                IpAddr::V4(v4) if auth.is_enabled() => connect_authed(v4, &auth).await,
+                IpAddr::V4(v4) if auth.is_enabled() => connect_authed(v4, &auth, vrf).await,
                 // Everything else — plain IPv4, or an IPv6 (unnumbered) peer, whose
                 // link-local address carries a scope id (interface) to dial it on.
-                _ => TcpStream::connect(peer_sockaddr(peer.addr, peer.scope_id)).await,
+                _ => connect_bound(peer.addr, peer.scope_id, vrf).await,
             }
         };
         match timeout(CONNECT_TIMEOUT, dial).await {
@@ -2302,7 +2322,11 @@ fn set_nonblocking(fd: i32) -> std::io::Result<()> {
 /// install the key, which must cover the SYN — so we build the socket by hand: install
 /// the key, start a non-blocking connect, then drive it to completion through tokio.
 /// IPv4 only here.
-async fn connect_authed(peer: Ipv4Addr, auth: &TcpAuth) -> std::io::Result<TcpStream> {
+async fn connect_authed(
+    peer: Ipv4Addr,
+    auth: &TcpAuth,
+    vrf_device: Option<&str>,
+) -> std::io::Result<TcpStream> {
     use std::os::fd::FromRawFd;
     let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0) };
     if fd < 0 {
@@ -2311,6 +2335,7 @@ async fn connect_authed(peer: Ipv4Addr, auth: &TcpAuth) -> std::io::Result<TcpSt
     // Until the fd is handed to a std stream below, close it ourselves on any error.
     let prepared = (|| -> std::io::Result<()> {
         auth.install(fd, peer)?;
+        bind_to_vrf(fd, vrf_device)?;
         set_nonblocking(fd)?;
         let sin = sockaddr_in_v4(peer, PORT);
         let rc = unsafe {
@@ -2343,11 +2368,107 @@ async fn connect_authed(peer: Ipv4Addr, auth: &TcpAuth) -> std::io::Result<TcpSt
     Ok(stream)
 }
 
+/// Bind a socket to a VRF (L3 master) device by name via `SO_BINDTODEVICE`, so it
+/// uses that VRF's routing table. A no-op when `device` is `None` (the default VRF).
+/// Must be set before `connect`/`bind`.
+fn bind_to_vrf(fd: i32, device: Option<&str>) -> std::io::Result<()> {
+    let Some(name) = device else { return Ok(()) };
+    let rc = unsafe {
+        libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_BINDTODEVICE,
+            name.as_ptr() as *const libc::c_void,
+            name.len() as libc::socklen_t,
+        )
+    };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// Dial a (non-authenticated) peer, optionally bound to a VRF device. With no VRF it
+/// is just tokio's `TcpStream::connect`; with one the socket is hand-built so
+/// `SO_BINDTODEVICE` can be set before the SYN (tokio's connect exposes no pre-connect
+/// hook). Handles both IPv4 and IPv6 (an IPv6 link-local peer carries a scope id).
+async fn connect_bound(
+    addr: IpAddr,
+    scope_id: Option<u32>,
+    vrf_device: Option<&str>,
+) -> std::io::Result<TcpStream> {
+    if vrf_device.is_none() {
+        return TcpStream::connect(peer_sockaddr(addr, scope_id)).await;
+    }
+    use std::os::fd::FromRawFd;
+    let family = match addr {
+        IpAddr::V4(_) => libc::AF_INET,
+        IpAddr::V6(_) => libc::AF_INET6,
+    };
+    let fd = unsafe { libc::socket(family, libc::SOCK_STREAM, 0) };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let prepared = (|| -> std::io::Result<()> {
+        bind_to_vrf(fd, vrf_device)?;
+        set_nonblocking(fd)?;
+        let rc = match addr {
+            IpAddr::V4(v4) => {
+                let sin = sockaddr_in_v4(v4, PORT);
+                unsafe {
+                    libc::connect(
+                        fd,
+                        std::ptr::addr_of!(sin) as *const libc::sockaddr,
+                        std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+                    )
+                }
+            }
+            IpAddr::V6(v6) => {
+                let sin6 = libc::sockaddr_in6 {
+                    sin6_family: libc::AF_INET6 as libc::sa_family_t,
+                    sin6_port: PORT.to_be(),
+                    sin6_flowinfo: 0,
+                    sin6_addr: libc::in6_addr { s6_addr: v6.octets() },
+                    sin6_scope_id: scope_id.unwrap_or(0),
+                };
+                unsafe {
+                    libc::connect(
+                        fd,
+                        std::ptr::addr_of!(sin6) as *const libc::sockaddr,
+                        std::mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t,
+                    )
+                }
+            }
+        };
+        if rc != 0 {
+            let e = std::io::Error::last_os_error();
+            if e.raw_os_error() != Some(libc::EINPROGRESS) {
+                return Err(e);
+            }
+        }
+        Ok(())
+    })();
+    if let Err(e) = prepared {
+        unsafe { libc::close(fd) };
+        return Err(e);
+    }
+    let std_stream = unsafe { std::net::TcpStream::from_raw_fd(fd) };
+    let stream = TcpStream::from_std(std_stream)?;
+    stream.writable().await?;
+    if let Some(e) = stream.take_error()? {
+        return Err(e);
+    }
+    Ok(stream)
+}
+
 /// Bind the BGP listener by hand so each authenticated peer's key (TCP-MD5 or TCP-AO)
 /// is installed before `listen`, letting the kernel verify that peer's inbound
 /// connections. IPv4, port 179 on every address — the same bind tokio's
 /// `TcpListener::bind` does, with the keys added.
-fn bind_listener_authed(peers: &[BgpPeerCfg]) -> std::io::Result<TcpListener> {
+fn bind_listener_authed(
+    peers: &[BgpPeerCfg],
+    vrf_device: Option<&str>,
+) -> std::io::Result<TcpListener> {
     use std::os::fd::FromRawFd;
     let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0) };
     if fd < 0 {
@@ -2367,6 +2488,7 @@ fn bind_listener_authed(peers: &[BgpPeerCfg]) -> std::io::Result<TcpListener> {
         if rc != 0 {
             return Err(std::io::Error::last_os_error());
         }
+        bind_to_vrf(fd, vrf_device)?;
         for p in peers {
             // TCP-MD5/AO is IPv4 transport only here; an IPv6 peer has no key to install.
             if let IpAddr::V4(v4) = p.addr {
@@ -2446,7 +2568,7 @@ fn setsockopt_i32(fd: i32, level: i32, name: i32, value: i32) -> std::io::Result
 /// so a single listener accepts both IPv4 (delivered as v4-mapped) and IPv6
 /// (unnumbered, RFC 5549) inbound connections. Built by hand because `IPV6_V6ONLY`
 /// must be cleared before `bind` and tokio's `TcpListener::bind` does not expose it.
-fn bind_listener_dualstack() -> std::io::Result<TcpListener> {
+fn bind_listener_dualstack(vrf_device: Option<&str>) -> std::io::Result<TcpListener> {
     use std::os::fd::FromRawFd;
     let fd = unsafe { libc::socket(libc::AF_INET6, libc::SOCK_STREAM, 0) };
     if fd < 0 {
@@ -2456,6 +2578,7 @@ fn bind_listener_dualstack() -> std::io::Result<TcpListener> {
         setsockopt_i32(fd, libc::SOL_SOCKET, libc::SO_REUSEADDR, 1)?;
         // Clear IPV6_V6ONLY so the socket also accepts IPv4 (as v4-mapped).
         setsockopt_i32(fd, libc::IPPROTO_IPV6, libc::IPV6_V6ONLY, 0)?;
+        bind_to_vrf(fd, vrf_device)?;
         let sin6 = libc::sockaddr_in6 {
             sin6_family: libc::AF_INET6 as libc::sa_family_t,
             sin6_port: PORT.to_be(),

@@ -183,15 +183,17 @@ implemented to its RFC.
   into the VRF's kernel table (via rtnetlink `RTA_TABLE`); `show vrf` reports them and
   startup reconciliation runs per table. Live-verified by `scripts/vrf-smoke.sh`
   (static into table 100, overlapping prefix isolated per table, route-map rejection,
-  `show vrf`). **Dynamic routing in a VRF** covers every IGP: **RIP** (`[rip] vrf =
-  "…"`), **OSPF** (`[ospf] vrf = "…"`), **IS-IS** (`[isis] vrf = "…"`) and **Babel**
-  (`[babel] vrf = "…"`) stamp the VRF's table on every route they produce
-  (`RouteUpdate` carries the table end to end), so their routes land in the VRF's
-  kernel table. Live-verified by `scripts/vrf-dynamic-smoke.sh` (RIP),
-  `scripts/vrf-ospf-smoke.sh` (OSPF), `scripts/vrf-isis-smoke.sh` (IS-IS) and
-  `scripts/vrf-babel-smoke.sh` (Babel) — B learns A's route into table 100, not the
-  main table. BGP reuses the same per-runner mechanism; BGP/MPLS L3VPN is the remaining
-  big piece. See [VRFs & Route Distinguishers](vrf.md).
+  `show vrf`). **Dynamic routing in a VRF** covers **every protocol**: **RIP** (`[rip]
+  vrf = "…"`), **OSPF** (`[ospf] vrf = "…"`), **IS-IS** (`[isis] vrf = "…"`), **Babel**
+  (`[babel] vrf = "…"`) and **BGP** (`[bgp] vrf = "…"`) stamp the VRF's table on every
+  route they produce (`RouteUpdate` carries the table end to end), so their routes land
+  in the VRF's kernel table; BGP additionally binds its session sockets to the VRF
+  (`SO_BINDTODEVICE`) so the peerings use the VRF's routing table. Live-verified by
+  `scripts/vrf-dynamic-smoke.sh` (RIP), `scripts/vrf-ospf-smoke.sh` (OSPF),
+  `scripts/vrf-isis-smoke.sh` (IS-IS), `scripts/vrf-babel-smoke.sh` (Babel) and
+  `scripts/vrf-bgp-smoke.sh` (BGP) — B learns A's route into table 100, not the main
+  table. The remaining big piece is **BGP/MPLS L3VPN** (VPNv4 AFI, RD on the wire,
+  route targets). See [VRFs & Route Distinguishers](vrf.md).
 - [~] A **management interface** and operational `show` commands — the daemon
   serves a Unix-domain control socket (`--socket`, default `/run/wren/wren.sock`).
   `wren show routes [protocol]` renders the central RIB's best routes à la `ip

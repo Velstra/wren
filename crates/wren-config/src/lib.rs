@@ -482,6 +482,12 @@ pub struct Bgp {
     /// A BMP (RFC 7854) monitoring station to stream this speaker's BGP state to.
     /// Unset disables BMP.
     pub bmp: Option<BgpBmp>,
+    /// The VRF this BGP instance runs in, named by a `[[vrf]]` block. Its session
+    /// sockets bind to the VRF's L3 master device (`SO_BINDTODEVICE`) so the TCP
+    /// connections to peers use the VRF's routing table, and every route it installs
+    /// goes into the VRF's kernel table instead of the main table. Unset runs BGP in
+    /// the default VRF (main table). This is a plain VRF, not an MPLS L3VPN.
+    pub vrf: Option<String>,
     /// The configured peers.
     #[serde(default)]
     pub neighbor: Vec<BgpNeighbor>,

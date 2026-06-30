@@ -1297,6 +1297,14 @@ fn build_bgp_config(
         warn!("bgp `confederation-id` set but `confederation-members` is empty; every differing remote-as is treated as a true external peer");
     }
 
+    let (vrf_table, vrf_device) = match &bgp.vrf {
+        Some(name) => (
+            cfg.vrf_table(name)
+                .with_context(|| format!("bgp references unknown vrf {name:?}"))?,
+            Some(name.clone()),
+        ),
+        None => (wren_core::RT_TABLE_MAIN, None),
+    };
     Ok(bgp::BgpConfig {
         local_as: bgp.local_as,
         router_id,
@@ -1314,6 +1322,8 @@ fn build_bgp_config(
         aggregates,
         roas,
         rpki_reject_invalid: bgp.rpki_reject_invalid,
+        vrf_table,
+        vrf_device,
     })
 }
 

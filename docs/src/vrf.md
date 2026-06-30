@@ -11,13 +11,14 @@ VRF is the main table, `254`), best-path selection runs per `(table, prefix)`, a
 kernel backend programs each route into its table via the rtnetlink `RTA_TABLE`
 attribute. Overlapping address space therefore stays separate end to end.
 
-> **Scope.** **Static** routes and every IGP — **RIP**, **OSPF**, **IS-IS** and
-> **Babel** — can be placed in a VRF today: a static with `vrf = "…"`, or an instance
-> with `[rip] vrf = "…"`, `[ospf] vrf = "…"`, `[isis] vrf = "…"` or `[babel] vrf =
-> "…"` installs its routes into the VRF's kernel table, with the VRF's Route
-> Distinguisher and route-maps. **BGP** still runs in the default VRF — it reuses the
-> same per-runner mechanism (a VRF table stamped on every route a runner produces), so
-> wiring it up is incremental. BGP/MPLS L3VPN is future work.
+> **Scope.** **Static** routes and **every routing protocol** — **RIP**, **OSPF**,
+> **IS-IS**, **Babel** and **BGP** — can be placed in a VRF today: a static with `vrf =
+> "…"`, or an instance with `[rip] vrf = "…"`, `[ospf] vrf = "…"`, `[isis] vrf = "…"`,
+> `[babel] vrf = "…"` or `[bgp] vrf = "…"` installs its routes into the VRF's kernel
+> table, with the VRF's Route Distinguisher and route-maps. BGP additionally binds its
+> session sockets to the VRF (so the TCP peerings use the VRF's routing table); this is
+> a **plain VRF**, not an MPLS L3VPN (VPNv4/RD-on-the-wire/route targets) — that
+> remains future work.
 
 ## Configuration
 
@@ -83,6 +84,23 @@ in both address families, go into the VRF's table:
 enabled    = true
 interfaces = ["eth1"]
 vrf        = "blue"          # selected routes go into table 100
+```
+
+BGP joins a VRF the same way, with one addition: besides stamping the VRF's table on
+every route it installs, it binds its session sockets to the VRF's L3 master device
+(`SO_BINDTODEVICE`), so the TCP peerings are established over the VRF's routing table.
+The peers must therefore be reachable within the VRF (their addresses on the enslaved
+interfaces). This is a plain per-VRF BGP, not an MPLS L3VPN.
+
+```toml
+[bgp]
+enabled  = true
+local-as = 65001
+vrf      = "blue"            # sessions + learned routes use table 100
+
+[[bgp.neighbor]]
+address   = "10.9.0.2"       # reachable on an interface enslaved to blue
+remote-as = 65002
 ```
 
 For the VRF to be a real forwarding context, create the Linux VRF device and enslave
