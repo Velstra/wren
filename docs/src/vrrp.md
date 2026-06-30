@@ -49,6 +49,26 @@ interface. Set `priority = 255` on the router that natively owns the address to
 make it the permanent master while it is up. Multiple `[[vrrp]]` blocks run
 independent virtual routers (different VRIDs, or different interfaces).
 
+### Tracking an uplink
+
+For a real firewall pair the master should step aside when *its own* uplink
+fails, so the backup — whose uplink still works — takes the gateway over. Track
+interfaces and the effective priority drops while any of them is down:
+
+```toml
+[[vrrp]]
+interface          = "lan0"
+vrid               = 51
+priority           = 200
+virtual-address    = ["10.0.0.254"]
+track-interface    = ["wan0"]   # the uplink to watch
+priority-decrement = 150        # subtracted while wan0 is down (default 50)
+```
+
+If `wan0` goes down the priority falls to `200 − 150 = 50`; a backup at priority
+100 then preempts and becomes master. When `wan0` recovers the priority returns to
+200 and (with `preempt = true`) this router takes the gateway back.
+
 > VRRP needs `CAP_NET_RAW` (the protocol-112 socket) and `CAP_NET_ADMIN` (to
 > assign the virtual IP).
 
@@ -65,7 +85,7 @@ current master (this router itself when it is master).
 
 ## Scope
 
-The runner is dual-stack (IPv4 and IPv6). Optional extensions — a dedicated
-virtual MAC (`00-00-5E-00-01-{vrid}`) instead of announcing the real interface
-MAC, and tracking a WAN interface or route to lower priority on failure — are
-future work.
+The runner is dual-stack (IPv4 and IPv6) with interface tracking. The remaining
+optional extension is a dedicated virtual MAC (`00-00-5E-00-01-{vrid}`) instead of
+announcing the real interface MAC; tracking a route (rather than an interface) to
+demote on upstream failure is a small follow-on.

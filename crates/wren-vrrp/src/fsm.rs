@@ -154,6 +154,24 @@ impl Vrrp {
         }
     }
 
+    /// Adjust our effective priority (e.g. because a tracked interface went down or
+    /// recovered). If we are master, advertise the change at once so peers
+    /// re-evaluate the election — a drop below a backup's priority lets it preempt;
+    /// a recovery lets us preempt back. Skew and master-down timing follow the new
+    /// priority automatically. Returns the actions to carry out (a `SendAdvert` when
+    /// master).
+    pub fn set_priority(&mut self, priority: u8) -> Vec<Action> {
+        if priority == self.cfg.priority {
+            return vec![];
+        }
+        self.cfg.priority = priority;
+        if self.state == State::Master {
+            vec![Action::SendAdvert]
+        } else {
+            vec![]
+        }
+    }
+
     /// Shutdown: relinquish the address and return to Initialize.
     pub fn on_shutdown(&mut self) -> Vec<Action> {
         let actions = match self.state {
@@ -398,5 +416,31 @@ mod tests {
         let a = v.on_advertisement(0, 100, ip("10.0.0.1"));
         assert_eq!(v.state(), State::Backup);
         assert_eq!(a, vec![Action::ArmMasterDownTimer(v.skew_time_cs())]);
+    }
+
+    #[test]
+    fn set_priority_readvertises_when_master_and_drives_failover() {
+        let mut v = Vrrp::new(cfg(200, true, "10.0.0.1"));
+        v.on_startup();
+        v.on_master_down_timer(); // become master at priority 200
+        assert_eq!(v.state(), State::Master);
+
+        // A tracked interface goes down → priority drops; a master re-advertises so
+        // peers re-evaluate.
+        let a = v.set_priority(50);
+        assert_eq!(a, vec![Action::SendAdvert]);
+        assert_eq!(v.priority(), 50);
+        // No change is a no-op.
+        assert!(v.set_priority(50).is_empty());
+
+        // A higher-priority backup now preempts: its advert makes us yield.
+        let y = v.on_advertisement(100, 100, ip("10.0.0.2"));
+        assert_eq!(v.state(), State::Backup);
+        assert_eq!(y[1], Action::ReleaseVip);
+
+        // Recovery while backup just updates the value (no advert); preemption back
+        // happens on the next received advert via the normal Backup path.
+        assert!(v.set_priority(200).is_empty());
+        assert_eq!(v.priority(), 200);
     }
 }

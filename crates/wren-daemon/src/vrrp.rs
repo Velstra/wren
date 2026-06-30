@@ -59,6 +59,11 @@ pub struct InstanceConfig {
     pub addresses: Vec<IpAddr>,
     /// The prefix length to assign each virtual address with.
     pub prefix_len: u8,
+    /// Interfaces to track: while any is down, the effective priority drops by
+    /// `priority_decrement` so a healthier peer can take over.
+    pub track_interfaces: Vec<String>,
+    /// How much to subtract from the base priority while a tracked interface is down.
+    pub priority_decrement: u8,
 }
 
 /// A read-only `show vrrp` query, answered from the instances the runner owns.
@@ -90,6 +95,14 @@ struct Instance {
     ipv6: bool,
     sock: Arc<UdpSocket>,
     mac: [u8; 6],
+    /// The configured priority before any tracking penalty.
+    base_priority: u8,
+    /// Interfaces whose state lowers the effective priority while down.
+    track_interfaces: Vec<String>,
+    /// The penalty applied while any tracked interface is down.
+    priority_decrement: u8,
+    /// Whether a tracked interface was down at the last poll (to log transitions).
+    tracked_down: bool,
     /// When the next advertisement is due (Master only).
     adver_deadline: Option<Instant>,
     /// When the master is declared down (Backup only).
@@ -138,6 +151,10 @@ pub async fn run(configs: Vec<InstanceConfig>, mut queries: mpsc::Receiver<VrrpQ
             ipv6,
             sock,
             mac,
+            base_priority: cfg.priority,
+            track_interfaces: cfg.track_interfaces,
+            priority_decrement: cfg.priority_decrement,
+            tracked_down: false,
             adver_deadline: None,
             master_down_deadline: None,
         };
@@ -154,6 +171,9 @@ pub async fn run(configs: Vec<InstanceConfig>, mut queries: mpsc::Receiver<VrrpQ
     }
     drop(adv_tx); // the reader tasks hold their own clones
 
+    // Re-evaluate tracked interfaces once a second, adjusting effective priority.
+    let mut track_poll = tokio::time::interval(Duration::from_secs(1));
+
     loop {
         let next = next_deadline(&instances);
         let timer = async {
@@ -163,6 +183,11 @@ pub async fn run(configs: Vec<InstanceConfig>, mut queries: mpsc::Receiver<VrrpQ
             }
         };
         tokio::select! {
+            _ = track_poll.tick() => {
+                for inst in instances.iter_mut() {
+                    poll_tracking(inst).await;
+                }
+            }
             Some(adv) = adv_rx.recv() => {
                 if let Some(inst) = instances.get_mut(adv.idx) {
                     let actions = inst.fsm.on_advertisement(adv.priority, adv.adver_int_cs, adv.src);
@@ -222,6 +247,33 @@ async fn apply_actions(inst: &mut Instance, actions: Vec<Action>) {
             Action::CancelMasterDownTimer => inst.master_down_deadline = None,
         }
     }
+}
+
+/// Re-evaluate this instance's tracked interfaces and adjust its effective
+/// priority: while any tracked interface is down, subtract `priority_decrement`
+/// (clamped to at least 1). A change is pushed into the FSM, which re-advertises
+/// if it is master so a healthier peer can preempt.
+async fn poll_tracking(inst: &mut Instance) {
+    if inst.track_interfaces.is_empty() {
+        return;
+    }
+    let any_down = inst.track_interfaces.iter().any(|i| !iface_running(i));
+    if any_down != inst.tracked_down {
+        inst.tracked_down = any_down;
+        info!(
+            vrid = inst.fsm.vrid(),
+            interface = %inst.ifname,
+            tracked_down = any_down,
+            "VRRP tracked-interface state changed",
+        );
+    }
+    let effective = if any_down {
+        inst.base_priority.saturating_sub(inst.priority_decrement).max(1)
+    } else {
+        inst.base_priority
+    };
+    let actions = inst.fsm.set_priority(effective);
+    apply_actions(inst, actions).await;
 }
 
 /// The VRRP multicast destination for this instance's family.
@@ -535,6 +587,37 @@ fn read_mac(ifname: &str) -> Option<[u8; 6]> {
     // SAFETY: closing the fd we opened.
     unsafe { libc::close(fd) };
     mac
+}
+
+/// Whether `ifname` is operationally up (`IFF_UP` && `IFF_RUNNING`), via the
+/// namespace-aware `SIOCGIFFLAGS` ioctl. A missing or unreadable interface counts
+/// as down.
+fn iface_running(ifname: &str) -> bool {
+    const SIOCGIFFLAGS: libc::c_ulong = 0x8913;
+    const IFF_UP: u16 = 0x1;
+    const IFF_RUNNING: u16 = 0x40;
+    let name = ifname.as_bytes();
+    if name.len() >= libc::IF_NAMESIZE {
+        return false;
+    }
+    // SAFETY: a plain datagram socket to carry the ioctl; closed below.
+    let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM | libc::SOCK_CLOEXEC, 0) };
+    if fd < 0 {
+        return false;
+    }
+    let mut ifr = [0u8; 40];
+    ifr[..name.len()].copy_from_slice(name);
+    // SAFETY: `ifr` is a 40-byte `ifreq` buffer; SIOCGIFFLAGS fills the flags field.
+    let rc = unsafe { libc::ioctl(fd, SIOCGIFFLAGS, ifr.as_mut_ptr()) };
+    let up = if rc == 0 {
+        let flags = u16::from_ne_bytes([ifr[16], ifr[17]]); // ifr_flags after the 16-byte name
+        (flags & IFF_UP) != 0 && (flags & IFF_RUNNING) != 0
+    } else {
+        false
+    };
+    // SAFETY: closing the fd we opened.
+    unsafe { libc::close(fd) };
+    up
 }
 
 /// Broadcast a gratuitous ARP for `vip` from `mac`, so switches and hosts relearn

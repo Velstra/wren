@@ -108,6 +108,14 @@ pub struct VrrpDef {
     /// (24 for IPv4, 64 for IPv6) when unset.
     #[serde(default, rename = "prefix-length")]
     pub prefix_length: Option<u8>,
+    /// Interfaces to track: if any of them is down, this router's effective
+    /// priority drops by `priority-decrement`, so a peer with healthy uplinks can
+    /// take over (e.g. track the WAN so a master with a failed uplink demotes).
+    #[serde(default, rename = "track-interface")]
+    pub track_interfaces: Vec<String>,
+    /// How much to subtract from `priority` while a tracked interface is down.
+    #[serde(default = "default_vrrp_decrement", rename = "priority-decrement")]
+    pub priority_decrement: u8,
 }
 
 fn default_vrrp_priority() -> u8 {
@@ -115,6 +123,9 @@ fn default_vrrp_priority() -> u8 {
 }
 fn default_vrrp_advert_ms() -> u32 {
     1000
+}
+fn default_vrrp_decrement() -> u8 {
+    50
 }
 fn default_true() -> bool {
     true

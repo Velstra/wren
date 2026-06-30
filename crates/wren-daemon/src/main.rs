@@ -1753,6 +1753,8 @@ fn build_vrrp_instances(cfg: &wren_config::Config) -> Result<Vec<vrrp::InstanceC
             preempt: def.preempt,
             addresses,
             prefix_len,
+            track_interfaces: def.track_interfaces.clone(),
+            priority_decrement: def.priority_decrement,
         });
     }
     Ok(out)
