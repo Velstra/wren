@@ -144,10 +144,17 @@ pub enum RouteEvent {
 /// changes until the subscriber disconnects.
 #[derive(Debug)]
 pub struct RouteSubscribe {
-    /// Where to deliver the snapshot and subsequent live events. Unbounded so the
-    /// single-threaded router never blocks fanning out to a slow subscriber.
-    pub events: mpsc::UnboundedSender<RouteEvent>,
+    /// Where to deliver the snapshot and subsequent live events. Bounded: a
+    /// subscriber that stops reading must not let the router queue events for it
+    /// without limit. The initial snapshot is delivered with backpressure (so it
+    /// is never truncated); subsequent live events use `try_send`, and a
+    /// subscriber whose buffer fills is dropped (it can reconnect and re-snapshot).
+    pub events: mpsc::Sender<RouteEvent>,
 }
+
+/// Capacity of each route-export subscriber channel. Bounds the memory a single
+/// slow/stuck `monitor routes` client can cause the router to hold.
+pub(crate) const SUBSCRIBER_CAP: usize = 1024;
 
 /// Run the router until the update channel closes (every sender dropped).
 ///
@@ -174,7 +181,7 @@ pub async fn run(
     let mut exported: BTreeMap<(u32, Prefix), Route> = BTreeMap::new();
     // Open route-export subscriptions (`wren monitor routes`); each receives live
     // RouteEvents. Closed ones are pruned lazily on the next fan-out.
-    let mut subscribers: Vec<mpsc::UnboundedSender<RouteEvent>> = Vec::new();
+    let mut subscribers: Vec<mpsc::Sender<RouteEvent>> = Vec::new();
     loop {
         tokio::select! {
             update = updates.recv() => match update {
@@ -193,7 +200,7 @@ pub async fn run(
                 let _ = req.respond.send(answer_query(rib, vrfs, &req.query));
             }
             Some(sub) = subscribes.recv() => {
-                subscribe_routes(&exported, &mut subscribers, sub);
+                subscribe_routes(&exported, &mut subscribers, sub).await;
             }
         }
     }
@@ -204,26 +211,34 @@ pub async fn run(
 /// router processes no route change while this runs — then a terminating
 /// [`RouteEvent::EndOfDump`], and finally retain the sender for live events. A
 /// subscriber that has already disconnected is simply dropped.
-fn subscribe_routes(
+async fn subscribe_routes(
     exported: &BTreeMap<(u32, Prefix), Route>,
-    subscribers: &mut Vec<mpsc::UnboundedSender<RouteEvent>>,
+    subscribers: &mut Vec<mpsc::Sender<RouteEvent>>,
     sub: RouteSubscribe,
 ) {
+    // Deliver the snapshot with backpressure (`send().await`) rather than
+    // `try_send`, so a large forwarding table (e.g. a full BGP feed) is never
+    // truncated when it exceeds the channel capacity. This briefly applies
+    // backpressure to the router, but a new subscription is a rare operator
+    // action.
     for route in exported.values() {
-        if sub.events.send(RouteEvent::Update(route.clone())).is_err() {
+        if sub.events.send(RouteEvent::Update(route.clone())).await.is_err() {
             return;
         }
     }
-    if sub.events.send(RouteEvent::EndOfDump).is_err() {
+    if sub.events.send(RouteEvent::EndOfDump).await.is_err() {
         return;
     }
     subscribers.push(sub.events);
 }
 
-/// Fan a route-export event out to every open subscriber, pruning closed ones.
-/// Sends are non-blocking (the channel is unbounded), so the router never stalls.
-fn fanout(subscribers: &mut Vec<mpsc::UnboundedSender<RouteEvent>>, event: RouteEvent) {
-    subscribers.retain(|s| s.send(event.clone()).is_ok());
+/// Fan a route-export event out to every open subscriber. Live events use
+/// non-blocking `try_send` so the router never stalls; a subscriber that is
+/// closed OR whose bounded buffer has filled (a slow/stuck client) is dropped —
+/// it can reconnect and re-snapshot. This bounds the memory any one subscriber
+/// can cost the router.
+fn fanout(subscribers: &mut Vec<mpsc::Sender<RouteEvent>>, event: RouteEvent) {
+    subscribers.retain(|s| s.try_send(event.clone()).is_ok());
 }
 
 /// Push the RIB's current best routes to the redistribution targets once at
@@ -377,7 +392,7 @@ fn apply(
     imports: &ImportFilters,
     fib_export: Option<&Filter>,
     exported: &mut BTreeMap<(u32, Prefix), Route>,
-    subscribers: &mut Vec<mpsc::UnboundedSender<RouteEvent>>,
+    subscribers: &mut Vec<mpsc::Sender<RouteEvent>>,
 ) -> Option<RedistEvent> {
     let change = match update {
         RouteUpdate::Announce(route) => {
@@ -422,7 +437,7 @@ fn program_fib(
     change: FibChange,
     fib_export: Option<&Filter>,
     exported: &mut BTreeMap<(u32, Prefix), Route>,
-    subscribers: &mut Vec<mpsc::UnboundedSender<RouteEvent>>,
+    subscribers: &mut Vec<mpsc::Sender<RouteEvent>>,
 ) {
     match change {
         FibChange::Install(route) => {
@@ -882,7 +897,7 @@ mod tests {
             // closed channel while the test runs.
             let _qtx = qtx;
             // A short timeout turns a hang (a missing event) into a test failure.
-            async fn next(rx: &mut mpsc::UnboundedReceiver<RouteEvent>) -> RouteEvent {
+            async fn next(rx: &mut mpsc::Receiver<RouteEvent>) -> RouteEvent {
                 timeout(Duration::from_secs(1), rx.recv())
                     .await
                     .unwrap()
@@ -891,7 +906,7 @@ mod tests {
 
             // Subscribe before any route exists: the snapshot is empty — just
             // EndOfDump.
-            let (etx, mut erx) = mpsc::unbounded_channel();
+            let (etx, mut erx) = mpsc::channel(SUBSCRIBER_CAP);
             stx.send(RouteSubscribe { events: etx }).await.unwrap();
             assert!(matches!(next(&mut erx).await, RouteEvent::EndOfDump));
 
@@ -932,7 +947,7 @@ mod tests {
                 RouteEvent::Update(r) => assert_eq!(r.prefix.to_string(), "198.51.100.0/24"),
                 other => panic!("expected live update on subscriber #1, got {other:?}"),
             }
-            let (etx2, mut erx2) = mpsc::unbounded_channel();
+            let (etx2, mut erx2) = mpsc::channel(SUBSCRIBER_CAP);
             stx.send(RouteSubscribe { events: etx2 }).await.unwrap();
             match next(&mut erx2).await {
                 RouteEvent::Update(r) => assert_eq!(r.prefix.to_string(), "198.51.100.0/24"),

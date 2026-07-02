@@ -291,6 +291,20 @@ pub(crate) fn read_prefix(
     buf: &[u8],
     ctx: &Compress,
 ) -> Option<(Prefix, usize)> {
+    // Reject a prefix length that exceeds the address family's real width
+    // BEFORE it is used to size a slice into the fixed 16-byte `addr` buffer
+    // below. `plen` comes straight off the wire (0..=255); without this guard
+    // an oversized value (e.g. plen=200 on an IPv4 update) overruns `addr` and
+    // panics. `Prefix::new` further down would reject it, but only after the
+    // slice write. Mirrors the family-width clamp wren-ospfv3/wren-isis apply.
+    let max_bits = match ae {
+        AE_IPV4 => 32,
+        AE_IPV6 => 128,
+        _ => return None,
+    };
+    if plen as usize > max_bits {
+        return None;
+    }
     let total = (plen as usize).div_ceil(8);
     let omitted = omitted as usize;
     if omitted > total {
@@ -353,5 +367,28 @@ mod tests {
         }]);
         let bytes = pkt.encode();
         assert_eq!(Packet::decode(&bytes).unwrap(), pkt);
+    }
+
+    // Regression: a single crafted Update TLV with an out-of-range prefix
+    // length (plen=200 on an IPv4 update) used to panic in `read_prefix` by
+    // overrunning its fixed 16-byte buffer. `decode` must now reject the TLV
+    // gracefully (preserved as `Tlv::Unknown`) instead of crashing the daemon.
+    #[test]
+    fn oversized_update_plen_does_not_panic() {
+        use crate::tlv::TYPE_UPDATE;
+        // Update TLV value: ae=IPv4, flags=0, plen=200, omitted=0, then
+        // interval/seqno/metric (6 bytes) + 25 prefix bytes = 35-byte value.
+        let mut value = vec![AE_IPV4, 0, 200, 0];
+        value.extend_from_slice(&[0u8; 6]); // interval, seqno, metric
+        value.extend_from_slice(&[0u8; 25]); // ceil(200/8) address bytes
+        let mut body = vec![TYPE_UPDATE, value.len() as u8];
+        body.extend_from_slice(&value);
+        let mut bytes = vec![MAGIC, VERSION];
+        bytes.extend_from_slice(&(body.len() as u16).to_be_bytes());
+        bytes.extend_from_slice(&body);
+        assert_eq!(bytes.len(), 41, "matches the reported crash payload size");
+        // Must not panic; the malformed Update is preserved as an Unknown TLV.
+        let pkt = Packet::decode(&bytes).expect("decodes without panicking");
+        assert!(matches!(pkt.body[0], Tlv::Unknown { .. }));
     }
 }

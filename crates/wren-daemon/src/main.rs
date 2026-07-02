@@ -165,6 +165,24 @@ async fn main() -> Result<()> {
         )
         .init();
 
+    // Supervision: each routing protocol runs in its own spawned task. With
+    // unwinding (no panic=abort, see the workspace Cargo.toml), a panic in one
+    // protocol's FSM terminates only that task rather than the whole daemon.
+    // This hook makes such a panic visible via tracing instead of being lost
+    // when the discarded JoinHandle drops, so the operator sees which protocol
+    // died and where. (Restart-on-panic supervision is future work.)
+    {
+        let default_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            let location = info
+                .location()
+                .map(|l| format!("{}:{}", l.file(), l.line()))
+                .unwrap_or_else(|| "<unknown>".to_string());
+            tracing::error!(location = %location, "task panicked: {info}");
+            default_hook(info);
+        }));
+    }
+
     let cfg = wren_config::Config::load(&args.config)
         .with_context(|| format!("loading {}", args.config.display()))?;
     info!(router_id = ?cfg.router_id, "configuration loaded");

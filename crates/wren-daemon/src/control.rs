@@ -88,6 +88,15 @@ pub async fn serve(path: PathBuf, channels: Channels) -> Result<()> {
     let _ = std::fs::remove_file(&path);
     let listener =
         UnixListener::bind(&path).with_context(|| format!("binding control socket {path:?}"))?;
+    // Restrict the socket to owner (root) rather than relying on the inherited
+    // umask: the control protocol accepts actions (e.g. `bgp refresh <peer>`),
+    // not just read-only `show`, so an unprivileged local user must not be able
+    // to connect.
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+            .with_context(|| format!("securing control socket {path:?}"))?;
+    }
     info!(socket = ?path, "control socket listening");
 
     loop {
@@ -107,11 +116,30 @@ pub async fn serve(path: PathBuf, channels: Channels) -> Result<()> {
 /// Read one command line, answer it, and close the connection.
 async fn handle_conn(stream: UnixStream, channels: Channels) -> Result<()> {
     let mut reader = BufReader::new(stream);
-    let mut line = String::new();
-    reader
-        .read_line(&mut line)
-        .await
-        .context("reading command")?;
+    // Read one command line, but cap it: an unterminated line would otherwise
+    // let a client grow this connection's buffer without bound. Uses the
+    // BufReader's fill_buf/consume so the reader stays intact for the long-lived
+    // subscribe path (which only writes afterwards).
+    const MAX_COMMAND_LEN: usize = 4096;
+    let mut line_buf: Vec<u8> = Vec::new();
+    loop {
+        let chunk = reader.fill_buf().await.context("reading command")?;
+        if chunk.is_empty() {
+            break; // EOF before newline
+        }
+        if let Some(pos) = chunk.iter().position(|&b| b == b'\n') {
+            line_buf.extend_from_slice(&chunk[..pos]);
+            reader.consume(pos + 1);
+            break;
+        }
+        let taken = chunk.len();
+        line_buf.extend_from_slice(chunk);
+        reader.consume(taken);
+        if line_buf.len() > MAX_COMMAND_LEN {
+            anyhow::bail!("control command exceeds {MAX_COMMAND_LEN} bytes");
+        }
+    }
+    let line = String::from_utf8_lossy(&line_buf);
     let line = line.trim();
 
     // A subscribe command opens a long-lived route-export stream rather than a
@@ -527,7 +555,9 @@ async fn stream_routes(
     mut reader: BufReader<UnixStream>,
     subscribe: &mpsc::Sender<RouteSubscribe>,
 ) -> Result<()> {
-    let (tx, mut rx) = mpsc::unbounded_channel();
+    // Bounded: the router drops this subscriber if the buffer fills (a client
+    // that stops reading), which bounds the memory it can cost the router.
+    let (tx, mut rx) = mpsc::channel(crate::router::SUBSCRIBER_CAP);
     if subscribe.send(RouteSubscribe { events: tx }).await.is_err() {
         reader
             .get_mut()

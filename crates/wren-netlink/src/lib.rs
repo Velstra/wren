@@ -584,6 +584,33 @@ impl KernelFib {
                 io::Error::last_os_error()
             )));
         }
+        // Bound the ACK read: this socket is driven synchronously from the
+        // router's async task, so a kernel that never replies (memory pressure,
+        // ENOBUFS storm) would otherwise hang the router loop indefinitely and
+        // silently stop route convergence. A receive timeout turns that into a
+        // recoverable per-request error instead of a deadlock. (Moving the whole
+        // netlink I/O off the async runtime is the larger follow-up; this closes
+        // the unbounded-hang failure mode.)
+        let tv = libc::timeval {
+            tv_sec: 5,
+            tv_usec: 0,
+        };
+        // SAFETY: setsockopt with a valid timeval for the fd we just opened.
+        let rc = unsafe {
+            libc::setsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                libc::SO_RCVTIMEO,
+                &tv as *const _ as *const c_void,
+                mem::size_of::<libc::timeval>() as libc::socklen_t,
+            )
+        };
+        if rc < 0 {
+            let err = io::Error::last_os_error();
+            // SAFETY: closing the fd we just opened.
+            unsafe { libc::close(fd) };
+            return Err(FibError(format!("setting netlink recv timeout: {err}")));
+        }
         // SAFETY: a zeroed sockaddr_nl with only the family set is a valid bind
         // address (the kernel auto-assigns the port id).
         let mut sa: libc::sockaddr_nl = unsafe { mem::zeroed() };

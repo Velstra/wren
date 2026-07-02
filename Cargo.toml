@@ -47,4 +47,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 [profile.release]
 lto = "thin"
 codegen-units = 1
-panic = "abort"
+# NOT panic = "abort": the daemon spawns one task per routing protocol. With
+# unwinding, a panic in one protocol's FSM stays contained to that task (its
+# JoinHandle resolves to Err and a supervisor logs it) instead of aborting the
+# whole process and taking every other protocol + the kernel FIB writer down.
