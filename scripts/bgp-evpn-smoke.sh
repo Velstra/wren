@@ -137,6 +137,14 @@ unshare -Urn bash -c '
   nsenter -t $L2PID -n "$WREN" --config "$WORK/l2.toml" --backend kernel --socket "$WORK/l2.sock" >"$WORK/l2.log" 2>&1 &
   sleep 9
 
+  # B4b: dynamically originate a type-2 MAC/IP route on Leaf1 at runtime — the
+  # write-side control API the fabric datapath drives as it learns local MACs.
+  # Leaf2 must import this MAC just like the static one, proving the dynamic
+  # origination reaches the run loop, updates the origination set, and advertises
+  # to the already-Established EVPN session.
+  nsenter -t $L1PID -n "$WREN" --socket "$WORK/l1.sock" evpn advertise 10100 02:00:5e:00:00:09 10.100.0.9 || true
+  sleep 2
+
   ok=1
   {
     echo "=== wren show bgp neighbors (on RR) ==="
@@ -157,6 +165,7 @@ unshare -Urn bash -c '
   grep -q "10.0.0.2 AS 65010 Established"         "$WORK/out.txt" || { echo "FAIL: RR-Leaf2 session not Established"; ok=0; }
   grep -q "via 10.0.0.1"                          "$WORK/out.txt" || { echo "FAIL: Leaf2 did not learn Leaf1 EVPN routes (via 10.0.0.1)"; ok=0; }
   grep -q "02:00:5e:00:00:01 -> vtep 10.0.0.1"    "$WORK/out.txt" || { echo "FAIL: Leaf1 MAC not imported into Leaf2 MAC-VRF"; ok=0; }
+  grep -q "02:00:5e:00:00:09 -> vtep 10.0.0.1"    "$WORK/out.txt" || { echo "FAIL: dynamically-advertised Leaf1 MAC (evpn advertise) not imported into Leaf2 MAC-VRF"; ok=0; }
   grep -q "flood -> 10.0.0.1"                      "$WORK/out.txt" || { echo "FAIL: Leaf1 VTEP not in Leaf2 flood set"; ok=0; }
   grep -Eq "\+ evpn vni 10100 mac 02:00:5e:00:00:01 .*vtep 10.0.0.1" "$WORK/out.txt" || { echo "FAIL: monitor evpn did not stream Leaf1 MAC"; ok=0; }
   grep -q "+ evpn vni 10100 flood 10.0.0.1"        "$WORK/out.txt" || { echo "FAIL: monitor evpn did not stream Leaf1 flood VTEP"; ok=0; }
