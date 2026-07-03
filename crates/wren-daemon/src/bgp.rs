@@ -41,7 +41,7 @@ use wren_bgp::capability::{Capability, ADD_PATH_BOTH, ADD_PATH_RECEIVE, ADD_PATH
 use wren_bgp::community::format_community;
 use wren_bgp::decision::{Path, DEFAULT_LOCAL_PREF};
 use wren_bgp::evpn::{encap_ext_community, Esi, EvpnNlri, Rd, TUNNEL_TYPE_VXLAN};
-use wren_bgp::evpn_rib::{EviTable, EvpnRib, EvpnRibEvent};
+use wren_bgp::evpn_rib::{EviChange, EviTable, EvpnRib, EvpnRibEvent};
 use wren_bgp::ext_community::format_ext_community;
 use wren_bgp::fsm::{Action, BgpFsm, Event, State, CODE_CEASE};
 use wren_bgp::large_community::format_large_community;
@@ -809,6 +809,127 @@ pub fn render_evpn_vnis(evis: &[(EvpnInstanceCfg, EviTable)]) -> String {
     out
 }
 
+// ---------------------------------------------------------------------------
+// EVPN monitor stream (`wren monitor evpn`) — the EVPN↔fabric bridge feed
+// ---------------------------------------------------------------------------
+
+/// Capacity of each EVPN monitor subscriber channel — mirrors the router's
+/// route-export bound so a slow `monitor evpn` client cannot make the BGP task
+/// hold events without limit.
+pub(crate) const EVPN_SUBSCRIBER_CAP: usize = 1024;
+
+/// A change to the EVPN forwarding state, streamed to a monitor subscriber over
+/// the control socket (`wren monitor evpn`). The stream mirrors the per-EVI
+/// MAC-VRF views: first a snapshot of every current remote MAC and flood VTEP
+/// (one [`MacUpdate`](EvpnEvent::MacUpdate)/[`FloodUpdate`](EvpnEvent::FloodUpdate)
+/// each, terminated by [`EndOfDump`](EvpnEvent::EndOfDump)), then live
+/// updates/withdrawals as EVPN routes change. This is the FPM-style feed the
+/// Velstra fabric controller consumes to program its overlay maps (the EVPN↔
+/// fabric bridge): the MAC-FDB, the ARP/ND suppression table and the BUM flood
+/// set. Every event is keyed by the EVI's own (locally configured) L2 VNI — the
+/// VNI the local datapath uses for that MAC-VRF.
+#[derive(Debug, Clone)]
+pub enum EvpnEvent {
+    /// Learn/replace a remote MAC: tunnel frames for `mac` on `vni` to `vtep`,
+    /// with `ip` bound to it (for ARP/ND suppression) when advertised.
+    MacUpdate {
+        /// The EVI's L2 VNI.
+        vni: u32,
+        /// The remote MAC.
+        mac: [u8; 6],
+        /// The IP bound to the MAC, if the route advertised one.
+        ip: Option<IpAddr>,
+        /// The VTEP to tunnel to.
+        vtep: IpAddr,
+    },
+    /// Forget a remote MAC on `vni`.
+    MacWithdraw {
+        /// The EVI's L2 VNI.
+        vni: u32,
+        /// The MAC that is gone.
+        mac: [u8; 6],
+    },
+    /// Add a remote VTEP to `vni`'s BUM flood set (from a type-3 IMET route).
+    FloodUpdate {
+        /// The EVI's L2 VNI.
+        vni: u32,
+        /// The VTEP to flood BUM traffic toward.
+        vtep: IpAddr,
+    },
+    /// Remove a remote VTEP from `vni`'s BUM flood set.
+    FloodWithdraw {
+        /// The EVI's L2 VNI.
+        vni: u32,
+        /// The VTEP that is gone.
+        vtep: IpAddr,
+    },
+    /// Marks the end of the initial snapshot; subsequent events are live.
+    EndOfDump,
+}
+
+/// A request to subscribe to the EVPN monitor stream, carrying the channel the
+/// BGP task pushes [`EvpnEvent`]s down. The task replays the current MAC-VRF
+/// views as updates followed by [`EvpnEvent::EndOfDump`], then retains the sender
+/// for live changes until the subscriber disconnects.
+#[derive(Debug)]
+pub struct EvpnSubscribe {
+    /// Where to deliver the snapshot and live events. Bounded: a subscriber whose
+    /// buffer fills is dropped (it can reconnect and re-snapshot).
+    pub events: mpsc::Sender<EvpnEvent>,
+}
+
+/// Translate one per-EVI [`EviChange`] into the monitor [`EvpnEvent`] for `vni`
+/// (the EVI's locally configured L2 VNI).
+fn evpn_event_for(vni: u32, change: &EviChange) -> EvpnEvent {
+    match change {
+        EviChange::MacLearned { mac, entry, .. } => {
+            EvpnEvent::MacUpdate { vni, mac: *mac, ip: entry.ip, vtep: entry.vtep }
+        }
+        EviChange::MacForgotten { mac, .. } => EvpnEvent::MacWithdraw { vni, mac: *mac },
+        EviChange::VtepAdded { vtep } => EvpnEvent::FloodUpdate { vni, vtep: *vtep },
+        EviChange::VtepRemoved { vtep } => EvpnEvent::FloodWithdraw { vni, vtep: *vtep },
+    }
+}
+
+/// Fan an EVPN monitor event out to every open subscriber. Live events use
+/// non-blocking `try_send` so the BGP task never stalls; a subscriber that is
+/// closed OR whose bounded buffer has filled (a slow/stuck client) is dropped —
+/// it can reconnect and re-snapshot.
+fn fanout_evpn(subscribers: &mut Vec<mpsc::Sender<EvpnEvent>>, event: EvpnEvent) {
+    subscribers.retain(|s| s.try_send(event.clone()).is_ok());
+}
+
+/// Register a new EVPN monitor subscriber: replay every EVI's current remote-MAC
+/// table and flood set as [`EvpnEvent`]s — a consistent snapshot, since the
+/// single-threaded BGP task processes no route change while this runs — then a
+/// terminating [`EvpnEvent::EndOfDump`], and finally retain the sender for live
+/// events. The snapshot is delivered with backpressure so a large MAC-VRF is
+/// never truncated. A subscriber that has already disconnected is dropped.
+async fn subscribe_evpn(
+    evis: &[(EvpnInstanceCfg, EviTable)],
+    subscribers: &mut Vec<mpsc::Sender<EvpnEvent>>,
+    sub: EvpnSubscribe,
+) {
+    for (inst, table) in evis {
+        for ((_eth_tag, mac), rm) in table.iter_macs() {
+            let ev = EvpnEvent::MacUpdate { vni: inst.vni, mac: *mac, ip: rm.ip, vtep: rm.vtep };
+            if sub.events.send(ev).await.is_err() {
+                return;
+            }
+        }
+        for vtep in table.iter_vteps() {
+            let ev = EvpnEvent::FloodUpdate { vni: inst.vni, vtep: *vtep };
+            if sub.events.send(ev).await.is_err() {
+                return;
+            }
+        }
+    }
+    if sub.events.send(EvpnEvent::EndOfDump).await.is_err() {
+        return;
+    }
+    subscribers.push(sub.events);
+}
+
 /// Render every candidate path in the Adj-RIB-In (à la `show ip bgp` with all paths):
 /// one line per path, grouped by destination, each marked `*` when it is the selected
 /// best and tagged with its received ADD-PATH Path Identifier (RFC 7911). This is how
@@ -973,6 +1094,7 @@ pub async fn run(
     mut rtr_rx: mpsc::Receiver<Vec<Roa>>,
     bmp_tx: Option<mpsc::Sender<crate::bmp::BmpEvent>>,
     mut bfd_down: mpsc::Receiver<IpAddr>,
+    mut evpn_subscribes: mpsc::Receiver<EvpnSubscribe>,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) -> Result<()> {
     // The neighbour table: every configured peer, its AS and whether the session
@@ -1150,6 +1272,10 @@ pub async fn run(
     let mut evis: Vec<(EvpnInstanceCfg, EviTable)> = Vec::new();
     let mut evpn_originated: Vec<EvpnOriginRoute> = Vec::new();
     let mut evpn_nh: BTreeMap<EvpnNlri, Vec<u8>> = BTreeMap::new();
+    // Open EVPN monitor subscriptions (`wren monitor evpn`); each receives the
+    // MAC-VRF snapshot then live changes. Closed ones are pruned on the next
+    // fan-out. This is the feed the fabric controller consumes (EVPN↔fabric bridge).
+    let mut evpn_subscribers: Vec<mpsc::Sender<EvpnEvent>> = Vec::new();
     if let Some(evpn) = &cfg.evpn {
         let nh = vtep_next_hop_octets(evpn.vtep_ip);
         for inst in &evpn.instances {
@@ -1291,6 +1417,12 @@ pub async fn run(
                 } else {
                     debug!(%peer, "BFD down for a peer with no established BGP session");
                 }
+                continue;
+            }
+            // A new `wren monitor evpn` client: replay the MAC-VRF snapshot, then
+            // retain it for live changes (the EVPN↔fabric bridge feed).
+            Some(sub) = evpn_subscribes.recv() => {
+                subscribe_evpn(&evis, &mut evpn_subscribers, sub).await;
                 continue;
             }
         };
@@ -1491,7 +1623,7 @@ pub async fn run(
                 // the withdrawals to the other EVPN peers (no graceful-restart retention
                 // for EVPN here).
                 for ev in evpn_rib.withdraw_peer(p) {
-                    handle_evpn_event(ev, Vec::new(), p, &mut evis, &mut evpn_nh, &local, &sessions)
+                    handle_evpn_event(ev, Vec::new(), p, &mut evis, &mut evpn_nh, &mut evpn_subscribers, &local, &sessions)
                         .await;
                 }
                 for pfx in addpath_affected {
@@ -1690,7 +1822,7 @@ pub async fn run(
                 // EVPN withdrawals (MP_UNREACH_NLRI, AFI 25 / SAFI 70, RFC 7432).
                 for nlri in mp_unreach_evpn(&update).to_vec() {
                     if let Some(ev) = evpn_rib.withdraw(peer, nlri) {
-                        handle_evpn_event(ev, Vec::new(), peer, &mut evis, &mut evpn_nh, &local, &sessions)
+                        handle_evpn_event(ev, Vec::new(), peer, &mut evis, &mut evpn_nh, &mut evpn_subscribers, &local, &sessions)
                             .await;
                     }
                 }
@@ -1705,7 +1837,7 @@ pub async fn run(
                                     continue;
                                 }
                                 if let Some(ev) = evpn_rib.update(peer, nlri, path.clone()) {
-                                    handle_evpn_event(ev, nh_octets.clone(), peer, &mut evis, &mut evpn_nh, &local, &sessions)
+                                    handle_evpn_event(ev, nh_octets.clone(), peer, &mut evis, &mut evpn_nh, &mut evpn_subscribers, &local, &sessions)
                                         .await;
                                 }
                             }
@@ -2303,19 +2435,25 @@ fn evpn_next_hop_ip(octets: &[u8]) -> Option<IpAddr> {
 /// raw next-hop octets (for next-hop-unchanged reflection, RFC 7432 §7.7), and
 /// re-advertise the change to every OTHER EVPN-activated session (the session-side
 /// propagation gate does the iBGP/echo filtering).
+#[allow(clippy::too_many_arguments)] // one fold-and-fan-out step over all EVPN cross-cutting state
 async fn handle_evpn_event(
     ev: EvpnRibEvent,
     nh: Vec<u8>,
     from_peer: IpAddr,
     evis: &mut [(EvpnInstanceCfg, EviTable)],
     evpn_nh: &mut BTreeMap<EvpnNlri, Vec<u8>>,
+    evpn_subscribers: &mut Vec<mpsc::Sender<EvpnEvent>>,
     local: &Local,
     sessions: &HashMap<IpAddr, mpsc::Sender<SessionCmd>>,
 ) {
-    // Fold the change into each per-EVI MAC-VRF view (RFC 7432 §9).
+    // Fold the change into each per-EVI MAC-VRF view (RFC 7432 §9), and stream the
+    // resulting forwarding delta to every `monitor evpn` subscriber (the EVPN↔
+    // fabric bridge feed). A route may match several EVIs; each emits its own event
+    // keyed by that EVI's VNI.
     for (inst, table) in evis.iter_mut() {
-        if table.apply(&ev) {
+        if let Some(change) = table.apply(&ev) {
             info!(evi = inst.evi, vni = inst.vni, "EVPN MAC-VRF view updated");
+            fanout_evpn(evpn_subscribers, evpn_event_for(inst.vni, &change));
         }
     }
     // Track the next hop and re-propagate to the other EVPN peers.

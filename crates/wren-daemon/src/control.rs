@@ -23,7 +23,7 @@ use tracing::{info, warn};
 #[cfg(feature = "babel")]
 use crate::babel::{BabelQuery, BabelQueryRequest};
 use crate::bfd::{BfdQuery, BfdQueryRequest};
-use crate::bgp::{BgpQuery, BgpQueryRequest};
+use crate::bgp::{BgpQuery, BgpQueryRequest, EvpnEvent, EvpnSubscribe};
 #[cfg(feature = "isis")]
 use crate::isis::{IsisQuery, IsisQueryRequest};
 #[cfg(feature = "ospf")]
@@ -47,6 +47,9 @@ pub struct Channels {
     /// To the central router loop to open a route-export stream (`monitor
     /// routes`). Always present — the router always runs.
     pub subscribe: mpsc::Sender<RouteSubscribe>,
+    /// To the BGP task to open an EVPN monitor stream (`monitor evpn`), if BGP is
+    /// running. This is the EVPN↔fabric bridge feed the fabric controller consumes.
+    pub evpn_subscribe: Option<mpsc::Sender<EvpnSubscribe>>,
     /// To the BGP task (`show bgp`), if BGP is running.
     pub bgp: Option<mpsc::Sender<BgpQueryRequest>>,
     /// To the BFD task (`show bfd`), if any BFD session is configured.
@@ -142,8 +145,12 @@ async fn handle_conn(stream: UnixStream, channels: Channels) -> Result<()> {
     let line = String::from_utf8_lossy(&line_buf);
     let line = line.trim();
 
-    // A subscribe command opens a long-lived route-export stream rather than a
-    // one-shot query/response, so handle it before the per-protocol parsers.
+    // A subscribe command opens a long-lived export stream rather than a one-shot
+    // query/response, so handle it before the per-protocol parsers. `monitor evpn`
+    // is checked first (its object distinguishes it from `monitor routes`).
+    if is_evpn_subscribe_command(line) {
+        return stream_evpn(reader, &channels.evpn_subscribe).await;
+    }
     if is_subscribe_command(line) {
         return stream_routes(reader, &channels.subscribe).await;
     }
@@ -224,7 +231,7 @@ async fn handle_conn(stream: UnixStream, channels: Channels) -> Result<()> {
              show ospf [neighbors|interfaces|database] | show ospf3 [neighbors|interfaces] | \
              show isis [neighbors|interfaces|database] | show babel [neighbors|routes] | \
              show bfd | show rip | show ripng | show vrrp | show vrf | \
-             show metrics | monitor routes\n"
+             show metrics | monitor routes | monitor evpn\n"
         )
     });
 
@@ -287,6 +294,20 @@ pub fn is_subscribe_command(line: &str) -> bool {
     }
 }
 
+/// Whether `line` opens an EVPN monitor subscription (`monitor evpn`). Same verb
+/// as [`is_subscribe_command`] (`monitor`/`subscribe`) but the object is `evpn`;
+/// this is the FPM-style EVPN feed the Velstra fabric controller consumes to
+/// program its overlay maps (the EVPN↔fabric bridge).
+pub fn is_evpn_subscribe_command(line: &str) -> bool {
+    let mut tokens = line.split_whitespace();
+    match tokens.next() {
+        Some("monitor") | Some("subscribe") => {
+            tokens.next() == Some("evpn") && tokens.next().is_none()
+        }
+        _ => false,
+    }
+}
+
 /// Render one [`RouteEvent`] as a single line of the route-export stream:
 ///
 /// ```text
@@ -324,6 +345,50 @@ fn format_route_event(event: &RouteEvent) -> String {
         RouteEvent::EndOfDump => out.push_str("% end-of-dump\n"),
     }
     out
+}
+
+/// Render one [`EvpnEvent`] as a single line of the EVPN monitor stream:
+///
+/// ```text
+/// + evpn vni <vni> mac <mac> [ip <ip>] vtep <vtep>   (remote MAC learn/change)
+/// - evpn vni <vni> mac <mac>                          (remote MAC withdraw)
+/// + evpn vni <vni> flood <vtep>                       (BUM flood VTEP add)
+/// - evpn vni <vni> flood <vtep>                       (BUM flood VTEP remove)
+/// % end-of-dump                                       (snapshot done)
+/// ```
+///
+/// Line-based and stable so the fabric controller can parse it into overlay-map
+/// updates. The MAC is lower-case colon-hex; `vni` names the EVI's L2 VNI.
+fn format_evpn_event(event: &EvpnEvent) -> String {
+    let mut out = String::new();
+    match event {
+        EvpnEvent::MacUpdate { vni, mac, ip, vtep } => {
+            let _ = write!(out, "+ evpn vni {vni} mac {}", fmt_mac(mac));
+            if let Some(ip) = ip {
+                let _ = write!(out, " ip {ip}");
+            }
+            let _ = writeln!(out, " vtep {vtep}");
+        }
+        EvpnEvent::MacWithdraw { vni, mac } => {
+            let _ = writeln!(out, "- evpn vni {vni} mac {}", fmt_mac(mac));
+        }
+        EvpnEvent::FloodUpdate { vni, vtep } => {
+            let _ = writeln!(out, "+ evpn vni {vni} flood {vtep}");
+        }
+        EvpnEvent::FloodWithdraw { vni, vtep } => {
+            let _ = writeln!(out, "- evpn vni {vni} flood {vtep}");
+        }
+        EvpnEvent::EndOfDump => out.push_str("% end-of-dump\n"),
+    }
+    out
+}
+
+/// Format a MAC address as lower-case colon-hex (`aa:bb:cc:dd:ee:ff`).
+fn fmt_mac(mac: &[u8; 6]) -> String {
+    format!(
+        "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+        mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
+    )
 }
 
 /// Parse one control command line into a [`Query`]. Returns `None` for anything
@@ -578,6 +643,48 @@ async fn stream_routes(
     while let Some(event) = rx.recv().await {
         if stream
             .write_all(format_route_event(&event).as_bytes())
+            .await
+            .is_err()
+        {
+            break; // client gone
+        }
+    }
+    Ok(())
+}
+
+/// Serve an EVPN monitor subscription (`wren monitor evpn`): register with the BGP
+/// task, then stream each [`EvpnEvent`] to the client as a line until the channel
+/// ends or the client disconnects. If BGP is not running there is nothing to
+/// subscribe to, so report that instead of hanging. Long-lived, like
+/// [`stream_routes`]; a dropped client is noticed on the next write and the BGP
+/// task prunes the closed sender on its next fan-out.
+async fn stream_evpn(
+    mut reader: BufReader<UnixStream>,
+    subscribe: &Option<mpsc::Sender<EvpnSubscribe>>,
+) -> Result<()> {
+    let Some(subscribe) = subscribe else {
+        reader
+            .get_mut()
+            .write_all(b"evpn is not enabled\n")
+            .await
+            .ok();
+        return Ok(());
+    };
+    // Bounded: the BGP task drops this subscriber if the buffer fills (a client
+    // that stops reading), which bounds the memory it can cost the task.
+    let (tx, mut rx) = mpsc::channel(crate::bgp::EVPN_SUBSCRIBER_CAP);
+    if subscribe.send(EvpnSubscribe { events: tx }).await.is_err() {
+        reader
+            .get_mut()
+            .write_all(b"error: bgp unavailable\n")
+            .await
+            .ok();
+        return Ok(());
+    }
+    let stream = reader.get_mut();
+    while let Some(event) = rx.recv().await {
+        if stream
+            .write_all(format_evpn_event(&event).as_bytes())
             .await
             .is_err()
         {
@@ -862,5 +969,53 @@ mod tests {
             "- 10.0.0.0/24 table 254\n"
         );
         assert_eq!(format_route_event(&RouteEvent::EndOfDump), "% end-of-dump\n");
+    }
+
+    #[test]
+    fn is_evpn_subscribe_command_matches_monitor_evpn_only() {
+        assert!(is_evpn_subscribe_command("monitor evpn"));
+        assert!(is_evpn_subscribe_command("subscribe evpn"));
+        // The `routes` object is the other stream, not this one.
+        assert!(!is_evpn_subscribe_command("monitor routes"));
+        assert!(!is_evpn_subscribe_command("monitor evpn extra"));
+        assert!(!is_evpn_subscribe_command("monitor"));
+        assert!(!is_evpn_subscribe_command(""));
+        // And `monitor evpn` must not be misread as a route subscription.
+        assert!(!is_subscribe_command("monitor evpn"));
+    }
+
+    #[test]
+    fn format_evpn_event_renders_mac_flood_and_end_of_dump() {
+        use std::net::IpAddr;
+        let mac = [0x02, 0x00, 0x5e, 0x00, 0x00, 0x01];
+        let vtep: IpAddr = "10.0.0.1".parse().unwrap();
+        // MAC with a bound IP (for ARP/ND suppression).
+        assert_eq!(
+            format_evpn_event(&EvpnEvent::MacUpdate {
+                vni: 10100,
+                mac,
+                ip: Some("10.100.0.1".parse().unwrap()),
+                vtep,
+            }),
+            "+ evpn vni 10100 mac 02:00:5e:00:00:01 ip 10.100.0.1 vtep 10.0.0.1\n"
+        );
+        // MAC without a bound IP.
+        assert_eq!(
+            format_evpn_event(&EvpnEvent::MacUpdate { vni: 10100, mac, ip: None, vtep }),
+            "+ evpn vni 10100 mac 02:00:5e:00:00:01 vtep 10.0.0.1\n"
+        );
+        assert_eq!(
+            format_evpn_event(&EvpnEvent::MacWithdraw { vni: 10100, mac }),
+            "- evpn vni 10100 mac 02:00:5e:00:00:01\n"
+        );
+        assert_eq!(
+            format_evpn_event(&EvpnEvent::FloodUpdate { vni: 10100, vtep }),
+            "+ evpn vni 10100 flood 10.0.0.1\n"
+        );
+        assert_eq!(
+            format_evpn_event(&EvpnEvent::FloodWithdraw { vni: 10100, vtep }),
+            "- evpn vni 10100 flood 10.0.0.1\n"
+        );
+        assert_eq!(format_evpn_event(&EvpnEvent::EndOfDump), "% end-of-dump\n");
     }
 }

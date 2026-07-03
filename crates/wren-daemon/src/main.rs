@@ -290,6 +290,11 @@ async fn main() -> Result<()> {
     // `_tx` end is held for the whole run so the router's subscribe select arm
     // never sees a closed channel.
     let (subscribe_tx, subscribe_rx) = mpsc::channel(QUERY_QUEUE);
+    // EVPN monitor subscriptions (`wren monitor evpn`) → the BGP task. The `_tx`
+    // end is held in `Channels` (only when BGP runs) so the task's subscribe arm
+    // never sees a closed channel; the `_rx` is moved into `bgp::run`.
+    let (evpn_subscribe_tx, evpn_subscribe_rx) = mpsc::channel(QUERY_QUEUE);
+    let mut evpn_subscribe_rx = Some(evpn_subscribe_rx);
     let (bgp_queries_tx, bgp_queries_rx) = mpsc::channel(QUERY_QUEUE);
     let mut bgp_queries_rx = Some(bgp_queries_rx);
     let bgp_enabled = cfg.bgp.as_ref().is_some_and(|b| b.enabled);
@@ -430,6 +435,7 @@ async fn main() -> Result<()> {
         let channels = control::Channels {
             router: queries_tx.clone(),
             subscribe: subscribe_tx.clone(),
+            evpn_subscribe: bgp_enabled.then(|| evpn_subscribe_tx.clone()),
             bgp: bgp_enabled.then(|| bgp_queries_tx.clone()),
             bfd: bfd_enabled.then(|| bfd_queries_tx.clone()),
             #[cfg(feature = "ospf")]
@@ -702,10 +708,11 @@ async fn main() -> Result<()> {
                 let qrx = bgp_queries_rx.take().expect("bgp queries rx taken once");
                 let rrx = rtr_rx.take().expect("rtr rx taken once");
                 let bdrx = bfd_down_rx.take().expect("bfd down rx taken once");
+                let esrx = evpn_subscribe_rx.take().expect("evpn subscribe rx taken once");
                 let sd = shutdown_tx.subscribe();
                 proto_handles.push(tokio::spawn(async move {
                     if let Err(e) =
-                        bgp::run(run_cfg, tx, qrx, redist_rx, rrx, bmp_for_engine, bdrx, sd).await
+                        bgp::run(run_cfg, tx, qrx, redist_rx, rrx, bmp_for_engine, bdrx, esrx, sd).await
                     {
                         error!(error = %e, "BGP engine stopped");
                     }

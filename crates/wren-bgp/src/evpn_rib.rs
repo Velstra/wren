@@ -169,6 +169,42 @@ pub struct RemoteMac {
     pub ip: Option<IpAddr>,
 }
 
+/// A change to one EVI's imported forwarding state, returned by
+/// [`EviTable::apply`]. This is exactly what a forwarding plane must mirror: the
+/// kernel bridge FDB, or — via the EVPN↔fabric bridge (`monitor evpn`) — the
+/// fabric overlay maps (MAC-FDB, ARP/ND table, BUM flood set). A single `apply`
+/// touches at most one entry, so it yields at most one change.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum EviChange {
+    /// A remote MAC appeared or changed: tunnel frames for `mac` (on `eth_tag`)
+    /// per `entry` (its VTEP, VNI and optional bound IP).
+    MacLearned {
+        /// The EVPN Ethernet Tag the MAC lives on (0 for VLAN-based service).
+        eth_tag: u32,
+        /// The learned MAC address.
+        mac: [u8; 6],
+        /// Where to tunnel to, and the IP bound to the MAC (for ARP/ND suppression).
+        entry: RemoteMac,
+    },
+    /// A remote MAC was withdrawn: stop tunnelling frames for it.
+    MacForgotten {
+        /// The EVPN Ethernet Tag the MAC lived on.
+        eth_tag: u32,
+        /// The MAC that is gone.
+        mac: [u8; 6],
+    },
+    /// A remote VTEP joined this EVI's BUM flood set (from a type-3 IMET route).
+    VtepAdded {
+        /// The originating VTEP to flood BUM traffic toward.
+        vtep: IpAddr,
+    },
+    /// A remote VTEP left this EVI's BUM flood set.
+    VtepRemoved {
+        /// The VTEP that is gone.
+        vtep: IpAddr,
+    },
+}
+
 /// One EVPN instance's imported view: the remote-MAC table and the remote-VTEP
 /// flood set, maintained incrementally from [`EvpnRibEvent`]s whose Route
 /// Targets match the EVI's import set (RFC 7432 §9.2).
@@ -208,9 +244,12 @@ impl EviTable {
         path.ext_communities.iter().any(|c| self.import_rts.contains(c))
     }
 
-    /// Apply one EVPN table change to this EVI's view. Returns `true` when the
-    /// view changed (a consumer should re-sync its forwarding state).
-    pub fn apply(&mut self, ev: &EvpnRibEvent) -> bool {
+    /// Apply one EVPN table change to this EVI's view. Returns `Some(change)`
+    /// when the view changed (a consumer should re-sync its forwarding state to
+    /// match), or `None` when nothing this EVI forwards was affected. `Some`
+    /// stands in for the old boolean "changed" — `apply(..).is_some()` is the
+    /// same predicate.
+    pub fn apply(&mut self, ev: &EvpnRibEvent) -> Option<EviChange> {
         match ev {
             EvpnRibEvent::Best { nlri, path } => {
                 if !self.imports(path) {
@@ -229,9 +268,13 @@ impl EviTable {
                         };
                         let key = (*eth_tag, *mac);
                         let changed = self.macs.get(&key) != Some(&entry);
-                        self.macs.insert(key, entry);
+                        self.macs.insert(key, entry.clone());
                         self.owners.insert(key, nlri.clone());
-                        changed
+                        changed.then_some(EviChange::MacLearned {
+                            eth_tag: *eth_tag,
+                            mac: *mac,
+                            entry,
+                        })
                     }
                     EvpnNlri::Imet { orig_ip, .. } => {
                         // Flood toward the advertised originating VTEP. The VNI
@@ -242,34 +285,37 @@ impl EviTable {
                         let changed = !self.vteps.contains_key(orig_ip);
                         self.vteps.insert(*orig_ip, 0);
                         self.vtep_owners.insert(*orig_ip, nlri.clone());
-                        changed
+                        changed.then_some(EviChange::VtepAdded { vtep: *orig_ip })
                     }
                     // Type 5 (IP prefix) feeds L3 (IRB) — handled by the RIB
                     // consumer, not the L2 view. Unknown types carry nothing.
-                    _ => false,
+                    _ => None,
                 }
             }
             EvpnRibEvent::Withdrawn(nlri) => self.remove_if_owner(nlri),
         }
     }
 
-    /// Remove whatever `nlri` currently backs in this view, if anything.
-    fn remove_if_owner(&mut self, nlri: &EvpnNlri) -> bool {
+    /// Remove whatever `nlri` currently backs in this view, if anything, and
+    /// report the resulting forwarding change.
+    fn remove_if_owner(&mut self, nlri: &EvpnNlri) -> Option<EviChange> {
         match nlri {
             EvpnNlri::MacIp { eth_tag, mac, .. } => {
                 let key = (*eth_tag, *mac);
                 if self.owners.get(&key) == Some(nlri) {
                     self.owners.remove(&key);
-                    self.macs.remove(&key).is_some()
+                    self.macs
+                        .remove(&key)
+                        .map(|_| EviChange::MacForgotten { eth_tag: *eth_tag, mac: *mac })
                 } else {
-                    false
+                    None
                 }
             }
             EvpnNlri::Imet { orig_ip, .. } if self.vtep_owners.get(orig_ip) == Some(nlri) => {
                 self.vtep_owners.remove(orig_ip);
-                self.vteps.remove(orig_ip).is_some()
+                self.vteps.remove(orig_ip).map(|_| EviChange::VtepRemoved { vtep: *orig_ip })
             }
-            _ => false,
+            _ => None,
         }
     }
 
@@ -393,7 +439,7 @@ mod tests {
         let ev = rib
             .update(peer, mac_route(1, 0x01, 10100), path(100, [10, 0, 0, 1], vec![RT]))
             .unwrap();
-        assert!(evi.apply(&ev));
+        assert!(evi.apply(&ev).is_some());
         assert_eq!(
             evi.lookup_mac(0, [0x02, 0, 0, 0, 0, 0x01]),
             Some(&RemoteMac { vtep: peer, vni: 10100, ip: None })
@@ -404,7 +450,7 @@ mod tests {
         let ev = rib
             .update(peer, mac_route(1, 0x02, 99), path(100, [10, 0, 0, 1], vec![other_rt]))
             .unwrap();
-        assert!(!evi.apply(&ev));
+        assert!(evi.apply(&ev).is_none());
         assert!(evi.lookup_mac(0, [0x02, 0, 0, 0, 0, 0x02]).is_none());
     }
 
@@ -416,12 +462,12 @@ mod tests {
         let nlri = imet(1, [192, 0, 2, 1]);
 
         let ev = rib.update(peer, nlri.clone(), path(100, [10, 0, 0, 1], vec![RT])).unwrap();
-        assert!(evi.apply(&ev));
+        assert!(evi.apply(&ev).is_some());
         assert_eq!(evi.iter_vteps().collect::<Vec<_>>(), vec![&ip([192, 0, 2, 1])]);
 
         // Withdrawal empties the flood set.
         let ev = rib.withdraw(peer, nlri).unwrap();
-        assert!(evi.apply(&ev));
+        assert!(evi.apply(&ev).is_some());
         assert_eq!(evi.iter_vteps().count(), 0);
     }
 
@@ -441,13 +487,13 @@ mod tests {
             label1: 10100,
             label2: None,
         };
-        evi.apply(&EvpnRibEvent::Best { nlri: a.clone(), path: path(100, [10, 0, 0, 1], vec![RT]) });
-        evi.apply(&EvpnRibEvent::Best { nlri: b.clone(), path: path(100, [10, 0, 0, 2], vec![RT]) });
+        let _ = evi.apply(&EvpnRibEvent::Best { nlri: a.clone(), path: path(100, [10, 0, 0, 1], vec![RT]) });
+        let _ = evi.apply(&EvpnRibEvent::Best { nlri: b.clone(), path: path(100, [10, 0, 0, 2], vec![RT]) });
         // b owns the entry now; withdrawing a changes nothing.
-        assert!(!evi.apply(&EvpnRibEvent::Withdrawn(a)));
+        assert!(evi.apply(&EvpnRibEvent::Withdrawn(a)).is_none());
         assert!(evi.lookup_mac(0, [0x02, 0, 0, 0, 0, 0x01]).is_some());
         // Withdrawing b removes it.
-        assert!(evi.apply(&EvpnRibEvent::Withdrawn(b)));
+        assert!(evi.apply(&EvpnRibEvent::Withdrawn(b)).is_some());
         assert!(evi.lookup_mac(0, [0x02, 0, 0, 0, 0, 0x01]).is_none());
     }
 
@@ -455,12 +501,53 @@ mod tests {
     fn rt_change_out_of_import_set_acts_as_withdraw() {
         let mut evi = EviTable::new(vec![RT]);
         let nlri = mac_route(1, 0x01, 10100);
-        evi.apply(&EvpnRibEvent::Best { nlri: nlri.clone(), path: path(100, [10, 0, 0, 1], vec![RT]) });
+        let _ = evi.apply(&EvpnRibEvent::Best { nlri: nlri.clone(), path: path(100, [10, 0, 0, 1], vec![RT]) });
         assert!(evi.lookup_mac(0, [0x02, 0, 0, 0, 0, 0x01]).is_some());
         // The same NLRI re-advertised without our RT drops out of the view.
         let foreign = auto_route_target(65001, 99);
         let changed = evi.apply(&EvpnRibEvent::Best { nlri, path: path(100, [10, 0, 0, 1], vec![foreign]) });
-        assert!(changed);
+        assert!(changed.is_some());
         assert!(evi.lookup_mac(0, [0x02, 0, 0, 0, 0, 0x01]).is_none());
+    }
+
+    #[test]
+    fn apply_reports_precise_forwarding_deltas() {
+        // The delta an EVI yields is exactly what the EVPN↔fabric bridge mirrors:
+        // MAC learn/forget and VTEP add/remove, each carrying its identifying keys.
+        let mut evi = EviTable::new(vec![RT]);
+        let peer = ip([10, 0, 0, 1]);
+
+        // type-2 → MacLearned with the VTEP and VNI.
+        let mac = [0x02, 0, 0, 0, 0, 0x01];
+        let ev = EvpnRibEvent::Best {
+            nlri: mac_route(1, 0x01, 10100),
+            path: path(100, [10, 0, 0, 1], vec![RT]),
+        };
+        assert_eq!(
+            evi.apply(&ev),
+            Some(EviChange::MacLearned {
+                eth_tag: 0,
+                mac,
+                entry: RemoteMac { vtep: peer, vni: 10100, ip: None },
+            })
+        );
+        // Re-applying the identical route is a no-op (no spurious churn downstream).
+        assert_eq!(evi.apply(&ev), None);
+        // Withdrawing it → MacForgotten with the same key.
+        assert_eq!(
+            evi.apply(&EvpnRibEvent::Withdrawn(mac_route(1, 0x01, 10100))),
+            Some(EviChange::MacForgotten { eth_tag: 0, mac })
+        );
+
+        // type-3 IMET → VtepAdded / VtepRemoved for the flood set.
+        let imet_nlri = imet(1, [192, 0, 2, 1]);
+        assert_eq!(
+            evi.apply(&EvpnRibEvent::Best { nlri: imet_nlri.clone(), path: path(100, [10, 0, 0, 1], vec![RT]) }),
+            Some(EviChange::VtepAdded { vtep: ip([192, 0, 2, 1]) })
+        );
+        assert_eq!(
+            evi.apply(&EvpnRibEvent::Withdrawn(imet_nlri)),
+            Some(EviChange::VtepRemoved { vtep: ip([192, 0, 2, 1]) })
+        );
     }
 }

@@ -26,7 +26,9 @@
 #   * the session to RR is Established; and
 #   * `show bgp evpn` carries Leaf1's routes via 10.0.0.1 (only possible via
 #     reflection); and
-#   * `show evpn` shows Leaf1's MAC and VTEP imported into the EVI 100 MAC-VRF.
+#   * `show evpn` shows Leaf1's MAC and VTEP imported into the EVI 100 MAC-VRF; and
+#   * `monitor evpn` streams Leaf1's MAC and flood VTEP as `+ evpn ...` lines (the
+#     FPM-style EVPN↔fabric bridge feed the fabric controller consumes).
 #
 # Usage:  bash scripts/bgp-evpn-smoke.sh
 set -euo pipefail
@@ -143,6 +145,11 @@ unshare -Urn bash -c '
     nsenter -t $L2PID -n "$WREN" --socket "$WORK/l2.sock" show bgp evpn || true
     echo "=== wren show evpn (on Leaf2) ==="
     nsenter -t $L2PID -n "$WREN" --socket "$WORK/l2.sock" show evpn || true
+    # The EVPN↔fabric bridge feed: a 3s snapshot of the FPM-style monitor stream
+    # the fabric controller consumes. Leaf2 must stream Leaf1s imported MAC and
+    # flood VTEP as `+ evpn ...` lines.
+    echo "=== wren monitor evpn (on Leaf2, 3s snapshot) ==="
+    timeout 3 nsenter -t $L2PID -n "$WREN" --socket "$WORK/l2.sock" monitor evpn || true
   } > "$WORK/out.txt" 2>&1
   cat "$WORK/out.txt"
 
@@ -151,6 +158,8 @@ unshare -Urn bash -c '
   grep -q "via 10.0.0.1"                          "$WORK/out.txt" || { echo "FAIL: Leaf2 did not learn Leaf1 EVPN routes (via 10.0.0.1)"; ok=0; }
   grep -q "02:00:5e:00:00:01 -> vtep 10.0.0.1"    "$WORK/out.txt" || { echo "FAIL: Leaf1 MAC not imported into Leaf2 MAC-VRF"; ok=0; }
   grep -q "flood -> 10.0.0.1"                      "$WORK/out.txt" || { echo "FAIL: Leaf1 VTEP not in Leaf2 flood set"; ok=0; }
+  grep -Eq "\+ evpn vni 10100 mac 02:00:5e:00:00:01 .*vtep 10.0.0.1" "$WORK/out.txt" || { echo "FAIL: monitor evpn did not stream Leaf1 MAC"; ok=0; }
+  grep -q "+ evpn vni 10100 flood 10.0.0.1"        "$WORK/out.txt" || { echo "FAIL: monitor evpn did not stream Leaf1 flood VTEP"; ok=0; }
 
   if [[ $ok -ne 1 ]]; then
     echo "--- RR log ---";    cat "$WORK/rr.log"
