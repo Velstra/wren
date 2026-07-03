@@ -111,7 +111,11 @@ struct Instance {
 
 /// Run every configured virtual router until cancelled. `queries` answers
 /// `show vrrp`.
-pub async fn run(configs: Vec<InstanceConfig>, mut queries: mpsc::Receiver<VrrpQueryRequest>) -> Result<()> {
+pub async fn run(
+    configs: Vec<InstanceConfig>,
+    mut queries: mpsc::Receiver<VrrpQueryRequest>,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+) -> Result<()> {
     let (adv_tx, mut adv_rx) = mpsc::channel::<AdvIn>(256);
     let mut instances: Vec<Instance> = Vec::new();
 
@@ -183,6 +187,17 @@ pub async fn run(configs: Vec<InstanceConfig>, mut queries: mpsc::Receiver<VrrpQ
             }
         };
         tokio::select! {
+            // Graceful shutdown (M10): relinquish mastership immediately by
+            // advertising priority 0 (RFC 5798 §6.4.3) so a Backup takes over
+            // now instead of after the master-down interval, then exit.
+            _ = shutdown.changed() => {
+                info!("VRRP shutting down; releasing mastership (priority 0)");
+                for inst in instances.iter_mut() {
+                    let actions = inst.fsm.on_shutdown();
+                    apply_actions(inst, actions).await;
+                }
+                return Ok(());
+            }
             _ = track_poll.tick() => {
                 for inst in instances.iter_mut() {
                     poll_tracking(inst).await;

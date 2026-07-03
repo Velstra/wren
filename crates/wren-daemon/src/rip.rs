@@ -126,6 +126,7 @@ pub async fn run(
     mut redist: mpsc::Receiver<Redistribution>,
     redistribute_metric: u32,
     mut queries: mpsc::Receiver<RipQueryRequest>,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) -> Result<()> {
     let mut ifaces = Vec::with_capacity(interfaces.len());
     for name in &interfaces {
@@ -195,6 +196,14 @@ pub async fn run(
 
     loop {
         tokio::select! {
+            // Graceful shutdown (M10): flush a poisoned update (metric 16 =
+            // infinity) for every advertised route so neighbours withdraw them
+            // now rather than on timeout, then exit.
+            _ = shutdown.changed() => {
+                info!("RIP shutting down; poisoning advertised routes");
+                send_full_update(&table, &ifaces, true).await;
+                return Ok(());
+            }
             received = pkt_rx.recv() => {
                 let Some(pkt) = received else {
                     warn!("all RIP receivers stopped");
@@ -209,7 +218,7 @@ pub async fn run(
                 for ev in table.tick(now) {
                     forward_event(ev, vrf_table, &updates).await;
                 }
-                send_full_update(&table, &ifaces).await;
+                send_full_update(&table, &ifaces, false).await;
                 table.clear_changed();
             }
             _ = housekeeping.tick() => {
@@ -339,9 +348,18 @@ async fn flush_triggered(table: &mut RipTable, ifaces: &[Iface]) {
 }
 
 /// Send the whole table (periodic update, RFC 2453 §3.8) out every interface.
-async fn send_full_update(table: &RipTable, ifaces: &[Iface]) {
+///
+/// When `poison` is set (graceful shutdown), every advertised route is forced to
+/// `METRIC_INFINITY` (16) so neighbours withdraw it immediately instead of waiting
+/// for the route to time out.
+async fn send_full_update(table: &RipTable, ifaces: &[Iface], poison: bool) {
     for iface in ifaces {
-        let entries = table.advertise(iface.ifindex);
+        let mut entries = table.advertise(iface.ifindex);
+        if poison {
+            for entry in &mut entries {
+                entry.metric = wren_rip::METRIC_INFINITY;
+            }
+        }
         send_response(&iface.sock, SocketAddr::from((RIP_MCAST, PORT)), &entries).await;
     }
 }

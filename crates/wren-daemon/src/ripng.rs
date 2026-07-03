@@ -23,7 +23,7 @@ use tokio::time::MissedTickBehavior;
 use tracing::{debug, info, warn};
 
 use wren_core::{NextHop, Protocol, Route};
-use wren_rip::{ng, Advert, Command, RipEvent, RipTable, UPDATE_SECS};
+use wren_rip::{ng, Advert, Command, RipEvent, RipTable, METRIC_INFINITY, UPDATE_SECS};
 
 use crate::connected;
 use crate::rip::{render_rip_routes, RipQuery, RipQueryRequest};
@@ -62,6 +62,7 @@ pub async fn run(
     mut redist: mpsc::Receiver<Redistribution>,
     redistribute_metric: u32,
     mut queries: mpsc::Receiver<RipQueryRequest>,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) -> Result<()> {
     let mut ifaces = Vec::with_capacity(interfaces.len());
     for name in &interfaces {
@@ -129,6 +130,14 @@ pub async fn run(
 
     loop {
         tokio::select! {
+            // Graceful shutdown (M10): flush a poisoned update (metric 16 =
+            // infinity) for every advertised route so neighbours withdraw them
+            // now rather than on timeout, then exit.
+            _ = shutdown.changed() => {
+                info!("RIPng shutting down; poisoning advertised routes");
+                send_full_update(&table, &ifaces, true).await;
+                return Ok(());
+            }
             received = pkt_rx.recv() => {
                 let Some(pkt) = received else {
                     warn!("all RIPng receivers stopped");
@@ -143,7 +152,7 @@ pub async fn run(
                 for ev in table.tick(now) {
                     forward_event(ev, &updates).await;
                 }
-                send_full_update(&table, &ifaces).await;
+                send_full_update(&table, &ifaces, false).await;
                 table.clear_changed();
             }
             _ = housekeeping.tick() => {
@@ -294,9 +303,17 @@ async fn flush_triggered(table: &mut RipTable, ifaces: &[Iface]) {
     table.clear_changed();
 }
 
-async fn send_full_update(table: &RipTable, ifaces: &[Iface]) {
+/// Send every advertised route to all interfaces. When `poison` is set, each
+/// route is rewritten to metric 16 (infinity) — the RFC 2080 graceful-shutdown
+/// goodbye that makes neighbours withdraw our routes immediately.
+async fn send_full_update(table: &RipTable, ifaces: &[Iface], poison: bool) {
     for iface in ifaces {
-        let adverts = table.adverts(iface.ifindex);
+        let mut adverts = table.adverts(iface.ifindex);
+        if poison {
+            for advert in &mut adverts {
+                advert.metric = METRIC_INFINITY;
+            }
+        }
         send_response(
             &iface.sock,
             SocketAddr::from((ng::ALL_RIP_ROUTERS, ng::PORT)),

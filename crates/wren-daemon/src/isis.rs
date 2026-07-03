@@ -416,6 +416,7 @@ pub fn render_isis_database(lsps: &[IsisLspInfo]) -> String {
 /// its own LSP, at `cfg.redistribute_metric`) and removes it again when its best
 /// path goes away, re-originating and flooding the LSP on each change. `queries`
 /// carries the operator's `show isis …` requests, answered out of the live state.
+#[allow(clippy::too_many_arguments)] // engine entry point: config + every I/O channel, incl. the shutdown signal
 pub async fn run(
     cfg: IsisConfig,
     updates: mpsc::Sender<RouteUpdate>,
@@ -424,6 +425,7 @@ pub async fn run(
     bfd_register: mpsc::Sender<crate::bfd::BfdCommand>,
     bfd_notify: mpsc::Sender<IpAddr>,
     mut bfd_down: mpsc::Receiver<IpAddr>,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) -> Result<()> {
     let mut ifaces = Vec::with_capacity(cfg.interfaces.len());
     for (i, ic) in cfg.interfaces.iter().enumerate() {
@@ -514,6 +516,13 @@ pub async fn run(
 
     loop {
         tokio::select! {
+            // Graceful shutdown (M10): IS-IS has no goodbye PDU, so exit cleanly
+            // and let neighbors drop the adjacency on hold-time expiry.
+            // (Purging self-originated LSPs is a follow-up.)
+            _ = shutdown.changed() => {
+                info!("IS-IS shutting down");
+                return Ok(());
+            }
             frame = rx.recv() => {
                 let Some(frame) = frame else { return Ok(()) };
                 isis.handle_frame(frame, start.elapsed().as_secs()).await;

@@ -369,6 +369,7 @@ pub async fn run(
     bfd_register: mpsc::Sender<crate::bfd::BfdCommand>,
     bfd_notify: mpsc::Sender<IpAddr>,
     mut bfd_down: mpsc::Receiver<IpAddr>,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) -> Result<()> {
     let mut ifaces = Vec::new();
     let mut areas: BTreeMap<Ipv4Addr, Area> = BTreeMap::new();
@@ -444,6 +445,13 @@ pub async fn run(
 
     loop {
         tokio::select! {
+            // Graceful shutdown (M10): OSPFv3 has no goodbye packet, so exit
+            // cleanly and let neighbors drop the adjacency on dead-interval.
+            // (Flushing self-originated LSAs to MaxAge is a follow-up.)
+            _ = shutdown.changed() => {
+                info!("OSPFv3 shutting down");
+                return Ok(());
+            }
             received = pkt_rx.recv() => {
                 let Some(pkt) = received else {
                     warn!("all OSPFv3 receivers stopped");

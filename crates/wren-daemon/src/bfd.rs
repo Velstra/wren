@@ -221,6 +221,7 @@ pub async fn run(
     cfg: BfdConfig,
     mut register: mpsc::Receiver<BfdCommand>,
     mut queries: mpsc::Receiver<BfdQueryRequest>,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) -> Result<()> {
     // The shared receive sockets: every peer sends its Control packets to our 3784.
     // Bind both families so one engine serves IPv4 (BGP) and IPv6 (OSPFv3) peers; a
@@ -280,6 +281,12 @@ pub async fn run(
         tokio::pin!(timer);
 
         tokio::select! {
+            // Graceful shutdown (M10): BFD has no goodbye packet; peers detect
+            // loss on their own det-mult timeout. Exit cleanly.
+            _ = shutdown.changed() => {
+                info!("BFD shutting down");
+                return Ok(());
+            }
             r = recv_from_opt(&rx4, &mut buf4) => {
                 if let Some((n, src)) = r {
                     on_receive(&mut sessions, &buf4[..n], key_of(src));

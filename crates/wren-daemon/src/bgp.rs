@@ -68,6 +68,10 @@ const CEASE_COLLISION: u8 = 7;
 /// Cease NOTIFICATION subcode 1, "Maximum Number of Prefixes Reached" (RFC 4486 §4) —
 /// sent when a peer advertises more prefixes than its configured `max-prefix` limit.
 const CEASE_MAXPREFIX: u8 = 1;
+/// Cease NOTIFICATION subcode 2, "Administrative Shutdown" (RFC 4486 §4) — sent to
+/// every peer when the daemon is shutting down gracefully (M10), so they tear the
+/// session down immediately instead of waiting out the hold timer.
+const CEASE_ADMIN: u8 = 2;
 
 /// A process-wide monotonic source of per-connection ids. Two connections to the
 /// same peer (a simultaneous open) share a peer address but get distinct ids, so
@@ -362,6 +366,10 @@ enum SessionCmd {
     /// Lose §6.8 collision detection: close this connection with a Cease, without
     /// reporting Down — the winning connection owns the peer's slot.
     Shutdown,
+    /// The daemon is shutting down (M10): send a Cease "Administrative Shutdown"
+    /// (RFC 4486 §4) and close, without reporting Down — the whole process is
+    /// exiting, so there is no slot left to evict.
+    CeaseAdmin,
     /// The peer exceeded its `max-prefix` limit: close the connection with a Cease
     /// "Maximum Number of Prefixes Reached" (RFC 4486 §4), without reporting Down —
     /// the central task has already withdrawn the peer's routes and damped it.
@@ -839,6 +847,7 @@ fn origin_str(o: Origin) -> &'static str {
 /// The same task answers `show bgp …` queries off the [`BgpRib`] and the neighbour
 /// table it owns, so operational state is read single-threaded with no locking —
 /// the same design as the central router loop's `show routes`.
+#[allow(clippy::too_many_arguments)] // engine entry point: config + every I/O channel, incl. the shutdown signal
 pub async fn run(
     cfg: BgpConfig,
     updates: mpsc::Sender<RouteUpdate>,
@@ -847,6 +856,7 @@ pub async fn run(
     mut rtr_rx: mpsc::Receiver<Vec<Roa>>,
     bmp_tx: Option<mpsc::Sender<crate::bmp::BmpEvent>>,
     mut bfd_down: mpsc::Receiver<IpAddr>,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) -> Result<()> {
     // The neighbour table: every configured peer, its AS and whether the session
     // is currently Established. Sorted for stable `show bgp neighbors` output.
@@ -1027,6 +1037,18 @@ pub async fn run(
         tokio::pin!(restart_timer);
 
         let msg = tokio::select! {
+            // Graceful shutdown (M10): send every established peer a Cease
+            // "Administrative Shutdown" so it tears the session down immediately
+            // instead of waiting out the hold timer, give the per-peer session
+            // tasks a brief moment to flush those NOTIFICATIONs, then exit.
+            _ = shutdown.changed() => {
+                info!("BGP shutting down; sending Cease (Administrative Shutdown) to peers");
+                for tx in sessions.values() {
+                    let _ = tx.send(SessionCmd::CeaseAdmin).await;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                return Ok(());
+            }
             msg = rx.recv() => match msg {
                 Some(msg) => msg,
                 None => break, // all sessions gone — daemon shutting down
@@ -2909,6 +2931,19 @@ async fn drive_session(
                     .send(&Message::Notification(Notification {
                         code: CODE_CEASE,
                         subcode: CEASE_COLLISION,
+                        data: vec![],
+                    }))
+                    .await;
+                return Ok(());
+            }
+            Step::Cmd(SessionCmd::CeaseAdmin) => {
+                // Graceful daemon shutdown (M10): tell the peer with a Cease
+                // "Administrative Shutdown" and close. Like Shutdown we do NOT
+                // report Down — the process is exiting, there is no slot to evict.
+                let _ = sess
+                    .send(&Message::Notification(Notification {
+                        code: CODE_CEASE,
+                        subcode: CEASE_ADMIN,
                         data: vec![],
                     }))
                     .await;

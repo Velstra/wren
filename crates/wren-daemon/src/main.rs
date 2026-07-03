@@ -329,6 +329,20 @@ async fn main() -> Result<()> {
     #[cfg(not(feature = "isis"))]
     let isis_bfd = false;
     let bfd_enabled = bgp_bfd || ospf_bfd || ospf3_bfd || isis_bfd;
+
+    // Graceful shutdown (M10): a watch channel every protocol engine observes.
+    // On Ctrl-C `main` flips it to `true`; each engine's select loop then emits
+    // its protocol goodbye (VRRP priority-0, BGP CEASE, RIP/Babel poison, …) and
+    // returns. `main` collects the engines' JoinHandles and awaits them within a
+    // grace window so those goodbyes actually reach the wire before the process
+    // exits. This is the ProtocolRunner lifecycle seam (Architektur-3) — the same
+    // signal a future config hot-reload would ride. Engines subscribe with
+    // `shutdown_tx.subscribe()`; ones not yet wired for a goodbye simply keep
+    // running until the process exits, exactly as before.
+    const GRACEFUL_SHUTDOWN_SECS: u64 = 2;
+    let (shutdown_tx, _) = tokio::sync::watch::channel(false);
+    let mut proto_handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+
     // Spawn the single BFD engine if any protocol enables it; protocols register
     // their peers over `bfd_register` once their sessions warrant it.
     if bfd_enabled {
@@ -344,11 +358,12 @@ async fn main() -> Result<()> {
         let rrx = bfd_register_rx.take().expect("bfd register rx taken once");
         let bqrx = bfd_queries_rx.take().expect("bfd queries rx taken once");
         info!(auth = auth.is_some(), echo = echo.is_some(), "BFD engine starting");
-        tokio::spawn(async move {
-            if let Err(e) = bfd::run(bfd::BfdConfig { session, auth, echo }, rrx, bqrx).await {
+        let sd = shutdown_tx.subscribe();
+        proto_handles.push(tokio::spawn(async move {
+            if let Err(e) = bfd::run(bfd::BfdConfig { session, auth, echo }, rrx, bqrx, sd).await {
                 error!(error = %e, "BFD engine stopped");
             }
-        });
+        }));
     }
     // The RTR (RFC 8210) ROA feed into the BGP engine. `rtr_tx` is held here for the
     // daemon's lifetime so the channel stays open even when no RTR cache is configured
@@ -440,11 +455,12 @@ async fn main() -> Result<()> {
         match build_vrrp_instances(&cfg) {
             Ok(instances) => {
                 let qrx = vrrp_queries_rx.take().expect("vrrp queries rx taken once");
-                tokio::spawn(async move {
-                    if let Err(e) = vrrp::run(instances, qrx).await {
+                let shutdown = shutdown_tx.subscribe();
+                proto_handles.push(tokio::spawn(async move {
+                    if let Err(e) = vrrp::run(instances, qrx, shutdown).await {
                         error!(error = %e, "VRRP engine stopped");
                     }
-                });
+                }));
             }
             Err(e) => error!(error = %e, "VRRP not started"),
         }
@@ -486,13 +502,14 @@ async fn main() -> Result<()> {
         };
         let tx = updates_tx.clone();
         let qrx = rip_queries_rx.take().expect("rip queries rx taken once");
-        tokio::spawn(async move {
+        let sd = shutdown_tx.subscribe();
+        proto_handles.push(tokio::spawn(async move {
             if let Err(e) =
-                rip::run(interfaces, rip_table, tx, redist_rx, redistribute_metric, qrx).await
+                rip::run(interfaces, rip_table, tx, redist_rx, redistribute_metric, qrx, sd).await
             {
                 error!(error = %e, "RIP engine stopped");
             }
-        });
+        }));
     }
 
     // Spawn the RIPng (IPv6) engine if it is configured.
@@ -524,11 +541,12 @@ async fn main() -> Result<()> {
         let interfaces = ripngcfg.interfaces.clone();
         let tx = updates_tx.clone();
         let qrx = ripng_queries_rx.take().expect("ripng queries rx taken once");
-        tokio::spawn(async move {
-            if let Err(e) = ripng::run(interfaces, tx, redist_rx, redistribute_metric, qrx).await {
+        let sd = shutdown_tx.subscribe();
+        proto_handles.push(tokio::spawn(async move {
+            if let Err(e) = ripng::run(interfaces, tx, redist_rx, redistribute_metric, qrx, sd).await {
                 error!(error = %e, "RIPng engine stopped");
             }
-        });
+        }));
     }
 
     // Spawn the OSPFv2 engine if it is configured.
@@ -566,13 +584,14 @@ async fn main() -> Result<()> {
                 let breg = bfd_register_tx.clone();
                 let bnotify = ospf_bfd_tx.clone();
                 let bdrx = ospf_bfd_rx.take().expect("ospf bfd rx taken once");
-                tokio::spawn(async move {
+                let sd = shutdown_tx.subscribe();
+                proto_handles.push(tokio::spawn(async move {
                     if let Err(e) =
-                        ospf::run(run_cfg, tx, redist_rx, qrx, breg, bnotify, bdrx).await
+                        ospf::run(run_cfg, tx, redist_rx, qrx, breg, bnotify, bdrx, sd).await
                     {
                         error!(error = %e, "OSPF engine stopped");
                     }
-                });
+                }));
             }
             Err(e) => error!(error = %e, "OSPF not started"),
         }
@@ -594,11 +613,12 @@ async fn main() -> Result<()> {
                 let breg = bfd_register_tx.clone();
                 let bnotify = ospf3_bfd_tx.clone();
                 let bdrx = ospf3_bfd_rx.take().expect("ospf3 bfd rx taken once");
-                tokio::spawn(async move {
-                    if let Err(e) = ospf3::run(run_cfg, tx, qrx, breg, bnotify, bdrx).await {
+                let sd = shutdown_tx.subscribe();
+                proto_handles.push(tokio::spawn(async move {
+                    if let Err(e) = ospf3::run(run_cfg, tx, qrx, breg, bnotify, bdrx, sd).await {
                         error!(error = %e, "OSPFv3 engine stopped");
                     }
-                });
+                }));
             }
             Err(e) => error!(error = %e, "OSPFv3 not started"),
         }
@@ -677,13 +697,14 @@ async fn main() -> Result<()> {
                 let qrx = bgp_queries_rx.take().expect("bgp queries rx taken once");
                 let rrx = rtr_rx.take().expect("rtr rx taken once");
                 let bdrx = bfd_down_rx.take().expect("bfd down rx taken once");
-                tokio::spawn(async move {
+                let sd = shutdown_tx.subscribe();
+                proto_handles.push(tokio::spawn(async move {
                     if let Err(e) =
-                        bgp::run(run_cfg, tx, qrx, redist_rx, rrx, bmp_for_engine, bdrx).await
+                        bgp::run(run_cfg, tx, qrx, redist_rx, rrx, bmp_for_engine, bdrx, sd).await
                     {
                         error!(error = %e, "BGP engine stopped");
                     }
-                });
+                }));
                 // Register each `bfd = true` neighbour with the BFD engine (RFC 5880).
                 // When BFD reports the peer down, the engine notifies `bfd_down_tx`,
                 // which the BGP engine reads to tear the session down.
@@ -754,11 +775,12 @@ async fn main() -> Result<()> {
                 }
                 let tx = updates_tx.clone();
                 let qrx = babel_queries_rx.take().expect("babel queries rx taken once");
-                tokio::spawn(async move {
-                    if let Err(e) = babel::run(run_cfg, tx, redist_rx, qrx).await {
+                let sd = shutdown_tx.subscribe();
+                proto_handles.push(tokio::spawn(async move {
+                    if let Err(e) = babel::run(run_cfg, tx, redist_rx, qrx, sd).await {
                         error!(error = %e, "Babel engine stopped");
                     }
-                });
+                }));
             }
             Err(e) => error!(error = %e, "Babel not started"),
         }
@@ -799,11 +821,12 @@ async fn main() -> Result<()> {
                 let breg = bfd_register_tx.clone();
                 let bnotify = isis_bfd_tx.clone();
                 let bdrx = isis_bfd_rx.take().expect("isis bfd rx taken once");
-                tokio::spawn(async move {
-                    if let Err(e) = isis::run(run_cfg, tx, redist_rx, qrx, breg, bnotify, bdrx).await {
+                let sd = shutdown_tx.subscribe();
+                proto_handles.push(tokio::spawn(async move {
+                    if let Err(e) = isis::run(run_cfg, tx, redist_rx, qrx, breg, bnotify, bdrx, sd).await {
                         error!(error = %e, "IS-IS engine stopped");
                     }
-                });
+                }));
             }
             Err(e) => error!(error = %e, "IS-IS not started"),
         }
@@ -820,7 +843,20 @@ async fn main() -> Result<()> {
         }
         r = tokio::signal::ctrl_c() => {
             r.context("waiting for shutdown signal")?;
-            info!("shutting down");
+            info!("shutting down; notifying peers");
+            // Tell every wired engine to send its protocol goodbye, then give
+            // them a bounded grace window to flush it before the process exits
+            // (M10). Routes are deliberately left installed in the FIB so traffic
+            // keeps flowing across a restart.
+            let _ = shutdown_tx.send(true);
+            let deadline = tokio::time::Instant::now()
+                + std::time::Duration::from_secs(GRACEFUL_SHUTDOWN_SECS);
+            for handle in proto_handles {
+                if tokio::time::timeout_at(deadline, handle).await.is_err() {
+                    warn!("graceful-shutdown grace period elapsed; exiting anyway");
+                    break;
+                }
+            }
         }
     }
     Ok(())

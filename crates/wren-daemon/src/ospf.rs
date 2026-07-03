@@ -447,6 +447,7 @@ pub fn render_ospf_database(lsas: &[OspfLsaInfo]) -> String {
 /// redistribution; OSPF originates each as an AS-external (type-5) LSA and
 /// withdraws it again when its best path goes away. `queries` carries the
 /// operator's `show ospf …` requests, answered out of the live state.
+#[allow(clippy::too_many_arguments)] // engine entry point: config + every I/O channel, incl. the shutdown signal
 pub async fn run(
     cfg: OspfConfig,
     updates: mpsc::Sender<RouteUpdate>,
@@ -455,6 +456,7 @@ pub async fn run(
     bfd_register: mpsc::Sender<crate::bfd::BfdCommand>,
     bfd_notify: mpsc::Sender<std::net::IpAddr>,
     mut bfd_down: mpsc::Receiver<std::net::IpAddr>,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) -> Result<()> {
     let mut ifaces = Vec::new();
     let mut areas: BTreeMap<Ipv4Addr, Area> = BTreeMap::new();
@@ -529,6 +531,13 @@ pub async fn run(
 
     loop {
         tokio::select! {
+            // Graceful shutdown (M10): OSPF has no goodbye packet, so exit
+            // cleanly and let neighbors drop the adjacency on dead-interval.
+            // (Flushing self-originated LSAs to MaxAge is a follow-up.)
+            _ = shutdown.changed() => {
+                info!("OSPF shutting down");
+                return Ok(());
+            }
             received = pkt_rx.recv() => {
                 let Some(pkt) = received else {
                     warn!("all OSPF receivers stopped");

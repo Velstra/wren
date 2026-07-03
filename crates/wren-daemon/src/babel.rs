@@ -217,6 +217,7 @@ pub async fn run(
     updates: mpsc::Sender<RouteUpdate>,
     mut redist: mpsc::Receiver<Redistribution>,
     mut queries: mpsc::Receiver<BabelQueryRequest>,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) -> Result<()> {
     let mut ifaces = Vec::with_capacity(cfg.interfaces.len());
     for name in &cfg.interfaces {
@@ -297,6 +298,13 @@ pub async fn run(
 
     loop {
         tokio::select! {
+            // Graceful shutdown (M10): retract our own routes (metric 0xFFFF =
+            // infinity) so neighbours remove them immediately, then exit.
+            _ = shutdown.changed() => {
+                info!("Babel shutting down; retracting routes");
+                send_retractions(&state, &ifaces).await;
+                return Ok(());
+            }
             received = pkt_rx.recv() => {
                 let Some(dg) = received else {
                     warn!("all Babel receivers stopped");
@@ -531,6 +539,37 @@ async fn send_updates(state: &mut State, ifaces: &[Iface]) {
     state.retractions.clear();
     if tlvs.is_empty() {
         return;
+    }
+    for iface in ifaces {
+        for chunk in chunk_updates(&tlvs) {
+            send_raw(&iface.sock, &Packet::new(chunk).encode()).await;
+        }
+    }
+}
+
+/// Graceful-shutdown goodbye (§3.5.5): re-advertise every route we originate — our
+/// own networks and any redistributed routes, all under our Router-ID — once at
+/// metric infinity (`METRIC_INFINITY` = 0xFFFF), so neighbours retract them
+/// immediately instead of waiting for us to time out. Reuses the ordinary
+/// [`chunk_updates`]/[`send_raw`] send path.
+async fn send_retractions(state: &State, ifaces: &[Iface]) {
+    let mut tlvs = vec![Tlv::RouterId(state.router_id)];
+    let own = state
+        .self_prefixes
+        .iter()
+        .copied()
+        .chain(state.redistributed.keys().copied());
+    for prefix in own {
+        tlvs.push(Tlv::Update {
+            flags: 0,
+            interval: UPDATE_INTERVAL_CS,
+            seqno: OUR_SEQNO,
+            metric: METRIC_INFINITY,
+            prefix,
+        });
+    }
+    if tlvs.len() == 1 {
+        return; // nothing of our own to retract
     }
     for iface in ifaces {
         for chunk in chunk_updates(&tlvs) {
