@@ -219,8 +219,8 @@ async fn handle_conn(stream: UnixStream, channels: Channels) -> Result<()> {
     let response = response.unwrap_or_else(|| {
         format!(
             "error: unknown command {line:?}\n\
-             usage: show routes [protocol] | show bgp [routes|paths|neighbors] | \
-             bgp refresh <peer> | \
+             usage: show routes [protocol] | show bgp [routes|paths|neighbors|roa|evpn] | \
+             show evpn | bgp refresh <peer> | \
              show ospf [neighbors|interfaces|database] | show ospf3 [neighbors|interfaces] | \
              show isis [neighbors|interfaces|database] | show babel [neighbors|routes] | \
              show bfd | show rip | show ripng | show vrrp | show vrf | \
@@ -363,23 +363,31 @@ pub fn parse_query(line: &str) -> Option<Query> {
 pub fn parse_bgp_query(line: &str) -> Option<BgpQuery> {
     let mut tokens = line.split_whitespace();
     match tokens.next()? {
-        "show" => {
-            if tokens.next()? != "bgp" {
-                return None;
+        "show" => match tokens.next()? {
+            "bgp" => {
+                let query = match tokens.next() {
+                    None | Some("routes") | Some("route") => BgpQuery::Routes,
+                    Some("paths") | Some("path") => BgpQuery::Paths,
+                    Some("neighbors") | Some("neighbours") | Some("summary") => BgpQuery::Neighbors,
+                    Some("roa") | Some("roas") => BgpQuery::Roa,
+                    Some("evpn") => BgpQuery::Evpn,
+                    Some(_) => return None,
+                };
+                // A trailing extra token is a malformed command.
+                if tokens.next().is_some() {
+                    return None;
+                }
+                Some(query)
             }
-            let query = match tokens.next() {
-                None | Some("routes") | Some("route") => BgpQuery::Routes,
-                Some("paths") | Some("path") => BgpQuery::Paths,
-                Some("neighbors") | Some("neighbours") | Some("summary") => BgpQuery::Neighbors,
-                Some("roa") | Some("roas") => BgpQuery::Roa,
-                Some(_) => return None,
-            };
-            // A trailing extra token is a malformed command.
-            if tokens.next().is_some() {
-                return None;
+            // `show evpn`: the per-EVI MAC-VRF views (RFC 7432 §9).
+            "evpn" => {
+                if tokens.next().is_some() {
+                    return None;
+                }
+                Some(BgpQuery::EvpnVnis)
             }
-            Some(query)
-        }
+            _ => None,
+        },
         // `bgp refresh <addr>`: the address is required and must parse, then the
         // command takes no more tokens.
         "bgp" => {
@@ -658,6 +666,8 @@ mod tests {
         assert_eq!(parse_bgp_query("show bgp path"), Some(BgpQuery::Paths));
         assert_eq!(parse_bgp_query("show bgp roa"), Some(BgpQuery::Roa));
         assert_eq!(parse_bgp_query("show bgp roas"), Some(BgpQuery::Roa));
+        assert_eq!(parse_bgp_query("show bgp evpn"), Some(BgpQuery::Evpn));
+        assert_eq!(parse_bgp_query("show evpn"), Some(BgpQuery::EvpnVnis));
     }
 
     #[test]
@@ -665,6 +675,7 @@ mod tests {
         assert!(parse_bgp_query("show routes").is_none()); // router query, not bgp
         assert!(parse_bgp_query("show bgp nonsense").is_none());
         assert!(parse_bgp_query("show bgp routes extra").is_none());
+        assert!(parse_bgp_query("show evpn extra").is_none());
         assert!(parse_bgp_query("").is_none());
     }
 

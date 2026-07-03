@@ -24,3 +24,29 @@ interfaces = ["enp1s0f0"]
 [ripng]
 enabled = true
 interfaces = ["enp1s0f0"]
+
+# BGP with EVPN (RFC 7432) — a VXLAN fabric leaf. Uncomment to enable.
+# [bgp]
+# local-as = 65001
+# router-id = "10.0.0.1"
+#
+# # An iBGP peer (the route reflector) that also carries EVPN.
+# [[bgp.neighbor]]
+# address = "10.0.0.254"
+# remote-as = 65001
+# evpn = true               # negotiate AFI 25 / SAFI 70 with this peer
+#
+# # EVPN: this VTEP's identity and the instances (MAC-VRFs) it participates in.
+# [bgp.evpn]
+# vtep-ip = "10.0.0.1"      # BGP next hop of every EVPN route we originate
+#
+# [[bgp.evpn.instance]]
+# evi = 100
+# vni = 10100               # the VXLAN Network Identifier this instance bridges
+# # rd defaults to "<router-id>:<evi>"; rt-import/rt-export default to
+# # "rt:<local-as>:<vni>". Override any of them explicitly:
+# rd = "10.0.0.1:100"
+# rt-import = ["rt:65001:10100"]
+# rt-export = ["rt:65001:10100"]
+# # Static MACs to advertise as type-2 routes (aa:bb:cc:dd:ee:ff or .../ip):
+# advertise-mac = ["02:00:5e:10:00:01/10.100.0.1"]

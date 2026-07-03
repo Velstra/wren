@@ -40,6 +40,8 @@ use wren_bgp::attr::{reconstruct_as_path, AsPathSegment, Origin, PathAttribute};
 use wren_bgp::capability::{Capability, ADD_PATH_BOTH, ADD_PATH_RECEIVE, ADD_PATH_SEND};
 use wren_bgp::community::format_community;
 use wren_bgp::decision::{Path, DEFAULT_LOCAL_PREF};
+use wren_bgp::evpn::{encap_ext_community, Esi, EvpnNlri, Rd, TUNNEL_TYPE_VXLAN};
+use wren_bgp::evpn_rib::{EviTable, EvpnRib, EvpnRibEvent};
 use wren_bgp::ext_community::format_ext_community;
 use wren_bgp::fsm::{Action, BgpFsm, Event, State, CODE_CEASE};
 use wren_bgp::large_community::format_large_community;
@@ -47,7 +49,8 @@ use wren_bgp::message::{AddPath, Message, Notification, Open, Update};
 use wren_bgp::rib::{BgpRib, RibEvent};
 use wren_bgp::rpki::{Roa, RoaTable, Validity};
 use wren_bgp::{
-    AFI_IPV4, AFI_IPV6, AS_TRANS, HEADER_LEN, MARKER, MAX_MESSAGE_LEN, PORT, SAFI_UNICAST, VERSION,
+    AFI_IPV4, AFI_IPV6, AFI_L2VPN, AS_TRANS, HEADER_LEN, MARKER, MAX_MESSAGE_LEN, PORT, SAFI_EVPN,
+    SAFI_UNICAST, VERSION,
 };
 
 use wren_core::{Prefix, Protocol, Route};
@@ -132,6 +135,41 @@ pub struct BgpConfig {
     /// `SO_BINDTODEVICE`, so the TCP connections to peers — and the inbound listener —
     /// use the VRF's routing table. `None` runs BGP in the default VRF (no bind).
     pub vrf_device: Option<String>,
+    /// EVPN (RFC 7432) configuration: this VTEP's identity and the EVPN instances it
+    /// participates in. `None` disables EVPN; it is carried only to neighbours that
+    /// negotiate the L2VPN/EVPN family (and are configured with `evpn = true`).
+    pub evpn: Option<EvpnConfig>,
+}
+
+/// Resolved EVPN (RFC 7432) configuration: this VTEP's identity and the EVPN
+/// instances (MAC-VRFs) it participates in.
+#[derive(Clone)]
+pub struct EvpnConfig {
+    /// This router's VTEP address — advertised as the BGP next hop of every EVPN
+    /// route it originates and as the type-3 (IMET) originating router IP.
+    pub vtep_ip: IpAddr,
+    /// The EVPN instances (one per MAC-VRF / VNI).
+    pub instances: Vec<EvpnInstanceCfg>,
+}
+
+/// One resolved EVPN instance (EVI): its identifiers, Route Distinguisher, the
+/// import/export Route Targets, and any static MACs to advertise as type-2 routes.
+#[derive(Clone)]
+pub struct EvpnInstanceCfg {
+    /// The EVPN instance identifier.
+    pub evi: u16,
+    /// The VXLAN Network Identifier this instance bridges (24-bit).
+    pub vni: u32,
+    /// The Route Distinguisher stamped on every route this instance originates.
+    pub rd: Rd,
+    /// Route Targets this instance imports (a route is admitted to the EVI's MAC-VRF
+    /// when its ext-communities intersect this set).
+    pub rt_import: Vec<[u8; 8]>,
+    /// Route Targets attached to every route this instance exports.
+    pub rt_export: Vec<[u8; 8]>,
+    /// Static MACs to advertise as type-2 MAC/IP routes, each with an optional IP for
+    /// remote ARP/ND suppression.
+    pub macs: Vec<([u8; 6], Option<IpAddr>)>,
 }
 
 /// A configured address aggregate (RFC 4271 §9.2.2.2). The `prefix` is advertised
@@ -226,6 +264,9 @@ pub struct BgpPeerCfg {
     /// Negotiate Extended Next Hop Encoding (RFC 5549) with this peer — exchange IPv4
     /// routes with an IPv6 next hop.
     pub ext_nexthop: bool,
+    /// Negotiate the L2VPN/EVPN address family (AFI 25 / SAFI 70, RFC 7432) with this
+    /// peer — advertise the EVPN Multiprotocol capability and carry EVPN routes to it.
+    pub evpn: bool,
 }
 
 impl BgpPeerCfg {
@@ -319,6 +360,8 @@ struct PeerProps {
     add_path: bool,
     /// Whether Extended Next Hop Encoding (RFC 5549) is configured for this peer.
     ext_nexthop: bool,
+    /// Whether the L2VPN/EVPN family (RFC 7432) is configured for this peer.
+    evpn: bool,
 }
 
 /// One prefix this speaker originates, with the COMMUNITIES to attach. The central
@@ -387,6 +430,35 @@ enum SessionCmd {
     /// knows the re-advertisement is complete. Pushed by the central task right
     /// after the origination snapshot and Loc-RIB propagation on Established.
     SendEndOfRib,
+    /// Advertise these locally-originated EVPN routes (IMET + static MAC/IP) to an
+    /// EVPN-activated peer (RFC 7432 §7).
+    AdvertiseEvpn(Vec<EvpnOriginRoute>),
+    /// Re-advertise these learned EVPN best routes (Adj-RIB-Out), next hop UNCHANGED
+    /// on reflection (RFC 7432 §7.7). The session applies the propagation gate.
+    PropagateEvpn(Vec<EvpnPropRoute>),
+    /// Withdraw these EVPN routes (MP_UNREACH_NLRI, AFI 25 / SAFI 70).
+    WithdrawEvpn(Vec<EvpnNlri>),
+}
+
+/// One locally-originated EVPN route the central task asks a session to advertise:
+/// the NLRI, the ext-communities to attach (its Route Targets plus the VXLAN
+/// encapsulation community), and the next hop (our VTEP, raw octets).
+#[derive(Clone)]
+struct EvpnOriginRoute {
+    nlri: EvpnNlri,
+    ext_communities: Vec<[u8; 8]>,
+    next_hop: Vec<u8>,
+}
+
+/// One learned EVPN best route the central task asks a session to re-advertise. The
+/// `next_hop` octets are carried alongside the [`Path`] because the decision `Path`
+/// does not store the raw EVPN next hop, and reflection must preserve it unchanged
+/// (RFC 7432 §7.7).
+#[derive(Clone)]
+struct EvpnPropRoute {
+    nlri: EvpnNlri,
+    path: Path,
+    next_hop: Vec<u8>,
 }
 
 /// One learned Loc-RIB route the central task asks a session to propagate. The
@@ -431,6 +503,8 @@ struct PeerInfo {
     add_path: bool,
     /// Whether Extended Next Hop Encoding (RFC 5549) is configured for this peer.
     ext_nexthop: bool,
+    /// Whether the L2VPN/EVPN family (RFC 7432) is configured for this peer.
+    evpn: bool,
 }
 
 /// A message from a per-peer session task to the central RIB task.
@@ -513,6 +587,10 @@ pub enum BgpQuery {
     /// Send a ROUTE-REFRESH to this peer (RFC 2918) — `bgp refresh <addr>`. Not a
     /// read-only query, but answered the same way (with a status line).
     Refresh(IpAddr),
+    /// The EVPN Loc-RIB best paths (RFC 7432) — `show bgp evpn`.
+    Evpn,
+    /// The per-EVI MAC-VRF views (remote MACs and the VTEP flood set) — `show evpn`.
+    EvpnVnis,
 }
 
 /// A control-socket query plus the channel to answer it on.
@@ -688,6 +766,45 @@ pub fn render_bgp_routes(rib: &BgpRib, roa: &RoaTable) -> String {
             let _ = write!(out, " rpki {}", roa.validate(prefix, origin).as_str());
         }
         out.push('\n');
+    }
+    out
+}
+
+/// Render the EVPN Loc-RIB best paths (RFC 7432), one per line — `show bgp evpn`.
+pub fn render_bgp_evpn(rib: &EvpnRib) -> String {
+    if rib.is_empty() {
+        return "no evpn routes\n".to_string();
+    }
+    let mut out = String::new();
+    for (nlri, path) in rib.iter_best() {
+        let _ = writeln!(out, "{nlri}  via {}  from {}", path.next_hop, path.peer_addr);
+    }
+    out
+}
+
+/// Render the per-EVI MAC-VRF views (RFC 7432 §9): each instance's remote-MAC table
+/// (type-2) and remote-VTEP flood set (type-3) — `show evpn`.
+pub fn render_evpn_vnis(evis: &[(EvpnInstanceCfg, EviTable)]) -> String {
+    if evis.is_empty() {
+        return "no evpn instances configured\n".to_string();
+    }
+    let mut out = String::new();
+    for (inst, table) in evis {
+        let _ = writeln!(out, "EVI {} vni {} rd {}", inst.evi, inst.vni, inst.rd);
+        for ((_eth_tag, mac), rm) in table.iter_macs() {
+            let _ = write!(
+                out,
+                "  mac {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} -> vtep {}",
+                mac[0], mac[1], mac[2], mac[3], mac[4], mac[5], rm.vtep
+            );
+            if let Some(ip) = rm.ip {
+                let _ = write!(out, " ip {ip}");
+            }
+            out.push('\n');
+        }
+        for vtep in table.iter_vteps() {
+            let _ = writeln!(out, "  flood -> {vtep}");
+        }
     }
     out
 }
@@ -959,6 +1076,7 @@ pub async fn run(
                         max_prefix: p.max_prefix,
                         add_path: p.add_path,
                         ext_nexthop: p.ext_nexthop,
+                        evpn: p.evpn,
                     },
                 )
             })
@@ -1013,6 +1131,7 @@ pub async fn run(
             ttl_security: peer.ttl_security,
             add_path: peer.add_path,
             ext_nexthop: peer.ext_nexthop,
+            evpn: peer.evpn,
         };
         let auth = peer.tcp_auth();
         let local = local.clone();
@@ -1022,6 +1141,47 @@ pub async fn run(
     // Drop our own sender; the listener and connectors keep theirs, so `rx` stays
     // open for the life of the daemon.
     drop(tx);
+
+    // EVPN (RFC 7432): the local origination set (one IMET per instance plus each
+    // static MAC), the EVPN Loc-RIB, the per-EVI MAC-VRFs, and a side map of each best
+    // route's raw next-hop octets — the decision `Path` does not carry them, and
+    // reflection must preserve the next hop unchanged (§7.7).
+    let mut evpn_rib = EvpnRib::new();
+    let mut evis: Vec<(EvpnInstanceCfg, EviTable)> = Vec::new();
+    let mut evpn_originated: Vec<EvpnOriginRoute> = Vec::new();
+    let mut evpn_nh: BTreeMap<EvpnNlri, Vec<u8>> = BTreeMap::new();
+    if let Some(evpn) = &cfg.evpn {
+        let nh = vtep_next_hop_octets(evpn.vtep_ip);
+        for inst in &evpn.instances {
+            evis.push((inst.clone(), EviTable::new(inst.rt_import.clone())));
+            // Every route this instance originates carries its export RTs plus the
+            // VXLAN encapsulation community (RFC 8365 §6).
+            let mut ext = inst.rt_export.clone();
+            ext.push(encap_ext_community(TUNNEL_TYPE_VXLAN));
+            // Type-3 IMET: "I participate in this EVI"; BUM floods toward our VTEP.
+            evpn_originated.push(EvpnOriginRoute {
+                nlri: EvpnNlri::Imet { rd: inst.rd, eth_tag: 0, orig_ip: evpn.vtep_ip },
+                ext_communities: ext.clone(),
+                next_hop: nh.clone(),
+            });
+            // Type-2 MAC/IP for each static MAC.
+            for (mac, ip) in &inst.macs {
+                evpn_originated.push(EvpnOriginRoute {
+                    nlri: EvpnNlri::MacIp {
+                        rd: inst.rd,
+                        esi: Esi::ZERO,
+                        eth_tag: 0,
+                        mac: *mac,
+                        ip: *ip,
+                        label1: inst.vni,
+                        label2: None,
+                    },
+                    ext_communities: ext.clone(),
+                    next_hop: nh.clone(),
+                });
+            }
+        }
+    }
 
     let mut rib = BgpRib::with_max_paths(cfg.max_paths);
     loop {
@@ -1082,6 +1242,8 @@ pub async fn run(
                         }
                         None => format!("no established session to {addr}\n"),
                     },
+                    BgpQuery::Evpn => render_bgp_evpn(&evpn_rib),
+                    BgpQuery::EvpnVnis => render_evpn_vnis(&evis),
                 };
                 let _ = req.respond.send(resp);
                 continue;
@@ -1226,6 +1388,28 @@ pub async fn run(
                         let _ = cmd_tx.send(SessionCmd::Advertise(vec![route])).await;
                     }
                 }
+                // EVPN (RFC 7432): to an EVPN-activated peer, advertise our
+                // locally-originated routes (IMET + static MACs) and re-advertise the
+                // learned EVPN best paths (next hop preserved). The session gates the
+                // propagation; the EVPN End-of-RIB rides in SendEndOfRib below.
+                if local.peers.get(&p).map(|pp| pp.evpn) == Some(true) {
+                    if !evpn_originated.is_empty() {
+                        let _ = cmd_tx.send(SessionCmd::AdvertiseEvpn(evpn_originated.clone())).await;
+                    }
+                    let prop_evpn: Vec<EvpnPropRoute> = evpn_rib
+                        .iter_best()
+                        .filter_map(|(nlri, path)| {
+                            evpn_nh.get(nlri).map(|nh| EvpnPropRoute {
+                                nlri: nlri.clone(),
+                                path: path.clone(),
+                                next_hop: nh.clone(),
+                            })
+                        })
+                        .collect();
+                    if !prop_evpn.is_empty() {
+                        let _ = cmd_tx.send(SessionCmd::PropagateEvpn(prop_evpn)).await;
+                    }
+                }
                 // Initial advertisement done: send the End-of-RIB marker so a helper
                 // on the peer's side knows our re-advertisement is complete (RFC 4724
                 // §2). Queued after Advertise/Propagate, so it arrives last.
@@ -1302,6 +1486,13 @@ pub async fn run(
                     for ev in rib.withdraw_peer(p) {
                         apply_event(ev, vrf_table, &updates, &sessions).await;
                     }
+                }
+                // EVPN (RFC 7432): drop everything this peer taught us and re-propagate
+                // the withdrawals to the other EVPN peers (no graceful-restart retention
+                // for EVPN here).
+                for ev in evpn_rib.withdraw_peer(p) {
+                    handle_evpn_event(ev, Vec::new(), p, &mut evis, &mut evpn_nh, &local, &sessions)
+                        .await;
                 }
                 for pfx in addpath_affected {
                     propagate_addpath(pfx, &rib, &local, &mut addpath, &addpath_send, &sessions).await;
@@ -1494,6 +1685,32 @@ pub async fn run(
                     for p in nlri {
                         import_and_install(import, peer, 0, *p, &path, &roa, rpki_reject, &mut rib, vrf_table, &updates, &sessions)
                             .await;
+                    }
+                }
+                // EVPN withdrawals (MP_UNREACH_NLRI, AFI 25 / SAFI 70, RFC 7432).
+                for nlri in mp_unreach_evpn(&update).to_vec() {
+                    if let Some(ev) = evpn_rib.withdraw(peer, nlri) {
+                        handle_evpn_event(ev, Vec::new(), peer, &mut evis, &mut evpn_nh, &local, &sessions)
+                            .await;
+                    }
+                }
+                // EVPN reachability (MP_REACH_NLRI): the next hop is raw octets (4 or
+                // 16). Unknown route types are kept off the RIB (ignored per §7).
+                if let Some((nh_octets, nlris)) = mp_reach_evpn(&update) {
+                    match evpn_next_hop_ip(&nh_octets) {
+                        Some(nh_ip) => {
+                            let path = build_path(&update, nh_ip, None, facts);
+                            for nlri in nlris.iter().cloned() {
+                                if matches!(nlri, EvpnNlri::Unknown { .. }) {
+                                    continue;
+                                }
+                                if let Some(ev) = evpn_rib.update(peer, nlri, path.clone()) {
+                                    handle_evpn_event(ev, nh_octets.clone(), peer, &mut evis, &mut evpn_nh, &local, &sessions)
+                                        .await;
+                                }
+                            }
+                        }
+                        None => warn!(peer = %peer, len = nh_octets.len(), "EVPN MP_REACH next hop is neither 4 nor 16 octets; ignored"),
                     }
                 }
                 // ADD-PATH (RFC 7911): for every IPv4 prefix this UPDATE touched,
@@ -2038,6 +2255,93 @@ fn mp_unreach_v6(update: &Update) -> &[Prefix] {
         .unwrap_or(&[])
 }
 
+/// The MP_REACH_NLRI carrying EVPN routes (AFI 25 / SAFI 70, RFC 7432 §7): the raw
+/// next-hop octets (the advertising VTEP, 4 or 16 bytes) and the EVPN NLRI.
+fn mp_reach_evpn(update: &Update) -> Option<(Vec<u8>, &[EvpnNlri])> {
+    update.attributes.iter().find_map(|a| match a {
+        PathAttribute::MpReachEvpn { next_hop, nlri } => Some((next_hop.clone(), nlri.as_slice())),
+        _ => None,
+    })
+}
+
+/// The MP_UNREACH_NLRI EVPN withdrawals of an UPDATE (AFI 25 / SAFI 70, RFC 7432).
+fn mp_unreach_evpn(update: &Update) -> &[EvpnNlri] {
+    update
+        .attributes
+        .iter()
+        .find_map(|a| match a {
+            PathAttribute::MpUnreachEvpn { withdrawn } => Some(withdrawn.as_slice()),
+            _ => None,
+        })
+        .unwrap_or(&[])
+}
+
+/// Our VTEP address as the raw next-hop octets carried in an EVPN MP_REACH_NLRI
+/// (4 octets for an IPv4 VTEP, 16 for an IPv6 one).
+fn vtep_next_hop_octets(ip: IpAddr) -> Vec<u8> {
+    match ip {
+        IpAddr::V4(a) => a.octets().to_vec(),
+        IpAddr::V6(a) => a.octets().to_vec(),
+    }
+}
+
+/// Parse an EVPN MP_REACH next hop (RFC 7432 §7): 4 octets is an IPv4 VTEP, 16 an
+/// IPv6 one; any other length is malformed and skipped by the caller.
+fn evpn_next_hop_ip(octets: &[u8]) -> Option<IpAddr> {
+    match octets.len() {
+        4 => Some(IpAddr::V4(Ipv4Addr::new(octets[0], octets[1], octets[2], octets[3]))),
+        16 => {
+            let mut b = [0u8; 16];
+            b.copy_from_slice(octets);
+            Some(IpAddr::V6(Ipv6Addr::from(b)))
+        }
+        _ => None,
+    }
+}
+
+/// Apply one EVPN Loc-RIB change to every EVI's MAC-VRF view, track the best route's
+/// raw next-hop octets (for next-hop-unchanged reflection, RFC 7432 §7.7), and
+/// re-advertise the change to every OTHER EVPN-activated session (the session-side
+/// propagation gate does the iBGP/echo filtering).
+async fn handle_evpn_event(
+    ev: EvpnRibEvent,
+    nh: Vec<u8>,
+    from_peer: IpAddr,
+    evis: &mut [(EvpnInstanceCfg, EviTable)],
+    evpn_nh: &mut BTreeMap<EvpnNlri, Vec<u8>>,
+    local: &Local,
+    sessions: &HashMap<IpAddr, mpsc::Sender<SessionCmd>>,
+) {
+    // Fold the change into each per-EVI MAC-VRF view (RFC 7432 §9).
+    for (inst, table) in evis.iter_mut() {
+        if table.apply(&ev) {
+            info!(evi = inst.evi, vni = inst.vni, "EVPN MAC-VRF view updated");
+        }
+    }
+    // Track the next hop and re-propagate to the other EVPN peers.
+    match ev {
+        EvpnRibEvent::Best { nlri, path } => {
+            evpn_nh.insert(nlri.clone(), nh.clone());
+            let route = EvpnPropRoute { nlri, path, next_hop: nh };
+            for (addr, tx) in sessions {
+                if *addr == from_peer || local.peers.get(addr).map(|pp| pp.evpn) != Some(true) {
+                    continue;
+                }
+                let _ = tx.send(SessionCmd::PropagateEvpn(vec![route.clone()])).await;
+            }
+        }
+        EvpnRibEvent::Withdrawn(nlri) => {
+            evpn_nh.remove(&nlri);
+            for (addr, tx) in sessions {
+                if *addr == from_peer || local.peers.get(addr).map(|pp| pp.evpn) != Some(true) {
+                    continue;
+                }
+                let _ = tx.send(SessionCmd::WithdrawEvpn(vec![nlri.clone()])).await;
+            }
+        }
+    }
+}
+
 /// Whether a learned `path` should be re-advertised to a peer (the Adj-RIB-Out
 /// decision) that is `to_ebgp`, a route-reflector client `to_rr_client`, at address
 /// `to_peer`. Never echo a route back to where it came from; honour the well-known
@@ -2172,6 +2476,7 @@ async fn accept_loop(listener: TcpListener, local: Arc<Local>, tx: mpsc::Sender<
                     ttl_security: props.ttl_security,
                     add_path: props.add_path,
                     ext_nexthop: props.ext_nexthop,
+                    evpn: props.evpn,
                 };
                 let local = local.clone();
                 let tx = tx.clone();
@@ -2716,6 +3021,8 @@ async fn drive_session(
         peer_id: Ipv4Addr::UNSPECIFIED,
         four_octet: false,
         mp_ipv6: false,
+        evpn_cfg: peer.evpn,
+        mp_evpn: false,
         add_path_cfg: peer.add_path,
         add_path_send: false,
         add_path_recv: false,
@@ -2763,6 +3070,10 @@ async fn drive_session(
                             sess.four_octet = o.supports_four_octet_as();
                             // Send IPv6 NLRI only if the peer can receive it (RFC 4760).
                             sess.mp_ipv6 = o.supports_multiprotocol(AFI_IPV6, SAFI_UNICAST);
+                            // Send EVPN NLRI only if the peer negotiated the family AND
+                            // it is configured here (RFC 7432 §4).
+                            sess.mp_evpn =
+                                sess.evpn_cfg && o.supports_multiprotocol(AFI_L2VPN, SAFI_EVPN);
                             // ADD-PATH (RFC 7911 §4): the directions in effect are the
                             // intersection of what we offered (Send+Receive when
                             // configured) and what the peer advertised. We may SEND when
@@ -2891,6 +3202,22 @@ async fn drive_session(
                     sess.withdraw_add_path(prefix, &ids).await?;
                 }
             }
+            // EVPN (RFC 7432): only act once Established and the family is negotiated.
+            Step::Cmd(SessionCmd::AdvertiseEvpn(routes)) => {
+                if sess.established && sess.mp_evpn {
+                    sess.advertise_evpn(&routes).await?;
+                }
+            }
+            Step::Cmd(SessionCmd::PropagateEvpn(routes)) => {
+                if sess.established && sess.mp_evpn {
+                    sess.propagate_evpn(&routes).await?;
+                }
+            }
+            Step::Cmd(SessionCmd::WithdrawEvpn(nlris)) => {
+                if sess.established && sess.mp_evpn {
+                    sess.withdraw_evpn(&nlris).await?;
+                }
+            }
             Step::Handled => {}
             // The central task asks us to send a ROUTE-REFRESH to the peer (the
             // operator ran `bgp refresh <peer>`). Send it for IPv4 unicast, and for
@@ -2918,6 +3245,16 @@ async fn drive_session(
                     if sess.mp_ipv6 {
                         let _ = sess
                             .send(&Message::Update(Update::end_of_rib_marker(AFI_IPV6, SAFI_UNICAST)))
+                            .await;
+                    }
+                    // EVPN End-of-RIB (RFC 7432 / RFC 4724 §2): an empty EVPN
+                    // MP_UNREACH_NLRI — the shape `Update::end_of_rib()` recognises.
+                    if sess.mp_evpn {
+                        let _ = sess
+                            .send(&Message::Update(Update {
+                                attributes: vec![PathAttribute::MpUnreachEvpn { withdrawn: vec![] }],
+                                ..Default::default()
+                            }))
                             .await;
                     }
                 }
@@ -3052,6 +3389,12 @@ struct Session<'a> {
     /// Whether the peer advertised the IPv6-unicast Multiprotocol capability
     /// (RFC 4760) — only then do we send it IPv6 NLRI in MP_REACH_NLRI.
     mp_ipv6: bool,
+    /// Whether this peer is EVPN-activated in our config (RFC 7432) — we then
+    /// advertise the L2VPN/EVPN Multiprotocol capability in our OPEN.
+    evpn_cfg: bool,
+    /// Whether the peer advertised the L2VPN/EVPN Multiprotocol capability
+    /// (RFC 7432) — only then do we send it EVPN NLRI.
+    mp_evpn: bool,
     /// Whether ADD-PATH (RFC 7911) is configured for this peer — we then advertise
     /// the ADD-PATH capability (Send+Receive, IPv4 unicast) in our OPEN.
     add_path_cfg: bool,
@@ -3118,6 +3461,12 @@ impl Session<'_> {
                             SAFI_UNICAST as u16,
                             AFI_IPV6,
                         )]));
+                    }
+                    // L2VPN/EVPN (RFC 7432 §4 + RFC 4760): advertise the EVPN
+                    // Multiprotocol capability when this peer is EVPN-activated.
+                    if self.evpn_cfg {
+                        open.capabilities
+                            .push(Capability::Multiprotocol { afi: AFI_L2VPN, safi: SAFI_EVPN });
                     }
                     // Keep the encoded OPEN for the BMP Peer Up (RFC 7854 §4.10).
                     let open_msg = Message::Open(open);
@@ -3543,6 +3892,63 @@ impl Session<'_> {
             attributes: vec![],
             nlri: vec![],
             nlri_path_ids: vec![],
+        }))
+        .await?;
+        Ok(())
+    }
+
+    /// Advertise locally-originated EVPN routes (IMET + static MAC/IP, RFC 7432 §7)
+    /// to this EVPN-activated peer. Routes are grouped by their ext-community set and
+    /// next hop — one MP_REACH_NLRI UPDATE per group, next hop = our VTEP.
+    async fn advertise_evpn(&mut self, routes: &[EvpnOriginRoute]) -> Result<()> {
+        type Key = (Vec<[u8; 8]>, Vec<u8>);
+        let mut groups: BTreeMap<Key, Vec<EvpnNlri>> = BTreeMap::new();
+        for r in routes {
+            groups
+                .entry((r.ext_communities.clone(), r.next_hop.clone()))
+                .or_default()
+                .push(r.nlri.clone());
+        }
+        for ((ext_communities, next_hop), nlri) in groups {
+            let mut attributes = self.base_path_attrs();
+            if !ext_communities.is_empty() {
+                attributes.push(PathAttribute::ExtendedCommunities(ext_communities));
+            }
+            attributes.push(PathAttribute::MpReachEvpn { next_hop, nlri });
+            self.send(&Message::Update(Update { attributes, ..Default::default() })).await?;
+        }
+        Ok(())
+    }
+
+    /// Re-advertise learned EVPN best routes to this peer (the Adj-RIB-Out). Applies
+    /// the propagation gate (never echo back to the peer it came from; iBGP split
+    /// horizon unless this peer is an RR client) and preserves the next hop unchanged
+    /// (RFC 7432 §7.7 — a route reflector does not rewrite the EVPN next hop). The
+    /// Route Targets ride in the path's ext-communities, re-added by
+    /// [`Self::propagated_base_attrs`].
+    async fn propagate_evpn(&mut self, routes: &[EvpnPropRoute]) -> Result<()> {
+        for r in routes {
+            if !should_propagate(&r.path, self.peer_type, self.peer.rr_client, self.peer.addr) {
+                continue;
+            }
+            let mut attributes = self.propagated_base_attrs(&r.path);
+            attributes.push(PathAttribute::MpReachEvpn {
+                next_hop: r.next_hop.clone(),
+                nlri: vec![r.nlri.clone()],
+            });
+            self.send(&Message::Update(Update { attributes, ..Default::default() })).await?;
+        }
+        Ok(())
+    }
+
+    /// Withdraw EVPN routes from this peer (MP_UNREACH_NLRI, AFI 25 / SAFI 70).
+    async fn withdraw_evpn(&mut self, nlris: &[EvpnNlri]) -> Result<()> {
+        if nlris.is_empty() {
+            return Ok(());
+        }
+        self.send(&Message::Update(Update {
+            attributes: vec![PathAttribute::MpUnreachEvpn { withdrawn: nlris.to_vec() }],
+            ..Default::default()
         }))
         .await?;
         Ok(())

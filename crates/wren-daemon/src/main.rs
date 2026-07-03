@@ -40,7 +40,7 @@ mod vrrp;
 mod sockopt;
 
 use std::collections::HashSet;
-use std::net::Ipv4Addr;
+use std::net::{IpAddr, Ipv4Addr};
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
@@ -1337,6 +1337,7 @@ fn build_bgp_config(
             default_originate: n.default_originate,
             add_path: n.add_path,
             ext_nexthop: n.extended_nexthop,
+            evpn: n.evpn,
             import,
             export,
         });
@@ -1429,6 +1430,15 @@ fn build_bgp_config(
         ),
         None => (wren_core::RT_TABLE_MAIN, None),
     };
+    // EVPN (RFC 7432): resolve the VTEP identity and each instance's RD / RTs / static
+    // MACs. Absent when `[bgp.evpn]` is not configured.
+    let evpn = match &bgp.evpn {
+        Some(e) => Some(build_evpn_config(e, bgp.local_as, router_id)?),
+        None => None,
+    };
+    if evpn.is_some() && !bgp.neighbor.iter().any(|n| n.evpn) {
+        warn!("bgp `[bgp.evpn]` is configured but no neighbor has `evpn = true`; no peer will carry EVPN");
+    }
     Ok(bgp::BgpConfig {
         local_as: bgp.local_as,
         router_id,
@@ -1448,7 +1458,120 @@ fn build_bgp_config(
         rpki_reject_invalid: bgp.rpki_reject_invalid,
         vrf_table,
         vrf_device,
+        evpn,
     })
+}
+
+/// Resolve `[bgp.evpn]` into a [`bgp::EvpnConfig`]: parse the VTEP IP, and for each
+/// instance the Route Distinguisher (defaulting to `router-id:evi`), the import and
+/// export Route Targets (defaulting both to the auto-derived `rt:<local-as>:<vni>`
+/// when neither is set, RFC 7432 §7.10.1), and the static MACs to advertise.
+fn build_evpn_config(
+    e: &wren_config::BgpEvpn,
+    local_as: u32,
+    router_id: Ipv4Addr,
+) -> Result<bgp::EvpnConfig> {
+    let vtep_ip: IpAddr = e
+        .vtep_ip
+        .parse()
+        .with_context(|| format!("bgp evpn vtep-ip {:?} must be an IP address", e.vtep_ip))?;
+    // The auto-derived Route Target is a 2-octet-AS community, so an AS above 65535
+    // cannot be represented — warn where a default RT would be relied on.
+    if local_as > u16::MAX as u32
+        && e.instance.iter().any(|i| i.rt_import.is_empty() && i.rt_export.is_empty())
+    {
+        warn!(
+            "bgp local-as {local_as} exceeds 65535; the auto-derived 2-octet EVPN Route Target truncates it — set explicit rt-import/rt-export"
+        );
+    }
+    let mut instances = Vec::with_capacity(e.instance.len());
+    for inst in &e.instance {
+        let rd = match &inst.rd {
+            Some(s) => parse_rd(s).with_context(|| {
+                format!("bgp evpn instance {} rd {s:?} must be ip:value or asn:value", inst.evi)
+            })?,
+            None => wren_bgp::evpn::Rd::from_ip(router_id, inst.evi),
+        };
+        let mut rt_import = Vec::with_capacity(inst.rt_import.len());
+        for s in &inst.rt_import {
+            rt_import.push(wren_bgp::ext_community::parse_ext_community(s).with_context(|| {
+                format!("bgp evpn instance {} rt-import {s:?} must be rt:asn:value", inst.evi)
+            })?);
+        }
+        let mut rt_export = Vec::with_capacity(inst.rt_export.len());
+        for s in &inst.rt_export {
+            rt_export.push(wren_bgp::ext_community::parse_ext_community(s).with_context(|| {
+                format!("bgp evpn instance {} rt-export {s:?} must be rt:asn:value", inst.evi)
+            })?);
+        }
+        // Default BOTH directions to the auto-derived rt:<local-as>:<vni> only when
+        // neither was set (RFC 7432 §7.10.1).
+        if rt_import.is_empty() && rt_export.is_empty() {
+            let auto = wren_bgp::evpn_rib::auto_route_target(local_as as u16, inst.vni);
+            rt_import.push(auto);
+            rt_export.push(auto);
+        }
+        let mut macs = Vec::with_capacity(inst.advertise_mac.len());
+        for s in &inst.advertise_mac {
+            macs.push(
+                parse_mac_ip(s)
+                    .with_context(|| format!("bgp evpn instance {} advertise-mac", inst.evi))?,
+            );
+        }
+        instances.push(bgp::EvpnInstanceCfg {
+            evi: inst.evi,
+            vni: inst.vni,
+            rd,
+            rt_import,
+            rt_export,
+            macs,
+        });
+    }
+    Ok(bgp::EvpnConfig { vtep_ip, instances })
+}
+
+/// Parse an EVPN Route Distinguisher: `ip:value` (a type-1 `router-id:value` RD) or
+/// `asn:value` (a type-0 2-octet-AS RD), per RFC 4364 §4.2.
+fn parse_rd(s: &str) -> Result<wren_bgp::evpn::Rd> {
+    let (admin, value) = s.split_once(':').context("expected ip:value or asn:value")?;
+    if let Ok(ip) = admin.parse::<Ipv4Addr>() {
+        let v: u16 = value
+            .parse()
+            .context("rd value must be a 16-bit number for an ip:value rd")?;
+        return Ok(wren_bgp::evpn::Rd::from_ip(ip, v));
+    }
+    let asn: u16 = admin
+        .parse()
+        .context("rd admin must be an IPv4 address or a 16-bit AS")?;
+    let v: u32 = value
+        .parse()
+        .context("rd value must be a 32-bit number for an asn:value rd")?;
+    Ok(wren_bgp::evpn::Rd::from_as2(asn, v))
+}
+
+/// Parse an EVPN `advertise-mac` entry: `aa:bb:cc:dd:ee:ff` or
+/// `aa:bb:cc:dd:ee:ff/10.0.0.5` (the optional IP feeds remote ARP/ND suppression).
+fn parse_mac_ip(s: &str) -> Result<([u8; 6], Option<IpAddr>)> {
+    let (mac_str, ip) = match s.split_once('/') {
+        Some((m, i)) => (
+            m,
+            Some(
+                i.parse::<IpAddr>()
+                    .with_context(|| format!("mac ip {i:?} must be an IP address"))?,
+            ),
+        ),
+        None => (s, None),
+    };
+    let parts: Vec<&str> = mac_str.split(':').collect();
+    if parts.len() != 6 {
+        anyhow::bail!("mac {mac_str:?} must be six colon-separated hex octets");
+    }
+    let mut mac = [0u8; 6];
+    for (i, p) in parts.iter().enumerate() {
+        mac[i] = u8::from_str_radix(p, 16)
+            .with_context(|| format!("mac octet {p:?} must be a hex byte"))?;
+    }
+    Ok((mac, ip))
 }
 
 /// Build a protocol's redistribution target from its `redistribute` list (the RIB
@@ -1817,4 +1940,52 @@ fn build_vrrp_instances(cfg: &wren_config::Config) -> Result<Vec<vrrp::InstanceC
         });
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::Ipv6Addr;
+
+    #[test]
+    fn parse_mac_ip_without_ip() {
+        let (mac, ip) = parse_mac_ip("02:00:5e:10:00:01").unwrap();
+        assert_eq!(mac, [0x02, 0x00, 0x5e, 0x10, 0x00, 0x01]);
+        assert_eq!(ip, None);
+    }
+
+    #[test]
+    fn parse_mac_ip_with_v4_and_v6() {
+        let (mac, ip) = parse_mac_ip("aa:bb:cc:dd:ee:ff/10.0.0.5").unwrap();
+        assert_eq!(mac, [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff]);
+        assert_eq!(ip, Some(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 5))));
+
+        let (_, ip6) = parse_mac_ip("aa:bb:cc:dd:ee:ff/2001:db8::5").unwrap();
+        assert_eq!(ip6, Some(IpAddr::V6("2001:db8::5".parse::<Ipv6Addr>().unwrap())));
+    }
+
+    #[test]
+    fn parse_mac_ip_rejects_malformed() {
+        assert!(parse_mac_ip("02:00:5e:10:00").is_err()); // too few octets
+        assert!(parse_mac_ip("02:00:5e:10:00:01:02").is_err()); // too many octets
+        assert!(parse_mac_ip("zz:00:5e:10:00:01").is_err()); // non-hex octet
+        assert!(parse_mac_ip("02:00:5e:10:00:01/not-an-ip").is_err()); // bad ip
+    }
+
+    #[test]
+    fn parse_rd_ip_and_asn_forms() {
+        // ip:value → type-1 RD.
+        let rd = parse_rd("192.0.2.1:100").unwrap();
+        assert_eq!(rd.to_string(), "192.0.2.1:100");
+        // asn:value → type-0 RD.
+        let rd = parse_rd("65001:10100").unwrap();
+        assert_eq!(rd.to_string(), "65001:10100");
+    }
+
+    #[test]
+    fn parse_rd_rejects_malformed() {
+        assert!(parse_rd("no-colon").is_err());
+        assert!(parse_rd("192.0.2.1:99999999").is_err()); // value too big for ip:value
+        assert!(parse_rd("70000:10").is_err()); // admin not a 16-bit AS or ip
+    }
 }
