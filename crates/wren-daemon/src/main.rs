@@ -18,6 +18,7 @@ mod bgp;
 mod bmp;
 mod connected;
 mod control;
+mod fib;
 mod metrics;
 mod query;
 #[cfg(feature = "isis")]
@@ -193,12 +194,16 @@ async fn main() -> Result<()> {
     } else {
         args.backend
     };
-    let mut fib: Box<dyn Fib> = match backend {
+    let fib_backend: Box<dyn Fib + Send> = match backend {
         Backend::Kernel => {
             Box::new(KernelFib::new().map_err(|e| anyhow::anyhow!("opening kernel FIB: {e}"))?)
         }
         Backend::Memory => Box::new(MemoryFib::default()),
     };
+    // Move the forwarding plane onto its own OS thread (review C7): its blocking
+    // netlink syscalls then never run on — and never stall — the async runtime.
+    // Everything below talks to it through this async handle.
+    let fib = fib::spawn(fib_backend);
 
     // Resolve the static routes once: their prefixes are the set we keep when
     // reconciling away a previous instance's leftover forwarding-plane routes.
@@ -209,9 +214,9 @@ async fn main() -> Result<()> {
     // forwarding plane that the current config no longer programs, so a restart
     // doesn't leave stale routes behind. (A no-op on the dry-run in-memory plane;
     // dynamic protocols re-install their routes as they reconverge.)
-    match fib.owned_routes() {
+    match fib.owned_routes().await {
         Ok(owned) if !owned.is_empty() => {
-            let removed = router::reconcile_owned(fib.as_mut(), owned, &keep);
+            let removed = router::reconcile_owned(&fib, owned, &keep).await;
             if removed > 0 {
                 info!(removed, "reconciled stale routes from a previous instance");
             }
@@ -254,11 +259,11 @@ async fn main() -> Result<()> {
             if let FibChange::Install(best) = &change {
                 // The export route-map may drop it (kept in the RIB, off the FIB).
                 if let Some(best) = vrf_routemap(&vrf_exports, best.clone()) {
-                    fib.apply(&FibChange::Install(best)).map_err(|e| anyhow::anyhow!(e))?;
+                    fib.apply(FibChange::Install(best)).await.map_err(|e| anyhow::anyhow!(e))?;
                     installed += 1;
                 }
             } else {
-                fib.apply(&change).map_err(|e| anyhow::anyhow!(e))?;
+                fib.apply(change).await.map_err(|e| anyhow::anyhow!(e))?;
             }
         }
     }
@@ -838,7 +843,7 @@ async fn main() -> Result<()> {
 
     info!("wren is running; press Ctrl-C to stop");
     tokio::select! {
-        _ = router::run(&mut rib, fib.as_mut(), updates_rx, &imports, fib_export.as_ref(), &redist_targets, &vrfs, queries_rx, subscribe_rx) => {
+        _ = router::run(&mut rib, &fib, updates_rx, &imports, fib_export.as_ref(), &redist_targets, &vrfs, queries_rx, subscribe_rx) => {
             warn!("router loop ended (all protocol senders dropped)");
         }
         r = tokio::signal::ctrl_c() => {
