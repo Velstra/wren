@@ -399,7 +399,16 @@ async fn service_echo(sessions: &mut HashMap<PeerKey, PeerSession>, echo_sock: &
             continue;
         }
         if echo.dst_mac.is_none() {
-            echo.dst_mac = bfd_echo::neighbor_mac(&echo.ifname, peer_v4);
+            // Resolving the neighbour MAC reads /proc/net/arp — a blocking file read.
+            // Run it on the blocking pool so it never stalls this Echo loop, whose
+            // whole purpose is sub-second liveness detection for *every* session
+            // (review finding M9). Once resolved the MAC is cached, so this happens
+            // only until the ARP entry completes.
+            let ifname = echo.ifname.clone();
+            echo.dst_mac = tokio::task::spawn_blocking(move || bfd_echo::neighbor_mac(&ifname, peer_v4))
+                .await
+                .ok()
+                .flatten();
         }
         let Some(dst) = echo.dst_mac else {
             // The ARP entry is not yet complete; retry on the next interval.

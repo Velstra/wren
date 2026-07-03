@@ -7,14 +7,23 @@
 //! resulting [`FibChange`]s into the [`Fib`]. That keeps best-path selection and
 //! FIB programming single-threaded and serialized, however many protocols feed it.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt::Write as _;
+use std::time::Duration;
 
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
 use wren_core::{Fib, FibChange, Prefix, Protocol, Rib, Route};
 use wren_filter::{Decision, Filter};
+
+/// How often the router re-tries prefixes whose last FIB write failed. A transient
+/// kernel error (ENOBUFS/EINTR — see the netlink backend's own bounded retry) can
+/// still exhaust its retries and leave a best-path route out of the kernel FIB; on
+/// each tick the router re-derives the desired state for those prefixes from the RIB
+/// and re-applies it, so a dropped route self-heals within one interval instead of
+/// lingering until its next independent change (review finding M8).
+const FIB_RECONCILE_INTERVAL: Duration = Duration::from_secs(15);
 
 /// Per-protocol import filters: applied to each route a protocol announces before
 /// it enters the RIB. A protocol with no entry imports everything unchanged.
@@ -179,18 +188,27 @@ pub async fn run(
     // export filter's accept→reject transition withdraw a previously-installed
     // route.
     let mut exported: BTreeMap<(u32, Prefix), Route> = BTreeMap::new();
+    // Prefixes whose last FIB write (install or remove) errored — retried on the
+    // periodic reconcile tick below until they succeed (review finding M8).
+    let mut failed: BTreeSet<(u32, Prefix)> = BTreeSet::new();
     // Open route-export subscriptions (`wren monitor routes`); each receives live
     // RouteEvents. Closed ones are pruned lazily on the next fan-out.
     let mut subscribers: Vec<mpsc::Sender<RouteEvent>> = Vec::new();
+    // Periodic FIB reconciliation. The first `tick()` completes immediately, so
+    // consume it up front — there is nothing to reconcile before the loop runs.
+    let mut reconcile = tokio::time::interval(FIB_RECONCILE_INTERVAL);
+    reconcile.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    reconcile.tick().await;
     loop {
         tokio::select! {
             update = updates.recv() => match update {
                 Some(update) => {
                     // Apply the update to the RIB/FIB; if the best path changed,
                     // fan that change out to the redistribution targets.
-                    if let Some(event) =
-                        apply(rib, fib, update, imports, fib_export, &mut exported, &mut subscribers)
-                    {
+                    if let Some(event) = apply(
+                        rib, fib, update, imports, fib_export,
+                        &mut exported, &mut subscribers, &mut failed,
+                    ) {
                         redistribute(redist, &event).await;
                     }
                 }
@@ -202,7 +220,40 @@ pub async fn run(
             Some(sub) = subscribes.recv() => {
                 subscribe_routes(&exported, &mut subscribers, sub).await;
             }
+            _ = reconcile.tick() => {
+                retry_failed(rib, fib, fib_export, &mut exported, &mut subscribers, &mut failed);
+            }
         }
+    }
+}
+
+/// Re-apply the desired forwarding state for every prefix whose last FIB write
+/// failed. The desired state is re-derived from the RIB (the single source of
+/// truth): a prefix that still has a best path is re-installed; one whose best path
+/// has since disappeared is removed. A write that succeeds this time clears the
+/// prefix from `failed` (via [`program_fib`]); one that fails again stays queued for
+/// the next tick. Called only from the reconcile tick, so a healthy router with no
+/// outstanding failures does no work here.
+fn retry_failed(
+    rib: &Rib,
+    fib: &mut dyn Fib,
+    fib_export: Option<&Filter>,
+    exported: &mut BTreeMap<(u32, Prefix), Route>,
+    subscribers: &mut Vec<mpsc::Sender<RouteEvent>>,
+    failed: &mut BTreeSet<(u32, Prefix)>,
+) {
+    if failed.is_empty() {
+        return;
+    }
+    // Snapshot the queue: program_fib mutates `failed` as each retry resolves.
+    let pending: Vec<(u32, Prefix)> = failed.iter().copied().collect();
+    debug!(count = pending.len(), "retrying failed FIB writes");
+    for (table, prefix) in pending {
+        let change = match rib.best_in(table, &prefix) {
+            Some(route) => FibChange::Install(route.clone()),
+            None => FibChange::Remove { table, prefix },
+        };
+        program_fib(fib, change, fib_export, exported, subscribers, failed);
     }
 }
 
@@ -385,6 +436,7 @@ pub fn render_routes(rib: &Rib, protocol: Option<Protocol>) -> String {
 /// for the same `(prefix, protocol, source)` is withdrawn, so re-announcing a
 /// now-rejected route cannot leave a stale entry behind. The resulting best-path
 /// change is then run through the FIB **export** filter before programming.
+#[allow(clippy::too_many_arguments)] // the router threads every cross-cutting input through
 fn apply(
     rib: &mut Rib,
     fib: &mut dyn Fib,
@@ -393,6 +445,7 @@ fn apply(
     fib_export: Option<&Filter>,
     exported: &mut BTreeMap<(u32, Prefix), Route>,
     subscribers: &mut Vec<mpsc::Sender<RouteEvent>>,
+    failed: &mut BTreeSet<(u32, Prefix)>,
 ) -> Option<RedistEvent> {
     let change = match update {
         RouteUpdate::Announce(route) => {
@@ -425,7 +478,7 @@ fn apply(
         FibChange::Install(route) => RedistEvent::Changed(route.clone()),
         FibChange::Remove { prefix, .. } => RedistEvent::Gone(*prefix),
     };
-    program_fib(fib, change, fib_export, exported, subscribers);
+    program_fib(fib, change, fib_export, exported, subscribers, failed);
     Some(event)
 }
 
@@ -438,6 +491,7 @@ fn program_fib(
     fib_export: Option<&Filter>,
     exported: &mut BTreeMap<(u32, Prefix), Route>,
     subscribers: &mut Vec<mpsc::Sender<RouteEvent>>,
+    failed: &mut BTreeSet<(u32, Prefix)>,
 ) {
     match change {
         FibChange::Install(route) => {
@@ -458,7 +512,7 @@ fn program_fib(
                         // If we had programmed this (vrf, prefix), withdraw it now —
                         // from the FIB and from every route-export subscriber.
                         if exported.remove(&(route.table, route.prefix)).is_some() {
-                            remove_from_fib(fib, route.table, route.prefix);
+                            remove_from_fib(fib, route.table, route.prefix, failed);
                             fanout(
                                 subscribers,
                                 RouteEvent::Withdraw { table: route.table, prefix: route.prefix },
@@ -473,6 +527,7 @@ fn program_fib(
             match fib.apply(&FibChange::Install(route.clone())) {
                 Ok(()) => {
                     exported.insert(key, route.clone());
+                    failed.remove(&key); // a retried write that finally landed
                     info!(
                         prefix = %route.prefix,
                         table = route.table,
@@ -483,7 +538,12 @@ fn program_fib(
                     // Mirror the install to the route-export stream.
                     fanout(subscribers, RouteEvent::Update(route));
                 }
-                Err(e) => warn!(error = %e, "applying FIB change"),
+                Err(e) => {
+                    // A failed install (e.g. transient ENOBUFS) is queued for the
+                    // periodic reconcile tick to retry, rather than silently lost.
+                    warn!(error = %e, prefix = %route.prefix, "FIB install failed; queued for retry");
+                    failed.insert(key);
+                }
             }
         }
         FibChange::Remove { table, prefix } => {
@@ -491,9 +551,10 @@ fn program_fib(
             // Skip prefixes we never programmed (e.g. export-rejected ones), so we
             // don't issue spurious kernel deletes or export withdrawals.
             if fib_export.is_some() && !was_exported {
+                failed.remove(&(table, prefix));
                 return;
             }
-            remove_from_fib(fib, table, prefix);
+            remove_from_fib(fib, table, prefix, failed);
             if was_exported {
                 fanout(subscribers, RouteEvent::Withdraw { table, prefix });
             }
@@ -501,11 +562,24 @@ fn program_fib(
     }
 }
 
-/// Remove `(table, prefix)` from the forwarding plane, logging the outcome.
-fn remove_from_fib(fib: &mut dyn Fib, table: u32, prefix: Prefix) {
+/// Remove `(table, prefix)` from the forwarding plane, logging the outcome. A
+/// transient failure is queued in `failed` for the reconcile tick to retry; a
+/// success clears any prior queued failure for the prefix.
+fn remove_from_fib(
+    fib: &mut dyn Fib,
+    table: u32,
+    prefix: Prefix,
+    failed: &mut BTreeSet<(u32, Prefix)>,
+) {
     match fib.apply(&FibChange::Remove { table, prefix }) {
-        Ok(()) => info!(%prefix, table, "route removed"),
-        Err(e) => warn!(error = %e, "applying FIB change"),
+        Ok(()) => {
+            info!(%prefix, table, "route removed");
+            failed.remove(&(table, prefix));
+        }
+        Err(e) => {
+            warn!(error = %e, %prefix, table, "FIB remove failed; queued for retry");
+            failed.insert((table, prefix));
+        }
     }
 }
 
@@ -558,6 +632,7 @@ mod tests {
         imports: ImportFilters,
         export: Option<Filter>,
         exported: BTreeMap<(u32, Prefix), Route>,
+        failed: BTreeSet<(u32, Prefix)>,
     }
 
     impl Harness {
@@ -568,6 +643,7 @@ mod tests {
                 imports: ImportFilters::new(),
                 export: None,
                 exported: BTreeMap::new(),
+                failed: BTreeSet::new(),
             }
         }
 
@@ -580,6 +656,7 @@ mod tests {
                 self.export.as_ref(),
                 &mut self.exported,
                 &mut Vec::new(),
+                &mut self.failed,
             );
         }
 
@@ -958,5 +1035,72 @@ mod tests {
         };
 
         tokio::join!(router, driver);
+    }
+
+    /// A [`Fib`] whose first `fail_installs` install attempts return a transient
+    /// error, then succeed — modelling an ENOBUFS burst that clears.
+    struct FlakyFib {
+        inner: MemoryFib,
+        fail_installs: u32,
+    }
+
+    impl Fib for FlakyFib {
+        fn apply(&mut self, change: &FibChange) -> Result<(), wren_core::FibError> {
+            if matches!(change, FibChange::Install(_)) && self.fail_installs > 0 {
+                self.fail_installs -= 1;
+                return Err(wren_core::FibError("transient ENOBUFS".into()));
+            }
+            self.inner.apply(change)
+        }
+    }
+
+    #[test]
+    fn failed_fib_install_is_queued_and_healed_by_reconcile() {
+        // A route whose first install attempt fails: it lands in `failed`, not the
+        // FIB, and is not lost.
+        let mut rib = Rib::new();
+        let mut fib = FlakyFib { inner: MemoryFib::default(), fail_installs: 1 };
+        let mut exported = BTreeMap::new();
+        let mut subs = Vec::new();
+        let mut failed = BTreeSet::new();
+
+        apply(
+            &mut rib,
+            &mut fib,
+            RouteUpdate::Announce(bgp_route("198.51.100.0/24", 5)),
+            &ImportFilters::new(),
+            None,
+            &mut exported,
+            &mut subs,
+            &mut failed,
+        );
+        let key = (wren_core::RT_TABLE_MAIN, "198.51.100.0/24".parse().unwrap());
+        assert!(fib.inner.installed.is_empty(), "install should have failed");
+        assert!(failed.contains(&key), "failed prefix must be queued for retry");
+
+        // The reconcile tick re-derives the desired state from the RIB and, now that
+        // the kernel error has cleared, installs the route and clears the queue.
+        retry_failed(&rib, &mut fib, None, &mut exported, &mut subs, &mut failed);
+        assert!(fib.inner.installed.contains_key(&key), "route should self-heal");
+        assert!(failed.is_empty(), "queue must clear once the write lands");
+    }
+
+    #[test]
+    fn reconcile_removes_a_failed_prefix_whose_best_path_vanished() {
+        // A prefix queued as failed whose RIB best path has since disappeared must be
+        // reconciled as a removal, not re-installed.
+        let rib = Rib::new();
+        let mut fib = MemoryFib::default();
+        let mut exported = BTreeMap::new();
+        let mut subs: Vec<mpsc::Sender<RouteEvent>> = Vec::new();
+        let mut failed = BTreeSet::new();
+        let key = (wren_core::RT_TABLE_MAIN, "203.0.113.0/24".parse().unwrap());
+        failed.insert(key);
+
+        // RIB has no best path for the prefix → reconcile issues a remove and clears
+        // the queue (MemoryFib remove of an absent key is a no-op success).
+        retry_failed(&rib, &mut fib, None, &mut exported, &mut subs, &mut failed);
+        assert!(failed.is_empty(), "vanished prefix must leave the retry queue");
+        assert!(fib.installed.is_empty());
     }
 }

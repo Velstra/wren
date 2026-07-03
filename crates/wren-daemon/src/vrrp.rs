@@ -399,14 +399,13 @@ async fn read_loop(idx: usize, sock: Arc<UdpSocket>, vrid: u8, ipv6: bool, tx: m
                 None => continue,
             }
         };
-        if !Advertisement::verify_checksum(payload, src, dst) {
-            debug!(%src, "VRRP advertisement failed checksum");
-            continue;
-        }
-        let adv = match Advertisement::decode(payload, ipv6) {
+        // Verify-then-decode in one step: `decode_verified` makes the pseudo-header
+        // checksum a precondition of obtaining an Advertisement, so a spoofed advert
+        // can never be acted on (a wrong checksum surfaces as DecodeError::Checksum).
+        let adv = match Advertisement::decode_verified(payload, ipv6, src, dst) {
             Ok(a) => a,
             Err(e) => {
-                debug!(%src, error = %e, "malformed VRRP advertisement");
+                debug!(%src, error = %e, "rejected VRRP advertisement");
                 continue;
             }
         };

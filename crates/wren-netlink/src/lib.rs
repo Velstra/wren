@@ -561,6 +561,26 @@ fn build_route_msg(
     buf
 }
 
+/// How many times a transient route write is retried before it is surfaced to the
+/// router (which then owns the longer-term periodic reconciliation).
+const FIB_MAX_RETRIES: u32 = 3;
+
+/// Whether a raw errno from a netlink write is transient — i.e. worth retrying after
+/// a brief pause rather than surfacing immediately. These come from a momentarily
+/// busy kernel and clear on their own; everything else (unreachable, exists, perm)
+/// is a real answer that a retry cannot change.
+fn is_transient_errno(errno: i32) -> bool {
+    // EAGAIN == EWOULDBLOCK on Linux, so the two need not be listed separately.
+    matches!(errno, libc::EINTR | libc::EAGAIN | libc::ENOBUFS | libc::EBUSY)
+}
+
+/// A failed netlink round-trip: the [`FibError`] to surface, plus the raw errno (when
+/// one was available) so the caller can classify it as transient or terminal.
+struct NetlinkFailure {
+    fib: FibError,
+    errno: Option<i32>,
+}
+
 /// A [`Fib`] backed by the Linux kernel routing table via rtnetlink.
 pub struct KernelFib {
     fd: i32,
@@ -656,37 +676,76 @@ impl KernelFib {
         Ok(())
     }
 
-    /// Send one route request and wait for its ACK.
+    /// Send one route request and wait for its ACK, retrying a transient kernel
+    /// error a bounded number of times before giving up. A busy kernel can reject a
+    /// route write with ENOBUFS/EINTR/EAGAIN/EBUSY under load; those clear on their
+    /// own, so a short backoff-and-retry here keeps a single flap from dropping a
+    /// prefix (review finding M8). A non-transient error (e.g. ENETUNREACH, EEXIST)
+    /// returns immediately — retrying it would only stall. Anything still failing
+    /// after the retries is surfaced to the router, which queues it for its own
+    /// periodic reconciliation.
     fn request(&mut self, msg: &[u8]) -> Result<(), FibError> {
-        self.send_to_kernel(msg)?;
+        let mut attempt = 0u32;
+        loop {
+            match self.request_once(msg) {
+                Ok(()) => return Ok(()),
+                Err(e) if e.errno.is_some_and(is_transient_errno) && attempt < FIB_MAX_RETRIES => {
+                    attempt += 1;
+                    // Linear backoff (20ms, 40ms, 60ms): brief, since these bursts
+                    // clear fast, and bounded so the router loop is never stalled long.
+                    std::thread::sleep(std::time::Duration::from_millis(20 * attempt as u64));
+                }
+                Err(e) => return Err(e.fib),
+            }
+        }
+    }
+
+    /// One send+recv round-trip. On failure, returns the [`FibError`] together with
+    /// the raw errno (when known) so [`request`] can decide whether to retry.
+    fn request_once(&mut self, msg: &[u8]) -> Result<(), NetlinkFailure> {
+        if let Err(fib) = self.send_to_kernel(msg) {
+            // send_to_kernel already stamped last_os_error into the message; recover
+            // the errno for the transient check.
+            let errno = io::Error::last_os_error().raw_os_error();
+            return Err(NetlinkFailure { fib, errno });
+        }
 
         // Read the ACK / error reply.
         let mut buf = [0u8; 4096];
         // SAFETY: `buf` is a valid, sufficiently-large mutable buffer.
         let n = unsafe { libc::recv(self.fd, buf.as_mut_ptr() as *mut c_void, buf.len(), 0) };
         if n < 0 {
-            return Err(FibError(format!(
-                "reading netlink reply: {}",
-                io::Error::last_os_error()
-            )));
+            let err = io::Error::last_os_error();
+            let errno = err.raw_os_error();
+            return Err(NetlinkFailure {
+                fib: FibError(format!("reading netlink reply: {err}")),
+                errno,
+            });
         }
         let n = n as usize;
         if n < NLMSGHDR_LEN {
-            return Err(FibError("truncated netlink reply".into()));
+            return Err(NetlinkFailure {
+                fib: FibError("truncated netlink reply".into()),
+                errno: None,
+            });
         }
         let nlmsg_type = u16::from_ne_bytes([buf[4], buf[5]]);
         if nlmsg_type == NLMSG_ERROR {
             // struct nlmsgerr { __s32 error; struct nlmsghdr msg; } — the error is
             // the first field after the 16-byte header. 0 means a plain ACK.
             if n < NLMSGHDR_LEN + 4 {
-                return Err(FibError("short netlink error reply".into()));
+                return Err(NetlinkFailure {
+                    fib: FibError("short netlink error reply".into()),
+                    errno: None,
+                });
             }
             let code = i32::from_ne_bytes([buf[16], buf[17], buf[18], buf[19]]);
             if code != 0 {
-                return Err(FibError(format!(
-                    "netlink: {}",
-                    io::Error::from_raw_os_error(-code)
-                )));
+                // nlmsgerr carries the negative errno.
+                return Err(NetlinkFailure {
+                    fib: FibError(format!("netlink: {}", io::Error::from_raw_os_error(-code))),
+                    errno: Some(-code),
+                });
             }
         }
         Ok(())

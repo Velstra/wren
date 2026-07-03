@@ -41,6 +41,11 @@ pub enum DecodeError {
     Version(u8),
     /// Message type is not Advertisement (1).
     Type(u8),
+    /// The internet checksum (pseudo-header + message) did not fold to zero.
+    /// A spoofed advertisement with a wrong checksum lands here, so callers that
+    /// go through [`Advertisement::decode_verified`] cannot accept it by forgetting
+    /// a separate verification step.
+    Checksum,
 }
 
 impl std::fmt::Display for DecodeError {
@@ -49,6 +54,7 @@ impl std::fmt::Display for DecodeError {
             DecodeError::Short => write!(f, "advertisement truncated"),
             DecodeError::Version(v) => write!(f, "unsupported VRRP version {v}"),
             DecodeError::Type(t) => write!(f, "unsupported VRRP message type {t}"),
+            DecodeError::Checksum => write!(f, "advertisement checksum invalid"),
         }
     }
 }
@@ -147,6 +153,25 @@ impl Advertisement {
         // A correct checksum makes the full ones-complement sum (pseudo-header +
         // message, checksum field included) fold to zero.
         fold_to_zero(src, dst, buf)
+    }
+
+    /// Verify the checksum **and** decode in one step — the safe path for received
+    /// traffic. This is the only decode entry a network runner should use: it makes
+    /// the pseudo-header checksum a precondition of obtaining an `Advertisement`, so
+    /// a spoofed advert cannot slip through by a caller forgetting the separate
+    /// [`verify_checksum`](Self::verify_checksum) call (the failure mode M6 flagged;
+    /// OSPF already enforces its checksum inline on decode). `src`/`dst` are the IP
+    /// addresses the datagram arrived with (`dst` being the VRRP multicast group).
+    pub fn decode_verified(
+        buf: &[u8],
+        ipv6: bool,
+        src: IpAddr,
+        dst: IpAddr,
+    ) -> Result<Advertisement, DecodeError> {
+        if !Self::verify_checksum(buf, src, dst) {
+            return Err(DecodeError::Checksum);
+        }
+        Self::decode(buf, ipv6)
     }
 }
 
@@ -283,6 +308,29 @@ mod tests {
         assert_eq!(Advertisement::decode(&bytes[..5], false), Err(DecodeError::Short));
         // Count says one address but the list is missing.
         assert_eq!(Advertisement::decode(&bytes[..HEADER_LEN], false), Err(DecodeError::Short));
+    }
+
+    #[test]
+    fn decode_verified_rejects_spoofed_checksum() {
+        let adv = Advertisement {
+            vrid: 42,
+            priority: 150,
+            max_adver_int_cs: 100,
+            addresses: vec![v4("10.0.0.254")],
+        };
+        let src = v4("10.0.0.1");
+        let dst = IpAddr::V4(MCAST_V4);
+        let bytes = adv.encode(src, dst);
+        // A well-formed, correctly-checksummed advert decodes through the safe path.
+        assert_eq!(Advertisement::decode_verified(&bytes, false, src, dst).unwrap(), adv);
+        // Flipping a priority byte (a VIP-hijack attempt) invalidates the checksum,
+        // so the safe path refuses to hand back an Advertisement at all.
+        let mut spoofed = bytes.clone();
+        spoofed[2] ^= 0xff;
+        assert_eq!(
+            Advertisement::decode_verified(&spoofed, false, src, dst),
+            Err(DecodeError::Checksum)
+        );
     }
 
     #[test]
