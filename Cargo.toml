@@ -7,6 +7,9 @@
 [workspace]
 resolver = "2"
 members = ["crates/*"]
+# `fuzz/` is a standalone cargo-fuzz workspace (nightly + libFuzzer); keep it out
+# of the stable root build/test (code-review Architektur-6).
+exclude = ["fuzz"]
 
 [workspace.package]
 version = "0.1.0"

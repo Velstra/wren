@@ -1,0 +1,96 @@
+# Wren wire-decoder fuzz harness (code-review Architektur-6).
+#
+# A standalone cargo-fuzz workspace (note the empty [workspace] table, which
+# detaches it from the parent so `cargo test` at the repo root never tries to
+# build the libFuzzer targets). Prereq — installed once, per machine:
+#
+#     cargo install cargo-fuzz
+#
+# Then, from the repo root:
+#
+#     cargo +nightly fuzz list
+#     cargo +nightly fuzz run bgp_message         # fuzz one decoder
+#     cargo +nightly fuzz run bgp_message corpus/bgp_message
+#
+# See README.md for the full target list and the seed-corpus notes.
+
+[package]
+name = "wren-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+wren-bgp = { path = "../crates/wren-bgp" }
+wren-ospf = { path = "../crates/wren-ospf" }
+wren-ospfv3 = { path = "../crates/wren-ospfv3" }
+wren-isis = { path = "../crates/wren-isis" }
+wren-bfd = { path = "../crates/wren-bfd" }
+wren-vrrp = { path = "../crates/wren-vrrp" }
+wren-babel = { path = "../crates/wren-babel" }
+
+# Detach from the parent workspace: the fuzz crate is its own root.
+[workspace]
+
+[profile.release]
+debug = 1
+
+[[bin]]
+name = "bgp_message"
+path = "fuzz_targets/bgp_message.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "bgp_rtr"
+path = "fuzz_targets/bgp_rtr.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "ospf_packet"
+path = "fuzz_targets/ospf_packet.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "ospfv3_packet"
+path = "fuzz_targets/ospfv3_packet.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "isis_pdu"
+path = "fuzz_targets/isis_pdu.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "bfd_control"
+path = "fuzz_targets/bfd_control.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "vrrp_advertisement"
+path = "fuzz_targets/vrrp_advertisement.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "babel_packet"
+path = "fuzz_targets/babel_packet.rs"
+test = false
+doc = false
+bench = false
