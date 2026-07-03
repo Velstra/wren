@@ -48,6 +48,8 @@ pub mod bmp;
 pub mod capability;
 pub mod community;
 pub mod decision;
+pub mod evpn;
+pub mod evpn_rib;
 pub mod ext_community;
 pub mod flowspec;
 pub mod fsm;
@@ -100,6 +102,8 @@ pub const AFI_IPV4: u16 = 1;
 pub const AFI_IPV6: u16 = 2;
 /// Subsequent Address Family Identifier: unicast forwarding.
 pub const SAFI_UNICAST: u8 = 1;
+/// Address Family Identifier: L2VPN — re-exported from [`evpn`].
+pub use evpn::{AFI_L2VPN, SAFI_EVPN};
 
 /// The reserved 2-octet AS number that stands in for a 4-octet AS in any field a
 /// legacy (2-octet) speaker reads — the OPEN `my_as` and a 2-octet AS_PATH /

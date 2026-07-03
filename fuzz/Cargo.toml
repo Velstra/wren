@@ -94,3 +94,10 @@ path = "fuzz_targets/babel_packet.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "evpn_nlri"
+path = "fuzz_targets/evpn_nlri.rs"
+test = false
+doc = false
+bench = false

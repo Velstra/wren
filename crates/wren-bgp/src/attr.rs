@@ -19,6 +19,7 @@ use std::net::Ipv4Addr;
 
 use wren_core::Prefix;
 
+use crate::evpn::{decode_evpn_nlris, encode_evpn_nlri, EvpnNlri, AFI_L2VPN, SAFI_EVPN};
 use crate::{as_trans_fit, decode_prefix, decode_prefix_v6, encode_prefix_any, AFI_IPV6};
 
 /// Attribute flag: the attribute is optional (vs. well-known).
@@ -202,6 +203,20 @@ pub enum PathAttribute {
         /// The prefixes being withdrawn.
         withdrawn: Vec<Prefix>,
     },
+    /// MP_REACH_NLRI carrying EVPN routes (AFI 25 / SAFI 70, RFC 7432 §7) — a
+    /// separate variant because EVPN NLRI are not IP prefixes.
+    MpReachEvpn {
+        /// The next hop: the advertising VTEP's address, 4 (IPv4) or 16 (IPv6)
+        /// raw octets.
+        next_hop: Vec<u8>,
+        /// The EVPN routes being advertised.
+        nlri: Vec<EvpnNlri>,
+    },
+    /// MP_UNREACH_NLRI carrying EVPN withdrawals (AFI 25 / SAFI 70).
+    MpUnreachEvpn {
+        /// The EVPN routes being withdrawn.
+        withdrawn: Vec<EvpnNlri>,
+    },
     /// ORIGINATOR_ID (type 9, optional non-transitive) — the BGP identifier of the
     /// router that first introduced the route into the local AS (RFC 4456), set by
     /// a route reflector for loop avoidance.
@@ -269,8 +284,12 @@ impl PathAttribute {
             PathAttribute::Aggregator { .. } => Self::AGGREGATOR,
             PathAttribute::Communities(_) => Self::COMMUNITIES,
             PathAttribute::ExtendedCommunities(_) => Self::EXTENDED_COMMUNITIES,
-            PathAttribute::MpReachNlri { .. } => Self::MP_REACH_NLRI,
-            PathAttribute::MpUnreachNlri { .. } => Self::MP_UNREACH_NLRI,
+            PathAttribute::MpReachNlri { .. } | PathAttribute::MpReachEvpn { .. } => {
+                Self::MP_REACH_NLRI
+            }
+            PathAttribute::MpUnreachNlri { .. } | PathAttribute::MpUnreachEvpn { .. } => {
+                Self::MP_UNREACH_NLRI
+            }
             PathAttribute::OriginatorId(_) => Self::ORIGINATOR_ID,
             PathAttribute::ClusterList(_) => Self::CLUSTER_LIST,
             PathAttribute::LargeCommunities(_) => Self::LARGE_COMMUNITIES,
@@ -287,6 +306,8 @@ impl PathAttribute {
             PathAttribute::MultiExitDisc(_)
             | PathAttribute::MpReachNlri { .. }
             | PathAttribute::MpUnreachNlri { .. }
+            | PathAttribute::MpReachEvpn { .. }
+            | PathAttribute::MpUnreachEvpn { .. }
             | PathAttribute::OriginatorId(_)
             | PathAttribute::ClusterList(_) => FLAG_OPTIONAL,
             PathAttribute::Aggregator { .. }
@@ -346,6 +367,23 @@ impl PathAttribute {
                 out.push(*safi);
                 for p in withdrawn {
                     encode_prefix_any(out, p);
+                }
+            }
+            PathAttribute::MpReachEvpn { next_hop, nlri } => {
+                out.extend_from_slice(&AFI_L2VPN.to_be_bytes());
+                out.push(SAFI_EVPN);
+                out.push(next_hop.len() as u8);
+                out.extend_from_slice(next_hop);
+                out.push(0); // Reserved (SNPA count, unused)
+                for n in nlri {
+                    encode_evpn_nlri(out, n);
+                }
+            }
+            PathAttribute::MpUnreachEvpn { withdrawn } => {
+                out.extend_from_slice(&AFI_L2VPN.to_be_bytes());
+                out.push(SAFI_EVPN);
+                for n in withdrawn {
+                    encode_evpn_nlri(out, n);
                 }
             }
             PathAttribute::OriginatorId(id) => out.extend_from_slice(&id.octets()),
@@ -488,8 +526,13 @@ impl PathAttribute {
                 }
                 let next_hop = value[4..nh_end].to_vec();
                 // value[nh_end] is the Reserved octet.
-                let nlri = decode_mp_prefixes(&value[nh_end + 1..], afi)?;
-                PathAttribute::MpReachNlri { afi, safi, next_hop, nlri }
+                if afi == AFI_L2VPN && safi == SAFI_EVPN {
+                    let nlri = decode_evpn_nlris(&value[nh_end + 1..])?;
+                    PathAttribute::MpReachEvpn { next_hop, nlri }
+                } else {
+                    let nlri = decode_mp_prefixes(&value[nh_end + 1..], afi)?;
+                    PathAttribute::MpReachNlri { afi, safi, next_hop, nlri }
+                }
             }
             Self::MP_UNREACH_NLRI => {
                 if value.len() < 3 {
@@ -497,8 +540,13 @@ impl PathAttribute {
                 }
                 let afi = u16::from_be_bytes([value[0], value[1]]);
                 let safi = value[2];
-                let withdrawn = decode_mp_prefixes(&value[3..], afi)?;
-                PathAttribute::MpUnreachNlri { afi, safi, withdrawn }
+                if afi == AFI_L2VPN && safi == SAFI_EVPN {
+                    let withdrawn = decode_evpn_nlris(&value[3..])?;
+                    PathAttribute::MpUnreachEvpn { withdrawn }
+                } else {
+                    let withdrawn = decode_mp_prefixes(&value[3..], afi)?;
+                    PathAttribute::MpUnreachNlri { afi, safi, withdrawn }
+                }
             }
             Self::ORIGINATOR_ID => {
                 if value.len() < 4 {
@@ -899,6 +947,50 @@ mod tests {
             safi: SAFI_UNICAST,
             withdrawn: vec![],
         });
+    }
+
+    #[test]
+    fn mp_reach_evpn_roundtrips() {
+        use crate::evpn::{Esi, EvpnNlri, Rd};
+        let attr = PathAttribute::MpReachEvpn {
+            next_hop: std::net::Ipv4Addr::new(192, 0, 2, 1).octets().to_vec(),
+            nlri: vec![
+                EvpnNlri::MacIp {
+                    rd: Rd::from_ip(std::net::Ipv4Addr::new(192, 0, 2, 1), 100),
+                    esi: Esi::ZERO,
+                    eth_tag: 0,
+                    mac: [0x02, 0, 0x5e, 0x10, 0, 0x01],
+                    ip: Some("10.0.0.5".parse().unwrap()),
+                    label1: 10100,
+                    label2: None,
+                },
+                EvpnNlri::Imet {
+                    rd: Rd::from_ip(std::net::Ipv4Addr::new(192, 0, 2, 1), 100),
+                    eth_tag: 0,
+                    orig_ip: "192.0.2.1".parse().unwrap(),
+                },
+            ],
+        };
+        roundtrip(attr.clone());
+        // Same wire type code (14) and flags as any other MP_REACH.
+        let mut buf = Vec::new();
+        attr.encode(&mut buf, true);
+        assert_eq!(buf[0], FLAG_OPTIONAL);
+        assert_eq!(buf[1], 14);
+    }
+
+    #[test]
+    fn mp_unreach_evpn_roundtrips_including_empty() {
+        use crate::evpn::{EvpnNlri, Rd};
+        roundtrip(PathAttribute::MpUnreachEvpn {
+            withdrawn: vec![EvpnNlri::Imet {
+                rd: Rd::from_ip(std::net::Ipv4Addr::new(192, 0, 2, 1), 100),
+                eth_tag: 0,
+                orig_ip: "192.0.2.1".parse().unwrap(),
+            }],
+        });
+        // The empty form is the EVPN End-of-RIB body.
+        roundtrip(PathAttribute::MpUnreachEvpn { withdrawn: vec![] });
     }
 
     #[test]

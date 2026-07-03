@@ -235,6 +235,10 @@ impl Update {
             [PathAttribute::MpUnreachNlri { afi, safi, withdrawn }] if withdrawn.is_empty() => {
                 Some((*afi, *safi))
             }
+            // An empty EVPN MP_UNREACH decodes into the EVPN-specific variant.
+            [PathAttribute::MpUnreachEvpn { withdrawn }] if withdrawn.is_empty() => {
+                Some((crate::AFI_L2VPN, crate::SAFI_EVPN))
+            }
             _ => None,
         }
     }

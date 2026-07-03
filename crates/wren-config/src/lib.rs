@@ -552,6 +552,53 @@ pub struct Bgp {
     /// The configured peers.
     #[serde(default)]
     pub neighbor: Vec<BgpNeighbor>,
+    /// EVPN address-family configuration (RFC 7432 over VXLAN, RFC 8365). Present
+    /// enables originating this router's EVPN routes; the family is spoken only
+    /// with neighbours that set `evpn = true`.
+    pub evpn: Option<BgpEvpn>,
+}
+
+/// The `[bgp.evpn]` section: this VTEP's identity plus the EVPN instances
+/// (MAC-VRFs) it participates in.
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct BgpEvpn {
+    /// This router's VTEP address: advertised as the BGP next hop of every EVPN
+    /// route it originates and as the type-3 (IMET) originating router IP —
+    /// remote PEs tunnel VXLAN traffic here.
+    #[serde(rename = "vtep-ip")]
+    pub vtep_ip: String,
+    /// The EVPN instances (one per MAC-VRF / VNI).
+    #[serde(default)]
+    pub instance: Vec<BgpEvpnInstance>,
+}
+
+/// One `[[bgp.evpn.instance]]`: an EVPN instance (EVI) bridging one VNI.
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct BgpEvpnInstance {
+    /// The EVPN instance identifier. Also the value of the auto-derived type-1
+    /// Route Distinguisher `router-id:evi`.
+    pub evi: u16,
+    /// The VXLAN Network Identifier this instance bridges (24-bit).
+    pub vni: u32,
+    /// Route Distinguisher override, as `ip:value` or `asn:value`. Defaults to
+    /// the auto-derived `router-id:evi`.
+    pub rd: Option<String>,
+    /// Route Targets to import, as `rt:asn:value` / `rt:ipv4:value` (the
+    /// `[[filter]]` ext-community syntax). Defaults to the auto-derived
+    /// `rt:<local-as>:<vni>` (RFC 7432 §7.10.1).
+    #[serde(default, rename = "rt-import")]
+    pub rt_import: Vec<String>,
+    /// Route Targets to attach on export. Defaults like `rt-import`.
+    #[serde(default, rename = "rt-export")]
+    pub rt_export: Vec<String>,
+    /// Local MACs to advertise as type-2 MAC/IP routes, each as
+    /// `aa:bb:cc:dd:ee:ff` or `aa:bb:cc:dd:ee:ff/ip` (the IP feeds remote
+    /// ARP/ND suppression). Dynamic learning arrives with the fabric bridge;
+    /// static entries serve gateways and smoke tests.
+    #[serde(default, rename = "advertise-mac")]
+    pub advertise_mac: Vec<String>,
 }
 
 /// A BMP monitoring station to stream BGP state to (`[bgp.bmp]`, RFC 7854). Wren
@@ -678,6 +725,11 @@ pub struct BgpNeighbor {
     /// Defaults to false.
     #[serde(default, rename = "extended-nexthop")]
     pub extended_nexthop: bool,
+    /// Negotiate the EVPN address family (AFI 25 / SAFI 70, RFC 7432) with this
+    /// neighbour: exchange EVPN routes for the instances configured under
+    /// `[bgp.evpn]`. Defaults to false.
+    #[serde(default)]
+    pub evpn: bool,
     /// Inbound route policy: the name of a `[[filter]]` applied to every route received
     /// from this neighbour before it enters the RIB (an import route-map). Reject drops
     /// the route; accept admits it, with any set-metric (→MED), set-preference
