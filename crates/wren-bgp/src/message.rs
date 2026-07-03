@@ -463,10 +463,12 @@ fn decode_update(body: &[u8], four_octet: bool, add_path: AddPath) -> Result<Upd
     let ap = add_path.ipv4_unicast;
     let wlen = u16::from_be_bytes([body[0], body[1]]) as usize;
     let mut off = 2;
+    // A Withdrawn-Routes-Length that overruns the message is a framing error that
+    // leaves the NLRI boundary undeterminable — RFC 7606 §4 keeps this session-fatal.
     if body.len() < off + wlen {
         return Err(DecodeError::Malformed);
     }
-    let (withdrawn, withdrawn_path_ids) = decode_prefixes(&body[off..off + wlen], ap)?;
+    let (mut withdrawn, mut withdrawn_path_ids) = decode_prefixes(&body[off..off + wlen], ap)?;
     off += wlen;
 
     if body.len() < off + 2 {
@@ -474,13 +476,39 @@ fn decode_update(body: &[u8], four_octet: bool, add_path: AddPath) -> Result<Upd
     }
     let alen = u16::from_be_bytes([body[off], body[off + 1]]) as usize;
     off += 2;
+    // Likewise, a Total-Path-Attribute-Length that overruns the message is framing-
+    // fatal (RFC 7606 §4): without it we cannot find where the NLRI begins.
     if body.len() < off + alen {
         return Err(DecodeError::Malformed);
     }
-    let attributes = decode_attributes(&body[off..off + alen], four_octet)?;
+    let attr_bytes = &body[off..off + alen];
     off += alen;
-
+    // The NLRI boundary is fixed by `alen` regardless of any error *inside* the
+    // attribute block, so the NLRI is always decodable here. A malformed NLRI field
+    // itself, however, is framing-fatal (we cannot tell what to withdraw).
     let (nlri, nlri_path_ids) = decode_prefixes(&body[off..], ap)?;
+
+    // RFC 7606 "treat-as-withdraw": rather than reset the session, a semantically
+    // broken UPDATE has its advertised NLRI withdrawn. This applies when a path
+    // attribute fails to decode (a single malformed optional attribute must not tear
+    // the session down) or when a mandatory well-known attribute is missing from an
+    // UPDATE that carries NLRI (RFC 4271 §5 mandates ORIGIN, AS_PATH and NEXT_HOP).
+    let attributes = match decode_attributes(attr_bytes, four_octet) {
+        Ok(attrs) if nlri.is_empty() || has_mandatory_attributes(&attrs) => attrs,
+        _ => {
+            // Fold the NLRI into the withdrawn set and drop the attributes.
+            withdrawn.extend(nlri);
+            withdrawn_path_ids.extend(nlri_path_ids);
+            return Ok(Update {
+                withdrawn,
+                attributes: Vec::new(),
+                nlri: Vec::new(),
+                nlri_path_ids: Vec::new(),
+                withdrawn_path_ids,
+            });
+        }
+    };
+
     Ok(Update {
         withdrawn,
         attributes,
@@ -488,6 +516,24 @@ fn decode_update(body: &[u8], four_octet: bool, add_path: AddPath) -> Result<Upd
         nlri_path_ids,
         withdrawn_path_ids,
     })
+}
+
+/// Whether the well-known mandatory attributes required for a NLRI-bearing IPv4
+/// UPDATE are all present (RFC 4271 §5: ORIGIN, AS_PATH, NEXT_HOP). Their absence
+/// triggers RFC 7606 treat-as-withdraw rather than a session reset.
+fn has_mandatory_attributes(attrs: &[PathAttribute]) -> bool {
+    let mut origin = false;
+    let mut as_path = false;
+    let mut next_hop = false;
+    for a in attrs {
+        match a {
+            PathAttribute::Origin(_) => origin = true,
+            PathAttribute::AsPath(_) => as_path = true,
+            PathAttribute::NextHop(_) => next_hop = true,
+            _ => {}
+        }
+    }
+    origin && as_path && next_hop
 }
 
 /// Decode a run of NLRI prefixes (IPv4 base NLRI). With `add_path`, each prefix is
@@ -571,6 +617,81 @@ mod tests {
         let bytes = Message::Keepalive.encode(true, AddPath::NONE);
         assert_eq!(bytes.len(), HEADER_LEN);
         roundtrip(Message::Keepalive);
+    }
+
+    /// Frame an UPDATE `body` (everything after the message type octet) into a full
+    /// BGP message: marker + total-length + type(2) + body.
+    fn frame_update(body: &[u8]) -> Vec<u8> {
+        let mut m = Vec::with_capacity(HEADER_LEN + body.len());
+        m.extend_from_slice(&MARKER);
+        m.extend_from_slice(&((HEADER_LEN + body.len()) as u16).to_be_bytes());
+        m.push(2); // UPDATE
+        m.extend_from_slice(body);
+        m
+    }
+
+    /// Assemble an UPDATE body from an attribute block and one IPv4 NLRI prefix
+    /// (10.0.0.0/24), with no withdrawn routes.
+    fn update_body(attrs: &[u8]) -> Vec<u8> {
+        let mut body = vec![0, 0]; // Withdrawn Routes Length = 0
+        body.extend_from_slice(&(attrs.len() as u16).to_be_bytes());
+        body.extend_from_slice(attrs);
+        body.extend_from_slice(&[24, 10, 0, 0]); // NLRI 10.0.0.0/24
+        body
+    }
+
+    #[test]
+    fn malformed_optional_attribute_treats_update_as_withdraw() {
+        // A syntactically-valid path (ORIGIN, AS_PATH, NEXT_HOP) plus a *malformed*
+        // optional MED (length 3, but MED must be 4 octets). RFC 7606: this must not
+        // reset the session — the UPDATE's NLRI is withdrawn instead.
+        let mut attrs = Vec::new();
+        PathAttribute::Origin(Origin::Igp).encode(&mut attrs, true);
+        PathAttribute::AsPath(vec![AsPathSegment::Sequence(vec![65001])]).encode(&mut attrs, true);
+        PathAttribute::NextHop(ip([10, 0, 0, 1])).encode(&mut attrs, true);
+        attrs.extend_from_slice(&[0x80, 4, 3, 0, 0, 0]); // MED: optional, type 4, len 3
+
+        let msg = frame_update(&update_body(&attrs));
+        let decoded = Message::decode(&msg, true, AddPath::NONE).expect("decodes, not a reset");
+        let Message::Update(u) = decoded else { panic!("expected UPDATE") };
+        assert_eq!(u.withdrawn, vec![p("10.0.0.0/24")], "NLRI must be withdrawn");
+        assert!(u.nlri.is_empty(), "no NLRI is advertised");
+        assert!(u.attributes.is_empty(), "attributes are dropped on treat-as-withdraw");
+    }
+
+    #[test]
+    fn missing_mandatory_attribute_treats_update_as_withdraw() {
+        // ORIGIN + NEXT_HOP present but AS_PATH missing, with NLRI: a well-known
+        // mandatory attribute is absent, so RFC 7606 treat-as-withdraw applies rather
+        // than a NOTIFICATION/reset.
+        let mut attrs = Vec::new();
+        PathAttribute::Origin(Origin::Igp).encode(&mut attrs, true);
+        PathAttribute::NextHop(ip([10, 0, 0, 1])).encode(&mut attrs, true);
+
+        let msg = frame_update(&update_body(&attrs));
+        let decoded = Message::decode(&msg, true, AddPath::NONE).expect("decodes, not a reset");
+        let Message::Update(u) = decoded else { panic!("expected UPDATE") };
+        assert_eq!(u.withdrawn, vec![p("10.0.0.0/24")], "NLRI must be withdrawn");
+        assert!(u.nlri.is_empty());
+        assert!(u.attributes.is_empty());
+    }
+
+    #[test]
+    fn well_formed_update_still_decodes_normally() {
+        // The treat-as-withdraw path must not disturb a valid UPDATE: all mandatory
+        // attributes present and well-formed → the NLRI is advertised as usual.
+        let mut attrs = Vec::new();
+        PathAttribute::Origin(Origin::Igp).encode(&mut attrs, true);
+        PathAttribute::AsPath(vec![AsPathSegment::Sequence(vec![65001])]).encode(&mut attrs, true);
+        PathAttribute::NextHop(ip([10, 0, 0, 1])).encode(&mut attrs, true);
+
+        let msg = frame_update(&update_body(&attrs));
+        let Message::Update(u) = Message::decode(&msg, true, AddPath::NONE).expect("decodes") else {
+            panic!("expected UPDATE")
+        };
+        assert_eq!(u.nlri, vec![p("10.0.0.0/24")], "NLRI is advertised");
+        assert!(u.withdrawn.is_empty(), "nothing withdrawn");
+        assert_eq!(u.attributes.len(), 3);
     }
 
     #[test]

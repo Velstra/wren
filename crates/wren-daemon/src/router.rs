@@ -25,6 +25,14 @@ use wren_filter::{Decision, Filter};
 /// lingering until its next independent change (review finding M8).
 const FIB_RECONCILE_INTERVAL: Duration = Duration::from_secs(15);
 
+/// Upper bound on how many queued protocol updates the router folds into the RIB
+/// before it programs the forwarding plane. During a flap storm many updates for the
+/// same prefixes pile up in the channel; draining them into the RIB first and then
+/// writing only the *net* best-path change per prefix once collapses N blocking
+/// netlink round-trips into one (review finding M7). The bound caps worst-case
+/// latency: anything beyond it is programmed on the next loop iteration.
+const MAX_COALESCE_BATCH: usize = 1024;
+
 /// Per-protocol import filters: applied to each route a protocol announces before
 /// it enters the RIB. A protocol with no entry imports everything unchanged.
 pub type ImportFilters = HashMap<Protocol, Filter>;
@@ -202,13 +210,33 @@ pub async fn run(
     loop {
         tokio::select! {
             update = updates.recv() => match update {
-                Some(update) => {
-                    // Apply the update to the RIB/FIB; if the best path changed,
-                    // fan that change out to the redistribution targets.
-                    if let Some(event) = apply(
-                        rib, fib, update, imports, fib_export,
-                        &mut exported, &mut subscribers, &mut failed,
-                    ) {
+                Some(first) => {
+                    // Coalesce a burst: fold this update and every other one already
+                    // waiting in the channel into the RIB, keeping only the net
+                    // best-path change per prefix (last write wins — each RIB change
+                    // carries the absolute new best, so the last one is the desired
+                    // state). Then program the forwarding plane once per prefix. In
+                    // steady state `try_recv` returns empty immediately, so a lone
+                    // update behaves exactly as before with no added latency.
+                    let mut coalesced: BTreeMap<(u32, Prefix), FibChange> = BTreeMap::new();
+                    if let Some(change) = ingest(rib, first, imports) {
+                        coalesced.insert(fib_key(&change), change);
+                    }
+                    let mut drained = 0;
+                    while drained < MAX_COALESCE_BATCH {
+                        match updates.try_recv() {
+                            Ok(u) => {
+                                drained += 1;
+                                if let Some(change) = ingest(rib, u, imports) {
+                                    coalesced.insert(fib_key(&change), change);
+                                }
+                            }
+                            Err(_) => break, // channel empty (or closed — recv() catches close)
+                        }
+                    }
+                    for (_key, change) in coalesced {
+                        let event = redist_event(&change);
+                        program_fib(fib, change, fib_export, &mut exported, &mut subscribers, &mut failed);
                         redistribute(redist, &event).await;
                     }
                 }
@@ -436,18 +464,12 @@ pub fn render_routes(rib: &Rib, protocol: Option<Protocol>) -> String {
 /// for the same `(prefix, protocol, source)` is withdrawn, so re-announcing a
 /// now-rejected route cannot leave a stale entry behind. The resulting best-path
 /// change is then run through the FIB **export** filter before programming.
-#[allow(clippy::too_many_arguments)] // the router threads every cross-cutting input through
-fn apply(
-    rib: &mut Rib,
-    fib: &mut dyn Fib,
-    update: RouteUpdate,
-    imports: &ImportFilters,
-    fib_export: Option<&Filter>,
-    exported: &mut BTreeMap<(u32, Prefix), Route>,
-    subscribers: &mut Vec<mpsc::Sender<RouteEvent>>,
-    failed: &mut BTreeSet<(u32, Prefix)>,
-) -> Option<RedistEvent> {
-    let change = match update {
+/// Fold one protocol update into the RIB, returning the resulting best-path change
+/// (or `None` if the installed best route did not change). This is the RIB half of
+/// the pipeline, split out from FIB programming so a burst of updates can be folded
+/// into the RIB first and programmed once per prefix (see [`run`]'s coalescing).
+fn ingest(rib: &mut Rib, update: RouteUpdate, imports: &ImportFilters) -> Option<FibChange> {
+    match update {
         RouteUpdate::Announce(route) => {
             let (table, prefix, protocol, source) =
                 (route.table, route.prefix, route.protocol, route.source);
@@ -467,17 +489,44 @@ fn apply(
             protocol,
             source,
         } => rib.withdraw(table, prefix, protocol, source),
-    };
+    }
+}
 
-    let change = change?; // the installed best route did not change
+/// The `(table, prefix)` a best-path change is keyed by — the coalescing key.
+fn fib_key(change: &FibChange) -> (u32, Prefix) {
+    match change {
+        FibChange::Install(route) => (route.table, route.prefix),
+        FibChange::Remove { table, prefix } => (*table, *prefix),
+    }
+}
 
-    // Capture the best-path change for redistribution before the FIB side of the
-    // story (connected routes and export-rejected routes are still redistributed,
-    // even though they are not programmed into the kernel here).
-    let event = match &change {
+/// The redistribution event a best-path change produces (connected and export-
+/// rejected routes are still redistributed even though they are not programmed).
+fn redist_event(change: &FibChange) -> RedistEvent {
+    match change {
         FibChange::Install(route) => RedistEvent::Changed(route.clone()),
         FibChange::Remove { prefix, .. } => RedistEvent::Gone(*prefix),
-    };
+    }
+}
+
+/// Fold one protocol update into the RIB and, if the best path changed, program the
+/// forwarding plane and return the redistribution event. Retained for the unit tests
+/// (which drive one update at a time); [`run`] uses [`ingest`] + [`program_fib`]
+/// directly so it can coalesce a burst.
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)] // the router threads every cross-cutting input through
+fn apply(
+    rib: &mut Rib,
+    fib: &mut dyn Fib,
+    update: RouteUpdate,
+    imports: &ImportFilters,
+    fib_export: Option<&Filter>,
+    exported: &mut BTreeMap<(u32, Prefix), Route>,
+    subscribers: &mut Vec<mpsc::Sender<RouteEvent>>,
+    failed: &mut BTreeSet<(u32, Prefix)>,
+) -> Option<RedistEvent> {
+    let change = ingest(rib, update, imports)?;
+    let event = redist_event(&change);
     program_fib(fib, change, fib_export, exported, subscribers, failed);
     Some(event)
 }
@@ -1102,5 +1151,52 @@ mod tests {
         retry_failed(&rib, &mut fib, None, &mut exported, &mut subs, &mut failed);
         assert!(failed.is_empty(), "vanished prefix must leave the retry queue");
         assert!(fib.installed.is_empty());
+    }
+
+    /// A [`Fib`] that counts install writes — to prove a coalesced burst hits the
+    /// forwarding plane once, not once per intermediate best-path change.
+    #[derive(Default)]
+    struct CountingFib {
+        inner: MemoryFib,
+        installs: u32,
+    }
+
+    impl Fib for CountingFib {
+        fn apply(&mut self, change: &FibChange) -> Result<(), wren_core::FibError> {
+            if matches!(change, FibChange::Install(_)) {
+                self.installs += 1;
+            }
+            self.inner.apply(change)
+        }
+    }
+
+    #[test]
+    fn coalescing_collapses_a_prefix_burst_into_one_fib_write() {
+        // Three announces for the same prefix, each strictly better (lower metric):
+        // driven one at a time this is three FIB installs; coalesced as run() does,
+        // it is a single install of the final best path (M7).
+        let mut rib = Rib::new();
+        let mut fib = CountingFib::default();
+        let mut exported = BTreeMap::new();
+        let mut subs = Vec::new();
+        let mut failed = BTreeSet::new();
+        let imports = ImportFilters::new();
+
+        // Fold the whole burst into the RIB first, keeping the net change per prefix.
+        let mut coalesced: BTreeMap<(u32, Prefix), FibChange> = BTreeMap::new();
+        for metric in [30, 20, 10] {
+            if let Some(change) = ingest(&mut rib, RouteUpdate::Announce(bgp_route("203.0.113.0/24", metric)), &imports) {
+                coalesced.insert(fib_key(&change), change);
+            }
+        }
+        // Each better metric changed the best path, so the RIB produced three changes…
+        // …but they collapse onto one prefix key.
+        assert_eq!(coalesced.len(), 1, "one prefix → one coalesced change");
+        for (_k, change) in coalesced {
+            program_fib(&mut fib, change, None, &mut exported, &mut subs, &mut failed);
+        }
+        assert_eq!(fib.installs, 1, "the burst became a single FIB write");
+        let key = (wren_core::RT_TABLE_MAIN, "203.0.113.0/24".parse().unwrap());
+        assert_eq!(fib.inner.installed.get(&key).unwrap().metric, 10, "final best path installed");
     }
 }
