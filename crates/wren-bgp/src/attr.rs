@@ -20,6 +20,7 @@ use std::net::Ipv4Addr;
 use wren_core::Prefix;
 
 use crate::evpn::{decode_evpn_nlris, encode_evpn_nlri, EvpnNlri, AFI_L2VPN, SAFI_EVPN};
+use crate::srv6::{decode_prefix_sid, encode_srv6_service_tlv, Srv6ServiceTlv};
 use crate::{as_trans_fit, decode_prefix, decode_prefix_v6, encode_prefix_any, AFI_IPV6};
 
 /// Attribute flag: the attribute is optional (vs. well-known).
@@ -243,6 +244,17 @@ pub enum PathAttribute {
         /// The BGP identifier of the aggregating router.
         id: Ipv4Addr,
     },
+    /// BGP Prefix-SID (type 40, optional transitive) — carries Segment Routing
+    /// SIDs for a route (RFC 8669 / RFC 9252). We model the SRv6 L2/L3 Service
+    /// TLVs (the overlay service SIDs) and keep any other top-level TLV verbatim
+    /// so a route reflector re-advertises it intact.
+    PrefixSid {
+        /// The SRv6 Service TLVs (L2 = type 6, L3 = type 5).
+        srv6: Vec<Srv6ServiceTlv>,
+        /// Top-level TLVs we don't model (e.g. MPLS-SR Label-Index / SRGB),
+        /// preserved as `(type, value)` for faithful re-advertisement.
+        other: Vec<(u8, Vec<u8>)>,
+    },
     /// An attribute type this implementation does not model, kept verbatim.
     Unknown {
         /// The original attribute flags.
@@ -271,6 +283,7 @@ impl PathAttribute {
     const AS4_PATH: u8 = 17;
     const AS4_AGGREGATOR: u8 = 18;
     const LARGE_COMMUNITIES: u8 = 32;
+    const PREFIX_SID: u8 = 40;
 
     /// The attribute type code.
     pub fn type_code(&self) -> u8 {
@@ -295,6 +308,7 @@ impl PathAttribute {
             PathAttribute::LargeCommunities(_) => Self::LARGE_COMMUNITIES,
             PathAttribute::As4Path(_) => Self::AS4_PATH,
             PathAttribute::As4Aggregator { .. } => Self::AS4_AGGREGATOR,
+            PathAttribute::PrefixSid { .. } => Self::PREFIX_SID,
             PathAttribute::Unknown { type_code, .. } => *type_code,
         }
     }
@@ -315,7 +329,8 @@ impl PathAttribute {
             | PathAttribute::ExtendedCommunities(_)
             | PathAttribute::LargeCommunities(_)
             | PathAttribute::As4Path(_)
-            | PathAttribute::As4Aggregator { .. } => FLAG_OPTIONAL | FLAG_TRANSITIVE,
+            | PathAttribute::As4Aggregator { .. }
+            | PathAttribute::PrefixSid { .. } => FLAG_OPTIONAL | FLAG_TRANSITIVE,
             PathAttribute::Unknown { flags, .. } => *flags,
             _ => FLAG_TRANSITIVE,
         }
@@ -408,6 +423,16 @@ impl PathAttribute {
             PathAttribute::As4Aggregator { asn, id } => {
                 out.extend_from_slice(&asn.to_be_bytes());
                 out.extend_from_slice(&id.octets());
+            }
+            PathAttribute::PrefixSid { srv6, other } => {
+                for tlv in srv6 {
+                    encode_srv6_service_tlv(out, tlv);
+                }
+                for (t, v) in other {
+                    out.push(*t);
+                    out.extend_from_slice(&(v.len() as u16).to_be_bytes());
+                    out.extend_from_slice(v);
+                }
             }
             PathAttribute::Unknown { value, .. } => out.extend_from_slice(value),
         }
@@ -572,6 +597,16 @@ impl PathAttribute {
                 let (asn, id) = decode_aggregator(value, true)?;
                 PathAttribute::As4Aggregator { asn, id }
             }
+            Self::PREFIX_SID => match decode_prefix_sid(value) {
+                Some((srv6, other)) => PathAttribute::PrefixSid { srv6, other },
+                // A malformed Prefix-SID is optional-transitive: keep it opaque
+                // (RFC 7606 attribute-discard) rather than failing the UPDATE.
+                None => PathAttribute::Unknown {
+                    flags,
+                    type_code,
+                    value: value.to_vec(),
+                },
+            },
             _ => PathAttribute::Unknown {
                 flags,
                 type_code,
@@ -742,6 +777,25 @@ mod tests {
     fn roundtrip(attr: PathAttribute) {
         roundtrip_w(attr.clone(), true);
         roundtrip_w(attr, false);
+    }
+
+    #[test]
+    fn prefix_sid_srv6_roundtrips() {
+        use crate::srv6::{behavior, build_service_sid, Srv6ServiceSid, Srv6ServiceTlv};
+        let (sid, structure) = build_service_sid("fc00:0:1::".parse().unwrap(), 48, 0, 10100);
+        let attr = PathAttribute::PrefixSid {
+            srv6: vec![Srv6ServiceTlv {
+                is_l2: true,
+                sids: vec![Srv6ServiceSid {
+                    sid,
+                    behavior: behavior::END_DT2U,
+                    flags: 0,
+                    structure,
+                }],
+            }],
+            other: vec![(3u8, vec![0u8; 5])],
+        };
+        roundtrip(attr);
     }
 
     #[test]

@@ -19,14 +19,14 @@ mod bmp;
 mod connected;
 mod control;
 mod fib;
-mod metrics;
-mod query;
 #[cfg(feature = "isis")]
 mod isis;
+mod metrics;
 #[cfg(feature = "ospf")]
 mod ospf;
 #[cfg(feature = "ospf3")]
 mod ospf3;
+mod query;
 #[cfg(feature = "rip")]
 mod rip;
 #[cfg(feature = "rip")]
@@ -107,6 +107,15 @@ enum Command {
         #[arg(trailing_var_arg = true)]
         args: Vec<String>,
     },
+    /// Run an EVPN action on a running wren daemon, e.g. `wren evpn advertise 100
+    /// aa:bb:cc:dd:ee:ff 10.0.0.5` to dynamically originate a type-2 MAC/IP route
+    /// (or `evpn withdraw …` to remove it). The write-side counterpart to `monitor
+    /// evpn`; the fabric datapath calls this as it learns/ages local MACs.
+    Evpn {
+        /// The action words, e.g. `advertise 100 aa:bb:cc:dd:ee:ff 10.0.0.5`.
+        #[arg(trailing_var_arg = true)]
+        args: Vec<String>,
+    },
     /// Stream the forwarding table from a running wren daemon as it changes
     /// (`wren monitor routes`): an initial snapshot followed by live route
     /// install/withdraw events. The FPM-style feed an external forwarding plane
@@ -151,6 +160,10 @@ async fn main() -> Result<()> {
     }
     if let Some(Command::Bgp { args: words }) = &args.command {
         let command = format!("bgp {}", words.join(" "));
+        return control::run_client(&args.socket, command.trim()).await;
+    }
+    if let Some(Command::Evpn { args: words }) = &args.command {
+        let command = format!("evpn {}", words.join(" "));
         return control::run_client(&args.socket, command.trim()).await;
     }
     // Monitor mode: open a long-lived route-export stream and print events as they
@@ -259,7 +272,9 @@ async fn main() -> Result<()> {
             if let FibChange::Install(best) = &change {
                 // The export route-map may drop it (kept in the RIB, off the FIB).
                 if let Some(best) = vrf_routemap(&vrf_exports, best.clone()) {
-                    fib.apply(FibChange::Install(best)).await.map_err(|e| anyhow::anyhow!(e))?;
+                    fib.apply(FibChange::Install(best))
+                        .await
+                        .map_err(|e| anyhow::anyhow!(e))?;
                     installed += 1;
                 }
             } else {
@@ -367,10 +382,25 @@ async fn main() -> Result<()> {
         let echo = bfd_echo_config(cfg.bfd.as_ref());
         let rrx = bfd_register_rx.take().expect("bfd register rx taken once");
         let bqrx = bfd_queries_rx.take().expect("bfd queries rx taken once");
-        info!(auth = auth.is_some(), echo = echo.is_some(), "BFD engine starting");
+        info!(
+            auth = auth.is_some(),
+            echo = echo.is_some(),
+            "BFD engine starting"
+        );
         let sd = shutdown_tx.subscribe();
         proto_handles.push(tokio::spawn(async move {
-            if let Err(e) = bfd::run(bfd::BfdConfig { session, auth, echo }, rrx, bqrx, sd).await {
+            if let Err(e) = bfd::run(
+                bfd::BfdConfig {
+                    session,
+                    auth,
+                    echo,
+                },
+                rrx,
+                bqrx,
+                sd,
+            )
+            .await
+            {
                 error!(error = %e, "BFD engine stopped");
             }
         }));
@@ -515,8 +545,16 @@ async fn main() -> Result<()> {
         let qrx = rip_queries_rx.take().expect("rip queries rx taken once");
         let sd = shutdown_tx.subscribe();
         proto_handles.push(tokio::spawn(async move {
-            if let Err(e) =
-                rip::run(interfaces, rip_table, tx, redist_rx, redistribute_metric, qrx, sd).await
+            if let Err(e) = rip::run(
+                interfaces,
+                rip_table,
+                tx,
+                redist_rx,
+                redistribute_metric,
+                qrx,
+                sd,
+            )
+            .await
             {
                 error!(error = %e, "RIP engine stopped");
             }
@@ -542,7 +580,10 @@ async fn main() -> Result<()> {
             redist_tx,
         ) {
             Ok(Some(target)) => {
-                info!(sources = target.sources.len(), "RIPng redistribution active");
+                info!(
+                    sources = target.sources.len(),
+                    "RIPng redistribution active"
+                );
                 redist_targets.push(target);
             }
             Ok(None) => {}
@@ -551,10 +592,14 @@ async fn main() -> Result<()> {
         let redistribute_metric = ripngcfg.redistribute_metric.unwrap_or(1);
         let interfaces = ripngcfg.interfaces.clone();
         let tx = updates_tx.clone();
-        let qrx = ripng_queries_rx.take().expect("ripng queries rx taken once");
+        let qrx = ripng_queries_rx
+            .take()
+            .expect("ripng queries rx taken once");
         let sd = shutdown_tx.subscribe();
         proto_handles.push(tokio::spawn(async move {
-            if let Err(e) = ripng::run(interfaces, tx, redist_rx, redistribute_metric, qrx, sd).await {
+            if let Err(e) =
+                ripng::run(interfaces, tx, redist_rx, redistribute_metric, qrx, sd).await
+            {
                 error!(error = %e, "RIPng engine stopped");
             }
         }));
@@ -617,7 +662,9 @@ async fn main() -> Result<()> {
                     warn!("OSPFv3 is enabled but the backend is in-memory — learned routes will not be installed in the kernel");
                 }
                 let tx = updates_tx.clone();
-                let qrx = ospf3_queries_rx.take().expect("ospf3 queries rx taken once");
+                let qrx = ospf3_queries_rx
+                    .take()
+                    .expect("ospf3 queries rx taken once");
                 // BFD (RFC 5880) plumbing: the engine registration channel, OSPFv3's
                 // own notify channel, and the down channel the engine reports failures
                 // on. Inert unless `[ospf3] bfd` is set.
@@ -666,7 +713,10 @@ async fn main() -> Result<()> {
                 if let Some(rtrcfg) = bgpcfg.rtr.as_ref() {
                     match rtrcfg.server.parse::<std::net::SocketAddr>() {
                         Ok(server) => {
-                            let rtr_run = rtr::RtrConfig { server, refresh: rtrcfg.refresh };
+                            let rtr_run = rtr::RtrConfig {
+                                server,
+                                refresh: rtrcfg.refresh,
+                            };
                             let roas_tx = rtr_tx.clone();
                             info!(%server, "RTR client starting");
                             tokio::spawn(async move { rtr::run(rtr_run, roas_tx).await });
@@ -687,12 +737,22 @@ async fn main() -> Result<()> {
                                 .sys_name
                                 .clone()
                                 .unwrap_or_else(|| run_cfg.router_id.to_string());
-                            let sys_descr =
-                                bmpcfg.sys_descr.clone().unwrap_or_else(|| "wren".to_string());
+                            let sys_descr = bmpcfg
+                                .sys_descr
+                                .clone()
+                                .unwrap_or_else(|| "wren".to_string());
                             let brx = bmp_rx.take().expect("bmp rx taken once");
                             info!(%station, "BMP client starting");
                             tokio::spawn(async move {
-                                bmp::run(bmp::BmpConfig { station, sys_name, sys_descr }, brx).await
+                                bmp::run(
+                                    bmp::BmpConfig {
+                                        station,
+                                        sys_name,
+                                        sys_descr,
+                                    },
+                                    brx,
+                                )
+                                .await
                             });
                             Some(bmp_tx.clone())
                         }
@@ -708,11 +768,23 @@ async fn main() -> Result<()> {
                 let qrx = bgp_queries_rx.take().expect("bgp queries rx taken once");
                 let rrx = rtr_rx.take().expect("rtr rx taken once");
                 let bdrx = bfd_down_rx.take().expect("bfd down rx taken once");
-                let esrx = evpn_subscribe_rx.take().expect("evpn subscribe rx taken once");
+                let esrx = evpn_subscribe_rx
+                    .take()
+                    .expect("evpn subscribe rx taken once");
                 let sd = shutdown_tx.subscribe();
                 proto_handles.push(tokio::spawn(async move {
-                    if let Err(e) =
-                        bgp::run(run_cfg, tx, qrx, redist_rx, rrx, bmp_for_engine, bdrx, esrx, sd).await
+                    if let Err(e) = bgp::run(
+                        run_cfg,
+                        tx,
+                        qrx,
+                        redist_rx,
+                        rrx,
+                        bmp_for_engine,
+                        bdrx,
+                        esrx,
+                        sd,
+                    )
+                    .await
                     {
                         error!(error = %e, "BGP engine stopped");
                     }
@@ -750,7 +822,9 @@ async fn main() -> Result<()> {
                                 })
                                 .await;
                         }
-                        Err(e) => warn!(error = %e, "skipping BFD for an unparsable neighbour address"),
+                        Err(e) => {
+                            warn!(error = %e, "skipping BFD for an unparsable neighbour address")
+                        }
                     }
                 }
             }
@@ -779,14 +853,19 @@ async fn main() -> Result<()> {
                     redist_tx,
                 ) {
                     Ok(Some(target)) => {
-                        info!(sources = target.sources.len(), "Babel redistribution active");
+                        info!(
+                            sources = target.sources.len(),
+                            "Babel redistribution active"
+                        );
                         redist_targets.push(target);
                     }
                     Ok(None) => {}
                     Err(e) => error!(error = %e, "Babel redistribution not configured"),
                 }
                 let tx = updates_tx.clone();
-                let qrx = babel_queries_rx.take().expect("babel queries rx taken once");
+                let qrx = babel_queries_rx
+                    .take()
+                    .expect("babel queries rx taken once");
                 let sd = shutdown_tx.subscribe();
                 proto_handles.push(tokio::spawn(async move {
                     if let Err(e) = babel::run(run_cfg, tx, redist_rx, qrx, sd).await {
@@ -819,7 +898,10 @@ async fn main() -> Result<()> {
                     redist_tx,
                 ) {
                     Ok(Some(target)) => {
-                        info!(sources = target.sources.len(), "IS-IS redistribution active");
+                        info!(
+                            sources = target.sources.len(),
+                            "IS-IS redistribution active"
+                        );
                         redist_targets.push(target);
                     }
                     Ok(None) => {}
@@ -835,7 +917,9 @@ async fn main() -> Result<()> {
                 let bdrx = isis_bfd_rx.take().expect("isis bfd rx taken once");
                 let sd = shutdown_tx.subscribe();
                 proto_handles.push(tokio::spawn(async move {
-                    if let Err(e) = isis::run(run_cfg, tx, redist_rx, qrx, breg, bnotify, bdrx, sd).await {
+                    if let Err(e) =
+                        isis::run(run_cfg, tx, redist_rx, qrx, breg, bnotify, bdrx, sd).await
+                    {
                         error!(error = %e, "IS-IS engine stopped");
                     }
                 }));
@@ -941,9 +1025,14 @@ fn build_ospf_config(
         Vec::new()
     };
     // Parse a list of area ids (dotted quads) into a set.
-    let parse_areas = |list: &[String], what: &str| -> Result<std::collections::HashSet<Ipv4Addr>> {
+    let parse_areas = |list: &[String],
+                       what: &str|
+     -> Result<std::collections::HashSet<Ipv4Addr>> {
         list.iter()
-            .map(|a| a.parse().with_context(|| format!("ospf {what} must be a dotted quad, e.g. \"1.0.0.0\"")))
+            .map(|a| {
+                a.parse()
+                    .with_context(|| format!("ospf {what} must be a dotted quad, e.g. \"1.0.0.0\""))
+            })
             .collect()
     };
     // Stub areas (RFC 2328 §3.6), plus the totally-stubby ("no-summary") subset,
@@ -1013,7 +1102,9 @@ fn build_ospf_auth(ospf: &wren_config::Ospf) -> Result<wren_ospf::packet::Auth> 
                 .filter(|k| !k.is_empty())
                 .context("ospf auth-type \"text\" requires a non-empty auth-key")?;
             if key.len() > 8 {
-                anyhow::bail!("ospf simple-password auth-key must be at most 8 bytes (RFC 2328 §D)");
+                anyhow::bail!(
+                    "ospf simple-password auth-key must be at most 8 bytes (RFC 2328 §D)"
+                );
             }
             Ok(Auth::Simple(key.as_bytes().to_vec()))
         }
@@ -1129,8 +1220,9 @@ fn parse_neighbor_addr(s: &str) -> Result<(std::net::IpAddr, Option<u32>)> {
         .with_context(|| format!("bgp neighbor address {s:?} must be an IP address"))?;
     let scope_id = match scope {
         Some(ifname) => {
-            let cstr = std::ffi::CString::new(ifname)
-                .with_context(|| format!("bgp neighbor interface {ifname:?} is not a valid name"))?;
+            let cstr = std::ffi::CString::new(ifname).with_context(|| {
+                format!("bgp neighbor interface {ifname:?} is not a valid name")
+            })?;
             // SAFETY: `cstr` is a valid NUL-terminated C string; if_nametoindex reads it.
             let idx = unsafe { libc::if_nametoindex(cstr.as_ptr()) };
             if idx == 0 {
@@ -1181,7 +1273,10 @@ fn bfd_echo_config(bfd: Option<&wren_config::Bfd>) -> Option<bfd::EchoParams> {
 /// Run a route through a VRF route-map: `None` if the route is in the default VRF or
 /// the VRF has no such route-map; otherwise the filter's verdict (rewritten route on
 /// accept, dropped on reject). Returns `Some(route)` to keep it, `None` to drop it.
-fn vrf_routemap(maps: &std::collections::HashMap<u32, Filter>, route: wren_core::Route) -> Option<wren_core::Route> {
+fn vrf_routemap(
+    maps: &std::collections::HashMap<u32, Filter>,
+    route: wren_core::Route,
+) -> Option<wren_core::Route> {
     match maps.get(&route.table) {
         Some(filter) => match filter.apply(&route) {
             Decision::Accept(r) => Some(r),
@@ -1197,7 +1292,10 @@ fn vrf_routemap(maps: &std::collections::HashMap<u32, Filter>, route: wren_core:
 fn build_vrf_routemaps(
     cfg: &wren_config::Config,
     by_name: &std::collections::HashMap<String, Filter>,
-) -> Result<(std::collections::HashMap<u32, Filter>, std::collections::HashMap<u32, Filter>)> {
+) -> Result<(
+    std::collections::HashMap<u32, Filter>,
+    std::collections::HashMap<u32, Filter>,
+)> {
     let mut imports = std::collections::HashMap::new();
     let mut exports = std::collections::HashMap::new();
     for v in &cfg.vrfs {
@@ -1218,24 +1316,38 @@ fn build_vrf_infos(cfg: &wren_config::Config) -> Result<Vec<router::VrfInfo>> {
     let mut out = Vec::with_capacity(cfg.vrfs.len());
     for v in &cfg.vrfs {
         if !seen.insert(v.table) {
-            anyhow::bail!("vrf {:?}: table {} is used by more than one vrf", v.name, v.table);
+            anyhow::bail!(
+                "vrf {:?}: table {} is used by more than one vrf",
+                v.name,
+                v.table
+            );
         }
         let rd = match &v.rd {
             Some(s) => Some(
                 RouteDistinguisher::parse(s)
-                    .with_context(|| format!("vrf {:?}: invalid route distinguisher {s:?}", v.name))?
+                    .with_context(|| {
+                        format!("vrf {:?}: invalid route distinguisher {s:?}", v.name)
+                    })?
                     .to_string(),
             ),
             None => None,
         };
-        out.push(router::VrfInfo { name: v.name.clone(), table: v.table, rd });
+        out.push(router::VrfInfo {
+            name: v.name.clone(),
+            table: v.table,
+            rd,
+        });
     }
     Ok(out)
 }
 
 fn bfd_auth_config(bfd: Option<&wren_config::Bfd>) -> Result<Option<wren_bfd::AuthConfig>> {
     let Some(bfd) = bfd else { return Ok(None) };
-    resolve_bfd_auth(bfd.auth_type.as_deref(), bfd.auth_key_id, bfd.auth_key.as_deref())
+    resolve_bfd_auth(
+        bfd.auth_type.as_deref(),
+        bfd.auth_key_id,
+        bfd.auth_key.as_deref(),
+    )
 }
 
 /// Resolve a BFD authentication block from its three fields, shared by the global
@@ -1372,7 +1484,10 @@ fn build_bgp_config(
                 agg.prefix
             );
         }
-        aggregates.push(bgp::Aggregate { prefix, summary_only: agg.summary_only });
+        aggregates.push(bgp::Aggregate {
+            prefix,
+            summary_only: agg.summary_only,
+        });
     }
 
     // Static RPKI ROAs (RFC 6811): the Validated ROA Payloads received-route origins
@@ -1393,7 +1508,11 @@ fn build_bgp_config(
                 prefix.max_len()
             );
         }
-        roas.push(wren_bgp::rpki::Roa { prefix, max_length, origin_as: r.origin_as });
+        roas.push(wren_bgp::rpki::Roa {
+            prefix,
+            max_length,
+            origin_as: r.origin_as,
+        });
     }
 
     let next_hop6 = match bgp.next_hop6.as_deref() {
@@ -1414,13 +1533,12 @@ fn build_bgp_config(
 
     let mut communities = Vec::with_capacity(bgp.community.len());
     for c in &bgp.community {
-        communities.push(
-            wren_bgp::community::parse_community(c)
-                .with_context(|| format!("bgp community {c:?} must be asn:value or a well-known name"))?,
-        );
+        communities.push(wren_bgp::community::parse_community(c).with_context(|| {
+            format!("bgp community {c:?} must be asn:value or a well-known name")
+        })?);
     }
-    let large_communities = parse_large_communities(&bgp.large_community)
-        .context("bgp large-community")?;
+    let large_communities =
+        parse_large_communities(&bgp.large_community).context("bgp large-community")?;
     let ext_communities = parse_ext_communities(&bgp.ext_community).context("bgp ext-community")?;
 
     // Confederation (RFC 5065): the Confederation Identifier presented externally,
@@ -1485,7 +1603,9 @@ fn build_evpn_config(
     // The auto-derived Route Target is a 2-octet-AS community, so an AS above 65535
     // cannot be represented — warn where a default RT would be relied on.
     if local_as > u16::MAX as u32
-        && e.instance.iter().any(|i| i.rt_import.is_empty() && i.rt_export.is_empty())
+        && e.instance
+            .iter()
+            .any(|i| i.rt_import.is_empty() && i.rt_export.is_empty())
     {
         warn!(
             "bgp local-as {local_as} exceeds 65535; the auto-derived 2-octet EVPN Route Target truncates it — set explicit rt-import/rt-export"
@@ -1495,21 +1615,34 @@ fn build_evpn_config(
     for inst in &e.instance {
         let rd = match &inst.rd {
             Some(s) => parse_rd(s).with_context(|| {
-                format!("bgp evpn instance {} rd {s:?} must be ip:value or asn:value", inst.evi)
+                format!(
+                    "bgp evpn instance {} rd {s:?} must be ip:value or asn:value",
+                    inst.evi
+                )
             })?,
             None => wren_bgp::evpn::Rd::from_ip(router_id, inst.evi),
         };
         let mut rt_import = Vec::with_capacity(inst.rt_import.len());
         for s in &inst.rt_import {
-            rt_import.push(wren_bgp::ext_community::parse_ext_community(s).with_context(|| {
-                format!("bgp evpn instance {} rt-import {s:?} must be rt:asn:value", inst.evi)
-            })?);
+            rt_import.push(
+                wren_bgp::ext_community::parse_ext_community(s).with_context(|| {
+                    format!(
+                        "bgp evpn instance {} rt-import {s:?} must be rt:asn:value",
+                        inst.evi
+                    )
+                })?,
+            );
         }
         let mut rt_export = Vec::with_capacity(inst.rt_export.len());
         for s in &inst.rt_export {
-            rt_export.push(wren_bgp::ext_community::parse_ext_community(s).with_context(|| {
-                format!("bgp evpn instance {} rt-export {s:?} must be rt:asn:value", inst.evi)
-            })?);
+            rt_export.push(
+                wren_bgp::ext_community::parse_ext_community(s).with_context(|| {
+                    format!(
+                        "bgp evpn instance {} rt-export {s:?} must be rt:asn:value",
+                        inst.evi
+                    )
+                })?,
+            );
         }
         // Default BOTH directions to the auto-derived rt:<local-as>:<vni> only when
         // neither was set (RFC 7432 §7.10.1).
@@ -1534,13 +1667,40 @@ fn build_evpn_config(
             macs,
         });
     }
-    Ok(bgp::EvpnConfig { vtep_ip, instances })
+    // Optional SRv6 locator (RFC 9252): "addr/len", byte-aligned, length 8..=96.
+    let srv6_locator = match &e.srv6_locator {
+        None => None,
+        Some(s) => {
+            let (addr_s, len_s) = s
+                .split_once('/')
+                .with_context(|| format!("bgp evpn srv6-locator {s:?} must be addr/len"))?;
+            let addr: std::net::Ipv6Addr = addr_s.parse().with_context(|| {
+                format!("bgp evpn srv6-locator {s:?} address must be an IPv6 address")
+            })?;
+            let len: u8 = len_s
+                .parse()
+                .with_context(|| format!("bgp evpn srv6-locator {s:?} length must be a number"))?;
+            if len % 8 != 0 || !(8..=96).contains(&len) {
+                anyhow::bail!(
+                    "bgp evpn srv6-locator {s:?}: must be a byte-aligned IPv6 prefix with length 8..=96"
+                );
+            }
+            Some((addr, len))
+        }
+    };
+    Ok(bgp::EvpnConfig {
+        vtep_ip,
+        srv6_locator,
+        instances,
+    })
 }
 
 /// Parse an EVPN Route Distinguisher: `ip:value` (a type-1 `router-id:value` RD) or
 /// `asn:value` (a type-0 2-octet-AS RD), per RFC 4364 §4.2.
 fn parse_rd(s: &str) -> Result<wren_bgp::evpn::Rd> {
-    let (admin, value) = s.split_once(':').context("expected ip:value or asn:value")?;
+    let (admin, value) = s
+        .split_once(':')
+        .context("expected ip:value or asn:value")?;
     if let Ok(ip) = admin.parse::<Ipv4Addr>() {
         let v: u16 = value
             .parse()
@@ -1596,7 +1756,10 @@ fn build_redist_target(
     let mut sources = HashSet::new();
     for name in redistribute {
         let source = protocol_from_name(name).with_context(|| {
-            format!("{} redistribute {name:?} is not a known protocol", protocol.name())
+            format!(
+                "{} redistribute {name:?} is not a known protocol",
+                protocol.name()
+            )
         })?;
         if source == protocol {
             anyhow::bail!("{} cannot redistribute its own routes", protocol.name());
@@ -1922,14 +2085,20 @@ fn build_vrrp_instances(cfg: &wren_config::Config) -> Result<Vec<vrrp::InstanceC
         let mut addresses = Vec::new();
         for a in &def.virtual_addresses {
             let ip: std::net::IpAddr = a.parse().with_context(|| {
-                format!("vrrp vrid {}: virtual-address {a:?} is not an IP address", def.vrid)
+                format!(
+                    "vrrp vrid {}: virtual-address {a:?} is not an IP address",
+                    def.vrid
+                )
             })?;
             addresses.push(ip);
         }
         // Every virtual address of one router must be of the same family.
         let ipv6 = addresses[0].is_ipv6();
         if addresses.iter().any(|a| a.is_ipv6() != ipv6) {
-            anyhow::bail!("vrrp vrid {}: virtual-addresses mix IPv4 and IPv6", def.vrid);
+            anyhow::bail!(
+                "vrrp vrid {}: virtual-addresses mix IPv4 and IPv6",
+                def.vrid
+            );
         }
         let prefix_len = def.prefix_length.unwrap_or(if ipv6 { 64 } else { 24 });
         // Round the interval to centiseconds, clamped to the 12-bit wire field.
@@ -1968,7 +2137,10 @@ mod tests {
         assert_eq!(ip, Some(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 5))));
 
         let (_, ip6) = parse_mac_ip("aa:bb:cc:dd:ee:ff/2001:db8::5").unwrap();
-        assert_eq!(ip6, Some(IpAddr::V6("2001:db8::5".parse::<Ipv6Addr>().unwrap())));
+        assert_eq!(
+            ip6,
+            Some(IpAddr::V6("2001:db8::5".parse::<Ipv6Addr>().unwrap()))
+        );
     }
 
     #[test]

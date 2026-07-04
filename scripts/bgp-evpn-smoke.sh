@@ -76,6 +76,7 @@ passive   = true
 evpn      = true
 [bgp.evpn]
 vtep-ip = "10.0.0.1"
+srv6-locator = "fc00:0:1::/48"
 [[bgp.evpn.instance]]
 evi = 100
 vni = 10100
@@ -96,6 +97,7 @@ passive   = true
 evpn      = true
 [bgp.evpn]
 vtep-ip = "10.0.0.2"
+srv6-locator = "fc00:0:1::/48"
 [[bgp.evpn.instance]]
 evi = 100
 vni = 10100
@@ -165,9 +167,13 @@ unshare -Urn bash -c '
   grep -q "10.0.0.2 AS 65010 Established"         "$WORK/out.txt" || { echo "FAIL: RR-Leaf2 session not Established"; ok=0; }
   grep -q "via 10.0.0.1"                          "$WORK/out.txt" || { echo "FAIL: Leaf2 did not learn Leaf1 EVPN routes (via 10.0.0.1)"; ok=0; }
   grep -q "02:00:5e:00:00:01 -> vtep 10.0.0.1"    "$WORK/out.txt" || { echo "FAIL: Leaf1 MAC not imported into Leaf2 MAC-VRF"; ok=0; }
+  # EVPN-over-SRv6 (RFC 9252): Leaf1s srv6-locator fc00:0:1::/48 yields an End.DT2U
+  # service SID for its MAC (disc 0, vni 10100) that Leaf2 parses and surfaces.
+  grep -Eq "02:00:5e:00:00:01 -> vtep 10.0.0.1 .*srv6 fc00:0:1:0:2774::" "$WORK/out.txt" || { echo "FAIL: Leaf1 MAC missing SRv6 service SID in show evpn"; ok=0; }
   grep -q "02:00:5e:00:00:09 -> vtep 10.0.0.1"    "$WORK/out.txt" || { echo "FAIL: dynamically-advertised Leaf1 MAC (evpn advertise) not imported into Leaf2 MAC-VRF"; ok=0; }
   grep -q "flood -> 10.0.0.1"                      "$WORK/out.txt" || { echo "FAIL: Leaf1 VTEP not in Leaf2 flood set"; ok=0; }
   grep -Eq "\+ evpn vni 10100 mac 02:00:5e:00:00:01 .*vtep 10.0.0.1" "$WORK/out.txt" || { echo "FAIL: monitor evpn did not stream Leaf1 MAC"; ok=0; }
+  grep -Eq "\+ evpn vni 10100 mac 02:00:5e:00:00:01 .*vtep 10.0.0.1 srv6 fc00:0:1:0:2774::" "$WORK/out.txt" || { echo "FAIL: monitor evpn did not carry Leaf1 MAC SRv6 service SID"; ok=0; }
   grep -q "+ evpn vni 10100 flood 10.0.0.1"        "$WORK/out.txt" || { echo "FAIL: monitor evpn did not stream Leaf1 flood VTEP"; ok=0; }
 
   if [[ $ok -ne 1 ]]; then

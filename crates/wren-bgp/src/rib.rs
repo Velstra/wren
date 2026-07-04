@@ -298,6 +298,7 @@ mod tests {
             communities: vec![],
             large_communities: vec![],
             ext_communities: vec![],
+            srv6_sid: None,
         }
     }
 

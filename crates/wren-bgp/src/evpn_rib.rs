@@ -167,6 +167,9 @@ pub struct RemoteMac {
     pub vni: u32,
     /// The IP bound to the MAC, if advertised (feeds ARP/ND suppression).
     pub ip: Option<IpAddr>,
+    /// The SRv6 service SID from the route's Prefix-SID attribute (RFC 9252), if
+    /// the advertising PE carries this MAC over SRv6 (End.DT2U) instead of VXLAN.
+    pub srv6_sid: Option<crate::srv6::Srv6Sid>,
 }
 
 /// A change to one EVI's imported forwarding state, returned by
@@ -265,6 +268,7 @@ impl EviTable {
                             vtep: path.next_hop,
                             vni: *label1,
                             ip: *ip,
+                            srv6_sid: path.srv6_sid.map(|s| s.sid),
                         };
                         let key = (*eth_tag, *mac);
                         let changed = self.macs.get(&key) != Some(&entry);
@@ -366,6 +370,7 @@ mod tests {
             communities: vec![],
             large_communities: vec![],
             ext_communities: rts,
+            srv6_sid: None,
         }
     }
 
@@ -442,7 +447,7 @@ mod tests {
         assert!(evi.apply(&ev).is_some());
         assert_eq!(
             evi.lookup_mac(0, [0x02, 0, 0, 0, 0, 0x01]),
-            Some(&RemoteMac { vtep: peer, vni: 10100, ip: None })
+            Some(&RemoteMac { vtep: peer, vni: 10100, ip: None, srv6_sid: None })
         );
 
         // Foreign RT → not imported.
@@ -528,7 +533,7 @@ mod tests {
             Some(EviChange::MacLearned {
                 eth_tag: 0,
                 mac,
-                entry: RemoteMac { vtep: peer, vni: 10100, ip: None },
+                entry: RemoteMac { vtep: peer, vni: 10100, ip: None, srv6_sid: None },
             })
         );
         // Re-applying the identical route is a no-op (no spurious churn downstream).

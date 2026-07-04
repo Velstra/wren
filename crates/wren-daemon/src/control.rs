@@ -30,12 +30,12 @@ use crate::isis::{IsisQuery, IsisQueryRequest};
 use crate::ospf::{OspfQuery, OspfQueryRequest};
 #[cfg(feature = "ospf3")]
 use crate::ospf3::{Ospf3Query, Ospf3QueryRequest};
+use crate::query::OwnedQuery;
 #[cfg(feature = "rip")]
 use crate::rip::{RipQuery, RipQueryRequest};
+use crate::router::{Query, QueryRequest, RouteEvent, RouteSubscribe};
 #[cfg(feature = "vrrp")]
 use crate::vrrp::VrrpQueryRequest;
-use crate::query::OwnedQuery;
-use crate::router::{Query, QueryRequest, RouteEvent, RouteSubscribe};
 
 /// The query channels the control socket forwards to. Every per-protocol channel
 /// is `None` when that protocol is not configured, so `show <proto>` can report
@@ -227,7 +227,7 @@ async fn handle_conn(stream: UnixStream, channels: Channels) -> Result<()> {
         format!(
             "error: unknown command {line:?}\n\
              usage: show routes [protocol] | show bgp [routes|paths|neighbors|roa|evpn] | \
-             show evpn | bgp refresh <peer> | \
+             show evpn | bgp refresh <peer> | evpn advertise|withdraw <vni> <mac> [ip] | \
              show ospf [neighbors|interfaces|database] | show ospf3 [neighbors|interfaces] | \
              show isis [neighbors|interfaces|database] | show babel [neighbors|routes] | \
              show bfd | show rip | show ripng | show vrrp | show vrf | \
@@ -350,7 +350,7 @@ fn format_route_event(event: &RouteEvent) -> String {
 /// Render one [`EvpnEvent`] as a single line of the EVPN monitor stream:
 ///
 /// ```text
-/// + evpn vni <vni> mac <mac> [ip <ip>] vtep <vtep>   (remote MAC learn/change)
+/// + evpn vni <vni> mac <mac> [ip <ip>] vtep <vtep> [srv6 <sid>]  (remote MAC learn/change)
 /// - evpn vni <vni> mac <mac>                          (remote MAC withdraw)
 /// + evpn vni <vni> flood <vtep>                       (BUM flood VTEP add)
 /// - evpn vni <vni> flood <vtep>                       (BUM flood VTEP remove)
@@ -362,12 +362,22 @@ fn format_route_event(event: &RouteEvent) -> String {
 fn format_evpn_event(event: &EvpnEvent) -> String {
     let mut out = String::new();
     match event {
-        EvpnEvent::MacUpdate { vni, mac, ip, vtep } => {
+        EvpnEvent::MacUpdate {
+            vni,
+            mac,
+            ip,
+            vtep,
+            srv6_sid,
+        } => {
             let _ = write!(out, "+ evpn vni {vni} mac {}", fmt_mac(mac));
             if let Some(ip) = ip {
                 let _ = write!(out, " ip {ip}");
             }
-            let _ = writeln!(out, " vtep {vtep}");
+            let _ = write!(out, " vtep {vtep}");
+            if let Some(sid) = srv6_sid {
+                let _ = write!(out, " srv6 {}", wren_bgp::srv6::sid_to_string(sid));
+            }
+            out.push('\n');
         }
         EvpnEvent::MacWithdraw { vni, mac } => {
             let _ = writeln!(out, "- evpn vni {vni} mac {}", fmt_mac(mac));
@@ -465,8 +475,48 @@ pub fn parse_bgp_query(line: &str) -> Option<BgpQuery> {
             }
             Some(BgpQuery::Refresh(addr))
         }
+        // `evpn advertise|withdraw <vni> <mac> [ip]`: dynamically originate or withdraw
+        // a type-2 MAC/IP route at runtime — the write-side counterpart to the
+        // `monitor evpn` read feed. `<vni>` is the L2 VNI, `<mac>` is colon-hex, and the
+        // optional `<ip>` is a host address for ARP/ND suppression.
+        "evpn" => {
+            let withdraw = match tokens.next()? {
+                "advertise" => false,
+                "withdraw" => true,
+                _ => return None,
+            };
+            let vni: u32 = tokens.next()?.parse().ok()?;
+            let mac = parse_mac(tokens.next()?)?;
+            let ip = match tokens.next() {
+                Some(s) => Some(s.parse::<std::net::IpAddr>().ok()?),
+                None => None,
+            };
+            if tokens.next().is_some() {
+                return None;
+            }
+            Some(BgpQuery::EvpnAdvertise {
+                vni,
+                mac,
+                ip,
+                withdraw,
+            })
+        }
         _ => None,
     }
+}
+
+/// Parse a MAC address in `aa:bb:cc:dd:ee:ff` form into its six octets. Returns
+/// `None` unless it is exactly six colon-separated hexadecimal bytes.
+fn parse_mac(s: &str) -> Option<[u8; 6]> {
+    let parts: Vec<&str> = s.split(':').collect();
+    if parts.len() != 6 {
+        return None;
+    }
+    let mut mac = [0u8; 6];
+    for (i, p) in parts.iter().enumerate() {
+        mac[i] = u8::from_str_radix(p, 16).ok()?;
+    }
+    Some(mac)
 }
 
 /// Parse a `show bfd` command into a [`BfdQuery`]. BFD keeps only session state,
@@ -545,9 +595,7 @@ pub fn parse_isis_query(line: &str) -> Option<IsisQuery> {
         return None;
     }
     let query = match tokens.next() {
-        None | Some("neighbors") | Some("neighbours") | Some("adjacencies") => {
-            IsisQuery::Neighbors
-        }
+        None | Some("neighbors") | Some("neighbours") | Some("adjacencies") => IsisQuery::Neighbors,
         Some("interfaces") | Some("interface") | Some("iface") => IsisQuery::Interfaces,
         Some("database") | Some("db") | Some("lsdb") => IsisQuery::Database,
         Some(_) => return None,
@@ -767,8 +815,14 @@ mod tests {
     fn parse_bgp_query_understands_show_bgp() {
         assert_eq!(parse_bgp_query("show bgp"), Some(BgpQuery::Routes));
         assert_eq!(parse_bgp_query("show bgp routes"), Some(BgpQuery::Routes));
-        assert_eq!(parse_bgp_query("show bgp neighbors"), Some(BgpQuery::Neighbors));
-        assert_eq!(parse_bgp_query("show bgp summary"), Some(BgpQuery::Neighbors));
+        assert_eq!(
+            parse_bgp_query("show bgp neighbors"),
+            Some(BgpQuery::Neighbors)
+        );
+        assert_eq!(
+            parse_bgp_query("show bgp summary"),
+            Some(BgpQuery::Neighbors)
+        );
         assert_eq!(parse_bgp_query("show bgp paths"), Some(BgpQuery::Paths));
         assert_eq!(parse_bgp_query("show bgp path"), Some(BgpQuery::Paths));
         assert_eq!(parse_bgp_query("show bgp roa"), Some(BgpQuery::Roa));
@@ -806,10 +860,73 @@ mod tests {
     }
 
     #[test]
+    fn parse_bgp_query_understands_evpn_advertise() {
+        // Happy path with an IPv4 host IP.
+        assert_eq!(
+            parse_bgp_query("evpn advertise 100 aa:bb:cc:dd:ee:ff 10.0.0.5"),
+            Some(BgpQuery::EvpnAdvertise {
+                vni: 100,
+                mac: [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff],
+                ip: Some("10.0.0.5".parse().unwrap()),
+                withdraw: false,
+            })
+        );
+        // Happy path with an IPv6 host IP.
+        assert_eq!(
+            parse_bgp_query("evpn advertise 100 aa:bb:cc:dd:ee:ff 2001:db8::5"),
+            Some(BgpQuery::EvpnAdvertise {
+                vni: 100,
+                mac: [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff],
+                ip: Some("2001:db8::5".parse().unwrap()),
+                withdraw: false,
+            })
+        );
+        // No IP: MAC-only type-2 route.
+        assert_eq!(
+            parse_bgp_query("evpn advertise 42 02:00:5e:10:00:01"),
+            Some(BgpQuery::EvpnAdvertise {
+                vni: 42,
+                mac: [0x02, 0x00, 0x5e, 0x10, 0x00, 0x01],
+                ip: None,
+                withdraw: false,
+            })
+        );
+        // Withdraw sets the flag.
+        assert_eq!(
+            parse_bgp_query("evpn withdraw 100 aa:bb:cc:dd:ee:ff"),
+            Some(BgpQuery::EvpnAdvertise {
+                vni: 100,
+                mac: [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff],
+                ip: None,
+                withdraw: true,
+            })
+        );
+    }
+
+    #[test]
+    fn parse_bgp_query_rejects_malformed_evpn_advertise() {
+        assert!(parse_bgp_query("evpn advertise").is_none()); // missing vni + mac
+        assert!(parse_bgp_query("evpn advertise 100").is_none()); // missing mac
+        assert!(parse_bgp_query("evpn advertise notanum aa:bb:cc:dd:ee:ff").is_none()); // bad vni
+        assert!(parse_bgp_query("evpn advertise 100 zz:bb:cc:dd:ee:ff").is_none()); // bad mac
+        assert!(parse_bgp_query("evpn advertise 100 aa:bb:cc:dd:ee").is_none()); // short mac
+        assert!(parse_bgp_query("evpn advertise 100 aa:bb:cc:dd:ee:ff bad-ip").is_none()); // bad ip
+        assert!(parse_bgp_query("evpn advertise 100 aa:bb:cc:dd:ee:ff 10.0.0.5 x").is_none()); // extra
+        assert!(parse_bgp_query("evpn frobnicate 100 aa:bb:cc:dd:ee:ff").is_none());
+        // bad verb
+    }
+
+    #[test]
     fn parse_bfd_query_understands_show_bfd() {
         assert_eq!(parse_bfd_query("show bfd"), Some(BfdQuery::Sessions));
-        assert_eq!(parse_bfd_query("show bfd sessions"), Some(BfdQuery::Sessions));
-        assert_eq!(parse_bfd_query("show bfd neighbors"), Some(BfdQuery::Sessions));
+        assert_eq!(
+            parse_bfd_query("show bfd sessions"),
+            Some(BfdQuery::Sessions)
+        );
+        assert_eq!(
+            parse_bfd_query("show bfd neighbors"),
+            Some(BfdQuery::Sessions)
+        );
         // Not a bfd command / malformed.
         assert!(parse_bfd_query("show bgp").is_none());
         assert!(parse_bfd_query("show bfd nonsense").is_none());
@@ -821,15 +938,27 @@ mod tests {
     #[test]
     fn parse_ospf_query_understands_show_ospf() {
         assert_eq!(parse_ospf_query("show ospf"), Some(OspfQuery::Neighbors));
-        assert_eq!(parse_ospf_query("show ospf neighbors"), Some(OspfQuery::Neighbors));
+        assert_eq!(
+            parse_ospf_query("show ospf neighbors"),
+            Some(OspfQuery::Neighbors)
+        );
         assert_eq!(
             parse_ospf_query("show ospf interfaces"),
             Some(OspfQuery::Interfaces)
         );
-        assert_eq!(parse_ospf_query("show ospf iface"), Some(OspfQuery::Interfaces));
-        assert_eq!(parse_ospf_query("show ospf database"), Some(OspfQuery::Database));
+        assert_eq!(
+            parse_ospf_query("show ospf iface"),
+            Some(OspfQuery::Interfaces)
+        );
+        assert_eq!(
+            parse_ospf_query("show ospf database"),
+            Some(OspfQuery::Database)
+        );
         assert_eq!(parse_ospf_query("show ospf db"), Some(OspfQuery::Database));
-        assert_eq!(parse_ospf_query("show ospf lsdb"), Some(OspfQuery::Database));
+        assert_eq!(
+            parse_ospf_query("show ospf lsdb"),
+            Some(OspfQuery::Database)
+        );
     }
 
     #[cfg(feature = "ospf")]
@@ -845,12 +974,18 @@ mod tests {
     #[test]
     fn parse_ospf3_query_understands_show_ospf3() {
         assert_eq!(parse_ospf3_query("show ospf3"), Some(Ospf3Query::Neighbors));
-        assert_eq!(parse_ospf3_query("show ospf3 neighbors"), Some(Ospf3Query::Neighbors));
+        assert_eq!(
+            parse_ospf3_query("show ospf3 neighbors"),
+            Some(Ospf3Query::Neighbors)
+        );
         assert_eq!(
             parse_ospf3_query("show ospf3 interfaces"),
             Some(Ospf3Query::Interfaces)
         );
-        assert_eq!(parse_ospf3_query("show ospf3 iface"), Some(Ospf3Query::Interfaces));
+        assert_eq!(
+            parse_ospf3_query("show ospf3 iface"),
+            Some(Ospf3Query::Interfaces)
+        );
     }
 
     #[cfg(all(feature = "ospf", feature = "ospf3"))]
@@ -869,7 +1004,10 @@ mod tests {
     #[test]
     fn parse_isis_query_understands_show_isis() {
         assert_eq!(parse_isis_query("show isis"), Some(IsisQuery::Neighbors));
-        assert_eq!(parse_isis_query("show isis neighbors"), Some(IsisQuery::Neighbors));
+        assert_eq!(
+            parse_isis_query("show isis neighbors"),
+            Some(IsisQuery::Neighbors)
+        );
         assert_eq!(
             parse_isis_query("show isis adjacencies"),
             Some(IsisQuery::Neighbors)
@@ -899,9 +1037,18 @@ mod tests {
     #[test]
     fn parse_babel_query_understands_show_babel() {
         assert_eq!(parse_babel_query("show babel"), Some(BabelQuery::Neighbors));
-        assert_eq!(parse_babel_query("show babel neighbors"), Some(BabelQuery::Neighbors));
-        assert_eq!(parse_babel_query("show babel neighbours"), Some(BabelQuery::Neighbors));
-        assert_eq!(parse_babel_query("show babel routes"), Some(BabelQuery::Routes));
+        assert_eq!(
+            parse_babel_query("show babel neighbors"),
+            Some(BabelQuery::Neighbors)
+        );
+        assert_eq!(
+            parse_babel_query("show babel neighbours"),
+            Some(BabelQuery::Neighbors)
+        );
+        assert_eq!(
+            parse_babel_query("show babel routes"),
+            Some(BabelQuery::Routes)
+        );
     }
 
     #[cfg(feature = "babel")]
@@ -917,9 +1064,18 @@ mod tests {
     #[test]
     fn parse_rip_query_understands_show_rip_and_ripng() {
         assert_eq!(parse_rip_query("show rip", "rip"), Some(RipQuery::Routes));
-        assert_eq!(parse_rip_query("show rip routes", "rip"), Some(RipQuery::Routes));
-        assert_eq!(parse_rip_query("show ripng", "ripng"), Some(RipQuery::Routes));
-        assert_eq!(parse_rip_query("show ripng route", "ripng"), Some(RipQuery::Routes));
+        assert_eq!(
+            parse_rip_query("show rip routes", "rip"),
+            Some(RipQuery::Routes)
+        );
+        assert_eq!(
+            parse_rip_query("show ripng", "ripng"),
+            Some(RipQuery::Routes)
+        );
+        assert_eq!(
+            parse_rip_query("show ripng route", "ripng"),
+            Some(RipQuery::Routes)
+        );
     }
 
     #[cfg(feature = "rip")]
@@ -968,7 +1124,10 @@ mod tests {
             }),
             "- 10.0.0.0/24 table 254\n"
         );
-        assert_eq!(format_route_event(&RouteEvent::EndOfDump), "% end-of-dump\n");
+        assert_eq!(
+            format_route_event(&RouteEvent::EndOfDump),
+            "% end-of-dump\n"
+        );
     }
 
     #[test]
@@ -996,13 +1155,33 @@ mod tests {
                 mac,
                 ip: Some("10.100.0.1".parse().unwrap()),
                 vtep,
+                srv6_sid: None,
             }),
             "+ evpn vni 10100 mac 02:00:5e:00:00:01 ip 10.100.0.1 vtep 10.0.0.1\n"
         );
         // MAC without a bound IP.
         assert_eq!(
-            format_evpn_event(&EvpnEvent::MacUpdate { vni: 10100, mac, ip: None, vtep }),
+            format_evpn_event(&EvpnEvent::MacUpdate {
+                vni: 10100,
+                mac,
+                ip: None,
+                vtep,
+                srv6_sid: None,
+            }),
             "+ evpn vni 10100 mac 02:00:5e:00:00:01 vtep 10.0.0.1\n"
+        );
+        // MAC carried over SRv6: the End.DT2U service SID is appended as `srv6 <sid>`.
+        let sid: wren_bgp::srv6::Srv6Sid =
+            std::net::Ipv6Addr::new(0xfc00, 0, 1, 0, 0x2774, 0, 0, 0).octets();
+        assert_eq!(
+            format_evpn_event(&EvpnEvent::MacUpdate {
+                vni: 10100,
+                mac,
+                ip: None,
+                vtep,
+                srv6_sid: Some(sid),
+            }),
+            "+ evpn vni 10100 mac 02:00:5e:00:00:01 vtep 10.0.0.1 srv6 fc00:0:1:0:2774::\n"
         );
         assert_eq!(
             format_evpn_event(&EvpnEvent::MacWithdraw { vni: 10100, mac }),

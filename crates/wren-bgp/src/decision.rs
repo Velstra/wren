@@ -77,6 +77,8 @@ pub struct Path {
     /// The EXTENDED_COMMUNITIES (RFC 4360) attached to this path — likewise
     /// retained for re-advertisement and policy, not part of the comparison.
     pub ext_communities: Vec<[u8; 8]>,
+    /// The SRv6 service SID from a received Prefix-SID attribute (RFC 9252), if any.
+    pub srv6_sid: Option<crate::srv6::Srv6ServiceSid>,
 }
 
 impl Path {
@@ -220,6 +222,7 @@ mod tests {
             communities: vec![],
             large_communities: vec![],
             ext_communities: vec![],
+            srv6_sid: None,
         }
     }
 

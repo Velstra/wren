@@ -568,6 +568,12 @@ pub struct BgpEvpn {
     /// remote PEs tunnel VXLAN traffic here.
     #[serde(rename = "vtep-ip")]
     pub vtep_ip: String,
+    /// Optional SRv6 locator prefix (e.g. `"fc00:0:1::/48"`). When set, every EVPN
+    /// route this VTEP originates carries an SRv6 L2 Service TLV (RFC 9252) — i.e.
+    /// EVPN-over-SRv6 instead of plain VXLAN. Must be a byte-aligned IPv6 prefix of
+    /// length 8..=96.
+    #[serde(default, rename = "srv6-locator")]
+    pub srv6_locator: Option<String>,
     /// The EVPN instances (one per MAC-VRF / VNI).
     #[serde(default)]
     pub instance: Vec<BgpEvpnInstance>,

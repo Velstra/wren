@@ -48,6 +48,7 @@ use wren_bgp::large_community::format_large_community;
 use wren_bgp::message::{AddPath, Message, Notification, Open, Update};
 use wren_bgp::rib::{BgpRib, RibEvent};
 use wren_bgp::rpki::{Roa, RoaTable, Validity};
+use wren_bgp::srv6::{behavior, build_service_sid, Srv6ServiceSid, Srv6ServiceTlv, Srv6Sid};
 use wren_bgp::{
     AFI_IPV4, AFI_IPV6, AFI_L2VPN, AS_TRANS, HEADER_LEN, MARKER, MAX_MESSAGE_LEN, PORT, SAFI_EVPN,
     SAFI_UNICAST, VERSION,
@@ -148,6 +149,11 @@ pub struct EvpnConfig {
     /// This router's VTEP address — advertised as the BGP next hop of every EVPN
     /// route it originates and as the type-3 (IMET) originating router IP.
     pub vtep_ip: IpAddr,
+    /// The SRv6 locator prefix `(address, prefix-len)` this VTEP programs service
+    /// SIDs from (RFC 9252). When set, every originated EVPN route carries a
+    /// Prefix-SID attribute with an SRv6 L2 Service TLV — EVPN-over-SRv6 rather
+    /// than plain VXLAN. `None` for a VXLAN-only VTEP.
+    pub srv6_locator: Option<(Ipv6Addr, u8)>,
     /// The EVPN instances (one per MAC-VRF / VNI).
     pub instances: Vec<EvpnInstanceCfg>,
 }
@@ -281,7 +287,10 @@ impl BgpPeerCfg {
         if let Some(pw) = &self.password {
             TcpAuth::Md5(pw.clone())
         } else if let Some(key) = &self.ao_key {
-            TcpAuth::Ao { key: key.clone(), key_id: self.ao_key_id }
+            TcpAuth::Ao {
+                key: key.clone(),
+                key_id: self.ao_key_id,
+            }
         } else {
             TcpAuth::None
         }
@@ -448,6 +457,30 @@ struct EvpnOriginRoute {
     nlri: EvpnNlri,
     ext_communities: Vec<[u8; 8]>,
     next_hop: Vec<u8>,
+    /// The SRv6 service SID to attach as a Prefix-SID (RFC 9252), if the instance
+    /// uses SRv6; `None` for a plain-VXLAN instance.
+    srv6: Option<Vec<Srv6ServiceTlv>>,
+}
+
+/// Build the SRv6 L2 Service TLV for an EVPN route when the instance's owner has
+/// an SRv6 locator: End.DT2M for the IMET (BUM) route, End.DT2U for MAC/IP.
+fn evpn_srv6_tlvs(evpn: &EvpnConfig, vni: u32, is_imet: bool) -> Option<Vec<Srv6ServiceTlv>> {
+    let (loc, len) = evpn.srv6_locator?;
+    let (disc, behavior) = if is_imet {
+        (1u8, behavior::END_DT2M)
+    } else {
+        (0u8, behavior::END_DT2U)
+    };
+    let (sid, structure) = build_service_sid(loc, len, disc, vni);
+    Some(vec![Srv6ServiceTlv {
+        is_l2: true,
+        sids: vec![Srv6ServiceSid {
+            sid,
+            behavior,
+            flags: 0,
+            structure,
+        }],
+    }])
 }
 
 /// One learned EVPN best route the central task asks a session to re-advertise. The
@@ -591,6 +624,22 @@ pub enum BgpQuery {
     Evpn,
     /// The per-EVI MAC-VRF views (remote MACs and the VTEP flood set) — `show evpn`.
     EvpnVnis,
+    /// Dynamically originate (or withdraw) a type-2 EVPN MAC/IP route at runtime —
+    /// `evpn advertise|withdraw <vni> <mac> [ip]`. The write-side counterpart to the
+    /// `monitor evpn` read feed: the fabric datapath calls this when it learns (or
+    /// ages out) a local MAC. Not a read-only query, but answered the same way (with a
+    /// status line). Updates the persistent origination set so peers connecting later
+    /// also receive it, and pushes to every currently-established EVPN session.
+    EvpnAdvertise {
+        /// The L2 VNI whose EVI the route belongs to (selects the RD / RTs).
+        vni: u32,
+        /// The MAC to advertise or withdraw.
+        mac: [u8; 6],
+        /// Optional host IP for remote ARP/ND suppression (type-2 MAC/IP).
+        ip: Option<IpAddr>,
+        /// `true` to withdraw the route, `false` to advertise it.
+        withdraw: bool,
+    },
 }
 
 /// A control-socket query plus the channel to answer it on.
@@ -663,8 +712,11 @@ fn effective_origination(
         })
         .collect();
     for agg in aggregates {
-        let contributors: Vec<Prefix> =
-            originated.keys().copied().filter(|c| covers(&agg.prefix, c)).collect();
+        let contributors: Vec<Prefix> = originated
+            .keys()
+            .copied()
+            .filter(|c| covers(&agg.prefix, c))
+            .collect();
         if contributors.is_empty() {
             continue; // no more-specific present: the aggregate is not advertised
         }
@@ -721,7 +773,11 @@ pub fn render_roa_table(roa: &RoaTable) -> String {
     }
     let mut out = String::new();
     for r in roa.iter() {
-        let _ = writeln!(out, "{} maxlen {} as {}", r.prefix, r.max_length, r.origin_as);
+        let _ = writeln!(
+            out,
+            "{} maxlen {} as {}",
+            r.prefix, r.max_length, r.origin_as
+        );
     }
     out
 }
@@ -742,17 +798,27 @@ pub fn render_bgp_routes(rib: &BgpRib, roa: &RoaTable) -> String {
             let _ = write!(out, " as-path {as_path}");
         }
         if !path.communities.is_empty() {
-            let comms: Vec<String> = path.communities.iter().map(|c| format_community(*c)).collect();
+            let comms: Vec<String> = path
+                .communities
+                .iter()
+                .map(|c| format_community(*c))
+                .collect();
             let _ = write!(out, " communities {}", comms.join(" "));
         }
         if !path.large_communities.is_empty() {
-            let comms: Vec<String> =
-                path.large_communities.iter().map(|c| format_large_community(*c)).collect();
+            let comms: Vec<String> = path
+                .large_communities
+                .iter()
+                .map(|c| format_large_community(*c))
+                .collect();
             let _ = write!(out, " large-communities {}", comms.join(" "));
         }
         if !path.ext_communities.is_empty() {
-            let comms: Vec<String> =
-                path.ext_communities.iter().map(|c| format_ext_community(*c)).collect();
+            let comms: Vec<String> = path
+                .ext_communities
+                .iter()
+                .map(|c| format_ext_community(*c))
+                .collect();
             let _ = write!(out, " ext-communities {}", comms.join(" "));
         }
         let _ = write!(out, " localpref {}", path.local_pref);
@@ -777,7 +843,11 @@ pub fn render_bgp_evpn(rib: &EvpnRib) -> String {
     }
     let mut out = String::new();
     for (nlri, path) in rib.iter_best() {
-        let _ = writeln!(out, "{nlri}  via {}  from {}", path.next_hop, path.peer_addr);
+        let _ = writeln!(
+            out,
+            "{nlri}  via {}  from {}",
+            path.next_hop, path.peer_addr
+        );
     }
     out
 }
@@ -799,6 +869,9 @@ pub fn render_evpn_vnis(evis: &[(EvpnInstanceCfg, EviTable)]) -> String {
             );
             if let Some(ip) = rm.ip {
                 let _ = write!(out, " ip {ip}");
+            }
+            if let Some(sid) = rm.srv6_sid {
+                let _ = write!(out, " srv6 {}", wren_bgp::srv6::sid_to_string(&sid));
             }
             out.push('\n');
         }
@@ -841,6 +914,9 @@ pub enum EvpnEvent {
         ip: Option<IpAddr>,
         /// The VTEP to tunnel to.
         vtep: IpAddr,
+        /// The SRv6 service SID (RFC 9252) the route carried, if it uses SRv6
+        /// (End.DT2U) rather than plain VXLAN.
+        srv6_sid: Option<Srv6Sid>,
     },
     /// Forget a remote MAC on `vni`.
     MacWithdraw {
@@ -882,9 +958,13 @@ pub struct EvpnSubscribe {
 /// (the EVI's locally configured L2 VNI).
 fn evpn_event_for(vni: u32, change: &EviChange) -> EvpnEvent {
     match change {
-        EviChange::MacLearned { mac, entry, .. } => {
-            EvpnEvent::MacUpdate { vni, mac: *mac, ip: entry.ip, vtep: entry.vtep }
-        }
+        EviChange::MacLearned { mac, entry, .. } => EvpnEvent::MacUpdate {
+            vni,
+            mac: *mac,
+            ip: entry.ip,
+            vtep: entry.vtep,
+            srv6_sid: entry.srv6_sid,
+        },
         EviChange::MacForgotten { mac, .. } => EvpnEvent::MacWithdraw { vni, mac: *mac },
         EviChange::VtepAdded { vtep } => EvpnEvent::FloodUpdate { vni, vtep: *vtep },
         EviChange::VtepRemoved { vtep } => EvpnEvent::FloodWithdraw { vni, vtep: *vtep },
@@ -912,13 +992,22 @@ async fn subscribe_evpn(
 ) {
     for (inst, table) in evis {
         for ((_eth_tag, mac), rm) in table.iter_macs() {
-            let ev = EvpnEvent::MacUpdate { vni: inst.vni, mac: *mac, ip: rm.ip, vtep: rm.vtep };
+            let ev = EvpnEvent::MacUpdate {
+                vni: inst.vni,
+                mac: *mac,
+                ip: rm.ip,
+                vtep: rm.vtep,
+                srv6_sid: rm.srv6_sid,
+            };
             if sub.events.send(ev).await.is_err() {
                 return;
             }
         }
         for vtep in table.iter_vteps() {
-            let ev = EvpnEvent::FloodUpdate { vni: inst.vni, vtep: *vtep };
+            let ev = EvpnEvent::FloodUpdate {
+                vni: inst.vni,
+                vtep: *vtep,
+            };
             if sub.events.send(ev).await.is_err() {
                 return;
             }
@@ -942,7 +1031,11 @@ pub fn render_bgp_paths(rib: &BgpRib) -> String {
         let best = rib.best(prefix) == Some(path);
         let mark = if best { "*" } else { " " };
         let as_path = format_as_path(&path.as_path);
-        let as_path = if as_path.is_empty() { "i".to_string() } else { as_path };
+        let as_path = if as_path.is_empty() {
+            "i".to_string()
+        } else {
+            as_path
+        };
         let _ = writeln!(
             out,
             "{mark} {prefix} path-id {path_id} via {} from {peer} as-path {as_path} localpref {}",
@@ -1006,7 +1099,12 @@ pub fn render_bgp_metrics(neighbors: &[NeighborSummary], rib_routes: usize) -> S
         "Configured BGP neighbours.",
         "gauge",
     );
-    crate::metrics::sample(&mut out, "wren_bgp_neighbors_configured", &[], neighbors.len());
+    crate::metrics::sample(
+        &mut out,
+        "wren_bgp_neighbors_configured",
+        &[],
+        neighbors.len(),
+    );
     crate::metrics::family(
         &mut out,
         "wren_bgp_neighbors_established",
@@ -1105,7 +1203,11 @@ pub async fn run(
         .map(|p| {
             (
                 p.addr,
-                NeighborState { remote_as: p.remote_as, established: false, refreshes_received: 0 },
+                NeighborState {
+                    remote_as: p.remote_as,
+                    established: false,
+                    refreshes_received: 0,
+                },
             )
         })
         .collect();
@@ -1163,12 +1265,19 @@ pub async fn run(
     // ignored — until the daemon is reconfigured (no auto-restart timer yet).
     let mut damped: HashSet<IpAddr> = HashSet::new();
     // Peers to which we advertise a default route (`0.0.0.0/0`) on Established.
-    let default_originate: HashSet<IpAddr> =
-        cfg.peers.iter().filter(|p| p.default_originate).map(|p| p.addr).collect();
+    let default_originate: HashSet<IpAddr> = cfg
+        .peers
+        .iter()
+        .filter(|p| p.default_originate)
+        .map(|p| p.addr)
+        .collect();
     // Per-peer inbound import filters (RFC-style import route-maps), applied to every
     // route received from the peer before it enters the RIB.
-    let imports: HashMap<IpAddr, Filter> =
-        cfg.peers.iter().filter_map(|p| p.import.clone().map(|f| (p.addr, f))).collect();
+    let imports: HashMap<IpAddr, Filter> = cfg
+        .peers
+        .iter()
+        .filter_map(|p| p.import.clone().map(|f| (p.addr, f)))
+        .collect();
     // ADD-PATH (RFC 7911): the established sessions for which send was negotiated (we
     // advertise every candidate path, not just the best), and the per-peer Adj-RIB-Out
     // state tracking which Path Identifiers we have advertised for each prefix.
@@ -1286,9 +1395,14 @@ pub async fn run(
             ext.push(encap_ext_community(TUNNEL_TYPE_VXLAN));
             // Type-3 IMET: "I participate in this EVI"; BUM floods toward our VTEP.
             evpn_originated.push(EvpnOriginRoute {
-                nlri: EvpnNlri::Imet { rd: inst.rd, eth_tag: 0, orig_ip: evpn.vtep_ip },
+                nlri: EvpnNlri::Imet {
+                    rd: inst.rd,
+                    eth_tag: 0,
+                    orig_ip: evpn.vtep_ip,
+                },
                 ext_communities: ext.clone(),
                 next_hop: nh.clone(),
+                srv6: evpn_srv6_tlvs(evpn, inst.vni, true),
             });
             // Type-2 MAC/IP for each static MAC.
             for (mac, ip) in &inst.macs {
@@ -1304,6 +1418,7 @@ pub async fn run(
                     },
                     ext_communities: ext.clone(),
                     next_hop: nh.clone(),
+                    srv6: evpn_srv6_tlvs(evpn, inst.vni, false),
                 });
             }
         }
@@ -1370,6 +1485,73 @@ pub async fn run(
                     },
                     BgpQuery::Evpn => render_bgp_evpn(&evpn_rib),
                     BgpQuery::EvpnVnis => render_evpn_vnis(&evis),
+                    // Dynamic type-2 origination/withdrawal (`evpn advertise|withdraw`).
+                    // Update the persistent origination set (so peers that connect later
+                    // still get it) then push to every established EVPN-activated session.
+                    BgpQuery::EvpnAdvertise { vni, mac, ip, withdraw } => match cfg.evpn.as_ref()
+                    {
+                        None => "evpn not configured\n".to_string(),
+                        Some(evpn) => match evis.iter().find(|(i, _)| i.vni == vni) {
+                            None => format!("no evpn instance for vni {vni}\n"),
+                            Some((inst, _)) => {
+                                // Same RD / export RTs / VXLAN-encap community and VTEP
+                                // next hop the static origination stamps (§6, RFC 8365).
+                                let rd = inst.rd;
+                                let mut ext = inst.rt_export.clone();
+                                ext.push(encap_ext_community(TUNNEL_TYPE_VXLAN));
+                                let nh = vtep_next_hop_octets(evpn.vtep_ip);
+                                let nlri = EvpnNlri::MacIp {
+                                    rd,
+                                    esi: Esi::ZERO,
+                                    eth_tag: 0,
+                                    mac,
+                                    ip,
+                                    label1: vni,
+                                    label2: None,
+                                };
+                                let mac_str = format!(
+                                    "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+                                    mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
+                                );
+                                if withdraw {
+                                    // Idempotent: drop any matching origination and tell
+                                    // every established EVPN peer to withdraw it.
+                                    evpn_originated.retain(|r| r.nlri != nlri);
+                                    evpn_nh.remove(&nlri);
+                                    for (addr, cmd_tx) in &sessions {
+                                        if local.peers.get(addr).map(|pp| pp.evpn) == Some(true) {
+                                            let _ = cmd_tx
+                                                .send(SessionCmd::WithdrawEvpn(vec![nlri.clone()]))
+                                                .await;
+                                        }
+                                    }
+                                    format!("withdrawing evpn vni {vni} mac {mac_str}\n")
+                                } else {
+                                    let route = EvpnOriginRoute {
+                                        nlri: nlri.clone(),
+                                        ext_communities: ext,
+                                        next_hop: nh.clone(),
+                                        srv6: evpn_srv6_tlvs(evpn, vni, false),
+                                    };
+                                    // Replace an existing origination with the same NLRI
+                                    // (dedup by key) or append a fresh one.
+                                    match evpn_originated.iter_mut().find(|r| r.nlri == nlri) {
+                                        Some(existing) => *existing = route.clone(),
+                                        None => evpn_originated.push(route.clone()),
+                                    }
+                                    evpn_nh.insert(nlri, nh);
+                                    for (addr, cmd_tx) in &sessions {
+                                        if local.peers.get(addr).map(|pp| pp.evpn) == Some(true) {
+                                            let _ = cmd_tx
+                                                .send(SessionCmd::AdvertiseEvpn(vec![route.clone()]))
+                                                .await;
+                                        }
+                                    }
+                                    format!("advertising evpn vni {vni} mac {mac_str}\n")
+                                }
+                            }
+                        },
+                    },
                 };
                 let _ = req.respond.send(resp);
                 continue;
@@ -1427,7 +1609,20 @@ pub async fn run(
             }
         };
         match msg {
-            PeerMsg::Established { peer: p, peer_id, inbound, conn_id, gr_restart_time, add_path_send: ap_send, cmd_tx, local_addr, local_port, remote_port, sent_open, received_open } => {
+            PeerMsg::Established {
+                peer: p,
+                peer_id,
+                inbound,
+                conn_id,
+                gr_restart_time,
+                add_path_send: ap_send,
+                cmd_tx,
+                local_addr,
+                local_port,
+                remote_port,
+                sent_open,
+                received_open,
+            } => {
                 // A peer damped for exceeding its max-prefix limit is kept down: shut
                 // any reconnection straight back down without advertising to it.
                 if damped.contains(&p) {
@@ -1500,7 +1695,10 @@ pub async fn run(
                 // rules — it drops anything it taught us, and iBGP→iBGP routes).
                 let prop: Vec<PropRoute> = rib
                     .iter_best()
-                    .map(|(prefix, path)| PropRoute { prefix: *prefix, path: path.clone() })
+                    .map(|(prefix, path)| PropRoute {
+                        prefix: *prefix,
+                        path: path.clone(),
+                    })
                     .collect();
                 if !prop.is_empty() {
                     let _ = cmd_tx.send(SessionCmd::Propagate(prop)).await;
@@ -1526,7 +1724,9 @@ pub async fn run(
                 // propagation; the EVPN End-of-RIB rides in SendEndOfRib below.
                 if local.peers.get(&p).map(|pp| pp.evpn) == Some(true) {
                     if !evpn_originated.is_empty() {
-                        let _ = cmd_tx.send(SessionCmd::AdvertiseEvpn(evpn_originated.clone())).await;
+                        let _ = cmd_tx
+                            .send(SessionCmd::AdvertiseEvpn(evpn_originated.clone()))
+                            .await;
                     }
                     let prop_evpn: Vec<EvpnPropRoute> = evpn_rib
                         .iter_best()
@@ -1554,7 +1754,15 @@ pub async fn run(
                     addpath_send.insert(p);
                     let prefixes: Vec<Prefix> = rib.iter_best().map(|(pfx, _)| *pfx).collect();
                     for pfx in prefixes {
-                        propagate_addpath(pfx, &rib, &local, &mut addpath, &addpath_send, &sessions).await;
+                        propagate_addpath(
+                            pfx,
+                            &rib,
+                            &local,
+                            &mut addpath,
+                            &addpath_send,
+                            &sessions,
+                        )
+                        .await;
                     }
                 }
             }
@@ -1575,7 +1783,11 @@ pub async fn run(
                 if let Some(tx) = &bmp_tx {
                     let asn = neighbors.get(&p).map(|n| n.remote_as).unwrap_or(0);
                     let bgp_id = bmp_peer_ids.remove(&p).unwrap_or(Ipv4Addr::UNSPECIFIED);
-                    let _ = tx.try_send(crate::bmp::BmpEvent::PeerDown { peer: p, asn, bgp_id });
+                    let _ = tx.try_send(crate::bmp::BmpEvent::PeerDown {
+                        peer: p,
+                        asn,
+                        bgp_id,
+                    });
                 }
                 sessions.remove(&p);
                 est_inbound.remove(&p);
@@ -1612,7 +1824,10 @@ pub async fn run(
                 let addpath_affected: Vec<Prefix> = if retained || addpath_send.is_empty() {
                     Vec::new()
                 } else {
-                    rib.prefixes_from(p).into_iter().filter(|x| x.is_ipv4()).collect()
+                    rib.prefixes_from(p)
+                        .into_iter()
+                        .filter(|x| x.is_ipv4())
+                        .collect()
                 };
                 if !retained {
                     for ev in rib.withdraw_peer(p) {
@@ -1623,11 +1838,21 @@ pub async fn run(
                 // the withdrawals to the other EVPN peers (no graceful-restart retention
                 // for EVPN here).
                 for ev in evpn_rib.withdraw_peer(p) {
-                    handle_evpn_event(ev, Vec::new(), p, &mut evis, &mut evpn_nh, &mut evpn_subscribers, &local, &sessions)
-                        .await;
+                    handle_evpn_event(
+                        ev,
+                        Vec::new(),
+                        p,
+                        &mut evis,
+                        &mut evpn_nh,
+                        &mut evpn_subscribers,
+                        &local,
+                        &sessions,
+                    )
+                    .await;
                 }
                 for pfx in addpath_affected {
-                    propagate_addpath(pfx, &rib, &local, &mut addpath, &addpath_send, &sessions).await;
+                    propagate_addpath(pfx, &rib, &local, &mut addpath, &addpath_send, &sessions)
+                        .await;
                 }
             }
             PeerMsg::RefreshRequest { peer: p, conn_id } => {
@@ -1649,7 +1874,10 @@ pub async fn run(
                     }
                     let prop: Vec<PropRoute> = rib
                         .iter_best()
-                        .map(|(prefix, path)| PropRoute { prefix: *prefix, path: path.clone() })
+                        .map(|(prefix, path)| PropRoute {
+                            prefix: *prefix,
+                            path: path.clone(),
+                        })
                         .collect();
                     if !prop.is_empty() {
                         let _ = cmd_tx.send(SessionCmd::Propagate(prop)).await;
@@ -1790,8 +2018,20 @@ pub async fn run(
                             let path = build_path(&update, IpAddr::V4(nh), None, facts);
                             for (i, p) in update.nlri.iter().enumerate() {
                                 let path_id = update.nlri_path_ids.get(i).copied().unwrap_or(0);
-                                import_and_install(import, peer, path_id, *p, &path, &roa, rpki_reject, &mut rib, vrf_table, &updates, &sessions)
-                                    .await;
+                                import_and_install(
+                                    import,
+                                    peer,
+                                    path_id,
+                                    *p,
+                                    &path,
+                                    &roa,
+                                    rpki_reject,
+                                    &mut rib,
+                                    vrf_table,
+                                    &updates,
+                                    &sessions,
+                                )
+                                .await;
                             }
                         }
                         None => warn!(peer = %peer, "UPDATE with NLRI but no NEXT_HOP — ignored"),
@@ -1800,11 +2040,27 @@ pub async fn run(
                 // IPv6 reachability: MP_REACH_NLRI carries its own next hop (RFC 4760).
                 // A link-local next hop (RFC 2545) is pinned to the ingress interface.
                 if let Some((nh6, nlri, is_link_local)) = mp_reach_v6(&update) {
-                    let iface = if is_link_local { ingress_iface.clone() } else { None };
+                    let iface = if is_link_local {
+                        ingress_iface.clone()
+                    } else {
+                        None
+                    };
                     let path = build_path(&update, IpAddr::V6(nh6), iface, facts);
                     for p in nlri {
-                        import_and_install(import, peer, 0, *p, &path, &roa, rpki_reject, &mut rib, vrf_table, &updates, &sessions)
-                            .await;
+                        import_and_install(
+                            import,
+                            peer,
+                            0,
+                            *p,
+                            &path,
+                            &roa,
+                            rpki_reject,
+                            &mut rib,
+                            vrf_table,
+                            &updates,
+                            &sessions,
+                        )
+                        .await;
                     }
                 }
                 // IPv4-over-IPv6 reachability (RFC 5549): MP_REACH_NLRI with IPv4 NLRI
@@ -1812,18 +2068,43 @@ pub async fn run(
                 // gateway (the kernel uses RTA_VIA). A link-local next hop is pinned to
                 // the ingress interface, like the IPv6-unicast case.
                 if let Some((nh6, nlri, is_link_local)) = mp_reach_v4_over_v6(&update) {
-                    let iface = if is_link_local { ingress_iface.clone() } else { None };
+                    let iface = if is_link_local {
+                        ingress_iface.clone()
+                    } else {
+                        None
+                    };
                     let path = build_path(&update, IpAddr::V6(nh6), iface, facts);
                     for p in nlri {
-                        import_and_install(import, peer, 0, *p, &path, &roa, rpki_reject, &mut rib, vrf_table, &updates, &sessions)
-                            .await;
+                        import_and_install(
+                            import,
+                            peer,
+                            0,
+                            *p,
+                            &path,
+                            &roa,
+                            rpki_reject,
+                            &mut rib,
+                            vrf_table,
+                            &updates,
+                            &sessions,
+                        )
+                        .await;
                     }
                 }
                 // EVPN withdrawals (MP_UNREACH_NLRI, AFI 25 / SAFI 70, RFC 7432).
                 for nlri in mp_unreach_evpn(&update).to_vec() {
                     if let Some(ev) = evpn_rib.withdraw(peer, nlri) {
-                        handle_evpn_event(ev, Vec::new(), peer, &mut evis, &mut evpn_nh, &mut evpn_subscribers, &local, &sessions)
-                            .await;
+                        handle_evpn_event(
+                            ev,
+                            Vec::new(),
+                            peer,
+                            &mut evis,
+                            &mut evpn_nh,
+                            &mut evpn_subscribers,
+                            &local,
+                            &sessions,
+                        )
+                        .await;
                     }
                 }
                 // EVPN reachability (MP_REACH_NLRI): the next hop is raw octets (4 or
@@ -1837,12 +2118,23 @@ pub async fn run(
                                     continue;
                                 }
                                 if let Some(ev) = evpn_rib.update(peer, nlri, path.clone()) {
-                                    handle_evpn_event(ev, nh_octets.clone(), peer, &mut evis, &mut evpn_nh, &mut evpn_subscribers, &local, &sessions)
-                                        .await;
+                                    handle_evpn_event(
+                                        ev,
+                                        nh_octets.clone(),
+                                        peer,
+                                        &mut evis,
+                                        &mut evpn_nh,
+                                        &mut evpn_subscribers,
+                                        &local,
+                                        &sessions,
+                                    )
+                                    .await;
                                 }
                             }
                         }
-                        None => warn!(peer = %peer, len = nh_octets.len(), "EVPN MP_REACH next hop is neither 4 nor 16 octets; ignored"),
+                        None => {
+                            warn!(peer = %peer, len = nh_octets.len(), "EVPN MP_REACH next hop is neither 4 nor 16 octets; ignored")
+                        }
                     }
                 }
                 // ADD-PATH (RFC 7911): for every IPv4 prefix this UPDATE touched,
@@ -1860,7 +2152,15 @@ pub async fn run(
                     touched.sort();
                     touched.dedup();
                     for pfx in touched {
-                        propagate_addpath(pfx, &rib, &local, &mut addpath, &addpath_send, &sessions).await;
+                        propagate_addpath(
+                            pfx,
+                            &rib,
+                            &local,
+                            &mut addpath,
+                            &addpath_send,
+                            &sessions,
+                        )
+                        .await;
                     }
                 }
             }
@@ -1936,10 +2236,16 @@ async fn apply_redistribution(
     // summary-only) suppress or restore its contributors, so push the whole delta —
     // not just the one prefix — to every established session.
     let next = effective_origination(originated, aggregates);
-    let withdrawn: Vec<Prefix> =
-        advertised.keys().filter(|p| !next.contains_key(p)).copied().collect();
-    let adv: Vec<OriginRoute> =
-        next.values().filter(|r| advertised.get(&r.prefix) != Some(r)).cloned().collect();
+    let withdrawn: Vec<Prefix> = advertised
+        .keys()
+        .filter(|p| !next.contains_key(p))
+        .copied()
+        .collect();
+    let adv: Vec<OriginRoute> = next
+        .values()
+        .filter(|r| advertised.get(&r.prefix) != Some(r))
+        .cloned()
+        .collect();
     *advertised = next;
     for tx in sessions.values() {
         if !adv.is_empty() {
@@ -2065,7 +2371,10 @@ async fn import_and_install(
 async fn propagate(ev: &RibEvent, sessions: &HashMap<IpAddr, mpsc::Sender<SessionCmd>>) {
     match ev {
         RibEvent::Best { prefix, path, .. } => {
-            let pr = PropRoute { prefix: *prefix, path: path.clone() };
+            let pr = PropRoute {
+                prefix: *prefix,
+                path: path.clone(),
+            };
             for tx in sessions.values() {
                 let _ = tx.send(SessionCmd::Propagate(vec![pr.clone()])).await;
             }
@@ -2128,8 +2437,12 @@ async fn propagate_addpath(
         return;
     }
     for &peer in addpath_send {
-        let Some(tx) = sessions.get(&peer) else { continue };
-        let Some(pp) = local.peers.get(&peer) else { continue };
+        let Some(tx) = sessions.get(&peer) else {
+            continue;
+        };
+        let Some(pp) = local.peers.get(&peer) else {
+            continue;
+        };
         let export = local.exports.get(&peer);
         // The paths to offer this peer, each under its stable Path Identifier.
         let mut desired: std::collections::BTreeMap<u32, Path> = std::collections::BTreeMap::new();
@@ -2141,12 +2454,23 @@ async fn propagate_addpath(
             if !should_propagate(path, pp.peer_type, pp.rr_client, peer) {
                 continue;
             }
-            let Some(fpath) = filter_path(export, prefix, path) else { continue };
+            let Some(fpath) = filter_path(export, prefix, path) else {
+                continue;
+            };
             desired.insert(state.id_for(src), fpath);
         }
         // Diff against what this peer currently holds for the prefix.
-        let advertised = state.out.entry(peer).or_default().entry(prefix).or_default();
-        let gone: Vec<u32> = advertised.iter().filter(|id| !desired.contains_key(id)).copied().collect();
+        let advertised = state
+            .out
+            .entry(peer)
+            .or_default()
+            .entry(prefix)
+            .or_default();
+        let gone: Vec<u32> = advertised
+            .iter()
+            .filter(|id| !desired.contains_key(id))
+            .copied()
+            .collect();
         for id in &gone {
             advertised.remove(id);
         }
@@ -2160,7 +2484,11 @@ async fn propagate_addpath(
         if !desired.is_empty() {
             let routes: Vec<AddPathRoute> = desired
                 .into_iter()
-                .map(|(path_id, path)| AddPathRoute { prefix, path_id, path })
+                .map(|(path_id, path)| AddPathRoute {
+                    prefix,
+                    path_id,
+                    path,
+                })
                 .collect();
             let _ = tx.send(SessionCmd::AdvertiseAddPath(routes)).await;
         }
@@ -2250,6 +2578,7 @@ fn build_path(
     let mut ext_communities = Vec::new();
     let mut originator_id = None;
     let mut cluster_list = Vec::new();
+    let mut srv6_sid = None;
     for a in &update.attributes {
         match a {
             PathAttribute::Origin(o) => origin = *o,
@@ -2262,6 +2591,9 @@ fn build_path(
             PathAttribute::ExtendedCommunities(c) => ext_communities = c.clone(),
             PathAttribute::OriginatorId(id) => originator_id = Some(*id),
             PathAttribute::ClusterList(ids) => cluster_list = ids.clone(),
+            PathAttribute::PrefixSid { srv6, .. } => {
+                srv6_sid = srv6.first().and_then(|t| t.first_sid()).copied();
+            }
             _ => {}
         }
     }
@@ -2289,6 +2621,7 @@ fn build_path(
         communities,
         large_communities,
         ext_communities,
+        srv6_sid,
     }
 }
 
@@ -2342,7 +2675,12 @@ fn base_next_hop(update: &Update) -> Option<Ipv4Addr> {
 /// which is what the peer intended on the shared link. Otherwise the global.
 fn mp_reach_v6(update: &Update) -> Option<(Ipv6Addr, &[Prefix], bool)> {
     update.attributes.iter().find_map(|a| match a {
-        PathAttribute::MpReachNlri { afi, next_hop, nlri, .. } if *afi == AFI_IPV6 => {
+        PathAttribute::MpReachNlri {
+            afi,
+            next_hop,
+            nlri,
+            ..
+        } if *afi == AFI_IPV6 => {
             let (global, link_local) = wren_bgp::decode_v6_next_hop(next_hop)?;
             match link_local {
                 Some(ll) => Some((ll, nlri.as_slice(), true)),
@@ -2360,9 +2698,12 @@ fn mp_reach_v6(update: &Update) -> Option<(Ipv6Addr, &[Prefix], bool)> {
 /// kernel installs each IPv4 prefix via this IPv6 gateway (RTA_VIA).
 fn mp_reach_v4_over_v6(update: &Update) -> Option<(Ipv6Addr, &[Prefix], bool)> {
     update.attributes.iter().find_map(|a| match a {
-        PathAttribute::MpReachNlri { afi, safi, next_hop, nlri }
-            if *afi == AFI_IPV4 && *safi == SAFI_UNICAST && next_hop.len() >= 16 =>
-        {
+        PathAttribute::MpReachNlri {
+            afi,
+            safi,
+            next_hop,
+            nlri,
+        } if *afi == AFI_IPV4 && *safi == SAFI_UNICAST && next_hop.len() >= 16 => {
             let (global, link_local) = wren_bgp::decode_v6_next_hop(next_hop)?;
             match link_local {
                 Some(ll) => Some((ll, nlri.as_slice(), true)),
@@ -2421,7 +2762,9 @@ fn vtep_next_hop_octets(ip: IpAddr) -> Vec<u8> {
 /// IPv6 one; any other length is malformed and skipped by the caller.
 fn evpn_next_hop_ip(octets: &[u8]) -> Option<IpAddr> {
     match octets.len() {
-        4 => Some(IpAddr::V4(Ipv4Addr::new(octets[0], octets[1], octets[2], octets[3]))),
+        4 => Some(IpAddr::V4(Ipv4Addr::new(
+            octets[0], octets[1], octets[2], octets[3],
+        ))),
         16 => {
             let mut b = [0u8; 16];
             b.copy_from_slice(octets);
@@ -2460,12 +2803,18 @@ async fn handle_evpn_event(
     match ev {
         EvpnRibEvent::Best { nlri, path } => {
             evpn_nh.insert(nlri.clone(), nh.clone());
-            let route = EvpnPropRoute { nlri, path, next_hop: nh };
+            let route = EvpnPropRoute {
+                nlri,
+                path,
+                next_hop: nh,
+            };
             for (addr, tx) in sessions {
                 if *addr == from_peer || local.peers.get(addr).map(|pp| pp.evpn) != Some(true) {
                     continue;
                 }
-                let _ = tx.send(SessionCmd::PropagateEvpn(vec![route.clone()])).await;
+                let _ = tx
+                    .send(SessionCmd::PropagateEvpn(vec![route.clone()]))
+                    .await;
             }
         }
         EvpnRibEvent::Withdrawn(nlri) => {
@@ -2557,12 +2906,7 @@ fn should_advertise(communities: &[u32], to_type: PeerType) -> bool {
 }
 
 /// Actively dial a peer, run the session, and retry on failure.
-async fn connector(
-    peer: PeerInfo,
-    auth: TcpAuth,
-    local: Arc<Local>,
-    tx: mpsc::Sender<PeerMsg>,
-) {
+async fn connector(peer: PeerInfo, auth: TcpAuth, local: Arc<Local>, tx: mpsc::Sender<PeerMsg>) {
     loop {
         // An authenticated peer needs its key installed on the socket before the
         // handshake, so it gets a hand-built connect; an ordinary peer uses tokio's.
@@ -2648,7 +2992,9 @@ fn sockaddr_in_v4(addr: Ipv4Addr, port: u16) -> libc::sockaddr_in {
     libc::sockaddr_in {
         sin_family: libc::AF_INET as libc::sa_family_t,
         sin_port: port.to_be(),
-        sin_addr: libc::in_addr { s_addr: u32::from(addr).to_be() },
+        sin_addr: libc::in_addr {
+            s_addr: u32::from(addr).to_be(),
+        },
         sin_zero: [0; 8],
     }
 }
@@ -2888,7 +3234,9 @@ async fn connect_bound(
                     sin6_family: libc::AF_INET6 as libc::sa_family_t,
                     sin6_port: PORT.to_be(),
                     sin6_flowinfo: 0,
-                    sin6_addr: libc::in6_addr { s6_addr: v6.octets() },
+                    sin6_addr: libc::in6_addr {
+                        s6_addr: v6.octets(),
+                    },
                     sin6_scope_id: scope_id.unwrap_or(0),
                 };
                 unsafe {
@@ -3000,9 +3348,12 @@ fn normalize_ip(ip: IpAddr) -> IpAddr {
 fn peer_sockaddr(addr: IpAddr, scope_id: Option<u32>) -> std::net::SocketAddr {
     match addr {
         IpAddr::V4(v4) => std::net::SocketAddr::from((v4, PORT)),
-        IpAddr::V6(v6) => {
-            std::net::SocketAddr::V6(std::net::SocketAddrV6::new(v6, PORT, 0, scope_id.unwrap_or(0)))
-        }
+        IpAddr::V6(v6) => std::net::SocketAddr::V6(std::net::SocketAddrV6::new(
+            v6,
+            PORT,
+            0,
+            scope_id.unwrap_or(0),
+        )),
     }
 }
 
@@ -3363,11 +3714,17 @@ async fn drive_session(
             Step::Cmd(SessionCmd::SendRefresh) => {
                 if sess.established && sess.peer_route_refresh {
                     let _ = sess
-                        .send(&Message::RouteRefresh { afi: AFI_IPV4, safi: SAFI_UNICAST })
+                        .send(&Message::RouteRefresh {
+                            afi: AFI_IPV4,
+                            safi: SAFI_UNICAST,
+                        })
                         .await;
                     if sess.mp_ipv6 {
                         let _ = sess
-                            .send(&Message::RouteRefresh { afi: AFI_IPV6, safi: SAFI_UNICAST })
+                            .send(&Message::RouteRefresh {
+                                afi: AFI_IPV6,
+                                safi: SAFI_UNICAST,
+                            })
                             .await;
                     }
                 }
@@ -3378,11 +3735,17 @@ async fn drive_session(
             Step::Cmd(SessionCmd::SendEndOfRib) => {
                 if sess.established {
                     let _ = sess
-                        .send(&Message::Update(Update::end_of_rib_marker(AFI_IPV4, SAFI_UNICAST)))
+                        .send(&Message::Update(Update::end_of_rib_marker(
+                            AFI_IPV4,
+                            SAFI_UNICAST,
+                        )))
                         .await;
                     if sess.mp_ipv6 {
                         let _ = sess
-                            .send(&Message::Update(Update::end_of_rib_marker(AFI_IPV6, SAFI_UNICAST)))
+                            .send(&Message::Update(Update::end_of_rib_marker(
+                                AFI_IPV6,
+                                SAFI_UNICAST,
+                            )))
                             .await;
                     }
                     // EVPN End-of-RIB (RFC 7432 / RFC 4724 §2): an empty EVPN
@@ -3390,7 +3753,9 @@ async fn drive_session(
                     if sess.mp_evpn {
                         let _ = sess
                             .send(&Message::Update(Update {
-                                attributes: vec![PathAttribute::MpUnreachEvpn { withdrawn: vec![] }],
+                                attributes: vec![PathAttribute::MpUnreachEvpn {
+                                    withdrawn: vec![],
+                                }],
                                 ..Default::default()
                             }))
                             .await;
@@ -3439,7 +3804,10 @@ async fn drive_session(
                     .await;
                 let _ = sess
                     .tx
-                    .send(PeerMsg::Down { peer: sess.peer.addr, conn_id: sess.conn_id })
+                    .send(PeerMsg::Down {
+                        peer: sess.peer.addr,
+                        conn_id: sess.conn_id,
+                    })
                     .await;
                 return Ok(());
             }
@@ -3576,12 +3944,8 @@ impl Session<'_> {
                     } else {
                         self.local.local_as
                     };
-                    let mut open = Open::new(
-                        VERSION,
-                        my_as,
-                        self.local.hold_time,
-                        self.local.router_id,
-                    );
+                    let mut open =
+                        Open::new(VERSION, my_as, self.local.hold_time, self.local.router_id);
                     // ADD-PATH (RFC 7911): when configured for this peer, advertise the
                     // ability to both send and receive multiple IPv4-unicast paths.
                     if self.add_path_cfg {
@@ -3603,8 +3967,10 @@ impl Session<'_> {
                     // L2VPN/EVPN (RFC 7432 §4 + RFC 4760): advertise the EVPN
                     // Multiprotocol capability when this peer is EVPN-activated.
                     if self.evpn_cfg {
-                        open.capabilities
-                            .push(Capability::Multiprotocol { afi: AFI_L2VPN, safi: SAFI_EVPN });
+                        open.capabilities.push(Capability::Multiprotocol {
+                            afi: AFI_L2VPN,
+                            safi: SAFI_EVPN,
+                        });
                     }
                     // Keep the encoded OPEN for the BMP Peer Up (RFC 7854 §4.10).
                     let open_msg = Message::Open(open);
@@ -3655,7 +4021,10 @@ impl Session<'_> {
                     if self.established {
                         let _ = self
                             .tx
-                            .send(PeerMsg::Down { peer: self.peer.addr, conn_id: self.conn_id })
+                            .send(PeerMsg::Down {
+                                peer: self.peer.addr,
+                                conn_id: self.conn_id,
+                            })
                             .await;
                         self.established = false;
                     }
@@ -3710,8 +4079,10 @@ impl Session<'_> {
     async fn advertise(&mut self, routes: &[OriginRoute]) -> Result<()> {
         // Per-neighbour outbound export policy: drop or re-tag originated routes before
         // they are grouped into UPDATEs.
-        let routes: Vec<OriginRoute> =
-            routes.iter().filter_map(|r| filter_origin(self.export.as_ref(), r)).collect();
+        let routes: Vec<OriginRoute> = routes
+            .iter()
+            .filter_map(|r| filter_origin(self.export.as_ref(), r))
+            .collect();
         let routes = &routes[..];
         type TagKey = (Vec<u32>, Vec<(u32, u32, u32)>, Vec<[u8; 8]>);
         let mut groups: BTreeMap<TagKey, Vec<Prefix>> = BTreeMap::new();
@@ -3762,10 +4133,19 @@ impl Session<'_> {
             base.push(PathAttribute::AtomicAggregate);
             let agg_as = self.local.external_as();
             if !self.four_octet && agg_as > u16::MAX as u32 {
-                base.push(PathAttribute::Aggregator { asn: AS_TRANS as u32, id: self.local.router_id });
-                base.push(PathAttribute::As4Aggregator { asn: agg_as, id: self.local.router_id });
+                base.push(PathAttribute::Aggregator {
+                    asn: AS_TRANS as u32,
+                    id: self.local.router_id,
+                });
+                base.push(PathAttribute::As4Aggregator {
+                    asn: agg_as,
+                    id: self.local.router_id,
+                });
             } else {
-                base.push(PathAttribute::Aggregator { asn: agg_as, id: self.local.router_id });
+                base.push(PathAttribute::Aggregator {
+                    asn: agg_as,
+                    id: self.local.router_id,
+                });
             }
             if !r.communities.is_empty() {
                 base.push(PathAttribute::Communities(r.communities.clone()));
@@ -3774,7 +4154,9 @@ impl Session<'_> {
                 base.push(PathAttribute::LargeCommunities(r.large_communities.clone()));
             }
             if !r.ext_communities.is_empty() {
-                base.push(PathAttribute::ExtendedCommunities(r.ext_communities.clone()));
+                base.push(PathAttribute::ExtendedCommunities(
+                    r.ext_communities.clone(),
+                ));
             }
             let (v4, v6) = if r.prefix.is_ipv4() {
                 (vec![r.prefix], vec![])
@@ -3797,20 +4179,24 @@ impl Session<'_> {
                 // True eBGP: prepend the externally visible AS (the Confederation
                 // Identifier if we are in a confederation, else our AS).
                 let ext = self.local.external_as();
-                base.push(PathAttribute::AsPath(vec![AsPathSegment::Sequence(vec![ext])]));
+                base.push(PathAttribute::AsPath(vec![AsPathSegment::Sequence(vec![
+                    ext,
+                ])]));
                 // Toward a legacy 2-octet peer our AS would collapse to AS_TRANS on the
                 // wire; carry the real 4-octet AS in AS4_PATH (RFC 6793).
                 if !self.four_octet && ext > u16::MAX as u32 {
-                    base.push(PathAttribute::As4Path(vec![AsPathSegment::Sequence(vec![ext])]));
+                    base.push(PathAttribute::As4Path(vec![AsPathSegment::Sequence(vec![
+                        ext,
+                    ])]));
                 }
             }
             PeerType::Confed => {
                 // Confed-eBGP (RFC 5065 §5.3): prepend our Member-AS to an
                 // AS_CONFED_SEQUENCE — internal to the confederation — and carry
                 // LOCAL_PREF, which is honoured across member-AS boundaries.
-                base.push(PathAttribute::AsPath(vec![AsPathSegment::ConfedSequence(vec![
-                    self.local.local_as,
-                ])]));
+                base.push(PathAttribute::AsPath(vec![AsPathSegment::ConfedSequence(
+                    vec![self.local.local_as],
+                )]));
                 base.push(PathAttribute::LocalPref(DEFAULT_LOCAL_PREF));
             }
             PeerType::Ibgp => {
@@ -3846,14 +4232,24 @@ impl Session<'_> {
                         next_hop: self.v6_next_hop_field(nh6, true),
                         nlri: v4,
                     });
-                    self.send(&Message::Update(Update { withdrawn: vec![], attributes, nlri: vec![], ..Default::default() }))
-                        .await?;
+                    self.send(&Message::Update(Update {
+                        withdrawn: vec![],
+                        attributes,
+                        nlri: vec![],
+                        ..Default::default()
+                    }))
+                    .await?;
                 }
                 _ => {
                     let mut attributes = base.clone();
                     attributes.push(PathAttribute::NextHop(self.local_ip));
-                    self.send(&Message::Update(Update { withdrawn: vec![], attributes, nlri: v4, ..Default::default() }))
-                        .await?;
+                    self.send(&Message::Update(Update {
+                        withdrawn: vec![],
+                        attributes,
+                        nlri: v4,
+                        ..Default::default()
+                    }))
+                    .await?;
                 }
             }
         }
@@ -3871,11 +4267,20 @@ impl Session<'_> {
                         next_hop: self.v6_next_hop_field(nh6, true),
                         nlri: v6,
                     });
-                    self.send(&Message::Update(Update { withdrawn: vec![], attributes, nlri: vec![], ..Default::default() }))
-                        .await?;
+                    self.send(&Message::Update(Update {
+                        withdrawn: vec![],
+                        attributes,
+                        nlri: vec![],
+                        ..Default::default()
+                    }))
+                    .await?;
                 }
-                (false, _) => debug!(peer = %self.peer.addr, "peer has no IPv6 capability; not advertising IPv6 NLRI"),
-                (true, None) => warn!(peer = %self.peer.addr, "IPv6 routes to advertise but no `[bgp] next-hop6` configured"),
+                (false, _) => {
+                    debug!(peer = %self.peer.addr, "peer has no IPv6 capability; not advertising IPv6 NLRI")
+                }
+                (true, None) => {
+                    warn!(peer = %self.peer.addr, "IPv6 routes to advertise but no `[bgp] next-hop6` configured")
+                }
             }
         }
         Ok(())
@@ -3894,7 +4299,7 @@ impl Session<'_> {
                 withdrawn: v4,
                 attributes: vec![],
                 nlri: vec![],
-            ..Default::default()
+                ..Default::default()
             }))
             .await?;
         }
@@ -3945,7 +4350,7 @@ impl Session<'_> {
                     withdrawn: vec![],
                     attributes,
                     nlri: vec![r.prefix],
-            ..Default::default()
+                    ..Default::default()
                 }))
                 .await?;
             } else {
@@ -3979,7 +4384,7 @@ impl Session<'_> {
                     withdrawn: vec![],
                     attributes,
                     nlri: vec![],
-            ..Default::default()
+                    ..Default::default()
                 }))
                 .await?;
             }
@@ -4039,21 +4444,35 @@ impl Session<'_> {
     /// to this EVPN-activated peer. Routes are grouped by their ext-community set and
     /// next hop — one MP_REACH_NLRI UPDATE per group, next hop = our VTEP.
     async fn advertise_evpn(&mut self, routes: &[EvpnOriginRoute]) -> Result<()> {
-        type Key = (Vec<[u8; 8]>, Vec<u8>);
+        type Key = (Vec<[u8; 8]>, Vec<u8>, Option<Vec<Srv6ServiceTlv>>);
         let mut groups: BTreeMap<Key, Vec<EvpnNlri>> = BTreeMap::new();
         for r in routes {
             groups
-                .entry((r.ext_communities.clone(), r.next_hop.clone()))
+                .entry((
+                    r.ext_communities.clone(),
+                    r.next_hop.clone(),
+                    r.srv6.clone(),
+                ))
                 .or_default()
                 .push(r.nlri.clone());
         }
-        for ((ext_communities, next_hop), nlri) in groups {
+        for ((ext_communities, next_hop, srv6), nlri) in groups {
             let mut attributes = self.base_path_attrs();
             if !ext_communities.is_empty() {
                 attributes.push(PathAttribute::ExtendedCommunities(ext_communities));
             }
+            if let Some(tlvs) = srv6 {
+                attributes.push(PathAttribute::PrefixSid {
+                    srv6: tlvs,
+                    other: vec![],
+                });
+            }
             attributes.push(PathAttribute::MpReachEvpn { next_hop, nlri });
-            self.send(&Message::Update(Update { attributes, ..Default::default() })).await?;
+            self.send(&Message::Update(Update {
+                attributes,
+                ..Default::default()
+            }))
+            .await?;
         }
         Ok(())
     }
@@ -4070,11 +4489,26 @@ impl Session<'_> {
                 continue;
             }
             let mut attributes = self.propagated_base_attrs(&r.path);
+            // Re-attach the SRv6 service SID unchanged (RFC 9252): a route reflector
+            // must not rewrite it, just as it preserves the EVPN next hop.
+            if let Some(sid) = r.path.srv6_sid {
+                attributes.push(PathAttribute::PrefixSid {
+                    srv6: vec![Srv6ServiceTlv {
+                        is_l2: true,
+                        sids: vec![sid],
+                    }],
+                    other: vec![],
+                });
+            }
             attributes.push(PathAttribute::MpReachEvpn {
                 next_hop: r.next_hop.clone(),
                 nlri: vec![r.nlri.clone()],
             });
-            self.send(&Message::Update(Update { attributes, ..Default::default() })).await?;
+            self.send(&Message::Update(Update {
+                attributes,
+                ..Default::default()
+            }))
+            .await?;
         }
         Ok(())
     }
@@ -4085,7 +4519,9 @@ impl Session<'_> {
             return Ok(());
         }
         self.send(&Message::Update(Update {
-            attributes: vec![PathAttribute::MpUnreachEvpn { withdrawn: nlris.to_vec() }],
+            attributes: vec![PathAttribute::MpUnreachEvpn {
+                withdrawn: nlris.to_vec(),
+            }],
             ..Default::default()
         }))
         .await?;
@@ -4145,10 +4581,14 @@ impl Session<'_> {
             attrs.push(PathAttribute::Communities(path.communities.clone()));
         }
         if !path.large_communities.is_empty() {
-            attrs.push(PathAttribute::LargeCommunities(path.large_communities.clone()));
+            attrs.push(PathAttribute::LargeCommunities(
+                path.large_communities.clone(),
+            ));
         }
         if !path.ext_communities.is_empty() {
-            attrs.push(PathAttribute::ExtendedCommunities(path.ext_communities.clone()));
+            attrs.push(PathAttribute::ExtendedCommunities(
+                path.ext_communities.clone(),
+            ));
         }
         attrs
     }
@@ -4166,7 +4606,11 @@ impl Session<'_> {
 /// Read one length-prefixed BGP message: the 19-byte header gives the total
 /// length, then the remaining body follows. `four_octet` is the session's
 /// negotiated AS_PATH width for decoding an UPDATE (RFC 6793).
-async fn read_message(rd: &mut OwnedReadHalf, four_octet: bool, add_path: AddPath) -> Result<Message> {
+async fn read_message(
+    rd: &mut OwnedReadHalf,
+    four_octet: bool,
+    add_path: AddPath,
+) -> Result<Message> {
     let mut hdr = [0u8; HEADER_LEN];
     rd.read_exact(&mut hdr)
         .await
@@ -4185,7 +4629,8 @@ async fn read_message(rd: &mut OwnedReadHalf, four_octet: bool, add_path: AddPat
             .await
             .context("reading BGP body")?;
     }
-    Message::decode(&buf, four_octet, add_path).map_err(|e| anyhow::anyhow!("decoding BGP message: {e}"))
+    Message::decode(&buf, four_octet, add_path)
+        .map_err(|e| anyhow::anyhow!("decoding BGP message: {e}"))
 }
 
 #[cfg(test)]
@@ -4226,8 +4671,13 @@ mod tests {
             communities: vec![0xFDE9_0064, NO_EXPORT],
             large_communities: vec![(65001, 1, 2)],
             ext_communities: vec![[0x00, 0x02, 0xFD, 0xE9, 0x00, 0x00, 0x00, 0x64]], // rt:65001:100
+            srv6_sid: None,
         };
-        rib.update(ip([10, 0, 0, 1]), "10.0.0.0/8".parse::<Prefix>().unwrap(), path);
+        rib.update(
+            ip([10, 0, 0, 1]),
+            "10.0.0.0/8".parse::<Prefix>().unwrap(),
+            path,
+        );
         let out = render_bgp_routes(&rib, &RoaTable::default());
         assert!(out.contains("10.0.0.0/8 via 192.0.2.1"));
         assert!(out.contains("large-communities 65001:1:2"));
@@ -4240,7 +4690,10 @@ mod tests {
 
     #[test]
     fn render_routes_empty_rib() {
-        assert_eq!(render_bgp_routes(&BgpRib::new(), &RoaTable::default()), "no bgp routes\n");
+        assert_eq!(
+            render_bgp_routes(&BgpRib::new(), &RoaTable::default()),
+            "no bgp routes\n"
+        );
     }
 
     #[test]
@@ -4282,8 +4735,13 @@ mod tests {
             communities: vec![],
             large_communities: vec![],
             ext_communities: vec![],
+            srv6_sid: None,
         };
-        rib.update(ip([10, 0, 0, 1]), "10.1.2.0/24".parse::<Prefix>().unwrap(), path);
+        rib.update(
+            ip([10, 0, 0, 1]),
+            "10.1.2.0/24".parse::<Prefix>().unwrap(),
+            path,
+        );
 
         // A ROA authorising AS 65002 for 10.0.0.0/8 up to /24 → Valid.
         let valid = RoaTable::new(vec![Roa {
@@ -4306,22 +4764,46 @@ mod tests {
     #[test]
     fn render_neighbors_lists_state() {
         let n = vec![
-            NeighborSummary { addr: ip([10, 0, 0, 2]), remote_as: 65002, established: true, refreshes_received: 2 },
-            NeighborSummary { addr: ip([10, 0, 0, 3]), remote_as: 4_200_000_000, established: false, refreshes_received: 0 },
+            NeighborSummary {
+                addr: ip([10, 0, 0, 2]),
+                remote_as: 65002,
+                established: true,
+                refreshes_received: 2,
+            },
+            NeighborSummary {
+                addr: ip([10, 0, 0, 3]),
+                remote_as: 4_200_000_000,
+                established: false,
+                refreshes_received: 0,
+            },
         ];
         let out = render_bgp_neighbors(&n);
         assert!(out.contains("10.0.0.2 AS 65002 Established refreshes 2"));
         assert!(out.contains("10.0.0.3 AS 4200000000 Idle"));
         // A peer with no refreshes does not show the counter.
-        assert!(!out.lines().find(|l| l.contains("10.0.0.3")).unwrap().contains("refreshes"));
+        assert!(!out
+            .lines()
+            .find(|l| l.contains("10.0.0.3"))
+            .unwrap()
+            .contains("refreshes"));
         assert_eq!(render_bgp_neighbors(&[]), "no bgp neighbors configured\n");
     }
 
     #[test]
     fn render_metrics_emits_prometheus_families() {
         let n = vec![
-            NeighborSummary { addr: ip([10, 0, 0, 2]), remote_as: 65002, established: true, refreshes_received: 3 },
-            NeighborSummary { addr: ip([10, 0, 0, 3]), remote_as: 65003, established: false, refreshes_received: 0 },
+            NeighborSummary {
+                addr: ip([10, 0, 0, 2]),
+                remote_as: 65002,
+                established: true,
+                refreshes_received: 3,
+            },
+            NeighborSummary {
+                addr: ip([10, 0, 0, 3]),
+                remote_as: 65003,
+                established: false,
+                refreshes_received: 0,
+            },
         ];
         let out = render_bgp_metrics(&n, 4);
         // Per-neighbour up/down gauge with neighbor + asn labels.
@@ -4367,6 +4849,7 @@ mod tests {
             communities: vec![],
             large_communities: vec![],
             ext_communities: vec![],
+            srv6_sid: None,
         }
     }
 
@@ -4391,7 +4874,11 @@ mod tests {
                 matcher: Match::prefix(PrefixList(vec![PrefixPattern::orlonger(
                     "10.50.0.0/16".parse().unwrap(),
                 )])),
-                modify: Modify { set_preference: Some(250), add_communities: vec![0xFFFF_FF01], ..Modify::default() },
+                modify: Modify {
+                    set_preference: Some(250),
+                    add_communities: vec![0xFFFF_FF01],
+                    ..Modify::default()
+                },
                 action: Action::Accept,
             }],
             default: Action::Reject,
@@ -4434,7 +4921,10 @@ mod tests {
                     matcher: Match::prefix(PrefixList(vec![PrefixPattern::exact(
                         "10.50.1.0/24".parse().unwrap(),
                     )])),
-                    modify: Modify { add_communities: vec![0x0001_0002], ..Modify::default() },
+                    modify: Modify {
+                        add_communities: vec![0x0001_0002],
+                        ..Modify::default()
+                    },
                     action: Action::Accept,
                 },
             ],
@@ -4450,11 +4940,20 @@ mod tests {
     #[test]
     fn collision_keeps_the_higher_identifier_connection() {
         // We have the lower id -> keep the inbound (peer-initiated) connection.
-        assert!(collision_keeps_inbound(id([10, 0, 0, 1]), id([10, 0, 0, 2])));
+        assert!(collision_keeps_inbound(
+            id([10, 0, 0, 1]),
+            id([10, 0, 0, 2])
+        ));
         // We have the higher id -> keep our own outbound connection.
-        assert!(!collision_keeps_inbound(id([10, 0, 0, 2]), id([10, 0, 0, 1])));
+        assert!(!collision_keeps_inbound(
+            id([10, 0, 0, 2]),
+            id([10, 0, 0, 1])
+        ));
         // Equal ids (a misconfiguration) -> keep the outbound.
-        assert!(!collision_keeps_inbound(id([10, 0, 0, 1]), id([10, 0, 0, 1])));
+        assert!(!collision_keeps_inbound(
+            id([10, 0, 0, 1]),
+            id([10, 0, 0, 1])
+        ));
     }
 
     #[test]
@@ -4474,7 +4973,10 @@ mod tests {
         prepend_as(&mut p, 65000);
         assert_eq!(
             p,
-            vec![AsPathSegment::Sequence(vec![65000]), AsPathSegment::Set(vec![10, 11])]
+            vec![
+                AsPathSegment::Sequence(vec![65000]),
+                AsPathSegment::Set(vec![10, 11])
+            ]
         );
     }
 
@@ -4482,9 +4984,19 @@ mod tests {
     fn propagation_never_echoes_to_the_origin_peer() {
         let path = learned_path(true, [10, 0, 0, 1]);
         // To the very peer it came from: suppressed.
-        assert!(!should_propagate(&path, PeerType::Ebgp, false, ip([10, 0, 0, 1])));
+        assert!(!should_propagate(
+            &path,
+            PeerType::Ebgp,
+            false,
+            ip([10, 0, 0, 1])
+        ));
         // To a different eBGP peer: propagated.
-        assert!(should_propagate(&path, PeerType::Ebgp, false, ip([10, 0, 0, 2])));
+        assert!(should_propagate(
+            &path,
+            PeerType::Ebgp,
+            false,
+            ip([10, 0, 0, 2])
+        ));
     }
 
     #[test]
@@ -4492,13 +5004,33 @@ mod tests {
         // A route learned from a non-client iBGP peer is not passed to another
         // non-client iBGP peer …
         let ibgp = learned_path(false, [10, 0, 0, 1]);
-        assert!(!should_propagate(&ibgp, PeerType::Ibgp, false, ip([10, 0, 0, 2])));
+        assert!(!should_propagate(
+            &ibgp,
+            PeerType::Ibgp,
+            false,
+            ip([10, 0, 0, 2])
+        ));
         // … but is passed on to an eBGP peer.
-        assert!(should_propagate(&ibgp, PeerType::Ebgp, false, ip([10, 0, 0, 2])));
+        assert!(should_propagate(
+            &ibgp,
+            PeerType::Ebgp,
+            false,
+            ip([10, 0, 0, 2])
+        ));
         // A route learned from eBGP goes to both iBGP and eBGP peers.
         let ebgp = learned_path(true, [10, 0, 0, 1]);
-        assert!(should_propagate(&ebgp, PeerType::Ibgp, false, ip([10, 0, 0, 2])));
-        assert!(should_propagate(&ebgp, PeerType::Ebgp, false, ip([10, 0, 0, 2])));
+        assert!(should_propagate(
+            &ebgp,
+            PeerType::Ibgp,
+            false,
+            ip([10, 0, 0, 2])
+        ));
+        assert!(should_propagate(
+            &ebgp,
+            PeerType::Ebgp,
+            false,
+            ip([10, 0, 0, 2])
+        ));
     }
 
     #[test]
@@ -4506,42 +5038,94 @@ mod tests {
         // An iBGP-learned route crosses into another Member-AS (confed-eBGP), like
         // it would to a true eBGP peer — the iBGP split horizon does not apply.
         let ibgp = learned_path(false, [10, 0, 0, 1]);
-        assert!(should_propagate(&ibgp, PeerType::Confed, false, ip([10, 0, 0, 2])));
+        assert!(should_propagate(
+            &ibgp,
+            PeerType::Confed,
+            false,
+            ip([10, 0, 0, 2])
+        ));
 
         // A confed-learned route (interior for the decision) still propagates freely
         // to iBGP, other confed and eBGP peers.
         let mut confed = learned_path(false, [10, 0, 0, 1]);
         confed.from_confed = true;
-        assert!(should_propagate(&confed, PeerType::Ibgp, false, ip([10, 0, 0, 2])));
-        assert!(should_propagate(&confed, PeerType::Confed, false, ip([10, 0, 0, 3])));
-        assert!(should_propagate(&confed, PeerType::Ebgp, false, ip([10, 0, 0, 4])));
+        assert!(should_propagate(
+            &confed,
+            PeerType::Ibgp,
+            false,
+            ip([10, 0, 0, 2])
+        ));
+        assert!(should_propagate(
+            &confed,
+            PeerType::Confed,
+            false,
+            ip([10, 0, 0, 3])
+        ));
+        assert!(should_propagate(
+            &confed,
+            PeerType::Ebgp,
+            false,
+            ip([10, 0, 0, 4])
+        ));
     }
 
     #[test]
     fn route_reflection_relaxes_the_split_horizon_for_clients() {
         // A route learned from a non-client iBGP peer IS reflected to a client.
         let from_nonclient = learned_path(false, [10, 0, 0, 1]);
-        assert!(should_propagate(&from_nonclient, PeerType::Ibgp, true, ip([10, 0, 0, 2])));
+        assert!(should_propagate(
+            &from_nonclient,
+            PeerType::Ibgp,
+            true,
+            ip([10, 0, 0, 2])
+        ));
 
         // A route learned from a client is reflected to every iBGP peer (client or
         // not) and to eBGP peers.
         let mut from_client = learned_path(false, [10, 0, 0, 1]);
         from_client.from_client = true;
-        assert!(should_propagate(&from_client, PeerType::Ibgp, false, ip([10, 0, 0, 2]))); // non-client iBGP
-        assert!(should_propagate(&from_client, PeerType::Ibgp, true, ip([10, 0, 0, 3]))); // client
-        assert!(should_propagate(&from_client, PeerType::Ebgp, false, ip([10, 0, 0, 4]))); // eBGP
+        assert!(should_propagate(
+            &from_client,
+            PeerType::Ibgp,
+            false,
+            ip([10, 0, 0, 2])
+        )); // non-client iBGP
+        assert!(should_propagate(
+            &from_client,
+            PeerType::Ibgp,
+            true,
+            ip([10, 0, 0, 3])
+        )); // client
+        assert!(should_propagate(
+            &from_client,
+            PeerType::Ebgp,
+            false,
+            ip([10, 0, 0, 4])
+        )); // eBGP
     }
 
     #[test]
     fn reflection_loop_check_drops_own_originator_or_cluster() {
-        let upd = |attrs: Vec<PathAttribute>| Update { withdrawn: vec![], attributes: attrs, nlri: vec![], ..Default::default() };
+        let upd = |attrs: Vec<PathAttribute>| Update {
+            withdrawn: vec![],
+            attributes: attrs,
+            nlri: vec![],
+            ..Default::default()
+        };
         let rid = id([10, 0, 0, 1]);
         let cid = id([1, 1, 1, 1]);
         // Our own ORIGINATOR_ID → loop.
-        assert!(is_reflection_loop(&upd(vec![PathAttribute::OriginatorId(rid)]), rid, cid));
+        assert!(is_reflection_loop(
+            &upd(vec![PathAttribute::OriginatorId(rid)]),
+            rid,
+            cid
+        ));
         // Our CLUSTER_ID in the CLUSTER_LIST → loop.
         assert!(is_reflection_loop(
-            &upd(vec![PathAttribute::ClusterList(vec![id([9, 9, 9, 9]), cid])]),
+            &upd(vec![PathAttribute::ClusterList(vec![
+                id([9, 9, 9, 9]),
+                cid
+            ])]),
             rid,
             cid
         ));
@@ -4557,7 +5141,12 @@ mod tests {
     fn propagation_honours_no_advertise() {
         let mut path = learned_path(true, [10, 0, 0, 1]);
         path.communities = vec![NO_ADVERTISE];
-        assert!(!should_propagate(&path, PeerType::Ebgp, false, ip([10, 0, 0, 2])));
+        assert!(!should_propagate(
+            &path,
+            PeerType::Ebgp,
+            false,
+            ip([10, 0, 0, 2])
+        ));
     }
 
     #[test]
@@ -4601,7 +5190,12 @@ mod tests {
 
     #[test]
     fn confed_loop_check_drops_our_member_as() {
-        let upd = |attrs: Vec<PathAttribute>| Update { withdrawn: vec![], attributes: attrs, nlri: vec![], ..Default::default() };
+        let upd = |attrs: Vec<PathAttribute>| Update {
+            withdrawn: vec![],
+            attributes: attrs,
+            nlri: vec![],
+            ..Default::default()
+        };
         // Our Member-AS inside an AS_CONFED_SEQUENCE → a confederation loop.
         let looped = upd(vec![PathAttribute::AsPath(vec![
             AsPathSegment::ConfedSequence(vec![65002, 65001]),
@@ -4622,7 +5216,10 @@ mod tests {
         // prepend_confed grows a leading AS_CONFED_SEQUENCE …
         let mut segs = vec![AsPathSegment::ConfedSequence(vec![65002])];
         prepend_confed(&mut segs, 65001);
-        assert_eq!(segs, vec![AsPathSegment::ConfedSequence(vec![65001, 65002])]);
+        assert_eq!(
+            segs,
+            vec![AsPathSegment::ConfedSequence(vec![65001, 65002])]
+        );
         // … or starts one in front of a regular sequence.
         let mut segs = vec![AsPathSegment::Sequence(vec![64500])];
         prepend_confed(&mut segs, 65001);
@@ -4657,7 +5254,14 @@ mod tests {
         let p: Prefix = "10.5.0.0/16".parse().unwrap();
         let mut advertised: BTreeMap<Prefix, OriginRoute> = BTreeMap::new();
 
-        apply_redistribution(Redistribution::Announce(static_route("10.5.0.0/16")), &mut originated, &[], &mut advertised, &sessions).await;
+        apply_redistribution(
+            Redistribution::Announce(static_route("10.5.0.0/16")),
+            &mut originated,
+            &[],
+            &mut advertised,
+            &sessions,
+        )
+        .await;
         assert!(originated.contains_key(&p));
         match rx.try_recv().unwrap() {
             SessionCmd::Advertise(routes) => assert_eq!(routes[0].prefix, p),
@@ -4665,10 +5269,24 @@ mod tests {
         }
 
         // Re-announcing the same prefix is idempotent: no second advertise.
-        apply_redistribution(Redistribution::Announce(static_route("10.5.0.0/16")), &mut originated, &[], &mut advertised, &sessions).await;
+        apply_redistribution(
+            Redistribution::Announce(static_route("10.5.0.0/16")),
+            &mut originated,
+            &[],
+            &mut advertised,
+            &sessions,
+        )
+        .await;
         assert!(rx.try_recv().is_err());
 
-        apply_redistribution(Redistribution::Withdraw(p), &mut originated, &[], &mut advertised, &sessions).await;
+        apply_redistribution(
+            Redistribution::Withdraw(p),
+            &mut originated,
+            &[],
+            &mut advertised,
+            &sessions,
+        )
+        .await;
         assert!(!originated.contains_key(&p));
         assert!(matches!(rx.try_recv().unwrap(), SessionCmd::Withdraw(_)));
     }
@@ -4691,7 +5309,14 @@ mod tests {
         sessions.insert(ip([10, 0, 0, 2]), tx);
         let mut advertised: BTreeMap<Prefix, OriginRoute> = BTreeMap::new();
 
-        apply_redistribution(Redistribution::Withdraw(p), &mut originated, &[], &mut advertised, &sessions).await;
+        apply_redistribution(
+            Redistribution::Withdraw(p),
+            &mut originated,
+            &[],
+            &mut advertised,
+            &sessions,
+        )
+        .await;
         assert!(originated.contains_key(&p)); // configured: kept
         assert!(rx.try_recv().is_err()); // nothing pushed
     }
@@ -4707,7 +5332,14 @@ mod tests {
         let p: Prefix = "2001:db8:99::/64".parse().unwrap();
         let mut advertised: BTreeMap<Prefix, OriginRoute> = BTreeMap::new();
 
-        apply_redistribution(Redistribution::Announce(static_route("2001:db8:99::/64")), &mut originated, &[], &mut advertised, &sessions).await;
+        apply_redistribution(
+            Redistribution::Announce(static_route("2001:db8:99::/64")),
+            &mut originated,
+            &[],
+            &mut advertised,
+            &sessions,
+        )
+        .await;
         assert!(originated.contains_key(&p));
         match rx.try_recv().unwrap() {
             SessionCmd::Advertise(routes) => assert_eq!(routes[0].prefix, p),
@@ -4738,8 +5370,13 @@ mod tests {
             communities: vec![],
             large_communities: vec![],
             ext_communities: vec![],
+            srv6_sid: None,
         };
-        rib.update(ip([10, 0, 0, 2]), "2001:db8:99::/64".parse::<Prefix>().unwrap(), path.clone());
+        rib.update(
+            ip([10, 0, 0, 2]),
+            "2001:db8:99::/64".parse::<Prefix>().unwrap(),
+            path.clone(),
+        );
         let out = render_bgp_routes(&rib, &RoaTable::default());
         assert!(out.contains("2001:db8:99::/64 via 2001:db8::2"));
         // And to_route carries the v6 next hop into the kernel route.
