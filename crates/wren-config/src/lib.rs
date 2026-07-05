@@ -81,6 +81,87 @@ pub struct Config {
     /// VRRP (RFC 5798) virtual routers — first-hop redundancy / firewall HA.
     #[serde(default, rename = "vrrp")]
     pub vrrp: Vec<VrrpDef>,
+    /// Multicast — the IGMP querier (RFC 3376) and IGMP proxy (RFC 4605), used for
+    /// IPTV and other multicast behind the firewall.
+    #[serde(default)]
+    pub multicast: Option<Multicast>,
+}
+
+/// The `[multicast]` block: the IGMP querier and RFC 4605 proxy configuration.
+///
+/// ```toml
+/// [multicast]
+/// enabled = true
+/// robustness = 2
+/// query-interval = 125
+///
+/// # A LAN the router is the elected IGMP querier for.
+/// [[multicast.interface]]
+/// name = "lan0"
+/// role = "querier"
+///
+/// # RFC 4605 proxy: pull streams from "wan0" for members seen on "lan0".
+/// [[multicast.interface]]
+/// name = "wan0"
+/// role = "upstream"
+/// [[multicast.interface]]
+/// name = "lan0"
+/// role = "downstream"
+/// ```
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct Multicast {
+    /// Whether multicast (IGMP/MLD) is enabled.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Run the IGMP querier/proxy (IPv4). Defaults to true.
+    pub igmp: Option<bool>,
+    /// Run the MLDv2 querier/proxy (IPv6, RFC 3810) on the same interfaces/roles.
+    /// Defaults to false.
+    pub mld: Option<bool>,
+    /// IGMP version to speak by default (2 or 3). Per-interface `igmp-version`
+    /// overrides this. Defaults to 3.
+    #[serde(rename = "igmp-version")]
+    pub igmp_version: Option<u8>,
+    /// The Robustness Variable (QRV), RFC 3376 §8.1. Defaults to 2.
+    pub robustness: Option<u8>,
+    /// The Query Interval in seconds, RFC 3376 §8.2. Defaults to 125.
+    #[serde(rename = "query-interval")]
+    pub query_interval: Option<u32>,
+    /// The Query Response Interval (max response time) in seconds, §8.3. Defaults to 10.
+    #[serde(rename = "query-response-interval")]
+    pub query_response_interval: Option<u32>,
+    /// The interfaces multicast runs on, each with a role.
+    #[serde(default, rename = "interface")]
+    pub interfaces: Vec<MulticastInterface>,
+}
+
+/// One `[[multicast.interface]]`: an interface and the role it plays.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct MulticastInterface {
+    /// The interface name.
+    pub name: String,
+    /// The role this interface plays. Defaults to `querier`.
+    #[serde(default)]
+    pub role: MulticastRole,
+    /// IGMP version for this interface (2 or 3), overriding the `[multicast]`
+    /// default. Unset inherits.
+    #[serde(rename = "igmp-version")]
+    pub igmp_version: Option<u8>,
+}
+
+/// The role a multicast interface plays.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum MulticastRole {
+    /// Act as the IGMP querier on this LAN: send queries and track membership.
+    #[default]
+    Querier,
+    /// The RFC 4605 proxy upstream interface: streams are pulled from here.
+    Upstream,
+    /// An RFC 4605 proxy downstream interface: membership here drives upstream joins.
+    Downstream,
 }
 
 /// One VRRP virtual router (`[[vrrp]]`). Two or more routers sharing a `vrid` on a
@@ -1129,6 +1210,57 @@ mod tests {
         assert_eq!(routes.len(), 2);
         assert_eq!(routes[0].prefix.to_string(), "0.0.0.0/0");
         assert_eq!(routes[1].metric, 10);
+    }
+
+    #[test]
+    fn parses_multicast_igmp_querier_and_proxy() {
+        let cfg = Config::from_toml(
+            r#"
+            router-id = "10.0.0.1"
+            [multicast]
+            enabled = true
+            mld = true
+            robustness = 2
+            query-interval = 30
+            [[multicast.interface]]
+            name = "lan0"
+            role = "querier"
+            [[multicast.interface]]
+            name = "wan0"
+            role = "upstream"
+            igmp-version = 3
+            [[multicast.interface]]
+            name = "lan1"
+            role = "downstream"
+            "#,
+        )
+        .expect("valid config");
+        let mc = cfg.multicast.expect("multicast block present");
+        assert!(mc.enabled);
+        assert_eq!(mc.mld, Some(true));
+        assert_eq!(mc.robustness, Some(2));
+        assert_eq!(mc.query_interval, Some(30));
+        assert_eq!(mc.interfaces.len(), 3);
+        assert_eq!(mc.interfaces[0].name, "lan0");
+        assert_eq!(mc.interfaces[0].role, MulticastRole::Querier);
+        assert_eq!(mc.interfaces[1].role, MulticastRole::Upstream);
+        assert_eq!(mc.interfaces[1].igmp_version, Some(3));
+        assert_eq!(mc.interfaces[2].role, MulticastRole::Downstream);
+    }
+
+    #[test]
+    fn multicast_role_defaults_to_querier() {
+        let cfg = Config::from_toml(
+            r#"
+            [multicast]
+            enabled = true
+            [[multicast.interface]]
+            name = "lan0"
+            "#,
+        )
+        .expect("valid config");
+        let mc = cfg.multicast.unwrap();
+        assert_eq!(mc.interfaces[0].role, MulticastRole::Querier);
     }
 
     #[test]

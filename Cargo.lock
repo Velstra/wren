@@ -594,6 +594,7 @@ dependencies = [
  "wren-config",
  "wren-core",
  "wren-filter",
+ "wren-igmp",
  "wren-isis",
  "wren-netlink",
  "wren-ospf",
@@ -608,6 +609,10 @@ version = "0.1.0"
 dependencies = [
  "wren-core",
 ]
+
+[[package]]
+name = "wren-igmp"
+version = "0.1.0"
 
 [[package]]
 name = "wren-isis"

@@ -19,8 +19,12 @@ mod bmp;
 mod connected;
 mod control;
 mod fib;
+#[cfg(feature = "igmp")]
+mod igmp;
 #[cfg(feature = "isis")]
 mod isis;
+#[cfg(feature = "igmp")]
+mod mld;
 mod metrics;
 #[cfg(feature = "ospf")]
 mod ospf;
@@ -125,6 +129,18 @@ enum Command {
         #[arg(trailing_var_arg = true)]
         args: Vec<String>,
     },
+    /// Join a multicast group on an interface and hold the membership (a diagnostic
+    /// / test helper). The kernel then emits genuine IGMP membership reports for the
+    /// group; runs until interrupted. Used by the IGMP querier smoke to stand in for
+    /// a receiving host.
+    #[cfg(feature = "igmp")]
+    McastJoin {
+        /// The multicast group to join, e.g. `239.1.1.1`.
+        group: String,
+        /// The interface to join it on, e.g. `eth0`.
+        #[arg(long)]
+        iface: String,
+    },
 }
 
 /// The mpsc capacity for protocol → router updates.
@@ -171,6 +187,20 @@ async fn main() -> Result<()> {
     if let Some(Command::Monitor { args: words }) = &args.command {
         let command = format!("monitor {}", words.join(" "));
         return control::run_monitor_client(&args.socket, command.trim()).await;
+    }
+    // `mcast-join` is a leaf helper: join the group and park (the kernel emits IGMP
+    // reports for it). It never returns, so handle it before standing up the daemon.
+    #[cfg(feature = "igmp")]
+    if let Some(Command::McastJoin { group, iface }) = &args.command {
+        tracing_subscriber::fmt()
+            .with_env_filter(
+                EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+            )
+            .init();
+        let g: IpAddr = group
+            .parse()
+            .with_context(|| format!("mcast-join group {group:?} is not an IP address"))?;
+        return igmp::mcast_join_blocking(g, iface);
     }
 
     tracing_subscriber::fmt()
@@ -907,6 +937,38 @@ async fn main() -> Result<()> {
                 }));
             }
             Err(e) => error!(error = %e, "Babel not started"),
+        }
+    }
+
+    // Spawn the IGMP querier / proxy (RFC 3376 / RFC 4605) if it is configured. It
+    // owns its own membership state and touches neither the RIB nor the FIB (the
+    // multicast forwarding cache is a separate kernel table), so it needs none of
+    // the router/redistribution plumbing — just a shutdown handle.
+    #[cfg(feature = "igmp")]
+    if let Some(mccfg) = cfg.multicast.as_ref().filter(|m| m.enabled) {
+        match build_querier_config(mccfg) {
+            Ok(run_cfg) => {
+                // IGMP (IPv4) — on by default; MLD (IPv6) — off by default. Both run
+                // the same querier over their address family on the same interfaces.
+                if mccfg.igmp.unwrap_or(true) {
+                    let sd = shutdown_tx.subscribe();
+                    let run_cfg = run_cfg.clone();
+                    proto_handles.push(tokio::spawn(async move {
+                        if let Err(e) = igmp::run(run_cfg, sd).await {
+                            error!(error = %e, "IGMP querier stopped");
+                        }
+                    }));
+                }
+                if mccfg.mld.unwrap_or(false) {
+                    let sd = shutdown_tx.subscribe();
+                    proto_handles.push(tokio::spawn(async move {
+                        if let Err(e) = mld::run(run_cfg, sd).await {
+                            error!(error = %e, "MLD querier stopped");
+                        }
+                    }));
+                }
+            }
+            Err(e) => error!(error = %e, "IGMP/MLD not started"),
         }
     }
 
@@ -1945,6 +2007,42 @@ fn build_redist_target(
         filter,
         tx,
     }))
+}
+
+/// Resolve the `[multicast]` config into the IGMP runner's [`igmp::QuerierConfig`],
+/// sorting the interfaces by role (querier / proxy upstream / proxy downstream).
+/// RFC 4605 allows a single upstream interface, so more than one is rejected.
+#[cfg(feature = "igmp")]
+fn build_querier_config(mc: &wren_config::Multicast) -> Result<igmp::QuerierConfig> {
+    use wren_config::MulticastRole;
+    let mut querier_interfaces = Vec::new();
+    let mut downstream = Vec::new();
+    let mut upstream = None;
+    for i in &mc.interfaces {
+        match i.role {
+            MulticastRole::Querier => querier_interfaces.push(i.name.clone()),
+            MulticastRole::Downstream => downstream.push(i.name.clone()),
+            MulticastRole::Upstream => {
+                if upstream.replace(i.name.clone()).is_some() {
+                    anyhow::bail!("multicast: only one upstream interface is supported (RFC 4605)");
+                }
+            }
+        }
+    }
+    if querier_interfaces.is_empty() && downstream.is_empty() && upstream.is_none() {
+        anyhow::bail!("[multicast] is enabled but no interfaces are configured");
+    }
+    Ok(igmp::QuerierConfig {
+        querier_interfaces,
+        upstream,
+        downstream,
+        robustness: mc.robustness.unwrap_or(2),
+        query_interval: std::time::Duration::from_secs(mc.query_interval.unwrap_or(125) as u64),
+        query_response_interval: std::time::Duration::from_secs(
+            mc.query_response_interval.unwrap_or(10) as u64,
+        ),
+        igmp_version: mc.igmp_version.unwrap_or(3),
+    })
 }
 
 /// Resolve the textual `[babel]` config into the runner's [`babel::BabelConfig`],

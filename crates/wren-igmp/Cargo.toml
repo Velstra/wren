@@ -1,0 +1,17 @@
+[package]
+name = "wren-igmp"
+description = "IGMP (RFC 3376 v3 querier) and IGMP proxy (RFC 4605): wire codec, membership state machine and upstream aggregation."
+keywords = ["routing", "igmp", "multicast", "networking"]
+categories = ["network-programming"]
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+# Deliberately dependency-free (std only), like `wren-core`: IGMP is host-address
+# arithmetic on `Ipv4Addr`, needs no `Prefix`/RIB types, and the pure codec +
+# state machine must be embeddable (e.g. into the Sentinel appliance) and fully
+# unit-testable with no sockets. The async socket runner lives in `wren-daemon`.
+[dependencies]
