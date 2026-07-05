@@ -478,6 +478,30 @@ pub struct Ospf {
     /// Defaults to 1.
     #[serde(rename = "auth-key-id")]
     pub auth_key_id: Option<u8>,
+    /// Enforce RFC 2328 §D.3 anti-replay for `auth-type = "md5"`: drop a received
+    /// packet whose cryptographic sequence number is lower than the last accepted from
+    /// that neighbour, so a captured packet cannot be replayed. Ignored for the other
+    /// auth types. Defaults to true.
+    #[serde(rename = "auth-replay-protection")]
+    pub auth_replay_protection: Option<bool>,
+    /// Seconds between Hellos on every OSPF interface (must match a neighbour's).
+    /// Defaults to the RFC 2328 recommendation (10 s).
+    #[serde(rename = "hello-interval")]
+    pub hello_interval: Option<u16>,
+    /// Seconds of silence after which a neighbour is declared down (must match a
+    /// neighbour's; conventionally four Hello intervals). Defaults to 40 s.
+    #[serde(rename = "dead-interval")]
+    pub dead_interval: Option<u32>,
+    /// Act as a graceful-restart (RFC 3623) **restarting** router: on a planned
+    /// shutdown, flood a Grace-LSA asking neighbours to keep forwarding through the
+    /// restart instead of tearing the adjacency down. Neighbours always act as helpers
+    /// on receipt regardless of this flag. Defaults to false.
+    #[serde(default, rename = "graceful-restart")]
+    pub graceful_restart: bool,
+    /// The grace period (seconds) advertised in the Grace-LSA — how long neighbours are
+    /// asked to hold the adjacency while this router restarts. Defaults to 120.
+    #[serde(rename = "graceful-restart-period")]
+    pub graceful_restart_period: Option<u32>,
     /// Run a BFD (RFC 5880) session to each OSPF neighbour for fast failure
     /// detection. When a neighbour reaches Full, a BFD session is brought up to it;
     /// if BFD goes down the adjacency is torn down at once instead of waiting for the

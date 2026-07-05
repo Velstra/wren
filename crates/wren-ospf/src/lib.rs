@@ -36,6 +36,7 @@
 use std::net::Ipv4Addr;
 
 pub mod flood;
+pub mod grace;
 pub mod interface;
 pub mod lsa;
 pub mod lsdb;

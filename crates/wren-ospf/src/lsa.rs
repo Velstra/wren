@@ -28,6 +28,14 @@ pub enum LsType {
     /// Type 7 — an external route within a not-so-stubby area (RFC 3101). Same body
     /// as a type-5, but area-scoped; an ABR translates it to type-5 for the AS.
     Nssa,
+    /// Type 9 — a link-local-scope opaque LSA (RFC 5250): carried only across the one
+    /// link it is flooded on, never re-flooded further. Grace-LSAs (RFC 3623) use this.
+    OpaqueLink,
+    /// Type 10 — an area-scope opaque LSA (RFC 5250): flooded throughout one area.
+    OpaqueArea,
+    /// Type 11 — an AS-scope opaque LSA (RFC 5250): flooded throughout the AS, like a
+    /// type-5.
+    OpaqueAs,
 }
 
 impl LsType {
@@ -40,6 +48,9 @@ impl LsType {
             4 => LsType::SummaryAsbr,
             5 => LsType::AsExternal,
             7 => LsType::Nssa,
+            9 => LsType::OpaqueLink,
+            10 => LsType::OpaqueArea,
+            11 => LsType::OpaqueAs,
             _ => return None,
         })
     }
@@ -53,7 +64,15 @@ impl LsType {
             LsType::SummaryAsbr => 4,
             LsType::AsExternal => 5,
             LsType::Nssa => 7,
+            LsType::OpaqueLink => 9,
+            LsType::OpaqueArea => 10,
+            LsType::OpaqueAs => 11,
         }
+    }
+
+    /// Whether this is an opaque LSA type (RFC 5250, type 9/10/11).
+    pub fn is_opaque(self) -> bool {
+        matches!(self, LsType::OpaqueLink | LsType::OpaqueArea | LsType::OpaqueAs)
     }
 }
 
@@ -290,6 +309,28 @@ pub struct AsExternalLsa {
     pub route_tag: u32,
 }
 
+/// An opaque-LSA body (Type 9/10/11, RFC 5250 §3): a sequence of type/length/value
+/// triples that OSPF floods but does not interpret — the meaning is defined by the
+/// application named in the header's Opaque Type (the top octet of the Link State ID).
+/// Wren carries the payload verbatim; the interpreting layer (e.g. Grace-LSA, RFC 3623)
+/// parses the TLVs.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct OpaqueLsa {
+    /// The raw TLV payload after the 20-byte header.
+    pub data: Vec<u8>,
+}
+
+/// Build the Link State ID for an opaque LSA (RFC 5250 §3): the top octet is the
+/// Opaque Type, the low 24 bits the Opaque ID.
+pub fn opaque_link_state_id(opaque_type: u8, opaque_id: u32) -> Ipv4Addr {
+    Ipv4Addr::from(((opaque_type as u32) << 24) | (opaque_id & 0x00ff_ffff))
+}
+
+/// The Opaque Type carried in an opaque LSA's Link State ID (its top octet).
+pub fn opaque_type_of(link_state_id: Ipv4Addr) -> u8 {
+    link_state_id.octets()[0]
+}
+
 /// A typed LSA body, selected by the header's [`LsType`].
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum LsaBody {
@@ -301,18 +342,22 @@ pub enum LsaBody {
     Summary(SummaryLsa),
     /// An AS-external-LSA (Type 5).
     AsExternal(AsExternalLsa),
+    /// An opaque LSA (Type 9/10/11 — the scope is disambiguated by the header).
+    Opaque(OpaqueLsa),
 }
 
 impl LsaBody {
     /// The LS type that must appear in the header for this body. For a summary
-    /// body the header decides between type 3 and 4, so this returns type 3 as
-    /// the representative; [`Lsa::encode`] preserves the header's own type.
+    /// body the header decides between type 3 and 4, and for an opaque body between
+    /// type 9/10/11, so this returns a representative (type 3 / type 9); [`Lsa::encode`]
+    /// preserves the header's own type.
     pub fn ls_type(&self) -> LsType {
         match self {
             LsaBody::Router(_) => LsType::Router,
             LsaBody::Network(_) => LsType::Network,
             LsaBody::Summary(_) => LsType::SummaryNetwork,
             LsaBody::AsExternal(_) => LsType::AsExternal,
+            LsaBody::Opaque(_) => LsType::OpaqueLink,
         }
     }
 }
@@ -346,6 +391,7 @@ impl Lsa {
             LsaBody::Network(n) => encode_network(n, &mut out),
             LsaBody::Summary(s) => encode_summary(s, &mut out),
             LsaBody::AsExternal(e) => encode_external(e, &mut out),
+            LsaBody::Opaque(o) => out.extend_from_slice(&o.data),
         }
         let len = out.len() as u16;
         out[18..20].copy_from_slice(&len.to_be_bytes());
@@ -372,6 +418,10 @@ impl Lsa {
             // A type-7 NSSA-external uses the very same body as a type-5 (RFC 3101).
             LsType::AsExternal | LsType::Nssa => {
                 LsaBody::AsExternal(decode_external(body_bytes)?)
+            }
+            // Opaque LSAs (type 9/10/11) carry an uninterpreted TLV payload.
+            LsType::OpaqueLink | LsType::OpaqueArea | LsType::OpaqueAs => {
+                LsaBody::Opaque(OpaqueLsa { data: body_bytes.to_vec() })
             }
         };
         Some((Lsa { header, body }, len))
@@ -528,11 +578,52 @@ mod tests {
             LsType::SummaryNetwork,
             LsType::SummaryAsbr,
             LsType::AsExternal,
+            LsType::OpaqueLink,
+            LsType::OpaqueArea,
+            LsType::OpaqueAs,
         ] {
             assert_eq!(LsType::from_u8(t.as_u8()), Some(t));
         }
         assert_eq!(LsType::from_u8(0), None);
-        assert_eq!(LsType::from_u8(11), None);
+        assert_eq!(LsType::from_u8(6), None);
+        assert_eq!(LsType::from_u8(8), None);
+        assert_eq!(LsType::from_u8(12), None);
+        assert!(LsType::OpaqueLink.is_opaque() && LsType::OpaqueAs.is_opaque());
+        assert!(!LsType::Router.is_opaque());
+    }
+
+    #[test]
+    fn opaque_link_state_id_packs_type_and_id() {
+        let lsid = opaque_link_state_id(3, 0x000102);
+        assert_eq!(lsid, Ipv4Addr::new(3, 0, 1, 2));
+        assert_eq!(opaque_type_of(lsid), 3);
+        // The id is masked to 24 bits — a stray top byte does not leak in.
+        assert_eq!(opaque_link_state_id(3, 0xff00_0102), Ipv4Addr::new(3, 0, 1, 2));
+    }
+
+    #[test]
+    fn opaque_lsa_roundtrips_verbatim() {
+        for ls_type in [LsType::OpaqueLink, LsType::OpaqueArea, LsType::OpaqueAs] {
+            let l = Lsa {
+                header: LsaHeader {
+                    ls_age: 1,
+                    options: crate::OPT_E,
+                    ls_type,
+                    link_state_id: opaque_link_state_id(3, 0),
+                    advertising_router: Ipv4Addr::new(10, 0, 0, 1),
+                    ls_seq: INITIAL_SEQUENCE_NUMBER,
+                    ls_checksum: 0,
+                    length: 0,
+                },
+                body: LsaBody::Opaque(OpaqueLsa { data: vec![0, 3, 0, 4, 0, 0, 0, 90] }),
+            };
+            let bytes = l.encode();
+            assert!(checksum_valid(&bytes));
+            let (decoded, consumed) = Lsa::decode(&bytes).expect("opaque decodes");
+            assert_eq!(consumed, bytes.len());
+            assert_eq!(decoded.header.ls_type, ls_type);
+            assert_eq!(decoded.body, l.body);
+        }
     }
 
     #[test]

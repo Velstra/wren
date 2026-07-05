@@ -183,12 +183,13 @@ struct PeerSession {
 struct EchoState {
     /// The egress interface index (for the AF_PACKET send).
     ifindex: u32,
-    /// The egress interface name (for the ARP-table neighbour-MAC lookup).
+    /// The egress interface name (for the IPv4 ARP-table neighbour-MAC lookup).
     ifname: String,
-    /// Our IPv4 address on that interface — the Echo packet's source and destination,
-    /// so the neighbour loops it back to us.
-    our_ip: Ipv4Addr,
-    /// The neighbour's MAC, resolved lazily from the kernel ARP table once known.
+    /// Our address on that interface — the Echo packet's source and destination, so the
+    /// neighbour loops it back to us. Its family (v4/v6) selects the packet builder and
+    /// the Echo socket used to transmit.
+    our_ip: IpAddr,
+    /// The neighbour's MAC, resolved lazily from the kernel neighbour cache once known.
     dst_mac: Option<[u8; 6]>,
     /// The next Echo sequence number to send.
     seq: u64,
@@ -259,20 +260,30 @@ pub async fn run(
     let mut sessions: HashMap<PeerKey, PeerSession> = HashMap::new();
     let mut next_discr: u32 = 1;
 
-    // The shared Echo socket (RFC 5880 §6.4), opened only when Echo is configured. A
-    // failure to open (e.g. no CAP_NET_RAW) disables Echo but leaves Control running.
-    let echo_sock = match cfg.echo {
-        Some(_) => match bfd_echo::EchoSock::open() {
-            Ok(s) => {
-                info!("BFD Echo enabled (UDP {ECHO_PORT})");
-                Some(s)
-            }
-            Err(e) => {
-                warn!(error = %e, "BFD Echo could not open its socket; Echo disabled");
-                None
-            }
-        },
-        None => None,
+    // The shared Echo sockets (RFC 5880 §6.4), opened only when Echo is configured — one
+    // per family, since an AF_PACKET socket delivers only frames of its bound ethertype.
+    // A failure to open (e.g. no CAP_NET_RAW) disables that family's Echo but leaves
+    // Control running.
+    let (echo_sock, echo_sock6) = match cfg.echo {
+        Some(_) => {
+            let v4 = match bfd_echo::EchoSock::open() {
+                Ok(s) => Some(s),
+                Err(e) => {
+                    warn!(error = %e, "BFD Echo (IPv4) could not open its socket; disabled");
+                    None
+                }
+            };
+            let v6 = match bfd_echo::EchoSock::open_v6() {
+                Ok(s) => Some(s),
+                Err(e) => {
+                    warn!(error = %e, "BFD Echo (IPv6) could not open its socket; disabled");
+                    None
+                }
+            };
+            info!(ipv4 = v4.is_some(), ipv6 = v6.is_some(), "BFD Echo enabled (UDP {ECHO_PORT})");
+            (v4, v6)
+        }
+        None => (None, None),
     };
 
     let mut buf4 = [0u8; 128];
@@ -310,6 +321,11 @@ pub async fn run(
                     on_echo_receive(&mut sessions, &pkt);
                 }
             }
+            r = echo_recv_opt(&echo_sock6) => {
+                if let Some(pkt) = r {
+                    on_echo_receive(&mut sessions, &pkt);
+                }
+            }
             () = &mut timer => {}
             Some(cmd) = register.recv() => {
                 handle_command(&mut sessions, &mut next_discr, cfg.session, cfg.auth.as_ref(), cfg.echo, cmd).await;
@@ -326,7 +342,7 @@ pub async fn run(
         service(&mut sessions);
         // Then the Echo function: transmit due Echo packets and fail any session whose
         // looped-back Echo stopped returning.
-        service_echo(&mut sessions, &echo_sock).await;
+        service_echo(&mut sessions, &echo_sock, &echo_sock6).await;
     }
 }
 
@@ -367,8 +383,14 @@ fn on_echo_receive(sessions: &mut HashMap<PeerKey, PeerSession>, pkt: &[u8]) {
 /// The Echo half of the service loop: for every Up session with Echo enabled, fail it
 /// if the looped Echo stopped returning, otherwise transmit a due Echo packet. Echo
 /// runs only while Up; a session not Up has its Echo detection reset.
-async fn service_echo(sessions: &mut HashMap<PeerKey, PeerSession>, echo_sock: &Option<EchoSock>) {
-    let Some(sock) = echo_sock else { return };
+async fn service_echo(
+    sessions: &mut HashMap<PeerKey, PeerSession>,
+    echo_sock: &Option<EchoSock>,
+    echo_sock6: &Option<EchoSock>,
+) {
+    if echo_sock.is_none() && echo_sock6.is_none() {
+        return;
+    }
     let now = Instant::now();
     for s in sessions.values_mut() {
         if s.echo.is_none() {
@@ -406,37 +428,52 @@ async fn service_echo(sessions: &mut HashMap<PeerKey, PeerSession>, echo_sock: &
         if !up {
             continue;
         }
-        // Transmit a due Echo packet, resolving the neighbour MAC lazily.
+        // Transmit a due Echo packet, resolving the neighbour MAC lazily. The socket and
+        // packet builder are chosen by the peer's family; a family whose Echo socket did
+        // not open is skipped.
         let discr = s.sess.local_discr();
-        let IpAddr::V4(peer_v4) = s.peer else { continue };
+        let peer = s.peer;
         let echo = s.echo.as_mut().expect("checked is_some above");
         if now < echo.next_tx {
             continue;
         }
+        let sock = match peer {
+            IpAddr::V4(_) => echo_sock.as_ref(),
+            IpAddr::V6(_) => echo_sock6.as_ref(),
+        };
+        let Some(sock) = sock else { continue };
         if echo.dst_mac.is_none() {
-            // Resolving the neighbour MAC reads /proc/net/arp — a blocking file read.
-            // Run it on the blocking pool so it never stalls this Echo loop, whose
-            // whole purpose is sub-second liveness detection for *every* session
-            // (review finding M9). Once resolved the MAC is cached, so this happens
-            // only until the ARP entry completes.
+            // Resolving the neighbour MAC hits the kernel neighbour cache (a blocking
+            // /proc read for IPv4, a blocking netlink dump for IPv6). Run it on the
+            // blocking pool so it never stalls this Echo loop, whose whole purpose is
+            // sub-second liveness detection for *every* session (review finding M9).
+            // Once resolved the MAC is cached, so this happens only until the entry
+            // completes.
             let ifname = echo.ifname.clone();
-            echo.dst_mac = tokio::task::spawn_blocking(move || bfd_echo::neighbor_mac(&ifname, peer_v4))
-                .await
-                .ok()
-                .flatten();
+            let ifindex = echo.ifindex;
+            echo.dst_mac = tokio::task::spawn_blocking(move || match peer {
+                IpAddr::V4(v4) => bfd_echo::neighbor_mac(&ifname, v4),
+                IpAddr::V6(v6) => bfd_echo::neighbor_mac_v6(ifindex, v6),
+            })
+            .await
+            .ok()
+            .flatten();
         }
         let Some(dst) = echo.dst_mac else {
-            // The ARP entry is not yet complete; retry on the next interval.
-            debug!(peer = %peer_v4, ifname = %echo.ifname, "BFD Echo: neighbour MAC not yet resolved");
+            // The neighbour entry is not yet complete; retry on the next interval.
+            debug!(%peer, ifname = %echo.ifname, "BFD Echo: neighbour MAC not yet resolved");
             echo.next_tx = now + Duration::from_micros(echo.params.interval_us);
             continue;
         };
-        let pkt = bfd_echo::build_echo(echo.our_ip, discr, echo.seq);
+        let pkt = match echo.our_ip {
+            IpAddr::V4(v4) => bfd_echo::build_echo(v4, discr, echo.seq),
+            IpAddr::V6(v6) => bfd_echo::build_echo_v6(v6, discr, echo.seq),
+        };
         let ifindex = echo.ifindex;
         echo.seq = echo.seq.wrapping_add(1);
         echo.next_tx = now + Duration::from_micros(echo.params.interval_us);
         let r = sock.send(&pkt, dst, ifindex).await;
-        debug!(peer = %peer_v4, ifindex, ok = r.is_ok(), "BFD Echo sent");
+        debug!(%peer, ifindex, ok = r.is_ok(), "BFD Echo sent");
     }
 }
 
@@ -489,20 +526,29 @@ async fn handle_command(
             *next_discr += 1;
             let mut subscribers = HashMap::new();
             subscribers.insert(consumer, notify);
-            // Set up Echo (RFC 5880 §6.4) for an IPv4 peer with a resolvable egress
+            // Set up Echo (RFC 5880 §6.4) for a peer (v4 or v6) with a resolvable egress
             // interface; the neighbour MAC is resolved lazily once Echo starts.
-            let echo = echo_cfg.and_then(|params| match peer {
-                IpAddr::V4(v4) => bfd_echo::egress_for(v4).map(|e| EchoState {
-                    ifindex: e.ifindex,
-                    ifname: e.ifname,
-                    our_ip: e.our_ip,
+            let echo = echo_cfg.and_then(|params| {
+                let (ifindex, ifname, our_ip) = match peer {
+                    IpAddr::V4(v4) => {
+                        let e = bfd_echo::egress_for(v4)?;
+                        (e.ifindex, e.ifname, IpAddr::V4(e.our_ip))
+                    }
+                    IpAddr::V6(v6) => {
+                        let e = bfd_echo::egress_for_v6(v6, scope_id)?;
+                        (e.ifindex, e.ifname, IpAddr::V6(e.our_ip))
+                    }
+                };
+                Some(EchoState {
+                    ifindex,
+                    ifname,
+                    our_ip,
                     dst_mac: None,
                     seq: 0,
                     next_tx: Instant::now(),
                     last_rx: None,
                     params,
-                }),
-                IpAddr::V6(_) => None,
+                })
             });
             info!(%peer, ?consumer, auth = effective_auth.is_some(), echo = echo.is_some(), "BFD session started");
             sessions.insert(

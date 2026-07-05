@@ -148,6 +148,22 @@ fn md5_key16(key: &[u8]) -> [u8; 16] {
     k
 }
 
+/// The cryptographic sequence number carried in the header of a received MD5
+/// (AuType 2) packet (RFC 2328 §D.3): bytes 4–7 of the 8-byte authentication field.
+/// Returns `None` if `buf` is too short or is not a cryptographically-authenticated
+/// packet. [`Packet::decode_auth`] validates the keyed digest but deliberately does
+/// not track this sequence; the caller enforces the non-decreasing (anti-replay)
+/// property across the packets it receives from each neighbour.
+pub fn crypto_seq(buf: &[u8]) -> Option<u32> {
+    if buf.len() < HEADER_LEN {
+        return None;
+    }
+    if u16::from_be_bytes([buf[14], buf[15]]) != AU_CRYPTO {
+        return None;
+    }
+    Some(u32::from_be_bytes([buf[20], buf[21], buf[22], buf[23]]))
+}
+
 /// The MD5 authentication digest over an OSPF packet (RFC 2328 §D.4.3): MD5 of the
 /// packet (header through body, with the auth field already filled and the checksum
 /// left zero) concatenated with the 16-byte key.
@@ -990,6 +1006,20 @@ mod tests {
         assert_eq!(Packet::decode_auth(&bytes, &wrong_key), Err(DecodeError::BadAuth));
         bytes[HEADER_LEN] ^= 0xff;
         assert_eq!(Packet::decode_auth(&bytes, &auth), Err(DecodeError::BadAuth));
+    }
+
+    #[test]
+    fn crypto_seq_reads_the_md5_sequence_and_ignores_other_schemes() {
+        // A crypto (AuType 2) packet exposes its sequence for anti-replay tracking.
+        let auth = Auth::Md5 { key_id: 3, key: b"k".to_vec(), seq: 0xdead_beef };
+        let bytes = sample_hello().encode_auth(&auth);
+        assert_eq!(super::crypto_seq(&bytes), Some(0xdead_beef));
+        // Null and simple-password packets carry no cryptographic sequence.
+        assert_eq!(super::crypto_seq(&sample_hello().encode_auth(&Auth::Null)), None);
+        let simple = sample_hello().encode_auth(&Auth::Simple(b"pw".to_vec()));
+        assert_eq!(super::crypto_seq(&simple), None);
+        // A truncated buffer yields None rather than panicking.
+        assert_eq!(super::crypto_seq(&bytes[..10]), None);
     }
 
     #[test]

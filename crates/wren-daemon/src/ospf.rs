@@ -40,8 +40,8 @@ use wren_core::Prefix;
 use wren_ospf::flood::{decide_flood, FloodDecision, FloodInput};
 use wren_ospf::interface::{Candidate, Interface, InterfaceEvent, InterfaceState, InterfaceType};
 use wren_ospf::lsa::{
-    AsExternalLsa, LsType, Lsa, LsaBody, LsaHeader, NetworkLsa, RouterLink, RouterLinkType,
-    RouterLsa, SummaryLsa, RTR_FLAG_B, RTR_FLAG_E,
+    AsExternalLsa, LsType, Lsa, LsaBody, LsaHeader, NetworkLsa, OpaqueLsa, RouterLink,
+    RouterLinkType, RouterLsa, SummaryLsa, RTR_FLAG_B, RTR_FLAG_E,
 };
 use wren_ospf::lsdb::{LsaKey, Lsdb};
 use wren_ospf::neighbor::{
@@ -124,6 +124,18 @@ pub struct OspfConfig {
     /// MD5 the carried sequence number is a template (0); the runner stamps an
     /// increasing value on each sent packet via [`Ospf::send_auth`].
     pub auth: Auth,
+    /// Enforce RFC 2328 §D.3 anti-replay on cryptographically-authenticated packets:
+    /// a received MD5 packet whose cryptographic sequence number is lower than the last
+    /// one accepted from that neighbour is dropped, so a captured packet cannot be
+    /// replayed even though its keyed digest still verifies. Has no effect unless
+    /// [`Self::auth`] is [`Auth::Md5`]. Defaults to on.
+    pub auth_replay_protection: bool,
+    /// Act as a graceful-restart (RFC 3623) restarting router: flood a Grace-LSA on a
+    /// planned shutdown so neighbours keep forwarding through the restart. Helper
+    /// behaviour (honouring a neighbour's Grace-LSA) is always on, independent of this.
+    pub graceful_restart: bool,
+    /// The grace period (seconds) this router advertises in its Grace-LSA.
+    pub grace_period: u32,
     /// Run a BFD (RFC 5880) session to each neighbour for fast failure detection:
     /// when a neighbour reaches Full a session is registered, and a BFD-down tears
     /// the adjacency down at once instead of waiting for the dead interval.
@@ -271,6 +283,27 @@ struct Ospf {
     bfd_register: mpsc::Sender<crate::bfd::BfdCommand>,
     bfd_notify: mpsc::Sender<std::net::IpAddr>,
     bfd_registered: HashSet<Ipv4Addr>,
+    /// The highest cryptographic sequence number accepted from each neighbour, keyed
+    /// by `(ifindex, source address)`, for RFC 2328 §D.3 anti-replay. A received MD5
+    /// packet with a lower sequence is a replay and is dropped. Empty (and unused)
+    /// unless [`OspfConfig::auth`] is MD5 and [`OspfConfig::auth_replay_protection`]
+    /// is set.
+    crypto_seqs: HashMap<(u32, Ipv4Addr), u32>,
+    /// Graceful-restart helper state (RFC 3623 §3): for each neighbour we are helping
+    /// through a restart. While an entry is live the neighbour is not torn down on
+    /// inactivity, so its LSAs stay in the database and forwarding continues across the
+    /// restart.
+    helping: HashMap<Ipv4Addr, GrHelper>,
+}
+
+/// One neighbour's graceful-restart helper state (RFC 3623 §3.2).
+struct GrHelper {
+    /// The elapsed-seconds deadline by which the grace period ends; help stops then.
+    deadline: u64,
+    /// The neighbour's `last_seen` when we entered helper mode. Help stops early once a
+    /// Hello arrives *after* this (`last_seen` advances) — the neighbour has come back
+    /// and re-synced, so the restart is complete.
+    seen_at_entry: u64,
 }
 
 /// A `show ospf …` query, answered by the OSPF task itself out of the state it
@@ -420,6 +453,9 @@ fn ls_type_name(t: LsType) -> &'static str {
         LsType::SummaryAsbr => "asbr-summary",
         LsType::AsExternal => "external",
         LsType::Nssa => "nssa-external",
+        LsType::OpaqueLink => "opaque-link",
+        LsType::OpaqueArea => "opaque-area",
+        LsType::OpaqueAs => "opaque-as",
     }
 }
 
@@ -535,6 +571,8 @@ pub async fn run(
         bfd_register,
         bfd_notify,
         bfd_registered: HashSet::new(),
+        crypto_seqs: HashMap::new(),
+        helping: HashMap::new(),
     };
     ospf.originate_externals().await;
     ospf.reoriginate_and_flood().await;
@@ -552,6 +590,13 @@ pub async fn run(
             // cleanly and let neighbors drop the adjacency on dead-interval.
             // (Flushing self-originated LSAs to MaxAge is a follow-up.)
             _ = shutdown.changed() => {
+                // Graceful restart (RFC 3623) restarting side: flood a Grace-LSA so
+                // neighbours hold our adjacency and keep forwarding through the restart.
+                // The kernel keeps our installed (proto-ospf) routes across the process
+                // restart, so the data plane is preserved on both sides.
+                if ospf.cfg.graceful_restart {
+                    ospf.originate_grace_lsas().await;
+                }
                 info!("OSPF shutting down");
                 return Ok(());
             }
@@ -689,6 +734,23 @@ impl Ospf {
                 return;
             }
         };
+        // RFC 2328 §D.3 anti-replay: the keyed digest is already verified, but a
+        // captured packet replays with a valid digest — reject it if its cryptographic
+        // sequence number regressed against the highest we have seen from this source.
+        if self.cfg.auth_replay_protection {
+            if let Some(seq) = wren_ospf::packet::crypto_seq(ospf) {
+                let key = (pkt.ifindex, pkt.src);
+                match self.crypto_seqs.get(&key) {
+                    Some(&last) if seq < last => {
+                        debug!(src = %pkt.src, seq, last, "dropping replayed OSPF packet (stale crypto sequence)");
+                        return;
+                    }
+                    _ => {
+                        self.crypto_seqs.insert(key, seq);
+                    }
+                }
+            }
+        }
         let Some(idx) = self.iface_index(pkt.ifindex) else {
             return;
         };
@@ -703,7 +765,7 @@ impl Ospf {
             Body::Hello(h) => self.handle_hello(idx, nbr_id, pkt.src, &h, now).await,
             Body::DatabaseDescription(dd) => self.handle_dd(idx, nbr_id, &dd).await,
             Body::LinkStateRequest(req) => self.handle_lsr(idx, nbr_id, &req).await,
-            Body::LinkStateUpdate(upd) => self.handle_lsu(idx, nbr_id, upd).await,
+            Body::LinkStateUpdate(upd) => self.handle_lsu(idx, nbr_id, upd, now).await,
             Body::LinkStateAck(_) => debug!(src = %pkt.src, "OSPF LSAck received"),
         }
     }
@@ -1081,9 +1143,42 @@ impl Ospf {
         send(&sock, dst, &bytes).await;
     }
 
+    /// Act on a Grace-LSA (RFC 3623 §3) received from `nbr_id`: enter graceful-restart
+    /// helper mode for the neighbour for the requested grace period, so its adjacency is
+    /// held (not torn down on inactivity) and its LSAs stay in the database while it
+    /// restarts — forwarding continues uninterrupted. A Grace-LSA received at MaxAge is
+    /// the restarting router signalling completion, so we exit helper mode at once.
+    fn handle_grace_lsa(&mut self, nbr_id: Ipv4Addr, lsa: &Lsa, now: u64) {
+        let LsaBody::Opaque(o) = &lsa.body else { return };
+        let Some(grace) = wren_ospf::grace::GraceLsa::decode(&o.data) else {
+            debug!(neighbor = %nbr_id, "ignoring malformed Grace-LSA");
+            return;
+        };
+        if lsa.header.ls_age >= wren_ospf::MAX_AGE {
+            if self.helping.remove(&nbr_id).is_some() {
+                info!(neighbor = %nbr_id, "OSPF graceful-restart helper: neighbour signalled completion, exiting helper mode");
+            }
+            return;
+        }
+        let seen_at_entry = self.neighbor_last_seen(nbr_id).unwrap_or(0);
+        let deadline = now + grace.grace_period as u64;
+        let fresh = self
+            .helping
+            .insert(nbr_id, GrHelper { deadline, seen_at_entry })
+            .is_none();
+        if fresh {
+            info!(neighbor = %nbr_id, grace_period = grace.grace_period, reason = ?grace.reason, "OSPF graceful-restart helper: entering helper mode");
+        }
+    }
+
+    /// The `last_seen` timestamp of the neighbour `nbr_id`, if known on any interface.
+    fn neighbor_last_seen(&self, nbr_id: Ipv4Addr) -> Option<u64> {
+        self.ifaces.iter().find_map(|i| i.neighbors.get(&nbr_id).map(|n| n.last_seen))
+    }
+
     /// Process a Link State Update (§13): install newer LSAs into the area
     /// database, acknowledge, pull the request list down, re-flood and re-run SPF.
-    async fn handle_lsu(&mut self, idx: usize, nbr_id: Ipv4Addr, upd: LinkStateUpdate) {
+    async fn handle_lsu(&mut self, idx: usize, nbr_id: Ipv4Addr, upd: LinkStateUpdate, now: u64) {
         let self_id = self.cfg.router_id;
         let area = self.ifaces[idx].area;
         let src_addr = match self.ifaces[idx].neighbors.get(&nbr_id) {
@@ -1095,6 +1190,21 @@ impl Ospf {
         let mut reflood_area = Vec::new();
         let mut reflood_ext = Vec::new();
         for lsa in upd.lsas {
+            // Opaque LSAs (RFC 5250) are not part of the SPF database. A link-local
+            // (type-9) Grace-LSA (RFC 3623) puts us into helper mode for the neighbour;
+            // any other opaque LSA is acknowledged but not stored or re-flooded (we do
+            // not yet interpret area/AS-scope opaque LSAs). Either way, never route an
+            // opaque LSA through the SPF flooding/LSDB path below.
+            if lsa.header.ls_type.is_opaque() {
+                if lsa.header.ls_type == LsType::OpaqueLink
+                    && wren_ospf::lsa::opaque_type_of(lsa.header.link_state_id)
+                        == wren_ospf::grace::OPAQUE_TYPE_GRACE
+                {
+                    self.handle_grace_lsa(nbr_id, &lsa, now);
+                }
+                ack_headers.push(lsa.header);
+                continue;
+            }
             let is_ext = lsa.header.ls_type == LsType::AsExternal;
             // Stub and NSSA areas carry no AS-external (type-5) LSAs; drop any that
             // arrive on such an interface rather than installing or acking it.
@@ -1672,6 +1782,50 @@ impl Ospf {
         self.run_spf_and_announce().await;
     }
 
+    /// Graceful-restart restarting side (RFC 3623 §2): flood a link-local Grace-LSA on
+    /// every interface, asking each Full neighbour to hold our adjacency for the grace
+    /// period while we restart. Sent once, just before the OSPF task exits.
+    async fn originate_grace_lsas(&self) {
+        let period = self.cfg.grace_period;
+        for iface in &self.ifaces {
+            let grace = wren_ospf::grace::GraceLsa {
+                grace_period: period,
+                reason: wren_ospf::grace::RestartReason::SoftwareRestart,
+                interface_address: iface.addr,
+            };
+            let lsa = Lsa {
+                header: LsaHeader {
+                    ls_age: 0,
+                    options: self.area_options(iface.area),
+                    ls_type: LsType::OpaqueLink,
+                    link_state_id: wren_ospf::lsa::opaque_link_state_id(
+                        wren_ospf::grace::OPAQUE_TYPE_GRACE,
+                        0,
+                    ),
+                    advertising_router: self.cfg.router_id,
+                    ls_seq: INITIAL_SEQUENCE_NUMBER,
+                    ls_checksum: 0,
+                    length: 0,
+                },
+                body: LsaBody::Opaque(OpaqueLsa { data: grace.encode() }),
+            };
+            let bytes = self.packet(
+                iface.area,
+                Body::LinkStateUpdate(LinkStateUpdate { lsas: vec![lsa] }),
+            );
+            let mut sent = 0;
+            for n in iface.neighbors.values() {
+                if n.fsm.state == NeighborState::Full {
+                    send(&iface.sock, n.addr, &bytes).await;
+                    sent += 1;
+                }
+            }
+            if sent > 0 {
+                info!(interface = %iface.name, grace_period = period, neighbours = sent, "OSPF graceful-restart: flooded Grace-LSA");
+            }
+        }
+    }
+
     /// Flood one LSA to every Full neighbour on an interface in `area`.
     async fn flood_lsa(&self, area: Ipv4Addr, lsa: &Lsa) {
         self.flood_lsa_except(area, lsa, Ipv4Addr::UNSPECIFIED)
@@ -1819,11 +1973,38 @@ impl Ospf {
     async fn age_neighbors(&mut self, now: u64) {
         let dead_interval = self.cfg.dead_interval as u64;
         let mut changed = false;
+        // Graceful-restart helper upkeep (RFC 3623 §3.2): a neighbour whose Hellos have
+        // resumed *since* we started helping (a fresh Hello advanced its last_seen) has
+        // come back, so exit helper mode; drop any helper entry whose grace period has
+        // expired.
+        let resumed: Vec<Ipv4Addr> = self
+            .helping
+            .iter()
+            .filter(|(id, h)| {
+                self.neighbor_last_seen(**id).is_some_and(|seen| seen > h.seen_at_entry)
+            })
+            .map(|(id, _)| *id)
+            .collect();
+        for id in resumed {
+            self.helping.remove(&id);
+            info!(neighbor = %id, "OSPF graceful-restart helper: neighbour restart complete, exiting helper mode");
+        }
+        self.helping.retain(|id, h| {
+            let live = now < h.deadline;
+            if !live {
+                info!(neighbor = %id, "OSPF graceful-restart helper: grace period expired, exiting helper mode");
+            }
+            live
+        });
         for idx in 0..self.ifaces.len() {
             let dead: Vec<Ipv4Addr> = self.ifaces[idx]
                 .neighbors
                 .iter()
-                .filter(|(_, n)| now.saturating_sub(n.last_seen) >= dead_interval)
+                // A neighbour we are helping through a graceful restart is exempt from
+                // the inactivity timeout — its adjacency is held so forwarding survives.
+                .filter(|(id, n)| {
+                    now.saturating_sub(n.last_seen) >= dead_interval && !self.helping.contains_key(id)
+                })
                 .map(|(id, _)| *id)
                 .collect();
             for id in dead {
@@ -1901,6 +2082,13 @@ impl Ospf {
                 .find(|(_, n)| n.addr == peer)
                 .map(|(id, _)| *id);
             let Some(id) = id else { continue };
+            // Hold the adjacency of a neighbour we are helping through a graceful restart
+            // (RFC 3623 §3.2): a BFD-reported path failure during its restart must not
+            // tear it down, or forwarding would flap — exactly what GR prevents.
+            if self.helping.contains_key(&id) {
+                debug!(neighbor = %id, %peer, "OSPF graceful-restart helper: ignoring BFD-down during restart");
+                continue;
+            }
             if let Some(mut n) = self.ifaces[idx].neighbors.remove(&id) {
                 n.fsm.handle(NeighborEvent::InactivityTimer, NeighborContext::default());
                 info!(interface = %self.ifaces[idx].name, neighbor = %id, %peer, "OSPF neighbour down (BFD)");
