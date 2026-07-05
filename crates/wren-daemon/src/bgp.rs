@@ -84,6 +84,10 @@ const CEASE_MAXPREFIX: u8 = 1;
 /// every peer when the daemon is shutting down gracefully (M10), so they tear the
 /// session down immediately instead of waiting out the hold timer.
 const CEASE_ADMIN: u8 = 2;
+/// Cease NOTIFICATION subcode 3, "Peer De-configured" (RFC 4486 §4) — sent to a peer
+/// whose neighbour statement was removed by a live configuration reload (SIGHUP), so
+/// it tears the session down at once instead of waiting out the hold timer.
+const CEASE_DECONFIGURED: u8 = 3;
 /// OPEN Message Error subcode 8, "Role Mismatch" (RFC 9234 §4.2) — sent when the peer's
 /// advertised BGP Role is not the complement of our configured role.
 const OPEN_ROLE_MISMATCH: u8 = 8;
@@ -499,6 +503,11 @@ enum SessionCmd {
     /// (RFC 4486 §4) and close, without reporting Down — the whole process is
     /// exiting, so there is no slot left to evict.
     CeaseAdmin,
+    /// This neighbour was removed by a live configuration reload (SIGHUP): send a
+    /// Cease "Peer De-configured" (RFC 4486 §4) and close, without reporting Down —
+    /// the central task has already withdrawn the peer's routes and dropped its
+    /// state, and its connector is cancelled so it will not re-dial.
+    CeaseDeconfigured,
     /// The peer exceeded its `max-prefix` limit: close the connection with a Cease
     /// "Maximum Number of Prefixes Reached" (RFC 4486 §4), without reporting Down —
     /// the central task has already withdrawn the peer's routes and damped it.
@@ -1434,6 +1443,7 @@ pub async fn run(
     mut bfd_down: mpsc::Receiver<IpAddr>,
     mut evpn_subscribes: mpsc::Receiver<EvpnSubscribe>,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
+    mut reconfig: mpsc::Receiver<BgpReconfig>,
 ) -> Result<()> {
     // The neighbour table: every configured peer, its AS and whether the session
     // is currently Established. Sorted for stable `show bgp neighbors` output.
@@ -1507,16 +1517,17 @@ pub async fn run(
     // down and kept down — any reconnection is shut down again and their UPDATEs are
     // ignored — until the daemon is reconfigured (no auto-restart timer yet).
     let mut damped: HashSet<IpAddr> = HashSet::new();
-    // Peers to which we advertise a default route (`0.0.0.0/0`) on Established.
-    let default_originate: HashSet<IpAddr> = cfg
+    // Peers to which we advertise a default route (`0.0.0.0/0`) on Established. Mutable
+    // so a live neighbour add/remove (SIGHUP) can adjust the set.
+    let mut default_originate: HashSet<IpAddr> = cfg
         .peers
         .iter()
         .filter(|p| p.default_originate)
         .map(|p| p.addr)
         .collect();
     // Per-peer inbound import filters (RFC-style import route-maps), applied to every
-    // route received from the peer before it enters the RIB.
-    let imports: HashMap<IpAddr, Filter> = cfg
+    // route received from the peer before it enters the RIB. Mutable for the same reason.
+    let mut imports: HashMap<IpAddr, Filter> = cfg
         .peers
         .iter()
         .filter_map(|p| p.import.clone().map(|f| (p.addr, f)))
@@ -1529,7 +1540,9 @@ pub async fn run(
 
     let members = cfg.confederation_members.clone();
     let vrf_table = cfg.vrf_table;
-    let local = Arc::new(Local {
+    // `local` is swapped for a fresh `Arc` on each live neighbour add/remove (SIGHUP),
+    // so it is mutable; the initial connectors and the listener capture the startup one.
+    let mut local = Arc::new(Local {
         local_as: cfg.local_as,
         router_id: cfg.router_id,
         hold_time: cfg.hold_time,
@@ -1596,33 +1609,24 @@ pub async fn run(
         Err(e) => warn!(error = %e, "BGP could not bind listener; active-connect only"),
     }
 
+    // A sender kept for the whole run so the live neighbour hot-reload (SIGHUP) can spawn
+    // a connector for a newly-configured peer. It also keeps `rx` open even with no peers
+    // configured; the daemon then idles on the select until shutdown (which the watch
+    // channel drives), exactly as it did before.
+    let conn_tx = tx.clone();
+    // The cancel handle for each active connector, keyed by peer, so a de-configured
+    // neighbour's connector can be stopped (flip to `true`) on a live reload.
+    let mut connector_cancels: HashMap<IpAddr, tokio::sync::watch::Sender<bool>> = HashMap::new();
     // One active connector per non-passive peer.
     for peer in &cfg.peers {
         if peer.passive {
             continue;
         }
-        let info = PeerInfo {
-            addr: peer.addr,
-            scope_id: peer.scope_id,
-            remote_as: peer.remote_as,
-            rr_client: peer.rr_client,
-            peer_type: classify(cfg.local_as, &members, peer.remote_as),
-            ttl_security: peer.ttl_security,
-            add_path: peer.add_path,
-            ext_nexthop: peer.ext_nexthop,
-            evpn: peer.evpn,
-            flowspec: peer.flowspec,
-            srpolicy: peer.srpolicy,
-            link_state: peer.link_state,
-            role: peer.role,
-        };
-        let auth = peer.tcp_auth();
-        let local = local.clone();
-        let tx = tx.clone();
-        tokio::spawn(async move { connector(info, auth, local, tx).await });
+        let cancel = spawn_bgp_connector(peer, cfg.local_as, &members, local.clone(), conn_tx.clone());
+        connector_cancels.insert(peer.addr, cancel);
     }
-    // Drop our own sender; the listener and connectors keep theirs, so `rx` stays
-    // open for the life of the daemon.
+    // Drop our original sender; `conn_tx`, the listener and the connectors keep theirs,
+    // so `rx` stays open for the life of the daemon.
     drop(tx);
 
     // EVPN (RFC 7432): the local origination set (one IMET per instance plus each
@@ -1884,6 +1888,142 @@ pub async fn run(
             // retain it for live changes (the EVPN↔fabric bridge feed).
             Some(sub) = evpn_subscribes.recv() => {
                 subscribe_evpn(&evis, &mut evpn_subscribers, sub).await;
+                continue;
+            }
+            // A live configuration reload (SIGHUP) added and/or removed neighbours. Bring
+            // the added peers up and tear the removed ones down cleanly; unchanged peers
+            // (named in neither list) keep their session and learned routes untouched.
+            Some(rc) = reconfig.recv() => {
+                // Remove first, so re-adding the same address in one reload frees its slot
+                // before the add re-creates it.
+                for addr in rc.remove {
+                    // Stop the connector re-dialling this peer.
+                    if let Some(cancel) = connector_cancels.remove(&addr) {
+                        let _ = cancel.send(true);
+                    }
+                    // Cleanly Cease an Established session ("Peer De-configured", RFC 4486
+                    // §4); the session does not report Down — we withdraw its routes here.
+                    if let Some(cmd_tx) = sessions.remove(&addr) {
+                        let _ = cmd_tx.send(SessionCmd::CeaseDeconfigured).await;
+                    }
+                    info!(peer = %addr, "BGP neighbour de-configured; removing session");
+                    // BMP Peer Down (RFC 7854 §4.9) for the removed peer, best-effort.
+                    if let Some(tx) = &bmp_tx {
+                        let asn = neighbors.get(&addr).map(|n| n.remote_as).unwrap_or(0);
+                        let bgp_id = bmp_peer_ids.remove(&addr).unwrap_or(Ipv4Addr::UNSPECIFIED);
+                        let _ = tx.try_send(crate::bmp::BmpEvent::PeerDown { peer: addr, asn, bgp_id });
+                    }
+                    // Forget every scrap of this peer's state.
+                    neighbors.remove(&addr);
+                    est_inbound.remove(&addr);
+                    current_conn.remove(&addr);
+                    gr_helper.remove(&addr);
+                    stale.remove(&addr);
+                    damped.remove(&addr);
+                    default_originate.remove(&addr);
+                    imports.remove(&addr);
+                    addpath_send.remove(&addr);
+                    addpath.drop_peer(addr);
+                    // Withdraw everything this peer taught us across every RIB (no
+                    // graceful-restart retention for a de-configured peer).
+                    for ev in rib.withdraw_peer(addr) {
+                        apply_event(ev, vrf_table, &updates, &sessions).await;
+                    }
+                    for ev in evpn_rib.withdraw_peer(addr) {
+                        handle_evpn_event(
+                            ev,
+                            Vec::new(),
+                            addr,
+                            &mut evis,
+                            &mut evpn_nh,
+                            &mut evpn_subscribers,
+                            &local,
+                            &sessions,
+                        )
+                        .await;
+                    }
+                    for ev in flowspec_rib.withdraw_peer(addr) {
+                        log_flowspec_event(&ev);
+                    }
+                    for ev in srpolicy_rib.withdraw_peer(addr) {
+                        log_srpolicy_event(&ev);
+                    }
+                    for ev in link_state_rib.withdraw_peer(addr) {
+                        log_linkstate_event(&ev);
+                    }
+                    // Drop the peer from the shared `Local` so later per-peer lookups in
+                    // the central task no longer see it.
+                    let mut peers = local.peers.clone();
+                    let mut exports = local.exports.clone();
+                    peers.remove(&addr);
+                    exports.remove(&addr);
+                    local = Arc::new(local_with_peers(&local, peers, exports));
+                }
+                // Bring up the newly-configured peers.
+                for peer in rc.add {
+                    let addr = peer.addr;
+                    // A peer already present (e.g. only its attributes changed, which is
+                    // out of scope) is left running untouched.
+                    if neighbors.contains_key(&addr) {
+                        debug!(peer = %addr, "BGP reconfig: neighbour already present; leaving it untouched");
+                        continue;
+                    }
+                    info!(peer = %addr, remote_as = peer.remote_as, "BGP neighbour configured; starting session");
+                    neighbors.insert(
+                        addr,
+                        NeighborState {
+                            remote_as: peer.remote_as,
+                            established: false,
+                            refreshes_received: 0,
+                        },
+                    );
+                    if peer.default_originate {
+                        default_originate.insert(addr);
+                    }
+                    if let Some(f) = peer.import.clone() {
+                        imports.insert(addr, f);
+                    }
+                    // Add the peer to the shared `Local` (its props + export filter) so the
+                    // central task and the new connector see it.
+                    let mut peers = local.peers.clone();
+                    let mut exports = local.exports.clone();
+                    peers.insert(
+                        addr,
+                        PeerProps {
+                            remote_as: peer.remote_as,
+                            rr_client: peer.rr_client,
+                            peer_type: classify(local.local_as, &members, peer.remote_as),
+                            ttl_security: peer.ttl_security,
+                            max_prefix: peer.max_prefix,
+                            add_path: peer.add_path,
+                            ext_nexthop: peer.ext_nexthop,
+                            evpn: peer.evpn,
+                            flowspec: peer.flowspec,
+                            srpolicy: peer.srpolicy,
+                            link_state: peer.link_state,
+                            role: peer.role,
+                        },
+                    );
+                    if let Some(f) = peer.export.clone() {
+                        exports.insert(addr, f);
+                    }
+                    local = Arc::new(local_with_peers(&local, peers, exports));
+                    // Dial the peer (active). A passive added peer would rely on the accept
+                    // loop, which holds the startup `Local` snapshot and does not know it —
+                    // a documented limitation of live neighbour add.
+                    if peer.passive {
+                        warn!(peer = %addr, "BGP reconfig: adding a passive neighbour at runtime is unsupported; not dialling");
+                    } else {
+                        let cancel = spawn_bgp_connector(
+                            &peer,
+                            local.local_as,
+                            &members,
+                            local.clone(),
+                            conn_tx.clone(),
+                        );
+                        connector_cancels.insert(addr, cancel);
+                    }
+                }
                 continue;
             }
         };
@@ -3502,8 +3642,18 @@ fn should_advertise(communities: &[u32], to_type: PeerType) -> bool {
 }
 
 /// Actively dial a peer, run the session, and retry on failure.
-async fn connector(peer: PeerInfo, auth: TcpAuth, local: Arc<Local>, tx: mpsc::Sender<PeerMsg>) {
+async fn connector(
+    peer: PeerInfo,
+    auth: TcpAuth,
+    local: Arc<Local>,
+    tx: mpsc::Sender<PeerMsg>,
+    mut cancel: tokio::sync::watch::Receiver<bool>,
+) {
     loop {
+        // The neighbour was de-configured by a live reload (SIGHUP): stop dialling.
+        if *cancel.borrow() {
+            return;
+        }
         // An authenticated peer needs its key installed on the socket before the
         // handshake, so it gets a hand-built connect; an ordinary peer uses tokio's.
         // Bind every dial to the VRF (L3 master) device, if any, so the connection
@@ -3521,7 +3671,17 @@ async fn connector(peer: PeerInfo, auth: TcpAuth, local: Arc<Local>, tx: mpsc::S
                 _ => connect_bound(peer.addr, peer.scope_id, vrf).await,
             }
         };
-        match timeout(CONNECT_TIMEOUT, dial).await {
+        // Race the dial against cancellation: a de-configure while we are connecting (no
+        // session yet) tears the connector down without waiting out the connect timeout.
+        let dialed = tokio::select! {
+            _ = cancel.changed() => return,
+            res = timeout(CONNECT_TIMEOUT, dial) => res,
+        };
+        match dialed {
+            // Do NOT race `cancel` against the live session here: a de-configure sends
+            // the session a Cease (SessionCmd::CeaseDeconfigured) first and lets it close
+            // gracefully; `drive_session` then returns and the top-of-loop check below
+            // stops the re-dial.
             Ok(Ok(stream)) => {
                 if let Err(e) = drive_session(stream, peer, &local, &tx, false).await {
                     debug!(peer = %peer.addr, error = %e, "BGP session ended");
@@ -3530,8 +3690,83 @@ async fn connector(peer: PeerInfo, auth: TcpAuth, local: Arc<Local>, tx: mpsc::S
             Ok(Err(e)) => debug!(peer = %peer.addr, error = %e, "BGP connect failed"),
             Err(_) => debug!(peer = %peer.addr, "BGP connect timed out"),
         }
-        sleep(CONNECT_RETRY).await;
+        if *cancel.borrow() {
+            return;
+        }
+        tokio::select! {
+            _ = cancel.changed() => return,
+            _ = sleep(CONNECT_RETRY) => {}
+        }
     }
+}
+
+/// Spawn an active connector for `peer` and return the [`watch::Sender`](tokio::sync::watch)
+/// that cancels it — flip it to `true` (on a de-configure) to stop the connector
+/// re-dialling. Mirrors the inline connector spawn in [`run`], factored out so the live
+/// neighbour hot-reload path (SIGHUP) can start a new peer's session the same way.
+fn spawn_bgp_connector(
+    peer: &BgpPeerCfg,
+    local_as: u32,
+    members: &[u32],
+    local: Arc<Local>,
+    tx: mpsc::Sender<PeerMsg>,
+) -> tokio::sync::watch::Sender<bool> {
+    let info = PeerInfo {
+        addr: peer.addr,
+        scope_id: peer.scope_id,
+        remote_as: peer.remote_as,
+        rr_client: peer.rr_client,
+        peer_type: classify(local_as, members, peer.remote_as),
+        ttl_security: peer.ttl_security,
+        add_path: peer.add_path,
+        ext_nexthop: peer.ext_nexthop,
+        evpn: peer.evpn,
+        flowspec: peer.flowspec,
+        srpolicy: peer.srpolicy,
+        link_state: peer.link_state,
+        role: peer.role,
+    };
+    let auth = peer.tcp_auth();
+    let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+    tokio::spawn(async move { connector(info, auth, local, tx, cancel_rx).await });
+    cancel_tx
+}
+
+/// Rebuild the shared [`Local`] with a replaced peer/export map — the central task
+/// swaps in a fresh `Arc<Local>` on each live neighbour add/remove (SIGHUP) so its own
+/// per-peer lookups (EVPN/FlowSpec/max-prefix gating) and any connector spawned
+/// afterwards see the current peer set. Every other field is copied unchanged.
+fn local_with_peers(
+    base: &Local,
+    peers: HashMap<IpAddr, PeerProps>,
+    exports: HashMap<IpAddr, Filter>,
+) -> Local {
+    Local {
+        local_as: base.local_as,
+        router_id: base.router_id,
+        hold_time: base.hold_time,
+        next_hop6: base.next_hop6,
+        cluster_id: base.cluster_id,
+        confed_id: base.confed_id,
+        peers,
+        exports,
+        vrf_device: base.vrf_device.clone(),
+        ebgp_require_policy: base.ebgp_require_policy,
+    }
+}
+
+/// The neighbour delta a live configuration reload (SIGHUP) hands the BGP engine: peers
+/// to start a session for (`add`) and peers whose neighbour statement was removed
+/// (`remove`, by transport address). Unchanged neighbours are left untouched — their
+/// session and learned routes survive the reload. Per-neighbour attribute changes on an
+/// existing peer (timers, filters, policy) are out of scope and handled as a restart of
+/// that neighbour is not attempted here.
+pub struct BgpReconfig {
+    /// Newly-configured peers to dial and bring up.
+    pub add: Vec<BgpPeerCfg>,
+    /// Removed peers' transport addresses; their sessions are torn down with a Cease
+    /// "Peer De-configured" and their learned routes withdrawn.
+    pub remove: Vec<IpAddr>,
 }
 
 /// Accept inbound connections and run a session for each known peer.
@@ -4523,6 +4758,20 @@ async fn drive_session(
                     .send(&Message::Notification(Notification {
                         code: CODE_CEASE,
                         subcode: CEASE_ADMIN,
+                        data: vec![],
+                    }))
+                    .await;
+                return Ok(());
+            }
+            Step::Cmd(SessionCmd::CeaseDeconfigured) => {
+                // The neighbour was removed by a live config reload (SIGHUP): tell the
+                // peer with a Cease "Peer De-configured" and close. Like CeaseAdmin we
+                // do NOT report Down — the central task already withdrew this peer's
+                // routes and dropped its state, and cancelled its connector.
+                let _ = sess
+                    .send(&Message::Notification(Notification {
+                        code: CODE_CEASE,
+                        subcode: CEASE_DECONFIGURED,
                         data: vec![],
                     }))
                     .await;

@@ -70,16 +70,25 @@ diffs them against the running set — installing added routes, removing deleted
 ones, and replacing changed ones through the same RIB/FIB pipeline as a live
 protocol update. An added or removed static therefore shows up immediately in
 `show routes` and streams to every open [`monitor routes`](#streaming-the-forwarding-table--wren-monitor-routes)
-subscriber. Because no protocol engine is touched, **every BGP/OSPF/IS-IS/…
-session and adjacency stays up across the reload**, as do the routes learned over
-them. A config that fails to parse (or names an unknown filter) is logged and
-ignored, so a bad edit never crashes the daemon or drops the running
-configuration.
+subscriber. Unaffected protocol engines are not touched, so **every
+BGP/OSPF/IS-IS/… session and adjacency stays up across the reload**, as do the
+routes learned over them. A config that fails to parse (or names an unknown
+filter) is logged and ignored, so a bad edit never crashes the daemon or drops
+the running configuration.
 
-> Live reconfiguration of the protocol engines themselves — adding or removing
-> BGP neighbours, enabling a protocol, or swapping filters on the fly — is not yet
-> wired (each needs a per-engine reconfiguration path); today those still require a
-> restart. Full model-driven management (gNMI/OpenConfig) is future work.
+The same reload also **adds and removes BGP neighbours live**: Wren diffs the
+re-read neighbour set against the running one and, without restarting the
+daemon, dials a newly-configured peer to bring its session up and tears a removed
+peer down with a Cease "Peer De-configured" (RFC 4486), withdrawing the routes it
+had taught us. **Neighbours that are unchanged keep their session and learned
+routes** — only the added and removed peers are disturbed.
+
+> Still restart-only: per-neighbour BGP *attribute* changes on an existing peer
+> (timers, filters, policy, address families — an unchanged peer address whose
+> settings differ is left running as-is), enabling a protocol that was off at
+> startup, adding a *passive* neighbour at runtime, and reconfiguring the other
+> protocol engines on the fly. Full model-driven management (gNMI/OpenConfig) is
+> future work.
 
 ## Prometheus metrics
 

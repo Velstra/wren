@@ -221,10 +221,15 @@ implemented to its RFC.
   in place — added/removed/changed routes flow through the RIB/FIB pipeline and
   stream to `monitor routes` subscribers — without restarting or disturbing any
   protocol session (a session or adjacency untouched by the edit stays up; a
-  config that fails to parse is logged and ignored). Live reconfiguration of the
-  engines themselves (BGP neighbours, enabling a protocol, filter swaps) and full
-  model-driven management (gNMI/OpenConfig) are still to come. More per-protocol
-  detail views and a richer API are to come too.
+  config that fails to parse is logged and ignored). The same reload also **adds
+  and removes BGP neighbours live** over a per-engine reconfig channel: a new peer
+  is dialled and brought up, a removed peer is torn down with a Cease "Peer
+  De-configured" and its routes withdrawn, and unchanged peers keep their session
+  and learned routes. Remaining live-reconfig gaps — per-neighbour BGP attribute
+  changes, enabling a protocol that was off at startup, runtime *passive*
+  neighbours, filter swaps on the other engines — and full model-driven management
+  (gNMI/OpenConfig) are still to come. More per-protocol detail views and a richer
+  API are to come too.
 - [~] **Startup reconciliation** — on boot the kernel backend reads the routing
   table back (`RTM_GETROUTE` dump) and removes routes a previous wren instance
   left behind that the current config no longer programs, so a restart never

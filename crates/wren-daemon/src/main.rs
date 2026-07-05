@@ -344,6 +344,14 @@ async fn main() -> Result<()> {
     // diffs against the running set and applies only the delta. The `_tx` end is held
     // for the whole run so the router's reload select arm never sees a closed channel.
     let (reload_tx, reload_rx) = mpsc::channel::<router::ReloadRoutes>(QUERY_QUEUE);
+    // SIGHUP BGP neighbour hot-reload → the BGP task. On SIGHUP the reload task diffs the
+    // re-read neighbour set against the running one and sends the add/remove delta here;
+    // the BGP engine starts the added peers and tears the removed ones down, leaving
+    // unchanged peers untouched. The `_tx` end is held for the whole run (moved into the
+    // reload task) so the engine's reconfig arm never sees a closed channel; the `_rx` is
+    // taken into `bgp::run` only when BGP is enabled.
+    let (bgp_reload_tx, bgp_reload_rx) = mpsc::channel::<bgp::BgpReconfig>(QUERY_QUEUE);
+    let mut bgp_reload_rx = Some(bgp_reload_rx);
     // EVPN monitor subscriptions (`wren monitor evpn`) → the BGP task. The `_tx`
     // end is held in `Channels` (only when BGP runs) so the task's subscribe arm
     // never sees a closed channel; the `_rx` is moved into `bgp::run`.
@@ -838,6 +846,7 @@ async fn main() -> Result<()> {
                     .take()
                     .expect("evpn subscribe rx taken once");
                 let sd = shutdown_tx.subscribe();
+                let rcrx = bgp_reload_rx.take().expect("bgp reload rx taken once");
                 proto_handles.push(tokio::spawn(async move {
                     if let Err(e) = bgp::run(
                         run_cfg,
@@ -849,6 +858,7 @@ async fn main() -> Result<()> {
                         bdrx,
                         esrx,
                         sd,
+                        rcrx,
                     )
                     .await
                     {
@@ -1036,17 +1046,35 @@ async fn main() -> Result<()> {
     // they were installed directly above, bypassing the router loop's fan-out.
     router::redistribute_seed(&redist_targets, &rib).await;
 
-    // SIGHUP: re-read the configuration and hot-apply the delta — currently the
-    // static routes — without restarting the daemon or disturbing any protocol
-    // session or adjacency. A reload that fails to parse (or names a bad filter) is
-    // logged and ignored so the running configuration is kept rather than a broken one
-    // applied. Live reconfiguration of the protocol engines themselves (adding/removing
-    // BGP neighbours, enabling a protocol, swapping filters) is future work; see the
-    // daemon docs. The task holds a clone of `reload_tx`; the original stays in scope
-    // so the router's reload arm never sees a closed channel.
+    // SIGHUP: re-read the configuration and hot-apply the delta — the static routes and
+    // the BGP neighbour set (add/remove) — without restarting the daemon or disturbing any
+    // unchanged session or adjacency. A reload that fails to parse (or names a bad filter)
+    // is logged and ignored so the running configuration is kept rather than a broken one
+    // applied. Live reconfiguration beyond this — per-neighbour BGP attribute changes,
+    // enabling a protocol, swapping filters on other protocols — is still future work; see
+    // the daemon docs. The task holds clones of `reload_tx` / `bgp_reload_tx`; the
+    // originals stay in scope so the router's and BGP engine's reload arms never see a
+    // closed channel.
     {
         let config_path = args.config.clone();
         let reload_tx = reload_tx.clone();
+        let bgp_reload_tx = bgp_reload_tx.clone();
+        // Only diff BGP neighbours when BGP is running: the engine is spawned only when it
+        // was enabled at startup, so an added neighbour has an engine to bring it up.
+        let bgp_reconfig_enabled = bgp_enabled;
+        // The neighbour set the running BGP engine currently holds, by transport address —
+        // the baseline the next reload diffs against. Seeded from the startup config.
+        let mut known_bgp_peers: std::collections::HashSet<std::net::IpAddr> = cfg
+            .bgp
+            .as_ref()
+            .filter(|b| b.enabled)
+            .map(|b| {
+                b.neighbor
+                    .iter()
+                    .filter_map(|n| parse_neighbor_addr(&n.address).ok().map(|(addr, _)| addr))
+                    .collect()
+            })
+            .unwrap_or_default();
         tokio::spawn(async move {
             let mut hup = match tokio::signal::unix::signal(
                 tokio::signal::unix::SignalKind::hangup(),
@@ -1059,20 +1087,54 @@ async fn main() -> Result<()> {
             };
             while hup.recv().await.is_some() {
                 info!("SIGHUP received; reloading configuration");
-                match reload_static_routes(&config_path) {
-                    Ok(statics) => {
-                        let count = statics.len();
-                        if reload_tx
-                            .send(router::ReloadRoutes { statics })
-                            .await
-                            .is_err()
-                        {
-                            break; // router loop gone; nothing more to reload
-                        }
-                        info!(statics = count, "configuration reloaded");
-                    }
+                let reloaded = match reload_config(&config_path) {
+                    Ok(r) => r,
                     Err(e) => {
-                        error!(error = %e, "config reload failed; keeping the running configuration")
+                        error!(error = %e, "config reload failed; keeping the running configuration");
+                        continue;
+                    }
+                };
+                let count = reloaded.statics.len();
+                if reload_tx
+                    .send(router::ReloadRoutes {
+                        statics: reloaded.statics,
+                    })
+                    .await
+                    .is_err()
+                {
+                    break; // router loop gone; nothing more to reload
+                }
+                info!(statics = count, "configuration reloaded");
+                // BGP neighbour hot-reload: diff the re-read neighbour set against the
+                // running one and send the add/remove delta to the BGP engine.
+                if bgp_reconfig_enabled {
+                    if let Some(new_peers) = reloaded.bgp_peers {
+                        let new_set: std::collections::HashSet<std::net::IpAddr> =
+                            new_peers.iter().map(|p| p.addr).collect();
+                        let add: Vec<bgp::BgpPeerCfg> = new_peers
+                            .into_iter()
+                            .filter(|p| !known_bgp_peers.contains(&p.addr))
+                            .collect();
+                        let remove: Vec<std::net::IpAddr> = known_bgp_peers
+                            .iter()
+                            .copied()
+                            .filter(|a| !new_set.contains(a))
+                            .collect();
+                        if add.is_empty() && remove.is_empty() {
+                            known_bgp_peers = new_set;
+                        } else {
+                            let (added, removed) = (add.len(), remove.len());
+                            if bgp_reload_tx
+                                .send(bgp::BgpReconfig { add, remove })
+                                .await
+                                .is_err()
+                            {
+                                warn!("BGP engine gone; neighbour hot-reload skipped");
+                            } else {
+                                info!(added, removed, "BGP neighbours hot-reloaded");
+                                known_bgp_peers = new_set;
+                            }
+                        }
                     }
                 }
             }
@@ -1454,24 +1516,49 @@ fn vrf_routemap(
     }
 }
 
-/// Re-read the configuration file and resolve its static routes for a SIGHUP
-/// hot-reload, applying each VRF's import route-map exactly as startup does (so the
-/// result is the same baseline the router already holds). Returns the resolved routes,
-/// or an error — a missing/unparsable file, bad TOML, or an unknown filter — so the
-/// caller can keep the running configuration rather than apply a broken one.
-fn reload_static_routes(path: &std::path::Path) -> Result<Vec<wren_core::Route>> {
+/// The parts of a re-read configuration a SIGHUP hot-reload hands the running daemon:
+/// the resolved static routes (for the router) and, when BGP is enabled, the resolved
+/// neighbour set (for the BGP engine's neighbour delta).
+struct ReloadedConfig {
+    /// Static routes, each already run through its VRF's import route-map — the same
+    /// baseline the router holds, so it can diff and apply only the delta.
+    statics: Vec<wren_core::Route>,
+    /// The configured BGP peers, or `None` when BGP is disabled/absent (the reload then
+    /// carries no neighbour delta).
+    bgp_peers: Option<Vec<bgp::BgpPeerCfg>>,
+}
+
+/// Re-read the configuration file for a SIGHUP hot-reload: resolve its static routes
+/// (applying each VRF's import route-map exactly as startup does, so the result is the
+/// same baseline the router already holds) and, when BGP is enabled, build its neighbour
+/// set. Returns both, or an error — a missing/unparsable file, bad TOML, or an unknown
+/// filter — so the caller can keep the running configuration rather than apply a broken
+/// one. Only neighbour add/remove is acted on by the caller; the rest of the BGP config
+/// is not live-reconfigured.
+fn reload_config(path: &std::path::Path) -> Result<ReloadedConfig> {
     let cfg = wren_config::Config::load(path)
         .with_context(|| format!("reloading {}", path.display()))?;
     let by_name = compile_named_filters(&cfg).context("compiling filters")?;
     let (vrf_imports, _vrf_exports) =
         build_vrf_routemaps(&cfg, &by_name).context("resolving vrf route-maps")?;
-    let mut out = Vec::new();
+    let mut statics = Vec::new();
     for route in cfg.static_routes().context("resolving static routes")? {
         if let Some(route) = vrf_routemap(&vrf_imports, route) {
-            out.push(route);
+            statics.push(route);
         }
     }
-    Ok(out)
+    let bgp_peers = match cfg.bgp.as_ref().filter(|b| b.enabled) {
+        Some(b) => Some(
+            build_bgp_config(&cfg, b, &by_name)
+                .context("resolving bgp neighbours")?
+                .peers,
+        ),
+        None => None,
+    };
+    Ok(ReloadedConfig {
+        statics,
+        bgp_peers,
+    })
 }
 
 /// Resolve each VRF's `import` / `export` route-maps to compiled filters, keyed by the
