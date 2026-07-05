@@ -31,6 +31,67 @@ pub const CAP_EXTENDED_NEXT_HOP: u8 = 5;
 /// The ADD-PATH capability code (RFC 7911 §4).
 pub const CAP_ADD_PATH: u8 = 69;
 
+/// The BGP Role capability code (RFC 9234 §4.1): the local speaker's role in its
+/// relationship with the peer, negotiated in OPEN so both ends agree on it before
+/// the Only-To-Customer (OTC) route-leak procedures apply.
+pub const CAP_BGP_ROLE: u8 = 9;
+
+/// A BGP Role (RFC 9234 §4): the role the **local** AS plays in its relationship
+/// with a neighbour. It is advertised to that neighbour in the Role capability and,
+/// once negotiated, drives the Only-To-Customer (OTC) attribute procedures (§5) that
+/// prevent route leaks. The two ends of a session must advertise complementary roles
+/// ([`BgpRole::complement`]); a mismatch is an OPEN error (§4.2).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum BgpRole {
+    /// The local AS is a transit **provider** of the neighbour (value 0).
+    Provider,
+    /// The local AS is a Route Server (value 1).
+    RouteServer,
+    /// The local AS is a Route Server **client** (value 2).
+    RouteServerClient,
+    /// The local AS is a transit **customer** of the neighbour (value 3).
+    Customer,
+    /// The two ASes are lateral **peers** (value 4).
+    Peer,
+}
+
+impl BgpRole {
+    /// The on-wire role value (RFC 9234 §4.1).
+    pub fn as_u8(self) -> u8 {
+        match self {
+            BgpRole::Provider => 0,
+            BgpRole::RouteServer => 1,
+            BgpRole::RouteServerClient => 2,
+            BgpRole::Customer => 3,
+            BgpRole::Peer => 4,
+        }
+    }
+
+    /// Decode the on-wire role value; `None` for an unassigned value.
+    pub fn from_u8(v: u8) -> Option<Self> {
+        Some(match v {
+            0 => BgpRole::Provider,
+            1 => BgpRole::RouteServer,
+            2 => BgpRole::RouteServerClient,
+            3 => BgpRole::Customer,
+            4 => BgpRole::Peer,
+            _ => return None,
+        })
+    }
+
+    /// The role the well-formed counterpart must advertise (RFC 9234 §4.2):
+    /// Provider ↔ Customer, RS ↔ RS-Client, Peer ↔ Peer.
+    pub fn complement(self) -> BgpRole {
+        match self {
+            BgpRole::Provider => BgpRole::Customer,
+            BgpRole::Customer => BgpRole::Provider,
+            BgpRole::RouteServer => BgpRole::RouteServerClient,
+            BgpRole::RouteServerClient => BgpRole::RouteServer,
+            BgpRole::Peer => BgpRole::Peer,
+        }
+    }
+}
+
 /// ADD-PATH Send/Receive: able to **receive** multiple paths (RFC 7911 §4).
 pub const ADD_PATH_RECEIVE: u8 = 1;
 /// ADD-PATH Send/Receive: able to **send** multiple paths (RFC 7911 §4).
@@ -78,6 +139,9 @@ pub enum Capability {
     /// (AFI 1, SAFI 1) reachable through an IPv6 next hop (Nexthop AFI 2). Note SAFI
     /// is a 2-octet field here (unlike the 1-octet SAFI elsewhere).
     ExtendedNextHop(Vec<(u16, u16, u16)>),
+    /// The BGP Role capability (code 9, RFC 9234 §4.1): the local speaker's
+    /// [`BgpRole`] in this relationship, carried as a single octet.
+    BgpRole(BgpRole),
     /// A capability this implementation does not model, kept verbatim.
     Unknown {
         /// The capability code.
@@ -97,6 +161,7 @@ impl Capability {
             Capability::FourOctetAs(_) => CAP_FOUR_OCTET_AS,
             Capability::AddPath(_) => CAP_ADD_PATH,
             Capability::ExtendedNextHop(_) => CAP_EXTENDED_NEXT_HOP,
+            Capability::BgpRole(_) => CAP_BGP_ROLE,
             Capability::Unknown { code, .. } => *code,
         }
     }
@@ -149,6 +214,11 @@ impl Capability {
                     out.extend_from_slice(&safi.to_be_bytes());
                     out.extend_from_slice(&nh_afi.to_be_bytes());
                 }
+            }
+            Capability::BgpRole(role) => {
+                // A single octet: the role value (RFC 9234 §4.1).
+                out.push(1);
+                out.push(role.as_u8());
             }
             Capability::Unknown { value, .. } => {
                 out.push(value.len() as u8);
@@ -221,6 +291,11 @@ impl Capability {
                     o += 6;
                 }
                 Capability::ExtendedNextHop(tuples)
+            }
+            // A Role value we don't recognise (RFC 9234 §4.1) is kept opaque rather
+            // than dropped, so it round-trips and can still trigger a mismatch check.
+            CAP_BGP_ROLE if value.len() == 1 && BgpRole::from_u8(value[0]).is_some() => {
+                Capability::BgpRole(BgpRole::from_u8(value[0]).unwrap())
             }
             _ => Capability::Unknown {
                 code,
@@ -373,6 +448,40 @@ mod tests {
         assert_eq!(opt[3], 6);
         assert_eq!(&opt[4..10], &[0x00, 0x01, 0x00, 0x01, 0x00, 0x02]);
         assert_eq!(parse_optional_parameters(&opt), caps);
+    }
+
+    #[test]
+    fn bgp_role_capability_roundtrips() {
+        let caps = vec![Capability::BgpRole(BgpRole::Customer)];
+        let opt = encode_optional_parameters(&caps);
+        // type 2 (capabilities param), then [cap 9 (role), len 1, role value 3].
+        assert_eq!(opt[0], OPT_PARAM_CAPABILITIES);
+        assert_eq!(opt[2], CAP_BGP_ROLE);
+        assert_eq!(opt[3], 1);
+        assert_eq!(opt[4], 3);
+        assert_eq!(parse_optional_parameters(&opt), caps);
+    }
+
+    #[test]
+    fn bgp_roles_are_complementary() {
+        assert_eq!(BgpRole::Provider.complement(), BgpRole::Customer);
+        assert_eq!(BgpRole::Customer.complement(), BgpRole::Provider);
+        assert_eq!(BgpRole::RouteServer.complement(), BgpRole::RouteServerClient);
+        assert_eq!(BgpRole::RouteServerClient.complement(), BgpRole::RouteServer);
+        assert_eq!(BgpRole::Peer.complement(), BgpRole::Peer);
+    }
+
+    #[test]
+    fn unassigned_bgp_role_value_is_kept_opaque() {
+        // Role value 9 is unassigned; it must not decode to a BgpRole.
+        let opt = [OPT_PARAM_CAPABILITIES, 3, CAP_BGP_ROLE, 1, 9];
+        assert_eq!(
+            parse_optional_parameters(&opt),
+            vec![Capability::Unknown {
+                code: CAP_BGP_ROLE,
+                value: vec![9]
+            }]
+        );
     }
 
     #[test]

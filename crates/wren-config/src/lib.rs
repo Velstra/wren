@@ -551,6 +551,14 @@ pub struct Bgp {
     /// are always accepted. Defaults to false (validate and show, but accept all).
     #[serde(default, rename = "rpki-reject-invalid")]
     pub rpki_reject_invalid: bool,
+    /// RFC 8212 strict default-deny for eBGP: when enabled, an eBGP neighbour with **no**
+    /// explicit `import` policy accepts no routes, and one with no explicit `export`
+    /// policy re-advertises no transit routes (locally-originated `network`/redistribute
+    /// and `default-originate` routes are exempt, as are iBGP sessions). The RFC
+    /// recommends this be on; wren defaults it **off** so existing configurations keep
+    /// their current behaviour — set `true` to require a policy on every eBGP peer.
+    #[serde(default, rename = "ebgp-require-policy")]
+    pub ebgp_require_policy: bool,
     /// An RTR (RFC 8210) validating cache to fetch ROAs from live, instead of (or in
     /// addition to) the static `[[bgp.roa]]` entries. Unset disables RTR.
     pub rtr: Option<BgpRtr>,
@@ -809,6 +817,13 @@ pub struct BgpNeighbor {
     /// with any set-community (and, for transit routes, set-metric/set-preference)
     /// modifications applied. Unset advertises everything.
     pub export: Option<String>,
+    /// This local speaker's BGP Role toward this neighbour (RFC 9234 §4), one of
+    /// `provider`, `customer`, `peer`, `rs-server` or `rs-client`. It is advertised in
+    /// the Role capability and must be the complement of the peer's role (Provider ↔
+    /// Customer, RS-Server ↔ RS-Client, Peer ↔ Peer) or the session is refused with a
+    /// Role Mismatch. Once set, the Only-To-Customer (OTC) route-leak procedures (§5)
+    /// apply to routes exchanged with this neighbour. Unset disables roles/OTC for it.
+    pub role: Option<String>,
     /// Run a BFD (RFC 5880) session to this neighbour for fast failure detection.
     /// When the BFD session goes down, the BGP session to this peer is torn down at
     /// once instead of waiting for the Hold Timer. Timing comes from the global

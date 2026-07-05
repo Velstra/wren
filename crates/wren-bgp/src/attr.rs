@@ -276,6 +276,10 @@ pub enum PathAttribute {
         /// preserved as `(type, value)` for faithful re-advertisement.
         other: Vec<(u8, Vec<u8>)>,
     },
+    /// Only-To-Customer (OTC, type 35, optional transitive) — the RFC 9234 §4.1
+    /// route-leak-prevention marker, carrying the AS number that first set it. A
+    /// route bearing OTC must not be advertised to a Provider, Peer or RS (§5).
+    OnlyToCustomer(u32),
     /// An attribute type this implementation does not model, kept verbatim.
     Unknown {
         /// The original attribute flags.
@@ -304,6 +308,7 @@ impl PathAttribute {
     const AS4_PATH: u8 = 17;
     const AS4_AGGREGATOR: u8 = 18;
     const LARGE_COMMUNITIES: u8 = 32;
+    const ONLY_TO_CUSTOMER: u8 = 35;
     const PREFIX_SID: u8 = 40;
 
     /// The attribute type code.
@@ -330,6 +335,7 @@ impl PathAttribute {
             PathAttribute::As4Path(_) => Self::AS4_PATH,
             PathAttribute::As4Aggregator { .. } => Self::AS4_AGGREGATOR,
             PathAttribute::PrefixSid { .. } => Self::PREFIX_SID,
+            PathAttribute::OnlyToCustomer(_) => Self::ONLY_TO_CUSTOMER,
             PathAttribute::Unknown { type_code, .. } => *type_code,
         }
     }
@@ -353,7 +359,8 @@ impl PathAttribute {
             | PathAttribute::LargeCommunities(_)
             | PathAttribute::As4Path(_)
             | PathAttribute::As4Aggregator { .. }
-            | PathAttribute::PrefixSid { .. } => FLAG_OPTIONAL | FLAG_TRANSITIVE,
+            | PathAttribute::PrefixSid { .. }
+            | PathAttribute::OnlyToCustomer(_) => FLAG_OPTIONAL | FLAG_TRANSITIVE,
             PathAttribute::Unknown { flags, .. } => *flags,
             _ => FLAG_TRANSITIVE,
         }
@@ -474,6 +481,7 @@ impl PathAttribute {
                     out.extend_from_slice(v);
                 }
             }
+            PathAttribute::OnlyToCustomer(asn) => out.extend_from_slice(&asn.to_be_bytes()),
             PathAttribute::Unknown { value, .. } => out.extend_from_slice(value),
         }
     }
@@ -643,6 +651,7 @@ impl PathAttribute {
                 let (asn, id) = decode_aggregator(value, true)?;
                 PathAttribute::As4Aggregator { asn, id }
             }
+            Self::ONLY_TO_CUSTOMER => PathAttribute::OnlyToCustomer(read_u32(value)?),
             Self::PREFIX_SID => match decode_prefix_sid(value) {
                 Some((srv6, other)) => PathAttribute::PrefixSid { srv6, other },
                 // A malformed Prefix-SID is optional-transitive: keep it opaque
@@ -938,6 +947,18 @@ mod tests {
         roundtrip(PathAttribute::Aggregator { asn: 65001, id: ip([10, 0, 0, 1]) });
         // A 4-octet aggregator AS only survives the 4-octet width.
         roundtrip_w(PathAttribute::Aggregator { asn: 196_618, id: ip([10, 0, 0, 1]) }, true);
+    }
+
+    #[test]
+    fn only_to_customer_roundtrips() {
+        // RFC 9234 OTC: a 4-octet AS, optional transitive.
+        roundtrip(PathAttribute::OnlyToCustomer(65001));
+        roundtrip(PathAttribute::OnlyToCustomer(4_200_000_000));
+        let mut buf = Vec::new();
+        PathAttribute::OnlyToCustomer(65001).encode(&mut buf, true);
+        assert_eq!(buf[0], FLAG_OPTIONAL | FLAG_TRANSITIVE);
+        assert_eq!(buf[1], 35); // OTC type code
+        assert_eq!(buf[2], 4); // length
     }
 
     #[test]

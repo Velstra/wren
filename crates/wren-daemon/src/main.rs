@@ -1269,6 +1269,23 @@ fn parse_neighbor_addr(s: &str) -> Result<(std::net::IpAddr, Option<u32>)> {
     Ok((addr, scope_id))
 }
 
+/// Parse a BGP Role name (RFC 9234 §4) into a [`wren_bgp::capability::BgpRole`]. The
+/// accepted names mirror the capability values: `provider`, `customer`, `peer`,
+/// `rs-server` (Route Server) and `rs-client` (Route Server client).
+fn parse_bgp_role(s: &str) -> Result<wren_bgp::capability::BgpRole> {
+    use wren_bgp::capability::BgpRole;
+    Ok(match s {
+        "provider" => BgpRole::Provider,
+        "customer" => BgpRole::Customer,
+        "peer" => BgpRole::Peer,
+        "rs-server" | "rs_server" => BgpRole::RouteServer,
+        "rs-client" | "rs_client" => BgpRole::RouteServerClient,
+        other => anyhow::bail!(
+            "unknown role {other:?} (expected provider, customer, peer, rs-server or rs-client)"
+        ),
+    })
+}
+
 /// Resolve the shared BFD (RFC 5880) session timing from the `[bfd]` block: the
 /// `min-tx` / `min-rx` intervals (milliseconds, default 300) and `detect-mult`
 /// (default 3), converted to the microsecond units the session FSM uses. Every BFD
@@ -1476,6 +1493,13 @@ fn build_bgp_config(
             Some(name) => Some(named_filter(by_name, name, "bgp neighbor export")?),
             None => None,
         };
+        // BGP Role (RFC 9234 §4): the local speaker's role toward this neighbour.
+        let role = match n.role.as_deref() {
+            Some(s) => Some(parse_bgp_role(s).with_context(|| {
+                format!("bgp neighbor {addr} role {s:?}")
+            })?),
+            None => None,
+        };
         peers.push(bgp::BgpPeerCfg {
             addr,
             scope_id,
@@ -1494,6 +1518,7 @@ fn build_bgp_config(
             flowspec: n.flowspec,
             import,
             export,
+            role,
         });
     }
 
@@ -1625,6 +1650,7 @@ fn build_bgp_config(
         aggregates,
         roas,
         rpki_reject_invalid: bgp.rpki_reject_invalid,
+        ebgp_require_policy: bgp.ebgp_require_policy,
         vrf_table,
         vrf_device,
         evpn,

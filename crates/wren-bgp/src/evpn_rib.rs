@@ -371,6 +371,7 @@ mod tests {
             large_communities: vec![],
             ext_communities: rts,
             srv6_sid: None,
+            otc: None,
         }
     }
 

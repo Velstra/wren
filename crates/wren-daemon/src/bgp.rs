@@ -37,7 +37,7 @@ use tokio::time::{sleep, sleep_until, timeout, Instant};
 use tracing::{debug, info, warn};
 
 use wren_bgp::attr::{reconstruct_as_path, AsPathSegment, Origin, PathAttribute};
-use wren_bgp::capability::{Capability, ADD_PATH_BOTH, ADD_PATH_RECEIVE, ADD_PATH_SEND};
+use wren_bgp::capability::{BgpRole, Capability, ADD_PATH_BOTH, ADD_PATH_RECEIVE, ADD_PATH_SEND};
 use wren_bgp::community::format_community;
 use wren_bgp::decision::{Path, DEFAULT_LOCAL_PREF};
 use wren_bgp::evpn::{encap_ext_community, Esi, EvpnNlri, Rd, TUNNEL_TYPE_VXLAN};
@@ -45,7 +45,7 @@ use wren_bgp::evpn_rib::{EviChange, EviTable, EvpnRib, EvpnRibEvent};
 use wren_bgp::ext_community::format_ext_community;
 use wren_bgp::flowspec::{Action as FsAction, FlowSpec};
 use wren_bgp::flowspec_rib::{actions_of, FlowSpecNlri, FlowSpecRib, FlowSpecRibEvent};
-use wren_bgp::fsm::{Action, BgpFsm, Event, State, CODE_CEASE};
+use wren_bgp::fsm::{Action, BgpFsm, Event, State, CODE_CEASE, CODE_OPEN_MESSAGE};
 use wren_bgp::large_community::format_large_community;
 use wren_bgp::message::{AddPath, Message, Notification, Open, Update};
 use wren_bgp::rib::{BgpRib, RibEvent};
@@ -78,6 +78,9 @@ const CEASE_MAXPREFIX: u8 = 1;
 /// every peer when the daemon is shutting down gracefully (M10), so they tear the
 /// session down immediately instead of waiting out the hold timer.
 const CEASE_ADMIN: u8 = 2;
+/// OPEN Message Error subcode 8, "Role Mismatch" (RFC 9234 §4.2) — sent when the peer's
+/// advertised BGP Role is not the complement of our configured role.
+const OPEN_ROLE_MISMATCH: u8 = 8;
 
 /// A process-wide monotonic source of per-connection ids. Two connections to the
 /// same peer (a simultaneous open) share a peer address but get distinct ids, so
@@ -131,6 +134,10 @@ pub struct BgpConfig {
     /// Drop received routes that RPKI origin validation classifies as Invalid
     /// (RFC 6811); `Valid` and `NotFound` are always accepted.
     pub rpki_reject_invalid: bool,
+    /// RFC 8212 strict default-deny for eBGP: an eBGP peer with no explicit `import`
+    /// filter accepts no routes, and with no explicit `export` filter re-advertises no
+    /// transit routes. iBGP and locally-originated routes are unaffected.
+    pub ebgp_require_policy: bool,
     /// The VRF (kernel routing table) this BGP instance installs its routes into.
     /// Defaults to [`wren_core::RT_TABLE_MAIN`] for the default VRF.
     pub vrf_table: u32,
@@ -290,6 +297,10 @@ pub struct BgpPeerCfg {
     /// set-community (and, for a propagated route, set-metric→MED / set-preference→
     /// LOCAL_PREF) modifications applied. `None` advertises everything unchanged.
     pub export: Option<Filter>,
+    /// This local speaker's BGP Role toward this peer (RFC 9234 §4), advertised in the
+    /// Role capability and driving the Only-To-Customer route-leak procedures. `None`
+    /// disables roles/OTC for this peer.
+    pub role: Option<BgpRole>,
     /// Negotiate ADD-PATH (RFC 7911) with this peer for IPv4 unicast — keep every
     /// path the peer sends and advertise all candidate paths back to it.
     pub add_path: bool,
@@ -375,6 +386,10 @@ struct Local {
     /// The VRF (L3 master) device name to bind session sockets to (`SO_BINDTODEVICE`),
     /// or `None` for the default VRF. Connectors and the accept loop read it.
     vrf_device: Option<String>,
+    /// RFC 8212 strict default-deny for eBGP (from [`BgpConfig::ebgp_require_policy`]):
+    /// an eBGP peer with no import filter accepts nothing, and with no export filter
+    /// re-advertises no transit routes.
+    ebgp_require_policy: bool,
 }
 
 impl Local {
@@ -403,6 +418,9 @@ struct PeerProps {
     evpn: bool,
     /// Whether the FlowSpec family (RFC 8955) is configured for this peer.
     flowspec: bool,
+    /// This local speaker's BGP Role toward this peer (RFC 9234 §4), if configured —
+    /// drives the Only-To-Customer route-leak procedures on received routes.
+    role: Option<BgpRole>,
 }
 
 /// One prefix this speaker originates, with the COMMUNITIES to attach. The central
@@ -575,6 +593,8 @@ struct PeerInfo {
     evpn: bool,
     /// Whether the FlowSpec family (RFC 8955) is configured for this peer.
     flowspec: bool,
+    /// This local speaker's BGP Role toward this peer (RFC 9234 §4), if configured.
+    role: Option<BgpRole>,
 }
 
 /// A message from a per-peer session task to the central RIB task.
@@ -1305,6 +1325,9 @@ pub async fn run(
     let static_roas = cfg.roas.clone();
     let mut roa = RoaTable::new(static_roas.clone());
     let rpki_reject = cfg.rpki_reject_invalid;
+    // RFC 8212 strict default-deny for eBGP: when set, an eBGP peer with no import
+    // filter accepts no reachability (the import-deny is applied per received UPDATE).
+    let require_policy = cfg.ebgp_require_policy;
     // Established sessions we can push origination changes to, keyed by peer.
     let mut sessions: HashMap<IpAddr, mpsc::Sender<SessionCmd>> = HashMap::new();
     // Whether each established session's connection was inbound, for §6.8 collision
@@ -1369,6 +1392,7 @@ pub async fn run(
                         ext_nexthop: p.ext_nexthop,
                         evpn: p.evpn,
                         flowspec: p.flowspec,
+                        role: p.role,
                     },
                 )
             })
@@ -1379,6 +1403,7 @@ pub async fn run(
             .filter_map(|p| p.export.clone().map(|f| (p.addr, f)))
             .collect(),
         vrf_device: cfg.vrf_device.clone(),
+        ebgp_require_policy: cfg.ebgp_require_policy,
     });
 
     let (tx, mut rx) = mpsc::channel::<PeerMsg>(PEER_QUEUE);
@@ -1425,6 +1450,7 @@ pub async fn run(
             ext_nexthop: peer.ext_nexthop,
             evpn: peer.evpn,
             flowspec: peer.flowspec,
+            role: peer.role,
         };
         let auth = peer.tcp_auth();
         let local = local.clone();
@@ -2101,11 +2127,30 @@ pub async fn run(
                     }
                 }
                 let import = imports.get(&peer);
+                // RFC 8212 strict default-deny: an eBGP peer with no import policy
+                // accepts no reachability. Withdrawals above are still honoured.
+                let import_deny = require_policy && facts.from_ebgp && import.is_none();
+                // RFC 9234 Only-To-Customer ingress: reject a leaked route, and compute
+                // the OTC value to stamp on an accepted one. The peer's (remote) role is
+                // the complement of our configured role toward it.
+                let remote_role = local
+                    .peers
+                    .get(&peer)
+                    .and_then(|pp| pp.role)
+                    .map(BgpRole::complement);
+                let (otc_reject, otc_add) = otc_ingress(remote_role, otc_from_update(&update), facts.as_);
+                if otc_reject {
+                    debug!(peer = %peer, "RFC 9234 OTC route leak; reachability rejected");
+                }
+                // Whether to drop this UPDATE's unicast reachability entirely (either the
+                // RFC 8212 default-deny or an RFC 9234 OTC leak).
+                let reject_reach = import_deny || otc_reject;
                 // IPv4 reachability: base NLRI with the IPv4 NEXT_HOP attribute.
-                if !update.nlri.is_empty() {
+                if !reject_reach && !update.nlri.is_empty() {
                     match base_next_hop(&update) {
                         Some(nh) => {
-                            let path = build_path(&update, IpAddr::V4(nh), None, facts);
+                            let mut path = build_path(&update, IpAddr::V4(nh), None, facts);
+                            path.otc = path.otc.or(otc_add);
                             for (i, p) in update.nlri.iter().enumerate() {
                                 let path_id = update.nlri_path_ids.get(i).copied().unwrap_or(0);
                                 import_and_install(
@@ -2129,13 +2174,14 @@ pub async fn run(
                 }
                 // IPv6 reachability: MP_REACH_NLRI carries its own next hop (RFC 4760).
                 // A link-local next hop (RFC 2545) is pinned to the ingress interface.
-                if let Some((nh6, nlri, is_link_local)) = mp_reach_v6(&update) {
+                if let Some((nh6, nlri, is_link_local)) = mp_reach_v6(&update).filter(|_| !reject_reach) {
                     let iface = if is_link_local {
                         ingress_iface.clone()
                     } else {
                         None
                     };
-                    let path = build_path(&update, IpAddr::V6(nh6), iface, facts);
+                    let mut path = build_path(&update, IpAddr::V6(nh6), iface, facts);
+                    path.otc = path.otc.or(otc_add);
                     for p in nlri {
                         import_and_install(
                             import,
@@ -2157,13 +2203,16 @@ pub async fn run(
                 // and an IPv6 next hop. The IPv4 prefix is installed via the IPv6
                 // gateway (the kernel uses RTA_VIA). A link-local next hop is pinned to
                 // the ingress interface, like the IPv6-unicast case.
-                if let Some((nh6, nlri, is_link_local)) = mp_reach_v4_over_v6(&update) {
+                if let Some((nh6, nlri, is_link_local)) =
+                    mp_reach_v4_over_v6(&update).filter(|_| !reject_reach)
+                {
                     let iface = if is_link_local {
                         ingress_iface.clone()
                     } else {
                         None
                     };
-                    let path = build_path(&update, IpAddr::V6(nh6), iface, facts);
+                    let mut path = build_path(&update, IpAddr::V6(nh6), iface, facts);
+                    path.otc = path.otc.or(otc_add);
                     for p in nlri {
                         import_and_install(
                             import,
@@ -2688,6 +2737,7 @@ fn build_path(
     let mut originator_id = None;
     let mut cluster_list = Vec::new();
     let mut srv6_sid = None;
+    let mut otc = None;
     for a in &update.attributes {
         match a {
             PathAttribute::Origin(o) => origin = *o,
@@ -2703,6 +2753,9 @@ fn build_path(
             PathAttribute::PrefixSid { srv6, .. } => {
                 srv6_sid = srv6.first().and_then(|t| t.first_sid()).copied();
             }
+            // Only-To-Customer (RFC 9234 §4.1): carried through so the egress
+            // route-leak rules can inspect it on re-advertisement.
+            PathAttribute::OnlyToCustomer(a) => otc = Some(*a),
             _ => {}
         }
     }
@@ -2731,6 +2784,47 @@ fn build_path(
         large_communities,
         ext_communities,
         srv6_sid,
+        otc,
+    }
+}
+
+/// The Only-To-Customer (RFC 9234 §4.1) AS an UPDATE carries, if the OTC attribute is
+/// present.
+fn otc_from_update(update: &Update) -> Option<u32> {
+    update.attributes.iter().find_map(|a| match a {
+        PathAttribute::OnlyToCustomer(v) => Some(*v),
+        _ => None,
+    })
+}
+
+/// RFC 9234 §5 ingress Only-To-Customer decision for reachability received from a peer
+/// whose (remote) BGP Role is `remote_role`. `otc_in` is the OTC value the UPDATE
+/// carries (if any) and `peer_as` the neighbouring AS. Returns `(reject, add)`: `reject`
+/// is true when the reachability is a route leak that must be dropped; `add` is the OTC
+/// value to stamp on the path when the RFC requires it be added on ingress.
+///
+///   * A route carrying OTC from a Customer or RS-Client is a leak (§5 ingress 1).
+///   * A route carrying OTC from a Peer whose OTC value is not that peer's AS is a
+///     leak (§5 ingress 2).
+///   * A route with no OTC received from a Provider, Peer or RS gets OTC = the remote
+///     AS (§5 ingress 3).
+///
+/// With no configured role the procedures do not apply (`(false, None)`).
+fn otc_ingress(remote_role: Option<BgpRole>, otc_in: Option<u32>, peer_as: u32) -> (bool, Option<u32>) {
+    let Some(role) = remote_role else {
+        return (false, None);
+    };
+    match otc_in {
+        Some(v) => {
+            let leak = matches!(role, BgpRole::Customer | BgpRole::RouteServerClient)
+                || (role == BgpRole::Peer && v != peer_as);
+            (leak, None)
+        }
+        None => {
+            let add = matches!(role, BgpRole::Provider | BgpRole::Peer | BgpRole::RouteServer)
+                .then_some(peer_as);
+            (false, add)
+        }
     }
 }
 
@@ -3112,6 +3206,7 @@ async fn accept_loop(listener: TcpListener, local: Arc<Local>, tx: mpsc::Sender<
                     ext_nexthop: props.ext_nexthop,
                     evpn: props.evpn,
                     flowspec: props.flowspec,
+                    role: props.role,
                 };
                 let local = local.clone();
                 let tx = tx.clone();
@@ -3642,6 +3737,7 @@ async fn drive_session(
         local,
         peer,
         export: local.exports.get(&peer.addr).cloned(),
+        role: peer.role,
         tx,
         cmd_tx,
         peer_type: peer.peer_type,
@@ -3702,9 +3798,21 @@ async fn drive_session(
                 Ok(msg) => match &msg {
                     Message::Open(o) => {
                         let peer_as = o.effective_as();
+                        // RFC 9234 §4.2: when we advertise a Role and the peer also
+                        // advertises one, they must be complementary — otherwise the
+                        // session is refused with a Role Mismatch. A peer that omits the
+                        // capability is accepted (non-strict), so roles can be rolled out
+                        // one side at a time.
+                        let role_mismatch = match (sess.role, o.role()) {
+                            (Some(mine), Some(theirs)) => theirs != mine.complement(),
+                            _ => false,
+                        };
                         if peer_as != sess.peer.remote_as {
                             warn!(peer = %sess.peer.addr, expected = sess.peer.remote_as, got = peer_as, "BGP OPEN AS mismatch");
                             Step::Event(Event::OpenError)
+                        } else if role_mismatch {
+                            warn!(peer = %sess.peer.addr, mine = ?sess.role, theirs = ?o.role(), "BGP OPEN role mismatch (RFC 9234)");
+                            Step::RoleMismatch
                         } else {
                             sess.peer_id = o.identifier;
                             // Keep the encoded OPEN for the BMP Peer Up (RFC 7854 §4.10).
@@ -3874,6 +3982,18 @@ async fn drive_session(
                 }
             }
             Step::Handled => {}
+            Step::RoleMismatch => {
+                // RFC 9234 §4.2: refuse the session with an OPEN Message Error
+                // "Role Mismatch" and close. We are not Established, so no Down.
+                let _ = sess
+                    .send(&Message::Notification(Notification {
+                        code: CODE_OPEN_MESSAGE,
+                        subcode: OPEN_ROLE_MISMATCH,
+                        data: vec![],
+                    }))
+                    .await;
+                break;
+            }
             // The central task asks us to send a ROUTE-REFRESH to the peer (the
             // operator ran `bgp refresh <peer>`). Send it for IPv4 unicast, and for
             // IPv6 unicast too when that family is negotiated (RFC 2918 §3).
@@ -4020,6 +4140,9 @@ enum Step {
     Cmd(SessionCmd),
     /// A message was handled inline with no FSM transition (e.g. ROUTE-REFRESH).
     Handled,
+    /// The peer's OPEN carried a BGP Role that is not the complement of ours
+    /// (RFC 9234 §4.2): close with an OPEN Message Error "Role Mismatch".
+    RoleMismatch,
     ReadFailed,
 }
 
@@ -4031,6 +4154,9 @@ struct Session<'a> {
     /// This peer's outbound export filter (RFC-style export route-map), applied to
     /// every route advertised to it. `None` advertises everything unchanged.
     export: Option<Filter>,
+    /// This local speaker's BGP Role toward this peer (RFC 9234 §4), if configured:
+    /// advertised in our OPEN and driving the Only-To-Customer egress procedures.
+    role: Option<BgpRole>,
     tx: &'a mpsc::Sender<PeerMsg>,
     /// Handed to the central task on Established so it can push origination
     /// commands (advertise/withdraw) back to this session.
@@ -4140,6 +4266,11 @@ impl Session<'_> {
                             SAFI_UNICAST,
                             ADD_PATH_BOTH,
                         )]));
+                    }
+                    // BGP Role (RFC 9234 §4.1): advertise our role so the peer can
+                    // verify the relationship and the OTC procedures engage.
+                    if let Some(role) = self.role {
+                        open.capabilities.push(Capability::BgpRole(role));
                     }
                     // Extended Next Hop Encoding (RFC 5549 / RFC 8950): when configured,
                     // advertise that we can receive IPv4 unicast with an IPv6 next hop.
@@ -4268,6 +4399,39 @@ impl Session<'_> {
             None
         };
         wren_bgp::encode_v6_next_hop(global, link_local)
+    }
+
+    /// This peer's (remote) BGP Role (RFC 9234): the complement of our configured role
+    /// toward it. `None` when no role is configured (roles/OTC disabled for this peer).
+    fn remote_role(&self) -> Option<BgpRole> {
+        self.role.map(BgpRole::complement)
+    }
+
+    /// RFC 9234 §5 egress rule 1: whether a route advertised to this peer must carry the
+    /// OTC attribute — true toward a Customer, Peer or RS-Client. Combined with
+    /// [`Session::otc_egress_block`], a locally-originated route is tagged OTC and a
+    /// transit route keeps its existing OTC.
+    fn otc_egress_add(&self) -> bool {
+        matches!(
+            self.remote_role(),
+            Some(BgpRole::Customer | BgpRole::Peer | BgpRole::RouteServerClient)
+        )
+    }
+
+    /// RFC 9234 §5 egress rule 2: whether a route that already carries OTC must NOT be
+    /// advertised to this peer — true toward a Provider, Peer or RS.
+    fn otc_egress_block(&self) -> bool {
+        matches!(
+            self.remote_role(),
+            Some(BgpRole::Provider | BgpRole::Peer | BgpRole::RouteServer)
+        )
+    }
+
+    /// RFC 8212 strict default-deny on the export side: a true-eBGP peer with no export
+    /// filter re-advertises no **transit** routes when strict mode is enabled.
+    /// Locally-originated routes are exempt (they do not flow through this gate).
+    fn export_deny_all(&self) -> bool {
+        self.local.ebgp_require_policy && self.from_ebgp && self.export.is_none()
     }
 
     /// Advertise originated routes to this peer, building the per-peer attributes
@@ -4404,6 +4568,11 @@ impl Session<'_> {
                 base.push(PathAttribute::LocalPref(DEFAULT_LOCAL_PREF));
             }
         }
+        // RFC 9234 §5 egress rule 1: a locally-originated route advertised to a
+        // Customer, Peer or RS-Client is tagged with OTC = our (externally visible) AS.
+        if self.otc_egress_add() {
+            base.push(PathAttribute::OnlyToCustomer(self.local.external_as()));
+        }
         base
     }
 
@@ -4524,8 +4693,18 @@ impl Session<'_> {
     /// route reflection), and honour the NO_EXPORT / NO_ADVERTISE communities.
     /// IPv4 unicast only for now.
     async fn propagate_routes(&mut self, routes: &[PropRoute]) -> Result<()> {
+        // RFC 8212 strict default-deny: a true-eBGP peer with no export policy
+        // re-advertises no transit routes at all.
+        if self.export_deny_all() {
+            return Ok(());
+        }
         for r in routes {
             if !should_propagate(&r.path, self.peer_type, self.peer.rr_client, self.peer.addr) {
+                continue;
+            }
+            // RFC 9234 §5 egress rule 2: a route already carrying OTC must not be
+            // advertised to a Provider, Peer or RS — the route-leak stop.
+            if self.otc_egress_block() && r.path.otc.is_some() {
                 continue;
             }
             // Per-neighbour outbound export policy: drop or re-tag the transit route.
@@ -4534,6 +4713,14 @@ impl Session<'_> {
                 None => continue,
             };
             let mut attributes = self.propagated_base_attrs(&path);
+            // RFC 9234 §5: keep any OTC the route already carries; toward a Customer,
+            // Peer or RS-Client add OTC = our AS when it has none (egress rule 1).
+            if let Some(otc) = path
+                .otc
+                .or_else(|| self.otc_egress_add().then_some(self.local.external_as()))
+            {
+                attributes.push(PathAttribute::OnlyToCustomer(otc));
+            }
             if r.prefix.is_ipv4() {
                 // IPv4: base NLRI with the IPv4 NEXT_HOP — preserved for iBGP, set
                 // to ourselves for eBGP.
@@ -4901,6 +5088,7 @@ mod tests {
             large_communities: vec![(65001, 1, 2)],
             ext_communities: vec![[0x00, 0x02, 0xFD, 0xE9, 0x00, 0x00, 0x00, 0x64]], // rt:65001:100
             srv6_sid: None,
+            otc: None,
         };
         rib.update(
             ip([10, 0, 0, 1]),
@@ -4965,6 +5153,7 @@ mod tests {
             large_communities: vec![],
             ext_communities: vec![],
             srv6_sid: None,
+            otc: None,
         };
         rib.update(
             ip([10, 0, 0, 1]),
@@ -5079,7 +5268,63 @@ mod tests {
             large_communities: vec![],
             ext_communities: vec![],
             srv6_sid: None,
+            otc: None,
         }
+    }
+
+    #[test]
+    fn otc_ingress_tags_routes_from_upstream() {
+        // No configured role: the OTC procedures do not engage.
+        assert_eq!(otc_ingress(None, None, 65001), (false, None));
+        assert_eq!(otc_ingress(None, Some(65001), 65001), (false, None));
+
+        // From a Provider/Peer/RS with no OTC: stamp OTC = the remote AS (§5 ingress 3).
+        assert_eq!(otc_ingress(Some(BgpRole::Provider), None, 65001), (false, Some(65001)));
+        assert_eq!(otc_ingress(Some(BgpRole::Peer), None, 65001), (false, Some(65001)));
+        assert_eq!(otc_ingress(Some(BgpRole::RouteServer), None, 65001), (false, Some(65001)));
+
+        // From a Customer/RS-Client with no OTC: nothing added.
+        assert_eq!(otc_ingress(Some(BgpRole::Customer), None, 65001), (false, None));
+        assert_eq!(otc_ingress(Some(BgpRole::RouteServerClient), None, 65001), (false, None));
+    }
+
+    #[test]
+    fn otc_ingress_rejects_leaked_routes() {
+        // A route carrying OTC from a Customer or RS-Client is a leak (§5 ingress 1).
+        assert_eq!(otc_ingress(Some(BgpRole::Customer), Some(65009), 65001), (true, None));
+        assert_eq!(otc_ingress(Some(BgpRole::RouteServerClient), Some(65009), 65001), (true, None));
+
+        // From a Peer: a leak only when the OTC value is not that peer's AS (§5 ingress 2).
+        assert_eq!(otc_ingress(Some(BgpRole::Peer), Some(65009), 65001), (true, None));
+        assert_eq!(otc_ingress(Some(BgpRole::Peer), Some(65001), 65001), (false, None));
+
+        // From a Provider/RS, a route with OTC already set is legitimate (kept).
+        assert_eq!(otc_ingress(Some(BgpRole::Provider), Some(65009), 65001), (false, None));
+    }
+
+    #[test]
+    fn otc_from_update_reads_the_attribute() {
+        let mut u = Update::default();
+        assert_eq!(otc_from_update(&u), None);
+        u.attributes.push(PathAttribute::OnlyToCustomer(65042));
+        assert_eq!(otc_from_update(&u), Some(65042));
+    }
+
+    #[test]
+    fn build_path_extracts_otc() {
+        let facts = PeerFacts {
+            addr: ip([10, 0, 0, 2]),
+            as_: 65001,
+            id: id([10, 0, 0, 2]),
+            from_ebgp: true,
+            from_confed: false,
+            from_client: false,
+        };
+        let mut u = Update::default();
+        u.attributes.push(PathAttribute::Origin(Origin::Igp));
+        u.attributes.push(PathAttribute::OnlyToCustomer(65001));
+        let path = build_path(&u, ip([10, 0, 0, 2]), None, facts);
+        assert_eq!(path.otc, Some(65001));
     }
 
     #[test]
@@ -5600,6 +5845,7 @@ mod tests {
             large_communities: vec![],
             ext_communities: vec![],
             srv6_sid: None,
+            otc: None,
         };
         rib.update(
             ip([10, 0, 0, 2]),

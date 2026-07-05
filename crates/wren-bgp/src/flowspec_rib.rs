@@ -271,6 +271,7 @@ mod tests {
             large_communities: vec![],
             ext_communities: ext,
             srv6_sid: None,
+            otc: None,
         }
     }
 

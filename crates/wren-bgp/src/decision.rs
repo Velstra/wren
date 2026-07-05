@@ -79,6 +79,11 @@ pub struct Path {
     pub ext_communities: Vec<[u8; 8]>,
     /// The SRv6 service SID from a received Prefix-SID attribute (RFC 9252), if any.
     pub srv6_sid: Option<crate::srv6::Srv6ServiceSid>,
+    /// The Only-To-Customer (OTC) AS this path carries (RFC 9234 §4.1), if the OTC
+    /// attribute was received or added on ingress. Retained for the egress route-leak
+    /// procedures (a path with OTC must not be advertised to a Provider/Peer/RS); not
+    /// part of the §9.1.2.2 comparison.
+    pub otc: Option<u32>,
 }
 
 impl Path {
@@ -223,6 +228,7 @@ mod tests {
             large_communities: vec![],
             ext_communities: vec![],
             srv6_sid: None,
+            otc: None,
         }
     }
 

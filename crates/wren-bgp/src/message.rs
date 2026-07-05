@@ -157,6 +157,15 @@ impl Open {
                 if families.iter().any(|(a, s, f)| *a == afi && *s == safi && *f))
         })
     }
+
+    /// The BGP Role the peer advertised (RFC 9234 §4.1), if any — its own role in
+    /// the relationship, which must be the complement of ours.
+    pub fn role(&self) -> Option<crate::capability::BgpRole> {
+        self.capabilities.iter().find_map(|c| match c {
+            Capability::BgpRole(r) => Some(*r),
+            _ => None,
+        })
+    }
 }
 
 /// Which address families have ADD-PATH (RFC 7911) in effect on a session, in the
