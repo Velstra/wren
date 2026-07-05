@@ -32,6 +32,7 @@ wren-isis = { path = "../crates/wren-isis" }
 wren-bfd = { path = "../crates/wren-bfd" }
 wren-vrrp = { path = "../crates/wren-vrrp" }
 wren-babel = { path = "../crates/wren-babel" }
+wren-igmp = { path = "../crates/wren-igmp" }
 
 # Detach from the parent workspace: the fuzz crate is its own root.
 [workspace]
@@ -98,6 +99,41 @@ bench = false
 [[bin]]
 name = "evpn_nlri"
 path = "fuzz_targets/evpn_nlri.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "flowspec_nlri"
+path = "fuzz_targets/flowspec_nlri.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "sr_policy"
+path = "fuzz_targets/sr_policy.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "link_state"
+path = "fuzz_targets/link_state.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "igmp_wire"
+path = "fuzz_targets/igmp_wire.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "mld_wire"
+path = "fuzz_targets/mld_wire.rs"
 test = false
 doc = false
 bench = false
