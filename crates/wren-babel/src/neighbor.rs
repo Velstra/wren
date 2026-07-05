@@ -170,6 +170,13 @@ impl NeighbourTable {
         self.neighbours.is_empty()
     }
 
+    /// Forget a single neighbour outright (e.g. a BFD-reported path failure); the
+    /// caller then flushes its routes. Unlike [`Self::expire`] this is unconditional
+    /// and immediate, not timeout-driven.
+    pub fn forget(&mut self, addr: &IpAddr) {
+        self.neighbours.remove(addr);
+    }
+
     /// Age the table at time `now`: drop neighbours whose last Hello is older than
     /// `hello_timeout` (returned, so the caller can flush their routes), and clear
     /// the txcost of neighbours whose last IHU is older than `ihu_timeout` (so the

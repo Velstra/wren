@@ -119,6 +119,10 @@ pub struct IsisConfig {
     pub holding_multiplier: u16,
     /// The interfaces IS-IS runs on.
     pub interfaces: Vec<IsisIfaceCfg>,
+    /// Leak Level-2 (backbone) prefixes down into this router's Level-1 area (RFC
+    /// 5302), advertised in the L1 LSP with the up/down bit set. Only meaningful on
+    /// an L1L2 router; the reverse (L1 → L2) is always on.
+    pub leak_l2_to_l1: bool,
     /// Run BFD (RFC 5880) to each neighbour with an up adjacency and tear the
     /// adjacency down at once when BFD reports the path failed (RFC 5882).
     pub bfd: bool,
@@ -232,6 +236,14 @@ struct Isis {
     /// reachability in our own LSP at their stored metric. Prefix → metric.
     ext_v4: BTreeMap<Prefix, u32>,
     ext_v6: BTreeMap<Prefix, u32>,
+    /// Inter-level leaked prefixes (L1L2 routers only, RFC 5302), recomputed after
+    /// every SPF from the per-level route sets and folded into our own LSP:
+    /// [`Self::leaked_into_l2`] carries L1 intra-area prefixes advertised up into L2
+    /// (up/down bit clear), [`Self::leaked_into_l1`] carries L2 backbone prefixes
+    /// advertised down into L1 (up/down bit set) when `leak_l2_to_l1` is on. Each maps
+    /// prefix → best metric.
+    leaked_into_l2: BTreeMap<Prefix, u32>,
+    leaked_into_l1: BTreeMap<Prefix, u32>,
     /// The prefixes currently announced to the router, for withdraw reconciliation.
     announced: HashSet<Prefix>,
     updates: mpsc::Sender<RouteUpdate>,
@@ -493,6 +505,8 @@ pub async fn run(
         v6_reach,
         ext_v4: BTreeMap::new(),
         ext_v6: BTreeMap::new(),
+        leaked_into_l2: BTreeMap::new(),
+        leaked_into_l1: BTreeMap::new(),
         announced: HashSet::new(),
         updates,
         bfd_register,
@@ -1002,9 +1016,6 @@ impl Isis {
             prefix: as_v4(p.addr()),
             sub_tlvs: None,
         }));
-        if !v4r.is_empty() {
-            tlvs.push(Tlv::ExtendedIpReachability(v4r));
-        }
         let mut v6r: Vec<Ipv6Reach> = self
             .v6_reach
             .iter()
@@ -1025,6 +1036,40 @@ impl Isis {
             prefix: as_v6(p.addr()),
             sub_tlvs: None,
         }));
+
+        // Inter-level leaked prefixes (RFC 5302): L1 intra-area prefixes advertised
+        // up into L2 with the up/down bit clear, L2 backbone prefixes advertised down
+        // into L1 with it set (so no L1L2 router leaks them back up). Split by family.
+        let leaked = if level == IsLevel::L2 {
+            &self.leaked_into_l2
+        } else {
+            &self.leaked_into_l1
+        };
+        let up_down = level == IsLevel::L1;
+        for (p, metric) in leaked {
+            if p.addr().is_ipv4() {
+                v4r.push(ExtIpReach {
+                    metric: *metric,
+                    up_down,
+                    prefix_len: p.len(),
+                    prefix: as_v4(p.addr()),
+                    sub_tlvs: None,
+                });
+            } else {
+                v6r.push(Ipv6Reach {
+                    metric: *metric,
+                    up_down,
+                    external: false,
+                    prefix_len: p.len(),
+                    prefix: as_v6(p.addr()),
+                    sub_tlvs: None,
+                });
+            }
+        }
+
+        if !v4r.is_empty() {
+            tlvs.push(Tlv::ExtendedIpReachability(v4r));
+        }
         if !v6r.is_empty() {
             tlvs.push(Tlv::Ipv6Reachability(v6r));
         }
@@ -1388,9 +1433,14 @@ impl Isis {
 
     async fn run_spf_and_announce(&mut self) {
         let mut chosen: BTreeMap<Prefix, Route> = BTreeMap::new();
+        // Keep each level's SPF route set so the inter-level leaking stage can
+        // re-advertise one level's learned prefixes into the other (RFC 5302).
+        let mut per_level: [Vec<spf::SpfRoute>; 2] = [Vec::new(), Vec::new()];
         for level in self.active_levels() {
             let li = lidx(level);
-            for r in spf::routes(&self.dbs[li], self.cfg.system_id, level) {
+            let result = spf::compute(&self.dbs[li], self.cfg.system_id, level);
+            for sr in &result.routes {
+                let r = sr.to_route();
                 // Our own connected prefixes are announced as Connected already.
                 if self.v4_reach.contains(&r.prefix) || self.v6_reach.contains(&r.prefix) {
                     continue;
@@ -1409,7 +1459,12 @@ impl Isis {
                     }
                 }
             }
+            per_level[li] = result.routes;
         }
+
+        // Recompute the leaked prefix sets and re-originate any changed LSP before
+        // reconciling the RIB, so the LSDB and the announced routes stay in step.
+        self.update_leaks(&per_level).await;
 
         let current: HashSet<Prefix> = chosen.keys().copied().collect();
         let vrf_table = self.cfg.vrf_table;
@@ -1437,6 +1492,53 @@ impl Isis {
                 .await;
         }
         self.announced = current;
+    }
+
+    /// Recompute the inter-level (L1↔L2) leaked prefix sets from the per-level SPF
+    /// results and re-originate any LSP whose leaked prefixes changed (RFC 5302).
+    /// Only an L1L2 router leaks: L1 intra-area prefixes go up into L2 by default,
+    /// and — when `leak_l2_to_l1` is set — L2 backbone prefixes go down into L1 with
+    /// the up/down bit set. `per_level` is indexed by [`lidx`] ([L1, L2]).
+    async fn update_leaks(&mut self, per_level: &[Vec<spf::SpfRoute>; 2]) {
+        if self.cfg.level != IsLevel::L1L2 {
+            return;
+        }
+        // L1 → L2 (always on): the area's internal prefixes, so other areas reach them.
+        let into_l2 = self.leak_candidates(&per_level[lidx(IsLevel::L1)]);
+        if into_l2 != self.leaked_into_l2 {
+            self.leaked_into_l2 = into_l2;
+            self.reoriginate(IsLevel::L2).await;
+        }
+        // L2 → L1 (opt-in): backbone prefixes pushed down into the area.
+        let into_l1 = if self.cfg.leak_l2_to_l1 {
+            self.leak_candidates(&per_level[lidx(IsLevel::L2)])
+        } else {
+            BTreeMap::new()
+        };
+        if into_l1 != self.leaked_into_l1 {
+            self.leaked_into_l1 = into_l1;
+            self.reoriginate(IsLevel::L1).await;
+        }
+    }
+
+    /// The prefixes eligible to leak from one level's SPF routes: the lowest metric
+    /// per prefix, excluding any we already originate natively (connected or
+    /// redistributed — those are in both LSPs already and must not be double-counted).
+    fn leak_candidates(&self, routes: &[spf::SpfRoute]) -> BTreeMap<Prefix, u32> {
+        let mut out: BTreeMap<Prefix, u32> = BTreeMap::new();
+        for sr in routes {
+            if self.v4_reach.contains(&sr.prefix)
+                || self.v6_reach.contains(&sr.prefix)
+                || self.ext_v4.contains_key(&sr.prefix)
+                || self.ext_v6.contains_key(&sr.prefix)
+            {
+                continue;
+            }
+            out.entry(sr.prefix)
+                .and_modify(|m| *m = (*m).min(sr.cost))
+                .or_insert(sr.cost);
+        }
+        out
     }
 }
 

@@ -86,6 +86,10 @@ pub struct OspfConfig {
     pub dead_interval: u32,
     /// Interfaces OSPF runs on, each with the area it belongs to.
     pub interfaces: Vec<OspfIfaceCfg>,
+    /// Interfaces OSPF runs on **passively**: their subnet is still advertised as a
+    /// stub link in this router's Router-LSA, but no Hellos are sent or processed on
+    /// them, so no adjacency forms (a subset of the names in [`Self::interfaces`]).
+    pub passive_interfaces: HashSet<String>,
     /// External destinations to redistribute into OSPF as AS-external (type-5)
     /// LSAs at startup (from `redistribute-static`). RIB-based redistribution
     /// (`[ospf] redistribute`) adds to this set dynamically over the run.
@@ -188,6 +192,9 @@ struct Iface {
     fsm: Interface,
     neighbors: HashMap<Ipv4Addr, OspfNeighbor>,
     wait_deadline: Option<u64>,
+    /// A passive interface: its subnet is advertised (stub link) but no Hellos are
+    /// sent or processed, so no adjacency forms.
+    passive: bool,
 }
 
 impl Iface {
@@ -470,11 +477,16 @@ pub async fn run(
         };
         let sock =
             Arc::new(UdpSocket::from_std(std_sock).context("registering OSPF socket with tokio")?);
+        let passive = cfg.passive_interfaces.contains(name);
         let mut fsm = Interface::new(cfg.router_id, cfg.priority, cfg.iface_type);
-        for act in fsm.handle(InterfaceEvent::InterfaceUp, &[]) {
-            debug!(interface = %name, ?act, "interface up");
+        // A passive interface forms no adjacency, so it never leaves Down; only an
+        // active interface runs the InterfaceUp transition (Hellos + DR election).
+        if !passive {
+            for act in fsm.handle(InterfaceEvent::InterfaceUp, &[]) {
+                debug!(interface = %name, ?act, "interface up");
+            }
         }
-        info!(interface = %name, ifindex, %addr, area = %ic.area, kind = ?cfg.iface_type, "OSPF up (proto 89)");
+        info!(interface = %name, ifindex, %addr, area = %ic.area, kind = ?cfg.iface_type, passive, "OSPF up (proto 89)");
         areas.entry(ic.area).or_insert_with(Area::new);
         ifaces.push(Iface {
             name: name.clone(),
@@ -486,6 +498,7 @@ pub async fn run(
             fsm,
             neighbors: HashMap::new(),
             wait_deadline: Some(cfg.dead_interval as u64),
+            passive,
         });
     }
     if ifaces.is_empty() {
@@ -495,6 +508,10 @@ pub async fn run(
 
     let (pkt_tx, mut pkt_rx) = mpsc::channel::<RawPacket>(256);
     for iface in &ifaces {
+        // A passive interface neither sends nor processes OSPF packets.
+        if iface.passive {
+            continue;
+        }
         spawn_receiver(iface.sock.clone(), iface.ifindex, pkt_tx.clone());
     }
     drop(pkt_tx);
@@ -1179,7 +1196,11 @@ impl Ospf {
         };
         let mut links = Vec::new();
         for iface in self.ifaces.iter().filter(|i| i.area == area) {
-            if self.cfg.iface_type == InterfaceType::PointToPoint {
+            if iface.passive {
+                // A passive interface forms no adjacency; its prefix is advertised
+                // as a stub link regardless of the interface's network type.
+                links.push(stub(iface));
+            } else if self.cfg.iface_type == InterfaceType::PointToPoint {
                 for n in iface
                     .neighbors
                     .values()
@@ -1933,6 +1954,11 @@ impl Ospf {
 
     async fn send_hellos(&self) {
         for iface in &self.ifaces {
+            // A passive interface stays silent — its subnet is still advertised (a
+            // stub link in the Router-LSA), but no Hello ever leaves it.
+            if iface.passive {
+                continue;
+            }
             let hello = Hello {
                 network_mask: len_to_mask(iface.mask_len),
                 hello_interval: self.cfg.hello_interval,

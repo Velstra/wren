@@ -264,6 +264,12 @@ pub struct Rip {
     /// The RIP metric (1..=15) advertised for redistributed routes. Defaults to 1.
     #[serde(rename = "redistribute-metric")]
     pub redistribute_metric: Option<u32>,
+    /// Run BFD (RFC 5880) to each RIP neighbour we forward through and expire its
+    /// routes at once when BFD reports the path failed, rather than waiting for the
+    /// 180-second route timeout. The neighbour is the gateway of the routes it
+    /// advertised; timing comes from the global `[bfd]` defaults. Defaults to false.
+    #[serde(default)]
+    pub bfd: bool,
     /// The VRF this RIP instance runs in (a `[[vrf]]` name). Its learned and connected
     /// routes are installed into that VRF's kernel table; the interfaces should be
     /// enslaved to the VRF device. Unset runs RIP in the default VRF (main table).
@@ -320,6 +326,14 @@ pub struct Ospf {
     /// use [`Ospf::area`]; these override the area per interface.
     #[serde(default)]
     pub interface: Vec<OspfInterface>,
+    /// Interfaces on which OSPF runs **passively**: their subnet is still advertised
+    /// into the link-state database (as a stub link in this router's Router-LSA), but
+    /// no Hellos are sent or processed on them, so no adjacency ever forms. Typical
+    /// for edge/access links that carry no OSPF peers yet whose prefix should be
+    /// reachable AS-wide. Each name here must also be an OSPF interface (listed in
+    /// [`Ospf::interfaces`] or a `[[ospf.interface]]` entry).
+    #[serde(default, rename = "passive-interfaces")]
+    pub passive_interfaces: Vec<String>,
     /// Redistribute the configured static routes into OSPF as AS-external (type-5)
     /// LSAs (making this router an ASBR).
     #[serde(default, rename = "redistribute-static")]
@@ -845,6 +859,12 @@ pub struct Babel {
     /// source"). Defaults to 0, like a directly-originated network.
     #[serde(rename = "redistribute-metric")]
     pub redistribute_metric: Option<u16>,
+    /// Run BFD (RFC 5880) to each Babel neighbour and expire the neighbour at once
+    /// when BFD reports the path failed, rather than waiting for the Hello-timeout.
+    /// The neighbour's address is its (link-local) source address; timing comes from
+    /// the global `[bfd]` defaults. Defaults to false.
+    #[serde(default)]
+    pub bfd: bool,
     /// The VRF this Babel instance runs in, named by a `[[vrf]]` block. Its sockets
     /// operate over the VRF's (enslaved) interfaces and every route it computes is
     /// installed into the VRF's kernel table instead of the main table. Unset runs
@@ -893,6 +913,12 @@ pub struct Isis {
     /// `metric`.
     #[serde(rename = "redistribute-metric")]
     pub redistribute_metric: Option<u32>,
+    /// Leak Level-2 (backbone) prefixes down into this router's Level-1 area (RFC
+    /// 5302), advertised with the up/down bit set so no other L1L2 router leaks them
+    /// back up into L2. Only an `l1l2` router leaks; the reverse direction (L1
+    /// intra-area prefixes up into L2) is always on. Defaults to false.
+    #[serde(default, rename = "l2-to-l1-leaking")]
+    pub l2_to_l1_leaking: bool,
     /// Run BFD (RFC 5880) to each neighbour with an up adjacency and tear the
     /// adjacency down at once when BFD reports the path failed (RFC 5882), rather
     /// than waiting for the holding time. The neighbour's IP comes from the IP
@@ -1724,6 +1750,28 @@ mod tests {
     }
 
     #[test]
+    fn parses_ospf_passive_interfaces() {
+        let cfg = Config::from_toml(
+            r#"
+            router-id = "10.0.0.1"
+            [ospf]
+            enabled = true
+            interfaces = ["eth1", "eth2"]
+            passive-interfaces = ["eth2"]
+            "#,
+        )
+        .expect("valid config");
+        let ospf = cfg.ospf.expect("ospf present");
+        assert_eq!(ospf.passive_interfaces, vec!["eth2".to_string()]);
+        // Defaults to empty when unset.
+        let cfg = Config::from_toml(
+            "router-id = \"10.0.0.1\"\n[ospf]\nenabled = true\ninterfaces = [\"eth1\"]\n",
+        )
+        .expect("valid config");
+        assert!(cfg.ospf.expect("ospf present").passive_interfaces.is_empty());
+    }
+
+    #[test]
     fn parses_ospf3_bfd() {
         let cfg = Config::from_toml(
             r#"
@@ -1804,6 +1852,54 @@ mod tests {
         )
         .expect("valid config");
         assert!(!cfg.isis.expect("isis present").bfd);
+    }
+
+    #[test]
+    fn parses_rip_and_babel_bfd() {
+        let cfg = Config::from_toml(
+            r#"
+            router-id = "10.0.0.1"
+            [rip]
+            enabled = true
+            interfaces = ["eth1"]
+            bfd = true
+            [babel]
+            enabled = true
+            interfaces = ["eth1"]
+            bfd = true
+            "#,
+        )
+        .expect("valid config");
+        assert!(cfg.rip.expect("rip present").bfd);
+        assert!(cfg.babel.expect("babel present").bfd);
+        // Both default to false when unset.
+        let cfg = Config::from_toml(
+            "router-id = \"10.0.0.1\"\n[rip]\nenabled = true\ninterfaces = [\"eth1\"]\n[babel]\nenabled = true\ninterfaces = [\"eth1\"]\n",
+        )
+        .expect("valid config");
+        assert!(!cfg.rip.expect("rip present").bfd);
+        assert!(!cfg.babel.expect("babel present").bfd);
+    }
+
+    #[test]
+    fn parses_isis_l2_to_l1_leaking() {
+        let cfg = Config::from_toml(
+            r#"
+            router-id = "10.0.0.1"
+            [isis]
+            enabled = true
+            interfaces = ["eth1"]
+            l2-to-l1-leaking = true
+            "#,
+        )
+        .expect("valid config");
+        assert!(cfg.isis.expect("isis present").l2_to_l1_leaking);
+        // Defaults to false when unset.
+        let cfg = Config::from_toml(
+            "router-id = \"10.0.0.1\"\n[isis]\nenabled = true\ninterfaces = [\"eth1\"]\n",
+        )
+        .expect("valid config");
+        assert!(!cfg.isis.expect("isis present").l2_to_l1_leaking);
     }
 
     #[test]

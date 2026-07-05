@@ -573,6 +573,27 @@ impl RipTable {
         events
     }
 
+    /// Expire every route learned through `peer` at once (a BFD-reported path
+    /// failure, RFC 5882): poison it (metric 16), start the garbage timer and flag it
+    /// changed, exactly as a route timeout would — but without waiting the 180-second
+    /// timeout. Connected and redistributed routes (which are "ours", not learned from
+    /// a neighbour) are left untouched. Returns the RIB events for the changes.
+    pub fn expire_via(&mut self, peer: IpAddr, now: u64) -> Vec<RipEvent> {
+        let mut events = Vec::new();
+        for (prefix, r) in self.routes.iter_mut() {
+            if r.connected || r.redistributed || r.next_hop != peer {
+                continue;
+            }
+            if r.metric < METRIC_INFINITY {
+                r.metric = METRIC_INFINITY;
+                r.delete_at = Some(now + GARBAGE_SECS);
+                r.changed = true;
+                events.push(RipEvent::Lost(*prefix));
+            }
+        }
+        events
+    }
+
     /// The routes to advertise out interface `out_ifindex`, applying **split
     /// horizon with poisoned reverse** (RFC 2453 §3.9 / RFC 2080 §2.6): a route
     /// learned on that interface is advertised back with metric = infinity. The
@@ -791,6 +812,29 @@ mod tests {
         assert_eq!(metric_of(&t.advertise(2), [10, 0, 0, 0]), Some(16));
         // Out a different interface (3): the real metric.
         assert_eq!(metric_of(&t.advertise(3), [10, 0, 0, 0]), Some(2));
+    }
+
+    #[test]
+    fn expire_via_poisons_only_that_peers_routes() {
+        let mut t = RipTable::new();
+        let a = Ipv4Addr::new(192, 0, 2, 1);
+        let b = Ipv4Addr::new(192, 0, 2, 2);
+        t.process(&net([10, 0, 0, 0], 24, 1), a, 2, 0); // via A
+        t.process(&net([10, 1, 0, 0], 24, 1), a, 2, 0); // via A
+        t.process(&net([10, 2, 0, 0], 24, 1), b, 2, 0); // via B
+        t.add_connected(Prefix::new(IpAddr::V4(Ipv4Addr::new(10, 3, 0, 0)), 24).unwrap(), 2);
+
+        // A's BFD session fails: both of A's routes are expired at once, B's untouched.
+        let events = t.expire_via(IpAddr::V4(a), 100);
+        assert_eq!(events.len(), 2);
+        assert!(events.contains(&RipEvent::Lost(Prefix::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 0)), 24).unwrap())));
+        assert!(events.contains(&RipEvent::Lost(Prefix::new(IpAddr::V4(Ipv4Addr::new(10, 1, 0, 0)), 24).unwrap())));
+        // A's routes are now unreachable; B's route and the connected one are intact.
+        assert_eq!(metric_of(&t.advertise(3), [10, 0, 0, 0]), Some(16));
+        assert_eq!(metric_of(&t.advertise(3), [10, 2, 0, 0]), Some(2));
+        assert_eq!(metric_of(&t.advertise(3), [10, 3, 0, 0]), Some(1));
+        // Idempotent: a second call finds nothing still reachable via A.
+        assert!(t.expire_via(IpAddr::V4(a), 101).is_empty());
     }
 
     #[test]

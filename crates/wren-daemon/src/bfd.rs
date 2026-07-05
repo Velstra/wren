@@ -100,6 +100,14 @@ pub enum BfdConsumer {
     /// engine is compiled in.
     #[cfg_attr(not(feature = "isis"), allow(dead_code))]
     Isis,
+    /// A RIP gateway (`[rip] bfd = true`). Only constructed when the RIP engine is
+    /// compiled in.
+    #[cfg_attr(not(feature = "rip"), allow(dead_code))]
+    Rip,
+    /// A Babel neighbour (`[babel] bfd = true`). Only constructed when the Babel
+    /// engine is compiled in.
+    #[cfg_attr(not(feature = "babel"), allow(dead_code))]
+    Babel,
 }
 
 /// A registration command from a protocol to the BFD engine.

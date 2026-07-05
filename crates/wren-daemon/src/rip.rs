@@ -19,11 +19,12 @@
 //! `setsockopt` on the raw fd before the socket is handed to `tokio` — the same
 //! minimal-dependency approach as `wren-netlink`.
 
+use std::collections::HashSet;
 use std::ffi::CString;
 use std::fmt::Write as _;
 use std::io;
 use std::mem;
-use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::os::raw::c_void;
 use std::os::unix::io::FromRawFd;
 use std::sync::Arc;
@@ -39,7 +40,8 @@ use tracing::{debug, info, warn};
 
 use wren_core::{NextHop, Protocol, Route};
 use wren_rip::{
-    Command, Entry, Message, RipEvent, RipTable, RouteInfo, MAX_ENTRIES, PORT, UPDATE_SECS,
+    Command, Entry, Message, RipEvent, RipTable, RouteInfo, MAX_ENTRIES, METRIC_INFINITY, PORT,
+    UPDATE_SECS,
 };
 
 use crate::connected;
@@ -119,6 +121,7 @@ pub fn render_rip_routes(
 /// `redist` carries RIB best-path routes the central router pushes for
 /// redistribution; RIP advertises each to its neighbours (at `redistribute_metric`,
 /// 1..=15) and poisons it again when its best path goes away.
+#[allow(clippy::too_many_arguments)] // engine entry point: config + every I/O channel, incl. BFD and shutdown
 pub async fn run(
     interfaces: Vec<String>,
     vrf_table: u32,
@@ -126,6 +129,10 @@ pub async fn run(
     mut redist: mpsc::Receiver<Redistribution>,
     redistribute_metric: u32,
     mut queries: mpsc::Receiver<RipQueryRequest>,
+    bfd: bool,
+    bfd_register: mpsc::Sender<crate::bfd::BfdCommand>,
+    bfd_notify: mpsc::Sender<IpAddr>,
+    mut bfd_down: mpsc::Receiver<IpAddr>,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) -> Result<()> {
     let mut ifaces = Vec::with_capacity(interfaces.len());
@@ -194,6 +201,10 @@ pub async fn run(
     let mut housekeeping = tokio::time::interval(Duration::from_secs(HOUSEKEEPING_SECS));
     housekeeping.tick().await;
 
+    // The peers we currently run a BFD session to (the gateways of our learned
+    // routes). Kept in step with the table after every change; empty when off.
+    let mut bfd_registered: HashSet<Ipv4Addr> = HashSet::new();
+
     loop {
         tokio::select! {
             // Graceful shutdown (M10): flush a poisoned update (metric 16 =
@@ -212,6 +223,23 @@ pub async fn run(
                 let now = start.elapsed().as_secs();
                 handle_packet(&mut table, vrf_table, &ifaces, &pkt, now, &updates).await;
                 flush_triggered(&mut table, &ifaces).await;
+                reconcile_bfd(&mut bfd_registered, &table, bfd, &bfd_register, &bfd_notify).await;
+            }
+            // BFD (RFC 5880) reported a gateway's forwarding path down: expire every
+            // route learned through it now, rather than after the 180 s route timeout.
+            Some(peer) = bfd_down.recv() => {
+                let now = start.elapsed().as_secs();
+                if let IpAddr::V4(v4) = peer {
+                    let events = table.expire_via(peer, now);
+                    if !events.is_empty() {
+                        info!(%v4, count = events.len(), "RIP routes expired (BFD)");
+                    }
+                    for ev in events {
+                        forward_event(ev, vrf_table, &updates).await;
+                    }
+                }
+                flush_triggered(&mut table, &ifaces).await;
+                reconcile_bfd(&mut bfd_registered, &table, bfd, &bfd_register, &bfd_notify).await;
             }
             _ = periodic.tick() => {
                 let now = start.elapsed().as_secs();
@@ -220,6 +248,7 @@ pub async fn run(
                 }
                 send_full_update(&table, &ifaces, false).await;
                 table.clear_changed();
+                reconcile_bfd(&mut bfd_registered, &table, bfd, &bfd_register, &bfd_notify).await;
             }
             _ = housekeeping.tick() => {
                 let now = start.elapsed().as_secs();
@@ -227,6 +256,7 @@ pub async fn run(
                     forward_event(ev, vrf_table, &updates).await;
                 }
                 flush_triggered(&mut table, &ifaces).await;
+                reconcile_bfd(&mut bfd_registered, &table, bfd, &bfd_register, &bfd_notify).await;
             }
             Some(r) = redist.recv() => {
                 let now = start.elapsed().as_secs();
@@ -328,6 +358,54 @@ async fn handle_packet(
             }
         }
     }
+}
+
+/// Keep the BFD (RFC 5880) registrations in step with the RIP gateways we forward
+/// through: register a session as a neighbour first becomes a learned route's next
+/// hop, deregister it once no learned route uses it any more. A no-op unless
+/// `[rip] bfd` is set. The BFD engine reports a session going down on `bfd_notify`,
+/// which the run loop turns into an immediate [`RipTable::expire_via`]. Connected
+/// and redistributed routes are "ours" (no gateway to track), so they are skipped.
+async fn reconcile_bfd(
+    registered: &mut HashSet<Ipv4Addr>,
+    table: &RipTable,
+    bfd: bool,
+    bfd_register: &mpsc::Sender<crate::bfd::BfdCommand>,
+    bfd_notify: &mpsc::Sender<IpAddr>,
+) {
+    if !bfd {
+        return;
+    }
+    let active: HashSet<Ipv4Addr> = table
+        .routes()
+        .iter()
+        .filter(|r| !r.connected && !r.redistributed && r.metric < METRIC_INFINITY)
+        .filter_map(|r| match r.next_hop {
+            IpAddr::V4(a) if !a.is_unspecified() => Some(a),
+            _ => None,
+        })
+        .collect();
+    for peer in active.difference(registered).copied().collect::<Vec<_>>() {
+        let _ = bfd_register
+            .send(crate::bfd::BfdCommand::Register {
+                peer: IpAddr::V4(peer),
+                scope_id: 0,
+                consumer: crate::bfd::BfdConsumer::Rip,
+                notify: bfd_notify.clone(),
+                auth: None, // RIP uses the global [bfd] key
+            })
+            .await;
+    }
+    for peer in registered.difference(&active).copied().collect::<Vec<_>>() {
+        let _ = bfd_register
+            .send(crate::bfd::BfdCommand::Deregister {
+                peer: IpAddr::V4(peer),
+                scope_id: 0,
+                consumer: crate::bfd::BfdConsumer::Rip,
+            })
+            .await;
+    }
+    *registered = active;
 }
 
 /// Send a triggered update (only changed routes, RFC 2453 §3.10.1) out every

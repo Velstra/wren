@@ -88,6 +88,9 @@ pub struct BabelConfig {
     /// The metric advertised for routes redistributed from the RIB (the metric
     /// "at the source"). 0 means "as good as a directly-originated network".
     pub redistribute_metric: u16,
+    /// Run BFD (RFC 5880) to each neighbour and forget it at once when BFD reports
+    /// the path failed, rather than waiting for the Hello-timeout. `[babel] bfd`.
+    pub bfd: bool,
     /// The VRF (kernel routing table) this Babel instance installs into. Every route
     /// it produces — its connected reachability and selected routes, both address
     /// families — is stamped with this table, so a Babel instance bound to a VRF
@@ -132,6 +135,10 @@ struct State {
     retractions: Vec<Prefix>,
     /// The next Hello sequence number to send.
     hello_seqno: u16,
+    /// The interface index each neighbour was last heard on, so a BFD session can be
+    /// scoped to the right link (Babel neighbours are IPv6 link-local). Only tracked
+    /// when `[babel] bfd` is set.
+    neighbour_ifindex: std::collections::BTreeMap<IpAddr, u32>,
 }
 
 /// Run Babel on `cfg.interfaces`, forwarding learned/lost routes to `updates`.
@@ -212,13 +219,18 @@ fn neighbor_infos(neighbours: &NeighbourTable) -> Vec<BabelNeighborInfo> {
         .collect()
 }
 
+#[allow(clippy::too_many_arguments)] // engine entry point: config + every I/O channel, incl. BFD and shutdown
 pub async fn run(
     cfg: BabelConfig,
     updates: mpsc::Sender<RouteUpdate>,
     mut redist: mpsc::Receiver<Redistribution>,
     mut queries: mpsc::Receiver<BabelQueryRequest>,
+    bfd_register: mpsc::Sender<crate::bfd::BfdCommand>,
+    bfd_notify: mpsc::Sender<IpAddr>,
+    mut bfd_down: mpsc::Receiver<IpAddr>,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) -> Result<()> {
+    let bfd = cfg.bfd;
     let mut ifaces = Vec::with_capacity(cfg.interfaces.len());
     for name in &cfg.interfaces {
         let (ifindex, std_sock) =
@@ -256,6 +268,7 @@ pub async fn run(
         redistributed: std::collections::BTreeMap::new(),
         retractions: Vec::new(),
         hello_seqno: 0,
+        neighbour_ifindex: std::collections::BTreeMap::new(),
     };
 
     // Originate our directly-connected networks (announced to the RIB as connected,
@@ -296,6 +309,11 @@ pub async fn run(
     let mut housekeeping = tokio::time::interval(Duration::from_secs(HOUSEKEEPING_SECS));
     housekeeping.tick().await;
 
+    // The neighbours we currently run a BFD session to, keyed by address and the
+    // interface index that scopes their link-local. Empty when BFD is off.
+    let mut bfd_registered: std::collections::HashSet<(IpAddr, u32)> =
+        std::collections::HashSet::new();
+
     loop {
         tokio::select! {
             // Graceful shutdown (M10): retract our own routes (metric 0xFFFF =
@@ -316,6 +334,21 @@ pub async fn run(
                     // A selection changed — flush a triggered Update promptly.
                     send_updates(&mut state, &ifaces).await;
                 }
+                reconcile_bfd(&mut bfd_registered, &state, bfd, &bfd_register, &bfd_notify).await;
+            }
+            // BFD (RFC 5880) reported a neighbour's forwarding path down: forget it
+            // now and flush its routes, rather than waiting for the Hello-timeout.
+            Some(peer) = bfd_down.recv() => {
+                if state.neighbours.contains(&peer) {
+                    info!(neighbour = %peer, "Babel neighbour lost (BFD)");
+                    state.neighbours.forget(&peer);
+                    state.neighbour_ifindex.remove(&peer);
+                    for ev in state.table.neighbour_lost(peer) {
+                        forward_event(&mut state.relayed, ev, vrf_table, &updates).await;
+                    }
+                    send_updates(&mut state, &ifaces).await;
+                }
+                reconcile_bfd(&mut bfd_registered, &state, bfd, &bfd_register, &bfd_notify).await;
             }
             _ = hello.tick() => {
                 send_hellos(&mut state, &ifaces).await;
@@ -328,10 +361,12 @@ pub async fn run(
                 let dead = state.neighbours.expire(now, HELLO_TIMEOUT, IHU_TIMEOUT);
                 for addr in dead {
                     info!(neighbour = %addr, "Babel neighbour lost");
+                    state.neighbour_ifindex.remove(&addr);
                     for ev in state.table.neighbour_lost(addr) {
                         forward_event(&mut state.relayed, ev, vrf_table, &updates).await;
                     }
                 }
+                reconcile_bfd(&mut bfd_registered, &state, bfd, &bfd_register, &bfd_notify).await;
             }
             Some(r) = redist.recv() => {
                 if apply_redistribution(&mut state, r, redistribute_metric) {
@@ -407,6 +442,51 @@ fn spawn_receiver(sock: Arc<UdpSocket>, ifindex: u32, pkt_tx: mpsc::Sender<Datag
     });
 }
 
+/// Keep the BFD (RFC 5880) registrations in step with the current neighbour set:
+/// register a session as a neighbour appears, deregister it as the neighbour goes
+/// away. A no-op unless `[babel] bfd` is set. Each session is keyed by the
+/// neighbour's link-local address *and* the interface index that scopes it. The BFD
+/// engine reports a session going down on `bfd_notify`, which the run loop turns
+/// into an immediate forget + route flush.
+async fn reconcile_bfd(
+    registered: &mut std::collections::HashSet<(IpAddr, u32)>,
+    state: &State,
+    bfd: bool,
+    bfd_register: &mpsc::Sender<crate::bfd::BfdCommand>,
+    bfd_notify: &mpsc::Sender<IpAddr>,
+) {
+    if !bfd {
+        return;
+    }
+    let active: std::collections::HashSet<(IpAddr, u32)> = state
+        .neighbours
+        .addresses()
+        .into_iter()
+        .filter_map(|a| state.neighbour_ifindex.get(&a).map(|scope| (a, *scope)))
+        .collect();
+    for (addr, scope) in active.difference(registered).copied().collect::<Vec<_>>() {
+        let _ = bfd_register
+            .send(crate::bfd::BfdCommand::Register {
+                peer: addr,
+                scope_id: scope,
+                consumer: crate::bfd::BfdConsumer::Babel,
+                notify: bfd_notify.clone(),
+                auth: None, // Babel uses the global [bfd] key
+            })
+            .await;
+    }
+    for (addr, scope) in registered.difference(&active).copied().collect::<Vec<_>>() {
+        let _ = bfd_register
+            .send(crate::bfd::BfdCommand::Deregister {
+                peer: addr,
+                scope_id: scope,
+                consumer: crate::bfd::BfdConsumer::Babel,
+            })
+            .await;
+    }
+    *registered = active;
+}
+
 /// Process one received datagram, returning whether any route selection changed.
 async fn handle_datagram(
     state: &mut State,
@@ -438,6 +518,9 @@ async fn handle_datagram(
         match tlv {
             Tlv::Hello { seqno, .. } => {
                 state.neighbours.on_hello(src, *seqno, now);
+                // Remember the link this neighbour lives on, so its BFD session can be
+                // scoped to the right interface (link-local addresses need a scope).
+                state.neighbour_ifindex.insert(src, dg.ifindex);
             }
             Tlv::Ihu {
                 rxcost, address, ..
@@ -900,6 +983,7 @@ mod tests {
             redistributed: std::collections::BTreeMap::new(),
             retractions: Vec::new(),
             hello_seqno: 0,
+            neighbour_ifindex: std::collections::BTreeMap::new(),
         };
         let tlvs = build_update_tlvs(&state);
         // One Router-ID followed by the two Updates (same originator).
@@ -925,6 +1009,7 @@ mod tests {
             redistributed: std::collections::BTreeMap::new(),
             retractions: Vec::new(),
             hello_seqno: 0,
+            neighbour_ifindex: std::collections::BTreeMap::new(),
         }
     }
 
@@ -1009,6 +1094,7 @@ mod tests {
             redistributed: std::collections::BTreeMap::new(),
             retractions: Vec::new(),
             hello_seqno: 0,
+            neighbour_ifindex: std::collections::BTreeMap::new(),
         };
         let tlvs = build_update_tlvs(&state);
         assert!(matches!(tlvs[0], Tlv::RouterId(id) if id == rid));

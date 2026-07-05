@@ -337,6 +337,14 @@ async fn main() -> Result<()> {
     let (isis_bfd_tx, isis_bfd_rx) = mpsc::channel::<std::net::IpAddr>(QUERY_QUEUE);
     #[cfg(feature = "isis")]
     let mut isis_bfd_rx = Some(isis_bfd_rx);
+    #[cfg(feature = "rip")]
+    let (rip_bfd_tx, rip_bfd_rx) = mpsc::channel::<std::net::IpAddr>(QUERY_QUEUE);
+    #[cfg(feature = "rip")]
+    let mut rip_bfd_rx = Some(rip_bfd_rx);
+    #[cfg(feature = "babel")]
+    let (babel_bfd_tx, babel_bfd_rx) = mpsc::channel::<std::net::IpAddr>(QUERY_QUEUE);
+    #[cfg(feature = "babel")]
+    let mut babel_bfd_rx = Some(babel_bfd_rx);
     let bgp_bfd = cfg
         .bgp
         .as_ref()
@@ -353,7 +361,15 @@ async fn main() -> Result<()> {
     let isis_bfd = cfg.isis.as_ref().is_some_and(|i| i.enabled && i.bfd);
     #[cfg(not(feature = "isis"))]
     let isis_bfd = false;
-    let bfd_enabled = bgp_bfd || ospf_bfd || ospf3_bfd || isis_bfd;
+    #[cfg(feature = "rip")]
+    let rip_bfd = cfg.rip.as_ref().is_some_and(|r| r.enabled && r.bfd);
+    #[cfg(not(feature = "rip"))]
+    let rip_bfd = false;
+    #[cfg(feature = "babel")]
+    let babel_bfd = cfg.babel.as_ref().is_some_and(|b| b.enabled && b.bfd);
+    #[cfg(not(feature = "babel"))]
+    let babel_bfd = false;
+    let bfd_enabled = bgp_bfd || ospf_bfd || ospf3_bfd || isis_bfd || rip_bfd || babel_bfd;
 
     // Graceful shutdown (M10): a watch channel every protocol engine observes.
     // On Ctrl-C `main` flips it to `true`; each engine's select loop then emits
@@ -534,6 +550,7 @@ async fn main() -> Result<()> {
         }
         let redistribute_metric = ripcfg.redistribute_metric.unwrap_or(1);
         let interfaces = ripcfg.interfaces.clone();
+        let ripcfg_bfd = ripcfg.bfd;
         // The VRF this RIP instance runs in (its routes go into that VRF's table).
         let rip_table = match &ripcfg.vrf {
             Some(name) => cfg
@@ -543,6 +560,12 @@ async fn main() -> Result<()> {
         };
         let tx = updates_tx.clone();
         let qrx = rip_queries_rx.take().expect("rip queries rx taken once");
+        // BFD (RFC 5880) plumbing: the engine registration channel, RIP's own notify
+        // sender (included in each registration), and the down channel the engine
+        // reports failures on. Inert unless `[rip] bfd` is set.
+        let breg = bfd_register_tx.clone();
+        let bnotify = rip_bfd_tx.clone();
+        let bdrx = rip_bfd_rx.take().expect("rip bfd rx taken once");
         let sd = shutdown_tx.subscribe();
         proto_handles.push(tokio::spawn(async move {
             if let Err(e) = rip::run(
@@ -552,6 +575,10 @@ async fn main() -> Result<()> {
                 redist_rx,
                 redistribute_metric,
                 qrx,
+                ripcfg_bfd,
+                breg,
+                bnotify,
+                bdrx,
                 sd,
             )
             .await
@@ -866,9 +893,15 @@ async fn main() -> Result<()> {
                 let qrx = babel_queries_rx
                     .take()
                     .expect("babel queries rx taken once");
+                // BFD (RFC 5880) plumbing: the engine registration channel, Babel's own
+                // notify sender (included in each registration), and the down channel
+                // the engine reports failures on. Inert unless `[babel] bfd` is set.
+                let breg = bfd_register_tx.clone();
+                let bnotify = babel_bfd_tx.clone();
+                let bdrx = babel_bfd_rx.take().expect("babel bfd rx taken once");
                 let sd = shutdown_tx.subscribe();
                 proto_handles.push(tokio::spawn(async move {
-                    if let Err(e) = babel::run(run_cfg, tx, redist_rx, qrx, sd).await {
+                    if let Err(e) = babel::run(run_cfg, tx, redist_rx, qrx, breg, bnotify, bdrx, sd).await {
                         error!(error = %e, "Babel engine stopped");
                     }
                 }));
@@ -1073,6 +1106,7 @@ fn build_ospf_config(
         hello_interval: wren_ospf::DEFAULT_HELLO_INTERVAL,
         dead_interval: wren_ospf::DEFAULT_DEAD_INTERVAL,
         interfaces,
+        passive_interfaces: ospf.passive_interfaces.iter().cloned().collect(),
         redistribute,
         redistribute_metric: ospf.redistribute_metric.unwrap_or(20),
         stub_areas,
@@ -1922,6 +1956,7 @@ fn build_babel_config(
         interfaces: babel.interfaces.clone(),
         originate,
         redistribute_metric: babel.redistribute_metric.unwrap_or(0),
+        bfd: babel.bfd,
         vrf_table,
     })
 }
@@ -2165,6 +2200,7 @@ fn build_isis_config(
         hello_interval: isis.hello_interval.unwrap_or(10),
         holding_multiplier: 3,
         interfaces,
+        leak_l2_to_l1: isis.l2_to_l1_leaking,
         bfd: isis.bfd,
         vrf_table,
     })
