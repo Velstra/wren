@@ -342,13 +342,10 @@ pub struct BgpPeerCfg {
 
 impl BgpPeerCfg {
     /// The transport authentication this peer's session uses (at most one scheme).
-    /// TCP-MD5 (RFC 2385) and TCP-AO (RFC 5925) are wired for IPv4 transport only
-    /// here, so an IPv6 (unnumbered) peer is always unauthenticated — `main.rs` warns
-    /// when a key is configured on such a peer.
+    /// TCP-MD5 (RFC 2385) and TCP-AO (RFC 5925) apply to both IPv4 and IPv6 transport
+    /// (A8-rest): the key is installed on the session socket with the peer's own address
+    /// family, so an IPv6 (e.g. RFC 5549) peer is authenticated exactly like an IPv4 one.
     fn tcp_auth(&self) -> TcpAuth {
-        if !self.addr.is_ipv4() {
-            return TcpAuth::None;
-        }
         if let Some(pw) = &self.password {
             TcpAuth::Md5(pw.clone())
         } else if let Some(key) = &self.ao_key {
@@ -381,7 +378,9 @@ impl TcpAuth {
     }
 
     /// Install this scheme's key for `peer` on socket `fd`, before the handshake.
-    fn install(&self, fd: i32, peer: Ipv4Addr) -> std::io::Result<()> {
+    /// `peer` may be IPv4 or IPv6 — the key is installed with a matching-family
+    /// sockaddr (host `/32` or `/128`).
+    fn install(&self, fd: i32, peer: IpAddr) -> std::io::Result<()> {
         match self {
             TcpAuth::None => Ok(()),
             TcpAuth::Md5(pw) => set_tcp_md5(fd, peer, pw),
@@ -3512,9 +3511,11 @@ async fn connector(peer: PeerInfo, auth: TcpAuth, local: Arc<Local>, tx: mpsc::S
         let vrf = local.vrf_device.as_deref();
         let dial = async {
             match peer.addr {
-                // An authenticated (TCP-MD5/AO) IPv4 peer needs its key installed on the
-                // socket before the SYN, so it gets a hand-built connect.
-                IpAddr::V4(v4) if auth.is_enabled() => connect_authed(v4, &auth, vrf).await,
+                // An authenticated (TCP-MD5/AO) peer — IPv4 or IPv6 — needs its key
+                // installed on the socket before the SYN, so it gets a hand-built connect.
+                _ if auth.is_enabled() => {
+                    connect_authed(peer.addr, peer.scope_id, &auth, vrf).await
+                }
                 // Everything else — plain IPv4, or an IPv6 (unnumbered) peer, whose
                 // link-local address carries a scope id (interface) to dial it on.
                 _ => connect_bound(peer.addr, peer.scope_id, vrf).await,
@@ -3600,11 +3601,60 @@ fn sockaddr_in_v4(addr: Ipv4Addr, port: u16) -> libc::sockaddr_in {
     }
 }
 
+/// A `sockaddr_in6` for `addr:port` (network byte order), with an optional interface
+/// `scope_id` (needed to dial a `fe80::/10` link-local peer).
+fn sockaddr_in6_v6(addr: Ipv6Addr, port: u16, scope_id: u32) -> libc::sockaddr_in6 {
+    libc::sockaddr_in6 {
+        sin6_family: libc::AF_INET6 as libc::sa_family_t,
+        sin6_port: port.to_be(),
+        sin6_flowinfo: 0,
+        sin6_addr: libc::in6_addr {
+            s6_addr: addr.octets(),
+        },
+        sin6_scope_id: scope_id,
+    }
+}
+
+/// Fill a `sockaddr_storage` with `peer` (port 0), the form the TCP-MD5/TCP-AO
+/// setsockopt structs carry their peer address in. Returns the storage plus the byte
+/// length of the family-specific sockaddr written into it.
+fn peer_storage(peer: IpAddr) -> (libc::sockaddr_storage, usize) {
+    let mut ss: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+    let len = match peer {
+        IpAddr::V4(v4) => {
+            let sin = sockaddr_in_v4(v4, 0);
+            // SAFETY: `sin` is a valid sockaddr_in that fits in a sockaddr_storage.
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    std::ptr::addr_of!(sin) as *const u8,
+                    std::ptr::addr_of_mut!(ss) as *mut u8,
+                    std::mem::size_of::<libc::sockaddr_in>(),
+                );
+            }
+            std::mem::size_of::<libc::sockaddr_in>()
+        }
+        IpAddr::V6(v6) => {
+            let sin6 = sockaddr_in6_v6(v6, 0, 0);
+            // SAFETY: `sin6` is a valid sockaddr_in6 that fits in a sockaddr_storage.
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    std::ptr::addr_of!(sin6) as *const u8,
+                    std::ptr::addr_of_mut!(ss) as *mut u8,
+                    std::mem::size_of::<libc::sockaddr_in6>(),
+                );
+            }
+            std::mem::size_of::<libc::sockaddr_in6>()
+        }
+    };
+    (ss, len)
+}
+
 /// Install a TCP-MD5 signature key (RFC 2385) for `peer` on socket `fd`. Set before
 /// the handshake, the kernel then signs every segment to that peer and rejects any
 /// inbound segment from it whose signature does not match the shared `password`. The
-/// key is at most `TCP_MD5SIG_MAXKEYLEN` (80) bytes.
-fn set_tcp_md5(fd: i32, peer: Ipv4Addr, password: &str) -> std::io::Result<()> {
+/// key is at most `TCP_MD5SIG_MAXKEYLEN` (80) bytes. `peer` may be IPv4 or IPv6 — the
+/// peer address is carried in a matching-family sockaddr inside `tcpm_addr`.
+fn set_tcp_md5(fd: i32, peer: IpAddr, password: &str) -> std::io::Result<()> {
     let key = password.as_bytes();
     if key.len() > 80 {
         return Err(std::io::Error::new(
@@ -3613,15 +3663,10 @@ fn set_tcp_md5(fd: i32, peer: Ipv4Addr, password: &str) -> std::io::Result<()> {
         ));
     }
     let mut sig: TcpMd5Sig = unsafe { std::mem::zeroed() };
-    let sin = sockaddr_in_v4(peer, 0);
-    // Copy the sockaddr_in into the (larger) sockaddr_storage field.
-    unsafe {
-        std::ptr::copy_nonoverlapping(
-            std::ptr::addr_of!(sin) as *const u8,
-            std::ptr::addr_of_mut!(sig.tcpm_addr) as *mut u8,
-            std::mem::size_of::<libc::sockaddr_in>(),
-        );
-    }
+    // The peer address (v4 or v6) goes into the sockaddr_storage `tcpm_addr` field;
+    // `tcpm_flags == 0` means an exact (non-prefix) host match, so `tcpm_prefixlen`
+    // stays zero for both families.
+    (sig.tcpm_addr, _) = peer_storage(peer);
     sig.tcpm_keylen = key.len() as u16;
     sig.tcpm_key[..key.len()].copy_from_slice(key);
     let rc = unsafe {
@@ -3671,7 +3716,7 @@ const TCP_AO_SHA1_MACLEN: u8 = 12;
 /// Set before the handshake, the kernel then derives per-connection traffic keys and
 /// authenticates every segment to/from that peer; the key becomes the current active
 /// key immediately (`set_current` / `set_rnext`).
-fn set_tcp_ao(fd: i32, peer: Ipv4Addr, key: &str, key_id: u8) -> std::io::Result<()> {
+fn set_tcp_ao(fd: i32, peer: IpAddr, key: &str, key_id: u8) -> std::io::Result<()> {
     let kb = key.as_bytes();
     if kb.is_empty() || kb.len() > TCP_AO_MAXKEYLEN {
         return Err(std::io::Error::new(
@@ -3680,18 +3725,13 @@ fn set_tcp_ao(fd: i32, peer: Ipv4Addr, key: &str, key_id: u8) -> std::io::Result
         ));
     }
     let mut ao: TcpAoAdd = unsafe { std::mem::zeroed() };
-    let sin = sockaddr_in_v4(peer, 0);
-    unsafe {
-        std::ptr::copy_nonoverlapping(
-            std::ptr::addr_of!(sin) as *const u8,
-            std::ptr::addr_of_mut!(ao.addr) as *mut u8,
-            std::mem::size_of::<libc::sockaddr_in>(),
-        );
-    }
+    // The peer address (v4 or v6) goes into the sockaddr_storage `addr` field.
+    (ao.addr, _) = peer_storage(peer);
     let alg = b"hmac(sha1)";
     ao.alg_name[..alg.len()].copy_from_slice(alg);
     ao.set_flags = 0b11; // set_current | set_rnext: use this key right away
-    ao.prefix = 32; // a host (/32) match for the peer address
+    // A full host match for the peer address: /32 for IPv4, /128 for IPv6.
+    ao.prefix = if peer.is_ipv6() { 128 } else { 32 };
     ao.sndid = key_id;
     ao.rcvid = key_id;
     ao.maclen = TCP_AO_SHA1_MACLEN;
@@ -3728,14 +3768,19 @@ fn set_nonblocking(fd: i32) -> std::io::Result<()> {
 /// tokio's `TcpStream::connect` hands back an already-connected socket — too late to
 /// install the key, which must cover the SYN — so we build the socket by hand: install
 /// the key, start a non-blocking connect, then drive it to completion through tokio.
-/// IPv4 only here.
+/// Handles both IPv4 and IPv6 transport (an IPv6 link-local peer carries a scope id).
 async fn connect_authed(
-    peer: Ipv4Addr,
+    peer: IpAddr,
+    scope_id: Option<u32>,
     auth: &TcpAuth,
     vrf_device: Option<&str>,
 ) -> std::io::Result<TcpStream> {
     use std::os::fd::FromRawFd;
-    let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0) };
+    let family = match peer {
+        IpAddr::V4(_) => libc::AF_INET,
+        IpAddr::V6(_) => libc::AF_INET6,
+    };
+    let fd = unsafe { libc::socket(family, libc::SOCK_STREAM, 0) };
     if fd < 0 {
         return Err(std::io::Error::last_os_error());
     }
@@ -3744,13 +3789,27 @@ async fn connect_authed(
         auth.install(fd, peer)?;
         bind_to_vrf(fd, vrf_device)?;
         set_nonblocking(fd)?;
-        let sin = sockaddr_in_v4(peer, PORT);
-        let rc = unsafe {
-            libc::connect(
-                fd,
-                std::ptr::addr_of!(sin) as *const libc::sockaddr,
-                std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
-            )
+        let rc = match peer {
+            IpAddr::V4(v4) => {
+                let sin = sockaddr_in_v4(v4, PORT);
+                unsafe {
+                    libc::connect(
+                        fd,
+                        std::ptr::addr_of!(sin) as *const libc::sockaddr,
+                        std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+                    )
+                }
+            }
+            IpAddr::V6(v6) => {
+                let sin6 = sockaddr_in6_v6(v6, PORT, scope_id.unwrap_or(0));
+                unsafe {
+                    libc::connect(
+                        fd,
+                        std::ptr::addr_of!(sin6) as *const libc::sockaddr,
+                        std::mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t,
+                    )
+                }
+            }
         };
         if rc != 0 {
             let e = std::io::Error::last_os_error();
@@ -3831,15 +3890,7 @@ async fn connect_bound(
                 }
             }
             IpAddr::V6(v6) => {
-                let sin6 = libc::sockaddr_in6 {
-                    sin6_family: libc::AF_INET6 as libc::sa_family_t,
-                    sin6_port: PORT.to_be(),
-                    sin6_flowinfo: 0,
-                    sin6_addr: libc::in6_addr {
-                        s6_addr: v6.octets(),
-                    },
-                    sin6_scope_id: scope_id.unwrap_or(0),
-                };
+                let sin6 = sockaddr_in6_v6(v6, PORT, scope_id.unwrap_or(0));
                 unsafe {
                     libc::connect(
                         fd,
@@ -3872,47 +3923,64 @@ async fn connect_bound(
 
 /// Bind the BGP listener by hand so each authenticated peer's key (TCP-MD5 or TCP-AO)
 /// is installed before `listen`, letting the kernel verify that peer's inbound
-/// connections. IPv4, port 179 on every address — the same bind tokio's
-/// `TcpListener::bind` does, with the keys added.
+/// connections. Port 179 on every address, with the keys added.
+///
+/// The socket family follows the authenticated peers: an all-IPv4 auth set keeps a
+/// plain `AF_INET` listener, while any IPv6-transport authenticated peer promotes it to
+/// an `AF_INET6` dual-stack socket (`IPV6_V6ONLY` off) so it accepts both IPv6 peers and
+/// IPv4 peers (delivered v4-mapped). Each peer's key is installed with its own address
+/// family (`set_tcp_*` builds a `/32` or `/128` sockaddr accordingly).
 fn bind_listener_authed(
     peers: &[BgpPeerCfg],
     vrf_device: Option<&str>,
 ) -> std::io::Result<TcpListener> {
     use std::os::fd::FromRawFd;
-    let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0) };
+    // Any authenticated IPv6 peer requires a dual-stack (AF_INET6) listener; otherwise
+    // an AF_INET one suffices (and keeps the pure-IPv4 behaviour byte-for-byte).
+    let dual = peers
+        .iter()
+        .any(|p| p.addr.is_ipv6() && p.tcp_auth().is_enabled());
+    let family = if dual { libc::AF_INET6 } else { libc::AF_INET };
+    let fd = unsafe { libc::socket(family, libc::SOCK_STREAM, 0) };
     if fd < 0 {
         return Err(std::io::Error::last_os_error());
     }
     let prepared = (|| -> std::io::Result<()> {
-        let one: i32 = 1;
-        let rc = unsafe {
-            libc::setsockopt(
-                fd,
-                libc::SOL_SOCKET,
-                libc::SO_REUSEADDR,
-                std::ptr::addr_of!(one) as *const libc::c_void,
-                std::mem::size_of::<i32>() as libc::socklen_t,
-            )
-        };
-        if rc != 0 {
-            return Err(std::io::Error::last_os_error());
+        setsockopt_i32(fd, libc::SOL_SOCKET, libc::SO_REUSEADDR, 1)?;
+        if dual {
+            // Clear IPV6_V6ONLY so the dual-stack socket also accepts IPv4 (v4-mapped).
+            setsockopt_i32(fd, libc::IPPROTO_IPV6, libc::IPV6_V6ONLY, 0)?;
         }
         bind_to_vrf(fd, vrf_device)?;
         for p in peers {
-            // TCP-MD5/AO is IPv4 transport only here; an IPv6 peer has no key to install.
-            if let IpAddr::V4(v4) = p.addr {
-                p.tcp_auth().install(fd, v4)?;
+            let auth = p.tcp_auth();
+            if auth.is_enabled() {
+                // Installed with the peer's own family — a v4 key as a sockaddr_in, a v6
+                // key as a sockaddr_in6. On the dual-stack socket the kernel folds a
+                // v4-mapped inbound connection back to its IPv4 key.
+                auth.install(fd, p.addr)?;
             }
         }
-        let sin = sockaddr_in_v4(Ipv4Addr::UNSPECIFIED, PORT);
-        if unsafe {
-            libc::bind(
-                fd,
-                std::ptr::addr_of!(sin) as *const libc::sockaddr,
-                std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
-            )
-        } < 0
-        {
+        let bound = if dual {
+            let sin6 = sockaddr_in6_v6(Ipv6Addr::UNSPECIFIED, PORT, 0);
+            unsafe {
+                libc::bind(
+                    fd,
+                    std::ptr::addr_of!(sin6) as *const libc::sockaddr,
+                    std::mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t,
+                )
+            }
+        } else {
+            let sin = sockaddr_in_v4(Ipv4Addr::UNSPECIFIED, PORT);
+            unsafe {
+                libc::bind(
+                    fd,
+                    std::ptr::addr_of!(sin) as *const libc::sockaddr,
+                    std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+                )
+            }
+        };
+        if bound < 0 {
             return Err(std::io::Error::last_os_error());
         }
         if unsafe { libc::listen(fd, 1024) } < 0 {
@@ -3991,13 +4059,7 @@ fn bind_listener_dualstack(vrf_device: Option<&str>) -> std::io::Result<TcpListe
         // Clear IPV6_V6ONLY so the socket also accepts IPv4 (as v4-mapped).
         setsockopt_i32(fd, libc::IPPROTO_IPV6, libc::IPV6_V6ONLY, 0)?;
         bind_to_vrf(fd, vrf_device)?;
-        let sin6 = libc::sockaddr_in6 {
-            sin6_family: libc::AF_INET6 as libc::sa_family_t,
-            sin6_port: PORT.to_be(),
-            sin6_flowinfo: 0,
-            sin6_addr: libc::in6_addr { s6_addr: [0u8; 16] }, // in6addr_any
-            sin6_scope_id: 0,
-        };
+        let sin6 = sockaddr_in6_v6(Ipv6Addr::UNSPECIFIED, PORT, 0); // [::]:179
         if unsafe {
             libc::bind(
                 fd,
@@ -5581,6 +5643,41 @@ mod tests {
             render_bgp_routes(&BgpRib::new(), &RoaTable::default()),
             "no bgp routes\n"
         );
+    }
+
+    // A8-rest: the transport-auth (TCP-MD5/TCP-AO) peer address is carried in a
+    // `sockaddr_storage` whose family follows the peer — a sockaddr_in for IPv4, a
+    // sockaddr_in6 for IPv6. These pure builders back both the connect and the listen
+    // side, so getting the family/address bytes right is what makes IPv6 auth work.
+    #[test]
+    fn peer_storage_encodes_v4_and_v6_with_the_right_family() {
+        // IPv4 → AF_INET sockaddr_in, address in network byte order.
+        let v4 = Ipv4Addr::new(192, 0, 2, 5);
+        let (ss, len) = peer_storage(IpAddr::V4(v4));
+        assert_eq!(len, std::mem::size_of::<libc::sockaddr_in>());
+        assert_eq!(ss.ss_family, libc::AF_INET as libc::sa_family_t);
+        // SAFETY: the family is AF_INET, so the storage holds a sockaddr_in.
+        let sin = unsafe { &*(std::ptr::addr_of!(ss) as *const libc::sockaddr_in) };
+        assert_eq!(sin.sin_addr.s_addr, u32::from(v4).to_be());
+
+        // IPv6 → AF_INET6 sockaddr_in6, the 16-byte address verbatim.
+        let v6: Ipv6Addr = "2001:db8::2".parse().unwrap();
+        let (ss6, len6) = peer_storage(IpAddr::V6(v6));
+        assert_eq!(len6, std::mem::size_of::<libc::sockaddr_in6>());
+        assert_eq!(ss6.ss_family, libc::AF_INET6 as libc::sa_family_t);
+        // SAFETY: the family is AF_INET6, so the storage holds a sockaddr_in6.
+        let sin6 = unsafe { &*(std::ptr::addr_of!(ss6) as *const libc::sockaddr_in6) };
+        assert_eq!(sin6.sin6_addr.s6_addr, v6.octets());
+    }
+
+    #[test]
+    fn sockaddr_in6_sets_family_port_addr_and_scope() {
+        let v6: Ipv6Addr = "fe80::1".parse().unwrap();
+        let sa = sockaddr_in6_v6(v6, PORT, 7);
+        assert_eq!(sa.sin6_family, libc::AF_INET6 as libc::sa_family_t);
+        assert_eq!(sa.sin6_port, PORT.to_be());
+        assert_eq!(sa.sin6_addr.s6_addr, v6.octets());
+        assert_eq!(sa.sin6_scope_id, 7); // the interface scope a link-local dial needs
     }
 
     #[test]

@@ -1595,16 +1595,10 @@ fn build_bgp_config(
         // The transport address: IPv4, or IPv6 for an unnumbered/RFC 5549 session. An
         // IPv6 link-local may carry an interface scope (`fe80::1%eth0`) to dial it on.
         let (addr, scope_id) = parse_neighbor_addr(&n.address)?;
-        // TCP-MD5 (RFC 2385) and TCP-AO (RFC 5925) are wired for IPv4 transport only
-        // here; on an IPv6 peer a configured key is ignored (with a warning).
-        let (password, ao_key) = if addr.is_ipv4() {
-            (n.password.clone(), n.ao_key.clone())
-        } else {
-            if n.password.is_some() || n.ao_key.is_some() {
-                tracing::warn!(peer = %addr, "TCP-MD5/AO is IPv4-only; ignoring the key on this IPv6 (unnumbered) BGP peer");
-            }
-            (None, None)
-        };
+        // TCP-MD5 (RFC 2385) and TCP-AO (RFC 5925) apply to both IPv4 and IPv6 transport
+        // (A8-rest): the key is installed on the session socket with the peer's own
+        // address family, so it flows through for any neighbour regardless of family.
+        let (password, ao_key) = (n.password.clone(), n.ao_key.clone());
         if let Some(pw) = &password {
             if pw.is_empty() || pw.len() > 80 {
                 anyhow::bail!(
