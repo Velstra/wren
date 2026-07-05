@@ -55,6 +55,32 @@ eBPF/XDP data plane, which subscribes, resolves each next-hop's L2 address, and
 programs its own route map. Keeping the contract a generic stream (rather than a
 Velstra-specific `Fib` backend) leaves Wren free of any consumer coupling.
 
+## Configuration hot-reload — `SIGHUP`
+
+Send the running daemon `SIGHUP` and it **re-reads its configuration file and
+applies the delta in place**, without restarting or disturbing unaffected
+protocol sessions:
+
+```sh
+$ kill -HUP "$(pidof wren)"      # or: systemctl reload wren
+```
+
+On `SIGHUP` Wren re-reads the config, resolves its static routes afresh, and
+diffs them against the running set — installing added routes, removing deleted
+ones, and replacing changed ones through the same RIB/FIB pipeline as a live
+protocol update. An added or removed static therefore shows up immediately in
+`show routes` and streams to every open [`monitor routes`](#streaming-the-forwarding-table--wren-monitor-routes)
+subscriber. Because no protocol engine is touched, **every BGP/OSPF/IS-IS/…
+session and adjacency stays up across the reload**, as do the routes learned over
+them. A config that fails to parse (or names an unknown filter) is logged and
+ignored, so a bad edit never crashes the daemon or drops the running
+configuration.
+
+> Live reconfiguration of the protocol engines themselves — adding or removing
+> BGP neighbours, enabling a protocol, or swapping filters on the fly — is not yet
+> wired (each needs a per-engine reconfiguration path); today those still require a
+> restart. Full model-driven management (gNMI/OpenConfig) is future work.
+
 ## Prometheus metrics
 
 `wren show metrics` renders the [Prometheus text exposition format][fmt]:

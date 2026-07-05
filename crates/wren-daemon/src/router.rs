@@ -171,6 +171,21 @@ pub struct RouteSubscribe {
     pub events: mpsc::Sender<RouteEvent>,
 }
 
+/// A request to reload the router's static routes from a freshly-read configuration
+/// (the SIGHUP hot-reload path). Carries the complete new desired static-route set;
+/// the router diffs it against the set it currently holds and applies only the delta
+/// — installing added routes, removing deleted ones, replacing changed ones —
+/// through the same RIB/FIB pipeline as a live protocol update (so a new route is
+/// programmed and streamed to `monitor routes` subscribers). Dynamically-learned
+/// routes are never touched, and no protocol engine is involved, so every session
+/// and adjacency stays up across a reload.
+#[derive(Debug)]
+pub struct ReloadRoutes {
+    /// The complete set of static routes the new configuration defines, already run
+    /// through any per-VRF import route-map by the caller (as at startup).
+    pub statics: Vec<Route>,
+}
+
 /// Capacity of each route-export subscriber channel. Bounds the memory a single
 /// slow/stuck `monitor routes` client can cause the router to hold.
 pub(crate) const SUBSCRIBER_CAP: usize = 1024;
@@ -192,12 +207,26 @@ pub async fn run(
     vrfs: &[VrfInfo],
     mut queries: mpsc::Receiver<QueryRequest>,
     mut subscribes: mpsc::Receiver<RouteSubscribe>,
+    statics: &[Route],
+    mut reloads: mpsc::Receiver<ReloadRoutes>,
 ) {
     // The best-path routes we have actually programmed into the FIB, keyed by
     // (vrf, prefix). Doubles as the route-export snapshot source, and lets the
     // export filter's accept→reject transition withdraw a previously-installed
     // route.
     let mut exported: BTreeMap<(u32, Prefix), Route> = BTreeMap::new();
+    // The static routes the running configuration defines, keyed by (vrf, prefix) —
+    // the baseline a SIGHUP reload diffs against. `main` seeds (installs) these into
+    // the FIB directly before this loop starts, so record them in `exported` too:
+    // they are in the forwarding plane, so a new `monitor routes` subscriber should
+    // see them in its snapshot, and a reload that removes one must be able to find
+    // and withdraw it.
+    let mut current_statics: BTreeMap<(u32, Prefix), Route> = BTreeMap::new();
+    for route in statics {
+        let key = (route.table, route.prefix);
+        current_statics.insert(key, route.clone());
+        exported.entry(key).or_insert_with(|| route.clone());
+    }
     // Prefixes whose last FIB write (install or remove) errored — retried on the
     // periodic reconcile tick below until they succeed (review finding M8).
     let mut failed: BTreeSet<(u32, Prefix)> = BTreeSet::new();
@@ -249,6 +278,12 @@ pub async fn run(
             }
             Some(sub) = subscribes.recv() => {
                 subscribe_routes(&exported, &mut subscribers, sub).await;
+            }
+            Some(reload) = reloads.recv() => {
+                reload_statics(
+                    rib, fib, fib_export, &mut exported, &mut subscribers,
+                    &mut failed, &mut current_statics, reload.statics,
+                ).await;
             }
             _ = reconcile.tick() => {
                 retry_failed(rib, fib, fib_export, &mut exported, &mut subscribers, &mut failed).await;
@@ -311,6 +346,75 @@ async fn subscribe_routes(
         return;
     }
     subscribers.push(sub.events);
+}
+
+/// Apply a static-route reload (SIGHUP hot-reload): diff the new desired static set
+/// against the one the router currently holds and carry only the delta into the RIB
+/// and forwarding plane. A route that is gone from the new set is withdrawn from the
+/// RIB; one that is new or whose definition changed is offered to the RIB; one that
+/// is byte-for-byte unchanged is left untouched (its RIB entry, and any FIB write, is
+/// not disturbed). Each resulting best-path change is programmed through
+/// [`program_fib`], so an added route reaches the kernel and streams to `monitor
+/// routes` subscribers exactly as a live protocol update would. Dynamically-learned
+/// routes are never touched — and since no protocol engine is involved, every session
+/// and adjacency stays up across the reload. `current` is replaced with the new set so
+/// the next reload diffs against it.
+#[allow(clippy::too_many_arguments)] // one delta step: the RIB, the FIB, and every fan-out sink
+async fn reload_statics(
+    rib: &mut Rib,
+    fib: &FibHandle,
+    fib_export: Option<&Filter>,
+    exported: &mut BTreeMap<(u32, Prefix), Route>,
+    subscribers: &mut Vec<mpsc::Sender<RouteEvent>>,
+    failed: &mut BTreeSet<(u32, Prefix)>,
+    current: &mut BTreeMap<(u32, Prefix), Route>,
+    new_statics: Vec<Route>,
+) {
+    // Index the new desired set by (table, prefix). A duplicate prefix in the config
+    // keeps the last, matching how the RIB's single (Static, source=0) candidate per
+    // prefix behaves.
+    let mut next: BTreeMap<(u32, Prefix), Route> = BTreeMap::new();
+    for route in new_statics {
+        next.insert((route.table, route.prefix), route);
+    }
+
+    // Removed: present in the old set, absent from the new one — withdraw the static
+    // candidate. If another protocol still has a route to that prefix, the RIB's
+    // best-path simply changes to it (program_fib installs it); otherwise the prefix
+    // is removed from the FIB.
+    let removed: Vec<(u32, Prefix, u64)> = current
+        .iter()
+        .filter(|(key, _)| !next.contains_key(key))
+        .map(|((table, prefix), route)| (*table, *prefix, route.source))
+        .collect();
+    let removed_count = removed.len();
+    for (table, prefix, source) in removed {
+        if let Some(change) = rib.withdraw(table, prefix, Protocol::Static, source) {
+            program_fib(fib, change, fib_export, exported, subscribers, failed).await;
+        }
+    }
+
+    // Added or changed: absent from the old set, or defined differently — offer to
+    // the RIB. An unchanged route is skipped so its RIB entry (and any FIB state) is
+    // left exactly as it is.
+    let mut changed_count = 0usize;
+    for (key, route) in &next {
+        if current.get(key) == Some(route) {
+            continue;
+        }
+        changed_count += 1;
+        if let Some(change) = rib.update(route.clone()) {
+            program_fib(fib, change, fib_export, exported, subscribers, failed).await;
+        }
+    }
+
+    *current = next;
+    info!(
+        added_or_changed = changed_count,
+        removed = removed_count,
+        total = current.len(),
+        "static routes reloaded",
+    );
 }
 
 /// Fan a route-export event out to every open subscriber. Live events use
@@ -1027,6 +1131,7 @@ mod tests {
         let (utx, urx) = mpsc::channel(16);
         let (qtx, qrx) = mpsc::channel::<QueryRequest>(16);
         let (stx, srx) = mpsc::channel::<RouteSubscribe>(16);
+        let (_rtx, rrx) = mpsc::channel::<ReloadRoutes>(16);
 
         // `run` borrows a `&mut Rib` for its whole lifetime, so it can't be
         // `tokio::spawn`ed (production runs it in `select!`, not spawned). Drive it
@@ -1037,7 +1142,7 @@ mod tests {
             let mut rib = Rib::new();
             let fib = crate::fib::spawn(Box::new(MemoryFib::default()));
             let imports = ImportFilters::new();
-            run(&mut rib, &fib, urx, &imports, None, &[], &[], qrx, srx).await;
+            run(&mut rib, &fib, urx, &imports, None, &[], &[], qrx, srx, &[], rrx).await;
         };
 
         let driver = async move {
@@ -1106,6 +1211,91 @@ mod tests {
         };
 
         tokio::join!(router, driver);
+    }
+
+    #[tokio::test]
+    async fn static_reload_applies_delta_and_leaves_learned_routes_untouched() {
+        let mut rib = Rib::new();
+        let fib = crate::fib::spawn(Box::new(MemoryFib::default()));
+        let mut exported: BTreeMap<(u32, Prefix), Route> = BTreeMap::new();
+        let mut subs: Vec<mpsc::Sender<RouteEvent>> = Vec::new();
+        let mut failed = BTreeSet::new();
+
+        // A learned BGP route and an initial static are already in the RIB/FIB —
+        // the state a running daemon holds before a SIGHUP.
+        let learned = bgp_route("203.0.113.0/24", 10);
+        rib.update(learned.clone());
+        fib.apply(FibChange::Install(learned.clone())).await.unwrap();
+        exported.insert((learned.table, learned.prefix), learned.clone());
+        let old_static = static_route("10.0.0.0/24");
+        rib.update(old_static.clone());
+        fib.apply(FibChange::Install(old_static.clone())).await.unwrap();
+        exported.insert((old_static.table, old_static.prefix), old_static.clone());
+
+        let mut current: BTreeMap<(u32, Prefix), Route> = BTreeMap::new();
+        current.insert((old_static.table, old_static.prefix), old_static.clone());
+
+        // Reload: drop 10.0.0.0/24, add 172.16.0.0/24. The BGP route is not part of
+        // the static set, so it must be left exactly in place.
+        let new_static = static_route("172.16.0.0/24");
+        reload_statics(
+            &mut rib,
+            &fib,
+            None,
+            &mut exported,
+            &mut subs,
+            &mut failed,
+            &mut current,
+            vec![new_static.clone()],
+        )
+        .await;
+
+        let owned = fib.owned_routes().await.unwrap();
+        // The added static is the best path for its prefix and is programmed.
+        assert!(rib.best_in(new_static.table, &new_static.prefix).is_some());
+        assert!(owned.iter().any(|r| r.prefix == new_static.prefix));
+        // The removed static is gone from both the RIB and the FIB.
+        assert!(rib.best_in(old_static.table, &old_static.prefix).is_none());
+        assert!(!owned.iter().any(|r| r.prefix == old_static.prefix));
+        // The learned BGP route is untouched — same protocol, still in the FIB.
+        let b = rib.best(&learned.prefix).expect("bgp route still present");
+        assert_eq!(b.protocol, Protocol::Bgp);
+        assert!(owned.iter().any(|r| r.prefix == learned.prefix));
+        // `current` now reflects the new desired set.
+        assert_eq!(current.len(), 1);
+        assert!(current.contains_key(&(new_static.table, new_static.prefix)));
+    }
+
+    #[tokio::test]
+    async fn static_reload_leaves_an_unchanged_route_in_place() {
+        // A reload whose static set is identical to the running one must be a no-op
+        // for the RIB: the unchanged route keeps its exact RIB entry.
+        let mut rib = Rib::new();
+        let fib = crate::fib::spawn(Box::new(MemoryFib::default()));
+        let mut exported: BTreeMap<(u32, Prefix), Route> = BTreeMap::new();
+        let mut subs: Vec<mpsc::Sender<RouteEvent>> = Vec::new();
+        let mut failed = BTreeSet::new();
+
+        let kept = static_route("10.0.0.0/24");
+        rib.update(kept.clone());
+        let mut current: BTreeMap<(u32, Prefix), Route> = BTreeMap::new();
+        current.insert((kept.table, kept.prefix), kept.clone());
+
+        reload_statics(
+            &mut rib,
+            &fib,
+            None,
+            &mut exported,
+            &mut subs,
+            &mut failed,
+            &mut current,
+            vec![kept.clone()],
+        )
+        .await;
+
+        // Still exactly one static, unchanged, and no route-export churn happened.
+        assert_eq!(current.len(), 1);
+        assert_eq!(rib.best_in(kept.table, &kept.prefix), Some(&kept));
     }
 
     /// A [`Fib`] whose first `fail_installs` install attempts return a transient

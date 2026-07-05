@@ -216,8 +216,15 @@ implemented to its RFC.
   owns the data (the router loop / the per-protocol task), with no shared access —
   the send/await plumbing is one generic helper, so a new `show <proto>` is a parser
   plus a render branch. Beyond `show`, `wren bgp refresh <peer>` sends that peer a
-  ROUTE-REFRESH (RFC 2918). More per-protocol detail views and a richer API are to
-  come.
+  ROUTE-REFRESH (RFC 2918). **Configuration hot-reload** rides the same seam: on
+  `SIGHUP` the daemon re-reads its config file and applies the static-route delta
+  in place — added/removed/changed routes flow through the RIB/FIB pipeline and
+  stream to `monitor routes` subscribers — without restarting or disturbing any
+  protocol session (a session or adjacency untouched by the edit stays up; a
+  config that fails to parse is logged and ignored). Live reconfiguration of the
+  engines themselves (BGP neighbours, enabling a protocol, filter swaps) and full
+  model-driven management (gNMI/OpenConfig) are still to come. More per-protocol
+  detail views and a richer API are to come too.
 - [~] **Startup reconciliation** — on boot the kernel backend reads the routing
   table back (`RTM_GETROUTE` dump) and removes routes a previous wren instance
   left behind that the current config no longer programs, so a restart never

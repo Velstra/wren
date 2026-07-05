@@ -293,11 +293,15 @@ async fn main() -> Result<()> {
     // its export route-map (VRF → kernel); either may drop or rewrite it.
     let mut rib = Rib::new();
     let mut installed = 0usize;
+    // The static routes actually admitted into the RIB (after each VRF import
+    // route-map): the baseline the router diffs a SIGHUP reload against.
+    let mut seeded_statics: Vec<wren_core::Route> = Vec::new();
     for route in statics {
         let route = match vrf_routemap(&vrf_imports, route) {
             Some(r) => r,
             None => continue, // import route-map rejected it
         };
+        seeded_statics.push(route.clone());
         if let Some(change) = rib.update(route) {
             if let FibChange::Install(best) = &change {
                 // The export route-map may drop it (kept in the RIB, off the FIB).
@@ -335,6 +339,11 @@ async fn main() -> Result<()> {
     // `_tx` end is held for the whole run so the router's subscribe select arm
     // never sees a closed channel.
     let (subscribe_tx, subscribe_rx) = mpsc::channel(QUERY_QUEUE);
+    // SIGHUP config hot-reload → the router loop. On SIGHUP a background task re-reads
+    // the config file, re-resolves its static routes, and sends them here; the router
+    // diffs against the running set and applies only the delta. The `_tx` end is held
+    // for the whole run so the router's reload select arm never sees a closed channel.
+    let (reload_tx, reload_rx) = mpsc::channel::<router::ReloadRoutes>(QUERY_QUEUE);
     // EVPN monitor subscriptions (`wren monitor evpn`) → the BGP task. The `_tx`
     // end is held in `Channels` (only when BGP runs) so the task's subscribe arm
     // never sees a closed channel; the `_rx` is moved into `bgp::run`.
@@ -1027,9 +1036,52 @@ async fn main() -> Result<()> {
     // they were installed directly above, bypassing the router loop's fan-out.
     router::redistribute_seed(&redist_targets, &rib).await;
 
+    // SIGHUP: re-read the configuration and hot-apply the delta — currently the
+    // static routes — without restarting the daemon or disturbing any protocol
+    // session or adjacency. A reload that fails to parse (or names a bad filter) is
+    // logged and ignored so the running configuration is kept rather than a broken one
+    // applied. Live reconfiguration of the protocol engines themselves (adding/removing
+    // BGP neighbours, enabling a protocol, swapping filters) is future work; see the
+    // daemon docs. The task holds a clone of `reload_tx`; the original stays in scope
+    // so the router's reload arm never sees a closed channel.
+    {
+        let config_path = args.config.clone();
+        let reload_tx = reload_tx.clone();
+        tokio::spawn(async move {
+            let mut hup = match tokio::signal::unix::signal(
+                tokio::signal::unix::SignalKind::hangup(),
+            ) {
+                Ok(s) => s,
+                Err(e) => {
+                    warn!(error = %e, "cannot install SIGHUP handler; config hot-reload disabled");
+                    return;
+                }
+            };
+            while hup.recv().await.is_some() {
+                info!("SIGHUP received; reloading configuration");
+                match reload_static_routes(&config_path) {
+                    Ok(statics) => {
+                        let count = statics.len();
+                        if reload_tx
+                            .send(router::ReloadRoutes { statics })
+                            .await
+                            .is_err()
+                        {
+                            break; // router loop gone; nothing more to reload
+                        }
+                        info!(statics = count, "configuration reloaded");
+                    }
+                    Err(e) => {
+                        error!(error = %e, "config reload failed; keeping the running configuration")
+                    }
+                }
+            }
+        });
+    }
+
     info!("wren is running; press Ctrl-C to stop");
     tokio::select! {
-        _ = router::run(&mut rib, &fib, updates_rx, &imports, fib_export.as_ref(), &redist_targets, &vrfs, queries_rx, subscribe_rx) => {
+        _ = router::run(&mut rib, &fib, updates_rx, &imports, fib_export.as_ref(), &redist_targets, &vrfs, queries_rx, subscribe_rx, &seeded_statics, reload_rx) => {
             warn!("router loop ended (all protocol senders dropped)");
         }
         r = tokio::signal::ctrl_c() => {
@@ -1400,6 +1452,26 @@ fn vrf_routemap(
         },
         None => Some(route),
     }
+}
+
+/// Re-read the configuration file and resolve its static routes for a SIGHUP
+/// hot-reload, applying each VRF's import route-map exactly as startup does (so the
+/// result is the same baseline the router already holds). Returns the resolved routes,
+/// or an error — a missing/unparsable file, bad TOML, or an unknown filter — so the
+/// caller can keep the running configuration rather than apply a broken one.
+fn reload_static_routes(path: &std::path::Path) -> Result<Vec<wren_core::Route>> {
+    let cfg = wren_config::Config::load(path)
+        .with_context(|| format!("reloading {}", path.display()))?;
+    let by_name = compile_named_filters(&cfg).context("compiling filters")?;
+    let (vrf_imports, _vrf_exports) =
+        build_vrf_routemaps(&cfg, &by_name).context("resolving vrf route-maps")?;
+    let mut out = Vec::new();
+    for route in cfg.static_routes().context("resolving static routes")? {
+        if let Some(route) = vrf_routemap(&vrf_imports, route) {
+            out.push(route);
+        }
+    }
+    Ok(out)
 }
 
 /// Resolve each VRF's `import` / `export` route-maps to compiled filters, keyed by the
