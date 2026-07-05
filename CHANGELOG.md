@@ -4,6 +4,63 @@ All notable changes to Wren are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and from `0.1.0` the project
 follows [Semantic Versioning](https://semver.org/).
 
+## [0.2.0] — 2026-07-05
+
+A broad Track-A expansion: BGP gains four new address families and route-leak
+protection, **multicast** arrives (IGMP + MLD), and OSPF learns **graceful
+restart**. Every slice ships with a rootless `unshare -Urn` smoke and unit tests.
+
+### BGP
+
+- **FlowSpec** (RFC 8955) — Flow Specification NLRI (AFI 1/2, SAFI 133) with a
+  per-peer FlowSpec RIB, capability negotiation, `[bgp.flowspec]` rule
+  origination (discard / rate-limit / mark), and `show bgp flowspec`.
+- **SR Policy over BGP** (RFC 9256, SAFI 73) — the SR-Policy candidate model and
+  wire codec (SAFI-73 NLRI + Tunnel Encapsulation attribute, RFC 9012, reusing
+  the SRv6 SID structures), an SR-Policy RIB with best-candidate selection per
+  `(colour, endpoint)`, and `show bgp sr-policy`.
+- **BGP-LS** (RFC 7752, SAFI 71) — Link-State NLRI + BGP-LS Attribute codec
+  (Node / Link / Prefix objects, loss-free TLVs incl. the SR TLVs), a Link-State
+  RIB, static `[[bgp.link-state]]` origination, and `show bgp link-state`.
+- **Routing security** — **eBGP default-deny** (RFC 8212, `ebgp-require-policy`)
+  and **BGP roles + Only-To-Customer** (RFC 9234): role capability negotiation
+  (Role Mismatch on conflict) and OTC ingress/egress procedures that stop
+  provider→peer route leaks.
+
+### Multicast (new)
+
+- A new dependency-free **`wren-igmp`** crate speaking both families:
+  **IGMPv3** (RFC 3376) over IPv4 and **MLDv2** (RFC 3810) over ICMPv6, sharing
+  one address-generic §6 membership state machine and an **RFC 4605** upstream
+  proxy.
+- Daemon **querier runners** (raw IGMP / ICMPv6 sockets), a `[multicast]` config
+  with per-family toggles, **querier election** (lowest-address wins) and §6.4
+  **Last-Member-Query** fast-leave.
+
+### OSPF
+
+- **Graceful restart** (RFC 3623) — the opaque-LSA (RFC 5250) infrastructure, the
+  **Grace-LSA** codec, **helper** mode (holds a neighbour's adjacency through its
+  restart) and the **restarting** side (originate Grace-LSAs, preserve the FIB
+  across the restart).
+- **Cryptographic anti-replay** (RFC 2328 Appendix D) — reject replayed MD5
+  packets whose sequence number regressed.
+- **Passive interfaces** — advertise a subnet without forming adjacencies on it.
+
+### BFD & IGP polish
+
+- **BFD Echo over IPv6** (RFC 5880 §6.4), alongside the existing IPv4 echo.
+- **IS-IS L1↔L2 route leaking** (RFC 5302 up/down bit).
+- **RIP** and **Babel** register neighbours with the BFD engine for sub-second
+  failure detection.
+
+### Deferred
+
+- The eBPF/XDP data-plane consumers of FlowSpec and SR Policy (flow
+  classification / dataplane steering) — the BGP signalling is complete, the
+  enforcement lives in the fabric data plane. Live IGP→BGP-LS export, TCP-AO/MD5
+  for IPv6 transport, and gNMI/hot-reload remain on the roadmap.
+
 ## [0.1.0] — 2026-06-30
 
 A large step up from the first release: BGP grows into a full-featured
@@ -105,5 +162,6 @@ the job of BIRD/FRR, rebuilt with a dependency-free, embeddable core.
   **smoke scripts** under `scripts/` (each runs in a throwaway `unshare -Urn`
   network namespace).
 
+[0.2.0]: https://github.com/velstra/wren/releases/tag/v0.2.0
 [0.1.0]: https://github.com/velstra/wren/releases/tag/v0.1.0
 [0.0.1]: https://github.com/velstra/wren/releases/tag/v0.0.1
