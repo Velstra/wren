@@ -1457,6 +1457,7 @@ fn build_bgp_config(
             add_path: n.add_path,
             ext_nexthop: n.extended_nexthop,
             evpn: n.evpn,
+            flowspec: n.flowspec,
             import,
             export,
         });
@@ -1564,6 +1565,15 @@ fn build_bgp_config(
     if evpn.is_some() && !bgp.neighbor.iter().any(|n| n.evpn) {
         warn!("bgp `[bgp.evpn]` is configured but no neighbor has `evpn = true`; no peer will carry EVPN");
     }
+    // FlowSpec (RFC 8955): resolve each `[[bgp.flowspec.rule]]` into a flow spec plus
+    // its action. Absent when `[bgp.flowspec]` is not configured.
+    let flowspec = match &bgp.flowspec {
+        Some(f) => Some(build_flowspec_config(f)?),
+        None => None,
+    };
+    if flowspec.is_some() && !bgp.neighbor.iter().any(|n| n.flowspec) {
+        warn!("bgp `[bgp.flowspec]` is configured but no neighbor has `flowspec = true`; no peer will carry FlowSpec");
+    }
     Ok(bgp::BgpConfig {
         local_as: bgp.local_as,
         router_id,
@@ -1584,6 +1594,7 @@ fn build_bgp_config(
         vrf_table,
         vrf_device,
         evpn,
+        flowspec,
     })
 }
 
@@ -1693,6 +1704,101 @@ fn build_evpn_config(
         srv6_locator,
         instances,
     })
+}
+
+/// Resolve `[bgp.flowspec]` into a [`bgp::FlowSpecConfig`]: for each rule, assemble
+/// the match components (dest/source prefix, protocol, ports) into a FlowSpec NLRI
+/// and parse its traffic-filtering action (RFC 8955 §4 + §7). A rule with no match
+/// component is rejected — it would match all traffic. IPv4 (AFI 1) only for now.
+fn build_flowspec_config(f: &wren_config::BgpFlowSpec) -> Result<bgp::FlowSpecConfig> {
+    use wren_bgp::flowspec::{Component, FlowSpec};
+    use wren_bgp::flowspec_rib::FlowSpecNlri;
+
+    let mut rules = Vec::with_capacity(f.rule.len());
+    for (i, r) in f.rule.iter().enumerate() {
+        let mut components = Vec::new();
+        if let Some(d) = &r.dest {
+            let p: wren_core::Prefix = d
+                .parse()
+                .with_context(|| format!("bgp flowspec rule {i} dest {d:?} must be addr/len"))?;
+            if !p.is_ipv4() {
+                anyhow::bail!("bgp flowspec rule {i} dest {d:?}: only IPv4 flow rules are supported");
+            }
+            components.push(Component::DestPrefix(p));
+        }
+        if let Some(s) = &r.source {
+            let p: wren_core::Prefix = s
+                .parse()
+                .with_context(|| format!("bgp flowspec rule {i} source {s:?} must be addr/len"))?;
+            if !p.is_ipv4() {
+                anyhow::bail!(
+                    "bgp flowspec rule {i} source {s:?}: only IPv4 flow rules are supported"
+                );
+            }
+            components.push(Component::SrcPrefix(p));
+        }
+        if !r.protocol.is_empty() {
+            components.push(Component::IpProto(flowspec_num_ops(&r.protocol)));
+        }
+        if !r.port.is_empty() {
+            components.push(Component::Port(flowspec_num_ops(&r.port)));
+        }
+        if !r.dest_port.is_empty() {
+            components.push(Component::DestPort(flowspec_num_ops(&r.dest_port)));
+        }
+        if !r.source_port.is_empty() {
+            components.push(Component::SrcPort(flowspec_num_ops(&r.source_port)));
+        }
+        if components.is_empty() {
+            anyhow::bail!(
+                "bgp flowspec rule {i} has no match component; it would match all traffic"
+            );
+        }
+        let action = parse_flowspec_action(r.action.as_deref())
+            .with_context(|| format!("bgp flowspec rule {i} action"))?;
+        rules.push(bgp::FlowSpecRuleCfg {
+            nlri: FlowSpecNlri::v4(FlowSpec { components }),
+            action,
+        });
+    }
+    Ok(bgp::FlowSpecConfig { rules })
+}
+
+/// A list of port/protocol values as OR-joined `= value` FlowSpec numeric ops.
+fn flowspec_num_ops(values: &[u16]) -> Vec<wren_bgp::flowspec::NumOp> {
+    values
+        .iter()
+        .map(|&v| wren_bgp::flowspec::NumOp::eq(v as u64))
+        .collect()
+}
+
+/// Parse a FlowSpec action string (RFC 8955 §7): `"discard"` / `"drop"`,
+/// `"rate-limit:<bytes-per-second>"` (a float; `0` is discard) or `"mark:<dscp>"`.
+/// `None` defaults to discard.
+fn parse_flowspec_action(s: Option<&str>) -> Result<wren_bgp::flowspec::Action> {
+    use wren_bgp::flowspec::Action;
+    let s = s.unwrap_or("discard").trim();
+    if s.eq_ignore_ascii_case("discard") || s.eq_ignore_ascii_case("drop") {
+        return Ok(Action::DISCARD);
+    }
+    if let Some(rate) = s.strip_prefix("rate-limit:") {
+        let bytes: f32 = rate
+            .trim()
+            .parse()
+            .with_context(|| format!("rate-limit rate {rate:?} must be a number (bytes/s)"))?;
+        return Ok(Action::RateLimit(bytes));
+    }
+    if let Some(dscp) = s.strip_prefix("mark:") {
+        let d: u8 = dscp
+            .trim()
+            .parse()
+            .with_context(|| format!("mark dscp {dscp:?} must be a number 0..=63"))?;
+        if d > 63 {
+            anyhow::bail!("mark dscp {d} must be 0..=63");
+        }
+        return Ok(Action::Marking(d));
+    }
+    anyhow::bail!("unknown action {s:?}; expected discard | rate-limit:<bytes/s> | mark:<dscp>")
 }
 
 /// Parse an EVPN Route Distinguisher: `ip:value` (a type-1 `router-id:value` RD) or

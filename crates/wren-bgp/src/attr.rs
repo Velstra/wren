@@ -20,6 +20,7 @@ use std::net::Ipv4Addr;
 use wren_core::Prefix;
 
 use crate::evpn::{decode_evpn_nlris, encode_evpn_nlri, EvpnNlri, AFI_L2VPN, SAFI_EVPN};
+use crate::flowspec::{decode_nlris as decode_flowspec_nlris, FlowSpec, SAFI_FLOWSPEC};
 use crate::srv6::{decode_prefix_sid, encode_srv6_service_tlv, Srv6ServiceTlv};
 use crate::{as_trans_fit, decode_prefix, decode_prefix_v6, encode_prefix_any, AFI_IPV6};
 
@@ -218,6 +219,26 @@ pub enum PathAttribute {
         /// The EVPN routes being withdrawn.
         withdrawn: Vec<EvpnNlri>,
     },
+    /// MP_REACH_NLRI carrying FlowSpec rules (AFI 1/2 · SAFI 133, RFC 8955 §4) — a
+    /// separate variant because FlowSpec NLRI are flow specifications, not IP
+    /// prefixes. The traffic-filtering action rides as an extended community on the
+    /// same UPDATE (§7), so it is not part of the NLRI.
+    MpReachFlowSpec {
+        /// The Address Family Identifier: [`crate::AFI_IPV4`] or [`crate::AFI_IPV6`].
+        afi: u16,
+        /// The next hop, raw octets. FlowSpec does not route to a next hop
+        /// (RFC 8955 §4 says it is ignored); originators send it empty.
+        next_hop: Vec<u8>,
+        /// The flow rules being advertised.
+        nlri: Vec<FlowSpec>,
+    },
+    /// MP_UNREACH_NLRI carrying FlowSpec withdrawals (AFI 1/2 · SAFI 133).
+    MpUnreachFlowSpec {
+        /// The Address Family Identifier the rules belong to.
+        afi: u16,
+        /// The flow rules being withdrawn.
+        withdrawn: Vec<FlowSpec>,
+    },
     /// ORIGINATOR_ID (type 9, optional non-transitive) — the BGP identifier of the
     /// router that first introduced the route into the local AS (RFC 4456), set by
     /// a route reflector for loop avoidance.
@@ -297,12 +318,12 @@ impl PathAttribute {
             PathAttribute::Aggregator { .. } => Self::AGGREGATOR,
             PathAttribute::Communities(_) => Self::COMMUNITIES,
             PathAttribute::ExtendedCommunities(_) => Self::EXTENDED_COMMUNITIES,
-            PathAttribute::MpReachNlri { .. } | PathAttribute::MpReachEvpn { .. } => {
-                Self::MP_REACH_NLRI
-            }
-            PathAttribute::MpUnreachNlri { .. } | PathAttribute::MpUnreachEvpn { .. } => {
-                Self::MP_UNREACH_NLRI
-            }
+            PathAttribute::MpReachNlri { .. }
+            | PathAttribute::MpReachEvpn { .. }
+            | PathAttribute::MpReachFlowSpec { .. } => Self::MP_REACH_NLRI,
+            PathAttribute::MpUnreachNlri { .. }
+            | PathAttribute::MpUnreachEvpn { .. }
+            | PathAttribute::MpUnreachFlowSpec { .. } => Self::MP_UNREACH_NLRI,
             PathAttribute::OriginatorId(_) => Self::ORIGINATOR_ID,
             PathAttribute::ClusterList(_) => Self::CLUSTER_LIST,
             PathAttribute::LargeCommunities(_) => Self::LARGE_COMMUNITIES,
@@ -322,6 +343,8 @@ impl PathAttribute {
             | PathAttribute::MpUnreachNlri { .. }
             | PathAttribute::MpReachEvpn { .. }
             | PathAttribute::MpUnreachEvpn { .. }
+            | PathAttribute::MpReachFlowSpec { .. }
+            | PathAttribute::MpUnreachFlowSpec { .. }
             | PathAttribute::OriginatorId(_)
             | PathAttribute::ClusterList(_) => FLAG_OPTIONAL,
             PathAttribute::Aggregator { .. }
@@ -399,6 +422,23 @@ impl PathAttribute {
                 out.push(SAFI_EVPN);
                 for n in withdrawn {
                     encode_evpn_nlri(out, n);
+                }
+            }
+            PathAttribute::MpReachFlowSpec { afi, next_hop, nlri } => {
+                out.extend_from_slice(&afi.to_be_bytes());
+                out.push(SAFI_FLOWSPEC);
+                out.push(next_hop.len() as u8);
+                out.extend_from_slice(next_hop);
+                out.push(0); // Reserved (SNPA count, unused)
+                for n in nlri {
+                    n.encode(out);
+                }
+            }
+            PathAttribute::MpUnreachFlowSpec { afi, withdrawn } => {
+                out.extend_from_slice(&afi.to_be_bytes());
+                out.push(SAFI_FLOWSPEC);
+                for n in withdrawn {
+                    n.encode(out);
                 }
             }
             PathAttribute::OriginatorId(id) => out.extend_from_slice(&id.octets()),
@@ -554,6 +594,9 @@ impl PathAttribute {
                 if afi == AFI_L2VPN && safi == SAFI_EVPN {
                     let nlri = decode_evpn_nlris(&value[nh_end + 1..])?;
                     PathAttribute::MpReachEvpn { next_hop, nlri }
+                } else if safi == SAFI_FLOWSPEC {
+                    let nlri = decode_flowspec_nlris(&value[nh_end + 1..])?;
+                    PathAttribute::MpReachFlowSpec { afi, next_hop, nlri }
                 } else {
                     let nlri = decode_mp_prefixes(&value[nh_end + 1..], afi)?;
                     PathAttribute::MpReachNlri { afi, safi, next_hop, nlri }
@@ -568,6 +611,9 @@ impl PathAttribute {
                 if afi == AFI_L2VPN && safi == SAFI_EVPN {
                     let withdrawn = decode_evpn_nlris(&value[3..])?;
                     PathAttribute::MpUnreachEvpn { withdrawn }
+                } else if safi == SAFI_FLOWSPEC {
+                    let withdrawn = decode_flowspec_nlris(&value[3..])?;
+                    PathAttribute::MpUnreachFlowSpec { afi, withdrawn }
                 } else {
                     let withdrawn = decode_mp_prefixes(&value[3..], afi)?;
                     PathAttribute::MpUnreachNlri { afi, safi, withdrawn }
@@ -1045,6 +1091,43 @@ mod tests {
         });
         // The empty form is the EVPN End-of-RIB body.
         roundtrip(PathAttribute::MpUnreachEvpn { withdrawn: vec![] });
+    }
+
+    #[test]
+    fn mp_reach_flowspec_roundtrips() {
+        use crate::flowspec::{Component, FlowSpec, NumOp};
+        use crate::AFI_IPV4;
+        let spec = FlowSpec {
+            components: vec![
+                Component::DestPrefix("10.50.0.0/24".parse().unwrap()),
+                Component::IpProto(vec![NumOp::eq(6)]),
+                Component::DestPort(vec![NumOp::eq(22)]),
+            ],
+        };
+        let attr = PathAttribute::MpReachFlowSpec {
+            afi: AFI_IPV4,
+            next_hop: vec![], // FlowSpec has no meaningful next hop (RFC 8955 §4)
+            nlri: vec![spec],
+        };
+        roundtrip(attr.clone());
+        // Same wire type code (14) and flags as any other MP_REACH.
+        let mut buf = Vec::new();
+        attr.encode(&mut buf, true);
+        assert_eq!(buf[0], FLAG_OPTIONAL);
+        assert_eq!(buf[1], 14);
+    }
+
+    #[test]
+    fn mp_unreach_flowspec_roundtrips_including_empty() {
+        use crate::flowspec::{Component, FlowSpec};
+        use crate::AFI_IPV4;
+        roundtrip(PathAttribute::MpUnreachFlowSpec {
+            afi: AFI_IPV4,
+            withdrawn: vec![FlowSpec {
+                components: vec![Component::DestPrefix("10.50.0.0/24".parse().unwrap())],
+            }],
+        });
+        roundtrip(PathAttribute::MpUnreachFlowSpec { afi: AFI_IPV4, withdrawn: vec![] });
     }
 
     #[test]

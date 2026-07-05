@@ -226,7 +226,7 @@ async fn handle_conn(stream: UnixStream, channels: Channels) -> Result<()> {
     let response = response.unwrap_or_else(|| {
         format!(
             "error: unknown command {line:?}\n\
-             usage: show routes [protocol] | show bgp [routes|paths|neighbors|roa|evpn] | \
+             usage: show routes [protocol] | show bgp [routes|paths|neighbors|roa|evpn|flowspec] | \
              show evpn | bgp refresh <peer> | evpn advertise|withdraw <vni> <mac> [ip] | \
              show ospf [neighbors|interfaces|database] | show ospf3 [neighbors|interfaces] | \
              show isis [neighbors|interfaces|database] | show babel [neighbors|routes] | \
@@ -446,6 +446,7 @@ pub fn parse_bgp_query(line: &str) -> Option<BgpQuery> {
                     Some("neighbors") | Some("neighbours") | Some("summary") => BgpQuery::Neighbors,
                     Some("roa") | Some("roas") => BgpQuery::Roa,
                     Some("evpn") => BgpQuery::Evpn,
+                    Some("flowspec") => BgpQuery::FlowSpec,
                     Some(_) => return None,
                 };
                 // A trailing extra token is a malformed command.
@@ -828,6 +829,7 @@ mod tests {
         assert_eq!(parse_bgp_query("show bgp roa"), Some(BgpQuery::Roa));
         assert_eq!(parse_bgp_query("show bgp roas"), Some(BgpQuery::Roa));
         assert_eq!(parse_bgp_query("show bgp evpn"), Some(BgpQuery::Evpn));
+        assert_eq!(parse_bgp_query("show bgp flowspec"), Some(BgpQuery::FlowSpec));
         assert_eq!(parse_bgp_query("show evpn"), Some(BgpQuery::EvpnVnis));
     }
 

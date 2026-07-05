@@ -239,6 +239,10 @@ impl Update {
             [PathAttribute::MpUnreachEvpn { withdrawn }] if withdrawn.is_empty() => {
                 Some((crate::AFI_L2VPN, crate::SAFI_EVPN))
             }
+            // Likewise an empty FlowSpec MP_UNREACH marks that AFI's FlowSpec family.
+            [PathAttribute::MpUnreachFlowSpec { afi, withdrawn }] if withdrawn.is_empty() => {
+                Some((*afi, crate::SAFI_FLOWSPEC))
+            }
             _ => None,
         }
     }

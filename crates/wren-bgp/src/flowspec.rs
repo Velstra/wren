@@ -177,6 +177,20 @@ impl FlowSpec {
     }
 }
 
+/// Decode a run of concatenated FlowSpec NLRI — the body of an MP_REACH_NLRI /
+/// MP_UNREACH_NLRI FlowSpec attribute (RFC 8955 §4), which carries one or more
+/// length-prefixed flow specifications back to back. Returns `None` on a truncated
+/// or malformed rule.
+pub fn decode_nlris(mut buf: &[u8]) -> Option<Vec<FlowSpec>> {
+    let mut out = Vec::new();
+    while !buf.is_empty() {
+        let (fs, used) = FlowSpec::decode(buf)?;
+        out.push(fs);
+        buf = &buf[used..];
+    }
+    Some(out)
+}
+
 fn encode_component(c: &Component, out: &mut Vec<u8>) {
     out.push(c.type_code());
     match c {

@@ -43,6 +43,8 @@ use wren_bgp::decision::{Path, DEFAULT_LOCAL_PREF};
 use wren_bgp::evpn::{encap_ext_community, Esi, EvpnNlri, Rd, TUNNEL_TYPE_VXLAN};
 use wren_bgp::evpn_rib::{EviChange, EviTable, EvpnRib, EvpnRibEvent};
 use wren_bgp::ext_community::format_ext_community;
+use wren_bgp::flowspec::{Action as FsAction, FlowSpec};
+use wren_bgp::flowspec_rib::{actions_of, FlowSpecNlri, FlowSpecRib, FlowSpecRibEvent};
 use wren_bgp::fsm::{Action, BgpFsm, Event, State, CODE_CEASE};
 use wren_bgp::large_community::format_large_community;
 use wren_bgp::message::{AddPath, Message, Notification, Open, Update};
@@ -51,7 +53,7 @@ use wren_bgp::rpki::{Roa, RoaTable, Validity};
 use wren_bgp::srv6::{behavior, build_service_sid, Srv6ServiceSid, Srv6ServiceTlv, Srv6Sid};
 use wren_bgp::{
     AFI_IPV4, AFI_IPV6, AFI_L2VPN, AS_TRANS, HEADER_LEN, MARKER, MAX_MESSAGE_LEN, PORT, SAFI_EVPN,
-    SAFI_UNICAST, VERSION,
+    SAFI_FLOWSPEC, SAFI_UNICAST, VERSION,
 };
 
 use wren_core::{Prefix, Protocol, Route};
@@ -140,6 +142,30 @@ pub struct BgpConfig {
     /// participates in. `None` disables EVPN; it is carried only to neighbours that
     /// negotiate the L2VPN/EVPN family (and are configured with `evpn = true`).
     pub evpn: Option<EvpnConfig>,
+    /// FlowSpec (RFC 8955) configuration: the flow rules this speaker originates.
+    /// `None` disables origination; the family is carried only to neighbours that
+    /// negotiate SAFI 133 (and are configured with `flowspec = true`). Received rules
+    /// are installed into the FlowSpec RIB regardless of whether any are originated.
+    pub flowspec: Option<FlowSpecConfig>,
+}
+
+/// Resolved FlowSpec (RFC 8955) configuration: the flow rules this speaker
+/// originates to its FlowSpec-activated neighbours.
+#[derive(Clone)]
+pub struct FlowSpecConfig {
+    /// The flow rules to originate (each a match specification plus its action).
+    pub rules: Vec<FlowSpecRuleCfg>,
+}
+
+/// One resolved FlowSpec rule to originate: the flow specification (its match
+/// components, under an AFI) and the traffic-filtering action that rides as an
+/// extended community on the same UPDATE (RFC 8955 §7).
+#[derive(Clone)]
+pub struct FlowSpecRuleCfg {
+    /// The flow specification (AFI + match components).
+    pub nlri: FlowSpecNlri,
+    /// The action applied to traffic the rule matches.
+    pub action: FsAction,
 }
 
 /// Resolved EVPN (RFC 7432) configuration: this VTEP's identity and the EVPN
@@ -273,6 +299,10 @@ pub struct BgpPeerCfg {
     /// Negotiate the L2VPN/EVPN address family (AFI 25 / SAFI 70, RFC 7432) with this
     /// peer — advertise the EVPN Multiprotocol capability and carry EVPN routes to it.
     pub evpn: bool,
+    /// Negotiate the FlowSpec address family (AFI 1/2 · SAFI 133, RFC 8955) with this
+    /// peer — advertise the FlowSpec Multiprotocol capability, originate the configured
+    /// rules to it, and install the rules it advertises into the FlowSpec RIB.
+    pub flowspec: bool,
 }
 
 impl BgpPeerCfg {
@@ -371,6 +401,8 @@ struct PeerProps {
     ext_nexthop: bool,
     /// Whether the L2VPN/EVPN family (RFC 7432) is configured for this peer.
     evpn: bool,
+    /// Whether the FlowSpec family (RFC 8955) is configured for this peer.
+    flowspec: bool,
 }
 
 /// One prefix this speaker originates, with the COMMUNITIES to attach. The central
@@ -447,6 +479,9 @@ enum SessionCmd {
     PropagateEvpn(Vec<EvpnPropRoute>),
     /// Withdraw these EVPN routes (MP_UNREACH_NLRI, AFI 25 / SAFI 70).
     WithdrawEvpn(Vec<EvpnNlri>),
+    /// Advertise these locally-originated FlowSpec rules (RFC 8955 §4) to a
+    /// FlowSpec-activated peer, each with its traffic-filtering action ext-community.
+    AdvertiseFlowSpec(Vec<FlowSpecRuleCfg>),
 }
 
 /// One locally-originated EVPN route the central task asks a session to advertise:
@@ -538,6 +573,8 @@ struct PeerInfo {
     ext_nexthop: bool,
     /// Whether the L2VPN/EVPN family (RFC 7432) is configured for this peer.
     evpn: bool,
+    /// Whether the FlowSpec family (RFC 8955) is configured for this peer.
+    flowspec: bool,
 }
 
 /// A message from a per-peer session task to the central RIB task.
@@ -624,6 +661,8 @@ pub enum BgpQuery {
     Evpn,
     /// The per-EVI MAC-VRF views (remote MACs and the VTEP flood set) — `show evpn`.
     EvpnVnis,
+    /// The FlowSpec Loc-RIB installed rules (RFC 8955) — `show bgp flowspec`.
+    FlowSpec,
     /// Dynamically originate (or withdraw) a type-2 EVPN MAC/IP route at runtime —
     /// `evpn advertise|withdraw <vni> <mac> [ip]`. The write-side counterpart to the
     /// `monitor evpn` read feed: the fabric datapath calls this when it learns (or
@@ -848,6 +887,27 @@ pub fn render_bgp_evpn(rib: &EvpnRib) -> String {
             "{nlri}  via {}  from {}",
             path.next_hop, path.peer_addr
         );
+    }
+    out
+}
+
+/// Render the FlowSpec Loc-RIB installed rules (RFC 8955), one per line —
+/// `show bgp flowspec`. Each line carries the match components, the
+/// traffic-filtering action(s) recovered from the best path's ext-communities
+/// (§7), and the advertising peer.
+pub fn render_bgp_flowspec(rib: &FlowSpecRib) -> String {
+    if rib.is_empty() {
+        return "no flowspec rules\n".to_string();
+    }
+    let mut out = String::new();
+    for (nlri, path) in rib.iter_best() {
+        let actions = actions_of(path);
+        let action = if actions.is_empty() {
+            "no-action".to_string()
+        } else {
+            actions.iter().map(|a| a.to_string()).collect::<Vec<_>>().join(", ")
+        };
+        let _ = writeln!(out, "{nlri}  ->  {action}  from {}", path.peer_addr);
     }
     out
 }
@@ -1308,6 +1368,7 @@ pub async fn run(
                         add_path: p.add_path,
                         ext_nexthop: p.ext_nexthop,
                         evpn: p.evpn,
+                        flowspec: p.flowspec,
                     },
                 )
             })
@@ -1363,6 +1424,7 @@ pub async fn run(
             add_path: peer.add_path,
             ext_nexthop: peer.ext_nexthop,
             evpn: peer.evpn,
+            flowspec: peer.flowspec,
         };
         let auth = peer.tcp_auth();
         let local = local.clone();
@@ -1423,6 +1485,19 @@ pub async fn run(
             }
         }
     }
+
+    // FlowSpec (RFC 8955): the local rules to originate to FlowSpec-activated peers,
+    // and the FlowSpec Loc-RIB holding the rules received from them. Unlike EVPN there
+    // is no per-instance import view — a rule is stored as-is and its action is read
+    // back from the best path's ext-communities. Installing the selected rules into a
+    // forwarding datapath (the fabric eBPF flow classifier) is a separate, privileged
+    // step and is not done here.
+    let mut flowspec_rib = FlowSpecRib::new();
+    let flowspec_originated: Vec<FlowSpecRuleCfg> = cfg
+        .flowspec
+        .as_ref()
+        .map(|f| f.rules.clone())
+        .unwrap_or_default();
 
     let mut rib = BgpRib::with_max_paths(cfg.max_paths);
     loop {
@@ -1485,6 +1560,7 @@ pub async fn run(
                     },
                     BgpQuery::Evpn => render_bgp_evpn(&evpn_rib),
                     BgpQuery::EvpnVnis => render_evpn_vnis(&evis),
+                    BgpQuery::FlowSpec => render_bgp_flowspec(&flowspec_rib),
                     // Dynamic type-2 origination/withdrawal (`evpn advertise|withdraw`).
                     // Update the persistent origination set (so peers that connect later
                     // still get it) then push to every established EVPN-activated session.
@@ -1742,6 +1818,16 @@ pub async fn run(
                         let _ = cmd_tx.send(SessionCmd::PropagateEvpn(prop_evpn)).await;
                     }
                 }
+                // FlowSpec (RFC 8955): to a FlowSpec-activated peer, advertise our
+                // configured flow rules. (Received rules live in the FlowSpec RIB and
+                // are not reflected onward here — origination is controller-driven.)
+                if local.peers.get(&p).map(|pp| pp.flowspec) == Some(true)
+                    && !flowspec_originated.is_empty()
+                {
+                    let _ = cmd_tx
+                        .send(SessionCmd::AdvertiseFlowSpec(flowspec_originated.clone()))
+                        .await;
+                }
                 // Initial advertisement done: send the End-of-RIB marker so a helper
                 // on the peer's side knows our re-advertisement is complete (RFC 4724
                 // §2). Queued after Advertise/Propagate, so it arrives last.
@@ -1849,6 +1935,10 @@ pub async fn run(
                         &sessions,
                     )
                     .await;
+                }
+                // FlowSpec (RFC 8955): drop every rule this peer taught us.
+                for ev in flowspec_rib.withdraw_peer(p) {
+                    log_flowspec_event(&ev);
                 }
                 for pfx in addpath_affected {
                     propagate_addpath(pfx, &rib, &local, &mut addpath, &addpath_send, &sessions)
@@ -2134,6 +2224,25 @@ pub async fn run(
                         }
                         None => {
                             warn!(peer = %peer, len = nh_octets.len(), "EVPN MP_REACH next hop is neither 4 nor 16 octets; ignored")
+                        }
+                    }
+                }
+                // FlowSpec withdrawals (MP_UNREACH_NLRI, SAFI 133, RFC 8955).
+                for nlri in mp_unreach_flowspec(&update) {
+                    if let Some(ev) = flowspec_rib.withdraw(peer, nlri) {
+                        log_flowspec_event(&ev);
+                    }
+                }
+                // FlowSpec reachability (MP_REACH_NLRI, SAFI 133): install each flow
+                // rule into the FlowSpec RIB. The action rides in the path's
+                // ext-communities (RFC 8955 §7), captured by `build_path`. FlowSpec has
+                // no next hop, so the path's next hop is the advertising peer.
+                if let Some((afi, nlris)) = mp_reach_flowspec(&update) {
+                    let path = build_path(&update, peer, None, facts);
+                    for spec in nlris {
+                        let nlri = FlowSpecNlri { afi, spec };
+                        if let Some(ev) = flowspec_rib.update(peer, nlri, path.clone()) {
+                            log_flowspec_event(&ev);
                         }
                     }
                 }
@@ -2749,6 +2858,49 @@ fn mp_unreach_evpn(update: &Update) -> &[EvpnNlri] {
         .unwrap_or(&[])
 }
 
+/// The MP_REACH_NLRI carrying FlowSpec rules (SAFI 133, RFC 8955 §4): the AFI and
+/// the flow specifications (owned, so the caller can install them while `update`
+/// stays borrowed elsewhere). The next hop is ignored (§4).
+fn mp_reach_flowspec(update: &Update) -> Option<(u16, Vec<FlowSpec>)> {
+    update.attributes.iter().find_map(|a| match a {
+        PathAttribute::MpReachFlowSpec { afi, nlri, .. } => Some((*afi, nlri.clone())),
+        _ => None,
+    })
+}
+
+/// The MP_UNREACH_NLRI FlowSpec withdrawals of an UPDATE (SAFI 133, RFC 8955),
+/// returned as owned NLRI keyed by their AFI.
+fn mp_unreach_flowspec(update: &Update) -> Vec<FlowSpecNlri> {
+    update
+        .attributes
+        .iter()
+        .find_map(|a| match a {
+            PathAttribute::MpUnreachFlowSpec { afi, withdrawn } => Some(
+                withdrawn
+                    .iter()
+                    .map(|spec| FlowSpecNlri { afi: *afi, spec: spec.clone() })
+                    .collect(),
+            ),
+            _ => None,
+        })
+        .unwrap_or_default()
+}
+
+/// Log a FlowSpec Loc-RIB change (RFC 8955). The wren-side deliverable stops at the
+/// RIB and its `show`; installing the selected rule into a forwarding datapath (the
+/// fabric eBPF flow classifier) is a separate, privileged step done elsewhere.
+fn log_flowspec_event(ev: &FlowSpecRibEvent) {
+    match ev {
+        FlowSpecRibEvent::Best { nlri, path } => {
+            let actions: Vec<String> = actions_of(path).iter().map(|a| a.to_string()).collect();
+            info!(rule = %nlri, action = %actions.join(","), from = %path.peer_addr, "FlowSpec rule installed");
+        }
+        FlowSpecRibEvent::Withdrawn(nlri) => {
+            info!(rule = %nlri, "FlowSpec rule withdrawn");
+        }
+    }
+}
+
 /// Our VTEP address as the raw next-hop octets carried in an EVPN MP_REACH_NLRI
 /// (4 octets for an IPv4 VTEP, 16 for an IPv6 one).
 fn vtep_next_hop_octets(ip: IpAddr) -> Vec<u8> {
@@ -2959,6 +3111,7 @@ async fn accept_loop(listener: TcpListener, local: Arc<Local>, tx: mpsc::Sender<
                     add_path: props.add_path,
                     ext_nexthop: props.ext_nexthop,
                     evpn: props.evpn,
+                    flowspec: props.flowspec,
                 };
                 let local = local.clone();
                 let tx = tx.clone();
@@ -3512,6 +3665,8 @@ async fn drive_session(
         mp_ipv6: false,
         evpn_cfg: peer.evpn,
         mp_evpn: false,
+        flowspec_cfg: peer.flowspec,
+        mp_flowspec: false,
         add_path_cfg: peer.add_path,
         add_path_send: false,
         add_path_recv: false,
@@ -3563,6 +3718,11 @@ async fn drive_session(
                             // it is configured here (RFC 7432 §4).
                             sess.mp_evpn =
                                 sess.evpn_cfg && o.supports_multiprotocol(AFI_L2VPN, SAFI_EVPN);
+                            // Send FlowSpec NLRI only if the peer negotiated SAFI 133
+                            // (for either AFI) AND it is configured here (RFC 8955 §4).
+                            sess.mp_flowspec = sess.flowspec_cfg
+                                && (o.supports_multiprotocol(AFI_IPV4, SAFI_FLOWSPEC)
+                                    || o.supports_multiprotocol(AFI_IPV6, SAFI_FLOWSPEC));
                             // ADD-PATH (RFC 7911 §4): the directions in effect are the
                             // intersection of what we offered (Send+Receive when
                             // configured) and what the peer advertised. We may SEND when
@@ -3707,6 +3867,12 @@ async fn drive_session(
                     sess.withdraw_evpn(&nlris).await?;
                 }
             }
+            // FlowSpec (RFC 8955): only act once Established and the family negotiated.
+            Step::Cmd(SessionCmd::AdvertiseFlowSpec(rules)) => {
+                if sess.established && sess.mp_flowspec {
+                    sess.advertise_flowspec(&rules).await?;
+                }
+            }
             Step::Handled => {}
             // The central task asks us to send a ROUTE-REFRESH to the peer (the
             // operator ran `bgp refresh <peer>`). Send it for IPv4 unicast, and for
@@ -3754,6 +3920,19 @@ async fn drive_session(
                         let _ = sess
                             .send(&Message::Update(Update {
                                 attributes: vec![PathAttribute::MpUnreachEvpn {
+                                    withdrawn: vec![],
+                                }],
+                                ..Default::default()
+                            }))
+                            .await;
+                    }
+                    // FlowSpec End-of-RIB (RFC 8955 / RFC 4724 §2): an empty FlowSpec
+                    // MP_UNREACH_NLRI for IPv4 (AFI 1 · SAFI 133).
+                    if sess.mp_flowspec {
+                        let _ = sess
+                            .send(&Message::Update(Update {
+                                attributes: vec![PathAttribute::MpUnreachFlowSpec {
+                                    afi: AFI_IPV4,
                                     withdrawn: vec![],
                                 }],
                                 ..Default::default()
@@ -3901,6 +4080,13 @@ struct Session<'a> {
     /// Whether the peer advertised the L2VPN/EVPN Multiprotocol capability
     /// (RFC 7432) — only then do we send it EVPN NLRI.
     mp_evpn: bool,
+    /// Whether this peer is FlowSpec-activated in our config (RFC 8955) — we then
+    /// advertise the FlowSpec Multiprotocol capability (AFI 1 and 2 · SAFI 133) in
+    /// our OPEN.
+    flowspec_cfg: bool,
+    /// Whether the peer advertised a FlowSpec Multiprotocol capability (SAFI 133,
+    /// AFI 1 or 2) — only then do we send it FlowSpec NLRI.
+    mp_flowspec: bool,
     /// Whether ADD-PATH (RFC 7911) is configured for this peer — we then advertise
     /// the ADD-PATH capability (Send+Receive, IPv4 unicast) in our OPEN.
     add_path_cfg: bool,
@@ -3970,6 +4156,19 @@ impl Session<'_> {
                         open.capabilities.push(Capability::Multiprotocol {
                             afi: AFI_L2VPN,
                             safi: SAFI_EVPN,
+                        });
+                    }
+                    // FlowSpec (RFC 8955 §4 + RFC 4760): advertise the FlowSpec
+                    // Multiprotocol capability for both IPv4 (AFI 1) and IPv6 (AFI 2)
+                    // when this peer is FlowSpec-activated.
+                    if self.flowspec_cfg {
+                        open.capabilities.push(Capability::Multiprotocol {
+                            afi: AFI_IPV4,
+                            safi: SAFI_FLOWSPEC,
+                        });
+                        open.capabilities.push(Capability::Multiprotocol {
+                            afi: AFI_IPV6,
+                            safi: SAFI_FLOWSPEC,
                         });
                     }
                     // Keep the encoded OPEN for the BMP Peer Up (RFC 7854 §4.10).
@@ -4525,6 +4724,36 @@ impl Session<'_> {
             ..Default::default()
         }))
         .await?;
+        Ok(())
+    }
+
+    /// Advertise locally-originated FlowSpec rules (RFC 8955 §4) to this
+    /// FlowSpec-activated peer. Rules are grouped by `(AFI, action)` — one
+    /// MP_REACH_NLRI UPDATE per group, carrying the action as a traffic-filtering
+    /// extended community (§7) shared by every NLRI in the group. FlowSpec has no
+    /// next hop (§4), so the MP_REACH next-hop field is sent empty.
+    async fn advertise_flowspec(&mut self, rules: &[FlowSpecRuleCfg]) -> Result<()> {
+        let mut groups: BTreeMap<(u16, [u8; 8]), Vec<FlowSpec>> = BTreeMap::new();
+        for r in rules {
+            groups
+                .entry((r.nlri.afi, r.action.encode()))
+                .or_default()
+                .push(r.nlri.spec.clone());
+        }
+        for ((afi, action_ec), nlri) in groups {
+            let mut attributes = self.base_path_attrs();
+            attributes.push(PathAttribute::ExtendedCommunities(vec![action_ec]));
+            attributes.push(PathAttribute::MpReachFlowSpec {
+                afi,
+                next_hop: vec![],
+                nlri,
+            });
+            self.send(&Message::Update(Update {
+                attributes,
+                ..Default::default()
+            }))
+            .await?;
+        }
         Ok(())
     }
 

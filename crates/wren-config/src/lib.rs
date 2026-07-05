@@ -556,6 +556,10 @@ pub struct Bgp {
     /// enables originating this router's EVPN routes; the family is spoken only
     /// with neighbours that set `evpn = true`.
     pub evpn: Option<BgpEvpn>,
+    /// FlowSpec address-family configuration (RFC 8955). Present enables originating
+    /// this router's flow rules; the family is spoken only with neighbours that set
+    /// `flowspec = true`.
+    pub flowspec: Option<BgpFlowSpec>,
 }
 
 /// The `[bgp.evpn]` section: this VTEP's identity plus the EVPN instances
@@ -605,6 +609,45 @@ pub struct BgpEvpnInstance {
     /// static entries serve gateways and smoke tests.
     #[serde(default, rename = "advertise-mac")]
     pub advertise_mac: Vec<String>,
+}
+
+/// The `[bgp.flowspec]` section: the flow rules this speaker originates (RFC 8955).
+/// Each rule is advertised to every neighbour with `flowspec = true`, its
+/// traffic-filtering action riding as an extended community on the same UPDATE.
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct BgpFlowSpec {
+    /// The flow rules to originate.
+    #[serde(default)]
+    pub rule: Vec<BgpFlowSpecRule>,
+}
+
+/// One `[[bgp.flowspec.rule]]`: a flow specification (its match components) plus the
+/// action to apply to matching traffic (RFC 8955 §4 + §7). Every component is
+/// optional; an empty rule matches nothing and is rejected at resolution.
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct BgpFlowSpecRule {
+    /// Destination-prefix match (type 1), as `addr/len` (IPv4 only for now).
+    pub dest: Option<String>,
+    /// Source-prefix match (type 2), as `addr/len`.
+    pub source: Option<String>,
+    /// IP-protocol match (type 3): the set of protocol numbers (e.g. `[6]` for TCP).
+    #[serde(default)]
+    pub protocol: Vec<u16>,
+    /// Port match (type 4): either source or destination port equals one of these.
+    #[serde(default)]
+    pub port: Vec<u16>,
+    /// Destination-port match (type 5).
+    #[serde(default, rename = "dest-port")]
+    pub dest_port: Vec<u16>,
+    /// Source-port match (type 6).
+    #[serde(default, rename = "source-port")]
+    pub source_port: Vec<u16>,
+    /// The action for matching traffic (RFC 8955 §7): `"discard"`,
+    /// `"rate-limit:<bytes-per-second>"` (a float; `0` is discard) or
+    /// `"mark:<dscp>"`. Defaults to `"discard"`.
+    pub action: Option<String>,
 }
 
 /// A BMP monitoring station to stream BGP state to (`[bgp.bmp]`, RFC 7854). Wren
@@ -736,6 +779,11 @@ pub struct BgpNeighbor {
     /// `[bgp.evpn]`. Defaults to false.
     #[serde(default)]
     pub evpn: bool,
+    /// Negotiate the FlowSpec address family (AFI 1/2 · SAFI 133, RFC 8955) with this
+    /// neighbour: exchange the flow rules configured under `[bgp.flowspec]`, and
+    /// install the ones this neighbour advertises. Defaults to false.
+    #[serde(default)]
+    pub flowspec: bool,
     /// Inbound route policy: the name of a `[[filter]]` applied to every route received
     /// from this neighbour before it enters the RIB (an import route-map). Reject drops
     /// the route; accept admits it, with any set-metric (→MED), set-preference
