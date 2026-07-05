@@ -21,6 +21,9 @@ use wren_core::Prefix;
 
 use crate::evpn::{decode_evpn_nlris, encode_evpn_nlri, EvpnNlri, AFI_L2VPN, SAFI_EVPN};
 use crate::flowspec::{decode_nlris as decode_flowspec_nlris, FlowSpec, SAFI_FLOWSPEC};
+use crate::link_state::{
+    decode_nlris as decode_ls_nlris, BgpLsAttribute, LinkStateNlri, AFI_LINK_STATE, SAFI_LINK_STATE,
+};
 use crate::sr_policy::{
     decode_nlris as decode_sr_policy_nlris, decode_tunnel_encap, encode_tunnel_encap, SrPolicyNlri,
     TunnelTlv, SAFI_SR_POLICY,
@@ -308,6 +311,24 @@ pub enum PathAttribute {
     /// route-leak-prevention marker, carrying the AS number that first set it. A
     /// route bearing OTC must not be advertised to a Provider, Peer or RS (§5).
     OnlyToCustomer(u32),
+    /// MP_REACH_NLRI carrying BGP-LS Link-State NLRI (AFI 16388 / SAFI 71,
+    /// RFC 7752) — a separate variant because Link-State NLRI are node/link/prefix
+    /// objects, not IP prefixes. Each object's attributes ride in the BGP-LS
+    /// Attribute (type 29) on the same UPDATE.
+    MpReachLinkState {
+        /// The next hop, raw octets (4 or 16).
+        next_hop: Vec<u8>,
+        /// The Link-State objects being advertised.
+        nlri: Vec<LinkStateNlri>,
+    },
+    /// MP_UNREACH_NLRI carrying BGP-LS withdrawals (AFI 16388 / SAFI 71).
+    MpUnreachLinkState {
+        /// The Link-State objects being withdrawn.
+        withdrawn: Vec<LinkStateNlri>,
+    },
+    /// BGP-LS Attribute (type 29, optional non-transitive, RFC 7752 §3.3) — the
+    /// node / link / prefix attribute TLVs of a Link-State object.
+    BgpLs(BgpLsAttribute),
     /// An attribute type this implementation does not model, kept verbatim.
     Unknown {
         /// The original attribute flags.
@@ -335,6 +356,7 @@ impl PathAttribute {
     const EXTENDED_COMMUNITIES: u8 = 16;
     const AS4_PATH: u8 = 17;
     const AS4_AGGREGATOR: u8 = 18;
+    const BGP_LS: u8 = 29;
     const LARGE_COMMUNITIES: u8 = 32;
     const TUNNEL_ENCAP: u8 = 23;
     const ONLY_TO_CUSTOMER: u8 = 35;
@@ -355,11 +377,13 @@ impl PathAttribute {
             PathAttribute::MpReachNlri { .. }
             | PathAttribute::MpReachEvpn { .. }
             | PathAttribute::MpReachFlowSpec { .. }
-            | PathAttribute::MpReachSrPolicy { .. } => Self::MP_REACH_NLRI,
+            | PathAttribute::MpReachSrPolicy { .. }
+            | PathAttribute::MpReachLinkState { .. } => Self::MP_REACH_NLRI,
             PathAttribute::MpUnreachNlri { .. }
             | PathAttribute::MpUnreachEvpn { .. }
             | PathAttribute::MpUnreachFlowSpec { .. }
-            | PathAttribute::MpUnreachSrPolicy { .. } => Self::MP_UNREACH_NLRI,
+            | PathAttribute::MpUnreachSrPolicy { .. }
+            | PathAttribute::MpUnreachLinkState { .. } => Self::MP_UNREACH_NLRI,
             PathAttribute::OriginatorId(_) => Self::ORIGINATOR_ID,
             PathAttribute::ClusterList(_) => Self::CLUSTER_LIST,
             PathAttribute::LargeCommunities(_) => Self::LARGE_COMMUNITIES,
@@ -368,6 +392,7 @@ impl PathAttribute {
             PathAttribute::PrefixSid { .. } => Self::PREFIX_SID,
             PathAttribute::TunnelEncap(_) => Self::TUNNEL_ENCAP,
             PathAttribute::OnlyToCustomer(_) => Self::ONLY_TO_CUSTOMER,
+            PathAttribute::BgpLs(_) => Self::BGP_LS,
             PathAttribute::Unknown { type_code, .. } => *type_code,
         }
     }
@@ -385,6 +410,9 @@ impl PathAttribute {
             | PathAttribute::MpUnreachFlowSpec { .. }
             | PathAttribute::MpReachSrPolicy { .. }
             | PathAttribute::MpUnreachSrPolicy { .. }
+            | PathAttribute::MpReachLinkState { .. }
+            | PathAttribute::MpUnreachLinkState { .. }
+            | PathAttribute::BgpLs(_)
             | PathAttribute::OriginatorId(_)
             | PathAttribute::ClusterList(_) => FLAG_OPTIONAL,
             PathAttribute::Aggregator { .. }
@@ -501,6 +529,24 @@ impl PathAttribute {
                 }
             }
             PathAttribute::TunnelEncap(tlvs) => out.extend_from_slice(&encode_tunnel_encap(tlvs)),
+            PathAttribute::MpReachLinkState { next_hop, nlri } => {
+                out.extend_from_slice(&AFI_LINK_STATE.to_be_bytes());
+                out.push(SAFI_LINK_STATE);
+                out.push(next_hop.len() as u8);
+                out.extend_from_slice(next_hop);
+                out.push(0); // Reserved (SNPA count, unused)
+                for n in nlri {
+                    n.encode(out);
+                }
+            }
+            PathAttribute::MpUnreachLinkState { withdrawn } => {
+                out.extend_from_slice(&AFI_LINK_STATE.to_be_bytes());
+                out.push(SAFI_LINK_STATE);
+                for n in withdrawn {
+                    n.encode(out);
+                }
+            }
+            PathAttribute::BgpLs(attr) => attr.encode(out),
             PathAttribute::OriginatorId(id) => out.extend_from_slice(&id.octets()),
             PathAttribute::ClusterList(ids) => {
                 for id in ids {
@@ -661,6 +707,9 @@ impl PathAttribute {
                 } else if safi == SAFI_SR_POLICY {
                     let nlri = decode_sr_policy_nlris(&value[nh_end + 1..], afi)?;
                     PathAttribute::MpReachSrPolicy { afi, next_hop, nlri }
+                } else if afi == AFI_LINK_STATE && safi == SAFI_LINK_STATE {
+                    let nlri = decode_ls_nlris(&value[nh_end + 1..])?;
+                    PathAttribute::MpReachLinkState { next_hop, nlri }
                 } else {
                     let nlri = decode_mp_prefixes(&value[nh_end + 1..], afi)?;
                     PathAttribute::MpReachNlri { afi, safi, next_hop, nlri }
@@ -681,6 +730,9 @@ impl PathAttribute {
                 } else if safi == SAFI_SR_POLICY {
                     let withdrawn = decode_sr_policy_nlris(&value[3..], afi)?;
                     PathAttribute::MpUnreachSrPolicy { afi, withdrawn }
+                } else if afi == AFI_LINK_STATE && safi == SAFI_LINK_STATE {
+                    let withdrawn = decode_ls_nlris(&value[3..])?;
+                    PathAttribute::MpUnreachLinkState { withdrawn }
                 } else {
                     let withdrawn = decode_mp_prefixes(&value[3..], afi)?;
                     PathAttribute::MpUnreachNlri { afi, safi, withdrawn }
@@ -715,6 +767,16 @@ impl PathAttribute {
                 Some(tlvs) => PathAttribute::TunnelEncap(tlvs),
                 // A malformed Tunnel Encapsulation attribute is optional-transitive:
                 // keep it opaque (RFC 7606) rather than failing the UPDATE.
+                None => PathAttribute::Unknown {
+                    flags,
+                    type_code,
+                    value: value.to_vec(),
+                },
+            },
+            Self::BGP_LS => match BgpLsAttribute::decode(value) {
+                Some(attr) => PathAttribute::BgpLs(attr),
+                // A malformed BGP-LS attribute is optional non-transitive: keep it
+                // opaque (RFC 7606) rather than failing the UPDATE.
                 None => PathAttribute::Unknown {
                     flags,
                     type_code,

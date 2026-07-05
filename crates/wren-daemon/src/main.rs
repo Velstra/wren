@@ -1582,6 +1582,7 @@ fn build_bgp_config(
             evpn: n.evpn,
             flowspec: n.flowspec,
             srpolicy: n.srpolicy,
+            link_state: n.link_state,
             import,
             export,
             role,
@@ -1708,6 +1709,15 @@ fn build_bgp_config(
     if !srpolicy_originate.is_empty() && !bgp.neighbor.iter().any(|n| n.srpolicy) {
         warn!("bgp `[[bgp.srpolicy]]` is configured but no neighbor has `srpolicy = true`; no peer will carry SR Policy");
     }
+    // BGP-LS (RFC 7752, SAFI 71): resolve each static `[[bgp.link-state]]` object into
+    // its Link-State NLRI plus BGP-LS attribute.
+    let mut link_state_originate = Vec::with_capacity(bgp.link_state.len());
+    for o in &bgp.link_state {
+        link_state_originate.push(build_link_state(o)?);
+    }
+    if !link_state_originate.is_empty() && !bgp.neighbor.iter().any(|n| n.link_state) {
+        warn!("bgp `[[bgp.link-state]]` is configured but no neighbor has `link-state = true`; no peer will carry BGP-LS");
+    }
     Ok(bgp::BgpConfig {
         local_as: bgp.local_as,
         router_id,
@@ -1731,6 +1741,7 @@ fn build_bgp_config(
         evpn,
         flowspec,
         srpolicy_originate,
+        link_state_originate,
     })
 }
 
@@ -1800,6 +1811,135 @@ fn parse_sid_or_label(s: &str) -> Result<wren_bgp::sr_policy::Segment> {
         return Ok(Segment::MplsLabel(label));
     }
     anyhow::bail!("{s:?} is neither an IPv6 SRv6 SID nor an MPLS label")
+}
+
+/// Resolve one static `[[bgp.link-state]]` object into a BGP-LS NLRI plus its
+/// attribute (RFC 7752): a Node, Link or Prefix with the given descriptors and
+/// attributes. Node identity uses the OSPF 4-octet IGP Router-ID.
+fn build_link_state(
+    o: &wren_config::BgpLinkState,
+) -> Result<(
+    wren_bgp::link_state::LinkStateNlri,
+    wren_bgp::link_state::BgpLsAttribute,
+)> {
+    use wren_bgp::link_state::{
+        BgpLsAttribute, LinkStateNlri, LsObjectKind, LsTlv, ATTR_ADMIN_GROUP, ATTR_IGP_METRIC,
+        ATTR_NODE_NAME, SUBTLV_AUTONOMOUS_SYSTEM, SUBTLV_IGP_ROUTER_ID, TLV_IP_REACHABILITY,
+        TLV_LOCAL_NODE_DESCRIPTORS, TLV_REMOTE_NODE_DESCRIPTORS,
+    };
+    // The IGP the object is attributed to (RFC 7752 §3.2 Protocol-IDs).
+    let protocol = match o.protocol.as_deref().unwrap_or("ospf") {
+        "isis-l1" => 1,
+        "isis-l2" => 2,
+        "ospf" | "ospfv2" => 3,
+        "direct" => 4,
+        "static" => 5,
+        "ospfv3" => 6,
+        other => anyhow::bail!("bgp link-state protocol {other:?} is unknown"),
+    };
+    let router_id: Ipv4Addr = o
+        .router_id
+        .parse()
+        .with_context(|| format!("bgp link-state router-id {:?} must be a dotted quad", o.router_id))?;
+    // Build a Node Descriptors TLV (256 local / 257 remote) from an IGP Router-ID and
+    // optional AS.
+    let node_descriptors = |rid: Ipv4Addr, as_num: Option<u32>, typ: u16| -> LsTlv {
+        let mut sub = Vec::new();
+        if let Some(asn) = as_num {
+            LsTlv {
+                typ: SUBTLV_AUTONOMOUS_SYSTEM,
+                value: asn.to_be_bytes().to_vec(),
+            }
+            .encode(&mut sub);
+        }
+        LsTlv {
+            typ: SUBTLV_IGP_ROUTER_ID,
+            value: rid.octets().to_vec(),
+        }
+        .encode(&mut sub);
+        LsTlv { typ, value: sub }
+    };
+
+    let mut descriptors = vec![node_descriptors(
+        router_id,
+        o.autonomous_system,
+        TLV_LOCAL_NODE_DESCRIPTORS,
+    )];
+    let kind = match o.kind.as_str() {
+        "node" => LsObjectKind::Node,
+        "link" => {
+            let remote: Ipv4Addr = o
+                .remote_router_id
+                .as_deref()
+                .context("bgp link-state link needs a `remote-router-id`")?
+                .parse()
+                .context("bgp link-state remote-router-id must be a dotted quad")?;
+            descriptors.push(node_descriptors(remote, None, TLV_REMOTE_NODE_DESCRIPTORS));
+            // Link descriptors: IPv4 interface (259) / neighbor (260) addresses.
+            if let Some(a) = &o.local_interface {
+                let ip: Ipv4Addr = a.parse().context("bgp link-state local-interface")?;
+                descriptors.push(LsTlv { typ: 259, value: ip.octets().to_vec() });
+            }
+            if let Some(a) = &o.remote_interface {
+                let ip: Ipv4Addr = a.parse().context("bgp link-state remote-interface")?;
+                descriptors.push(LsTlv { typ: 260, value: ip.octets().to_vec() });
+            }
+            LsObjectKind::Link
+        }
+        "prefix" | "ipv4-prefix" => {
+            let p: wren_core::Prefix = o
+                .prefix
+                .as_deref()
+                .context("bgp link-state prefix needs a `prefix`")?
+                .parse()
+                .context("bgp link-state prefix must be addr/len")?;
+            // IP Reachability (265): prefix-length then the significant prefix octets.
+            let octet_len = p.len().div_ceil(8) as usize;
+            let bytes: Vec<u8> = match p.addr() {
+                std::net::IpAddr::V4(a) => a.octets()[..octet_len].to_vec(),
+                std::net::IpAddr::V6(a) => a.octets()[..octet_len].to_vec(),
+            };
+            let mut value = vec![p.len()];
+            value.extend_from_slice(&bytes);
+            descriptors.push(LsTlv { typ: TLV_IP_REACHABILITY, value });
+            if p.addr().is_ipv6() {
+                LsObjectKind::Ipv6Prefix
+            } else {
+                LsObjectKind::Ipv4Prefix
+            }
+        }
+        other => anyhow::bail!("bgp link-state type {other:?} must be node, link or prefix"),
+    };
+
+    // The attribute TLVs relevant to the object.
+    let mut tlvs = Vec::new();
+    if let Some(name) = &o.name {
+        tlvs.push(LsTlv {
+            typ: ATTR_NODE_NAME,
+            value: name.as_bytes().to_vec(),
+        });
+    }
+    if let Some(m) = o.igp_metric {
+        // 3-octet IGP metric (RFC 7752 §3.3.2.3).
+        tlvs.push(LsTlv {
+            typ: ATTR_IGP_METRIC,
+            value: m.to_be_bytes()[1..4].to_vec(),
+        });
+    }
+    if let Some(ag) = o.admin_group {
+        tlvs.push(LsTlv {
+            typ: ATTR_ADMIN_GROUP,
+            value: ag.to_be_bytes().to_vec(),
+        });
+    }
+
+    let nlri = LinkStateNlri {
+        kind,
+        protocol,
+        identifier: 0,
+        descriptors,
+    };
+    Ok((nlri, BgpLsAttribute::new(tlvs)))
 }
 
 /// Resolve `[bgp.evpn]` into a [`bgp::EvpnConfig`]: parse the VTEP IP, and for each

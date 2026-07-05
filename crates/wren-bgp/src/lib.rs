@@ -55,6 +55,8 @@ pub mod flowspec;
 pub mod flowspec_rib;
 pub mod fsm;
 pub mod large_community;
+pub mod link_state;
+pub mod link_state_rib;
 pub mod message;
 pub mod nexthop;
 pub mod rib;
@@ -114,6 +116,8 @@ pub use flowspec::SAFI_FLOWSPEC;
 /// Subsequent Address Family Identifier: SR Policy (SAFI 73) — re-exported from
 /// [`sr_policy`]. Rides under AFI 1 (IPv4) and AFI 2 (IPv6) endpoints.
 pub use sr_policy::SAFI_SR_POLICY;
+/// Address Family / SAFI for BGP-LS (RFC 7752) — re-exported from [`link_state`].
+pub use link_state::{AFI_LINK_STATE, SAFI_LINK_STATE};
 
 /// The reserved 2-octet AS number that stands in for a 4-octet AS in any field a
 /// legacy (2-octet) speaker reads — the OPEN `my_as` and a 2-octet AS_PATH /

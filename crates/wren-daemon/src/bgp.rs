@@ -49,6 +49,8 @@ use wren_bgp::sr_policy::{
     SrPolicyEncoding, SrPolicyNlri, TunnelTlv, SAFI_SR_POLICY,
 };
 use wren_bgp::sr_policy_rib::{SrPolicyEntry, SrPolicyRib, SrPolicyRibEvent};
+use wren_bgp::link_state::{BgpLsAttribute, LinkStateNlri, AFI_LINK_STATE, SAFI_LINK_STATE};
+use wren_bgp::link_state_rib::{LinkStateEntry, LinkStateRib, LinkStateRibEvent};
 use wren_bgp::fsm::{Action, BgpFsm, Event, State, CODE_CEASE, CODE_OPEN_MESSAGE};
 use wren_bgp::large_community::format_large_community;
 use wren_bgp::message::{AddPath, Message, Notification, Open, Update};
@@ -163,6 +165,11 @@ pub struct BgpConfig {
     /// `srpolicy = true`. Received policies are installed into the SR Policy RIB
     /// regardless of whether any are originated.
     pub srpolicy_originate: Vec<(SrPolicyNlri, SrPolicyEncoding)>,
+    /// Static BGP-LS (RFC 7752) objects this speaker originates over SAFI 71: each an
+    /// NLRI plus its BGP-LS attribute. Advertised to neighbours configured with
+    /// `link-state = true`. Received objects are installed into the BGP-LS RIB
+    /// regardless of whether any are originated.
+    pub link_state_originate: Vec<(LinkStateNlri, BgpLsAttribute)>,
 }
 
 /// Resolved FlowSpec (RFC 8955) configuration: the flow rules this speaker
@@ -327,6 +334,10 @@ pub struct BgpPeerCfg {
     /// peer — advertise the SR Policy Multiprotocol capability, originate the configured
     /// policies to it, and install the policies it advertises into the SR Policy RIB.
     pub srpolicy: bool,
+    /// Negotiate the BGP-LS address family (AFI 16388 · SAFI 71, RFC 7752) with this
+    /// peer — advertise the BGP-LS Multiprotocol capability, originate the static
+    /// Link-State objects to it, and install the objects it advertises into the RIB.
+    pub link_state: bool,
 }
 
 impl BgpPeerCfg {
@@ -433,6 +444,8 @@ struct PeerProps {
     flowspec: bool,
     /// Whether the SR Policy family (RFC 9256, SAFI 73) is configured for this peer.
     srpolicy: bool,
+    /// Whether the BGP-LS family (RFC 7752, SAFI 71) is configured for this peer.
+    link_state: bool,
     /// This local speaker's BGP Role toward this peer (RFC 9234 §4), if configured —
     /// drives the Only-To-Customer route-leak procedures on received routes.
     role: Option<BgpRole>,
@@ -518,6 +531,9 @@ enum SessionCmd {
     /// Advertise these locally-originated SR Policies (RFC 9256, SAFI 73) to an
     /// SR-Policy-activated peer: each an NLRI plus its Tunnel Encapsulation contents.
     AdvertiseSrPolicy(Vec<(SrPolicyNlri, SrPolicyEncoding)>),
+    /// Advertise these static BGP-LS objects (RFC 7752, SAFI 71) to a BGP-LS-activated
+    /// peer: each an NLRI plus its BGP-LS attribute.
+    AdvertiseLinkState(Vec<(LinkStateNlri, BgpLsAttribute)>),
 }
 
 /// One locally-originated EVPN route the central task asks a session to advertise:
@@ -613,6 +629,8 @@ struct PeerInfo {
     flowspec: bool,
     /// Whether the SR Policy family (RFC 9256, SAFI 73) is configured for this peer.
     srpolicy: bool,
+    /// Whether the BGP-LS family (RFC 7752, SAFI 71) is configured for this peer.
+    link_state: bool,
     /// This local speaker's BGP Role toward this peer (RFC 9234 §4), if configured.
     role: Option<BgpRole>,
 }
@@ -706,6 +724,8 @@ pub enum BgpQuery {
     /// The SR Policy Loc-RIB installed policies (RFC 9256, SAFI 73) — `show bgp
     /// sr-policy` / `show sr-policy`.
     SrPolicy,
+    /// The BGP-LS Loc-RIB objects (RFC 7752, SAFI 71) — `show bgp link-state`.
+    LinkState,
     /// Dynamically originate (or withdraw) a type-2 EVPN MAC/IP route at runtime —
     /// `evpn advertise|withdraw <vni> <mac> [ip]`. The write-side counterpart to the
     /// `monitor evpn` read feed: the fabric datapath calls this when it learns (or
@@ -1007,6 +1027,70 @@ fn render_binding_sid(bsid: &wren_bgp::sr_policy::BindingSid) -> String {
         BindingSid::Srv6Sid(sid) => std::net::Ipv6Addr::from(*sid).to_string(),
         BindingSid::MplsLabel(label) => format!("label:{label}"),
     }
+}
+
+/// Render the BGP-LS Loc-RIB objects (RFC 7752) — `show bgp link-state`. One line per
+/// Link-State object (node / link / prefix) with the identifying descriptors and the
+/// key attributes (node name, IGP metric, admin group, SRLGs, SR presence). This is
+/// the topology a controller consumes; wren does not export its own IGP into BGP-LS.
+pub fn render_bgp_linkstate(rib: &LinkStateRib) -> String {
+    use wren_bgp::link_state::{
+        format_router_id, LsObjectKind, TLV_LOCAL_NODE_DESCRIPTORS, TLV_REMOTE_NODE_DESCRIPTORS,
+    };
+    if rib.is_empty() {
+        return "no link-state objects\n".to_string();
+    }
+    let mut out = String::new();
+    for (nlri, entry) in rib.iter_best() {
+        let attr = &entry.attr;
+        let local = nlri
+            .igp_router_id(TLV_LOCAL_NODE_DESCRIPTORS)
+            .map(|id| format_router_id(&id))
+            .unwrap_or_else(|| "?".to_string());
+        // The object-identifying middle field: the endpoint(s) or prefix.
+        let ident = match nlri.kind {
+            LsObjectKind::Node => local.clone(),
+            LsObjectKind::Link => {
+                let remote = nlri
+                    .igp_router_id(TLV_REMOTE_NODE_DESCRIPTORS)
+                    .map(|id| format_router_id(&id))
+                    .unwrap_or_else(|| "?".to_string());
+                format!("{local} -> {remote}")
+            }
+            LsObjectKind::Ipv4Prefix | LsObjectKind::Ipv6Prefix => nlri
+                .prefix()
+                .map(|p| format!("{local}: {p}"))
+                .unwrap_or_else(|| local.clone()),
+        };
+        // The attribute detail relevant to the object kind.
+        let mut detail = Vec::new();
+        if let Some(name) = attr.node_name() {
+            detail.push(format!("name {name}"));
+        }
+        if let Some(m) = attr.igp_metric() {
+            detail.push(format!("metric {m}"));
+        }
+        if let Some(ag) = attr.admin_group() {
+            detail.push(format!("admin-group 0x{ag:08x}"));
+        }
+        let srlgs = attr.srlgs();
+        if !srlgs.is_empty() {
+            let s: Vec<String> = srlgs.iter().map(|s| s.to_string()).collect();
+            detail.push(format!("srlg [{}]", s.join(",")));
+        }
+        if attr.has_sr() {
+            detail.push("sr".to_string());
+        }
+        let _ = writeln!(
+            out,
+            "{} {}  [{}]  from {}",
+            nlri.kind,
+            ident,
+            detail.join(", "),
+            entry.path.peer_addr
+        );
+    }
+    out
 }
 
 /// Render the per-EVI MAC-VRF views (RFC 7432 §9): each instance's remote-MAC table
@@ -1470,6 +1554,7 @@ pub async fn run(
                         evpn: p.evpn,
                         flowspec: p.flowspec,
                         srpolicy: p.srpolicy,
+                        link_state: p.link_state,
                         role: p.role,
                     },
                 )
@@ -1529,6 +1614,7 @@ pub async fn run(
             evpn: peer.evpn,
             flowspec: peer.flowspec,
             srpolicy: peer.srpolicy,
+            link_state: peer.link_state,
             role: peer.role,
         };
         let auth = peer.tcp_auth();
@@ -1609,6 +1695,11 @@ pub async fn run(
     // steering datapath is a separate, privileged step done elsewhere.
     let mut srpolicy_rib = SrPolicyRib::new();
     let srpolicy_originate = cfg.srpolicy_originate.clone();
+    // The BGP-LS RIB (RFC 7752, SAFI 71): received Link-State objects a controller
+    // consumes. Like the FlowSpec RIB, the wren-side deliverable stops here —
+    // exporting the local IGP topology into BGP-LS is a separate, larger step.
+    let mut link_state_rib = LinkStateRib::new();
+    let link_state_originate = cfg.link_state_originate.clone();
 
     let mut rib = BgpRib::with_max_paths(cfg.max_paths);
     loop {
@@ -1673,6 +1764,7 @@ pub async fn run(
                     BgpQuery::EvpnVnis => render_evpn_vnis(&evis),
                     BgpQuery::FlowSpec => render_bgp_flowspec(&flowspec_rib),
                     BgpQuery::SrPolicy => render_bgp_srpolicy(&srpolicy_rib),
+                    BgpQuery::LinkState => render_bgp_linkstate(&link_state_rib),
                     // Dynamic type-2 origination/withdrawal (`evpn advertise|withdraw`).
                     // Update the persistent origination set (so peers that connect later
                     // still get it) then push to every established EVPN-activated session.
@@ -1951,6 +2043,16 @@ pub async fn run(
                         .send(SessionCmd::AdvertiseSrPolicy(srpolicy_originate.clone()))
                         .await;
                 }
+                // BGP-LS (RFC 7752, SAFI 71): to a BGP-LS-activated peer, advertise our
+                // static Link-State objects. Received objects live in the BGP-LS RIB and
+                // are not reflected onward here.
+                if local.peers.get(&p).map(|pp| pp.link_state) == Some(true)
+                    && !link_state_originate.is_empty()
+                {
+                    let _ = cmd_tx
+                        .send(SessionCmd::AdvertiseLinkState(link_state_originate.clone()))
+                        .await;
+                }
                 // Initial advertisement done: send the End-of-RIB marker so a helper
                 // on the peer's side knows our re-advertisement is complete (RFC 4724
                 // §2). Queued after Advertise/Propagate, so it arrives last.
@@ -2066,6 +2168,10 @@ pub async fn run(
                 // SR Policy (RFC 9256): drop every candidate this peer taught us.
                 for ev in srpolicy_rib.withdraw_peer(p) {
                     log_srpolicy_event(&ev);
+                }
+                // BGP-LS (RFC 7752): drop every Link-State object this peer taught us.
+                for ev in link_state_rib.withdraw_peer(p) {
+                    log_linkstate_event(&ev);
                 }
                 for pfx in addpath_affected {
                     propagate_addpath(pfx, &rib, &local, &mut addpath, &addpath_send, &sessions)
@@ -2416,6 +2522,29 @@ pub async fn run(
                         };
                         if let Some(ev) = srpolicy_rib.update(peer, nlri, entry) {
                             log_srpolicy_event(&ev);
+                        }
+                    }
+                }
+                // BGP-LS withdrawals (MP_UNREACH_NLRI, SAFI 71, RFC 7752).
+                for nlri in mp_unreach_linkstate(&update) {
+                    if let Some(ev) = link_state_rib.withdraw(peer, nlri) {
+                        log_linkstate_event(&ev);
+                    }
+                }
+                // BGP-LS reachability (MP_REACH_NLRI, SAFI 71): install each Link-State
+                // object into the BGP-LS RIB. Its attributes ride in the BGP-LS
+                // Attribute (type 29) on the same UPDATE. BGP-LS has no forwarding next
+                // hop, so the path's next hop is the advertising peer.
+                if let Some(nlris) = mp_reach_linkstate(&update) {
+                    let path = build_path(&update, peer, None, facts);
+                    let attr = linkstate_attr_of(&update).unwrap_or_default();
+                    for nlri in nlris {
+                        let entry = LinkStateEntry {
+                            path: path.clone(),
+                            attr: attr.clone(),
+                        };
+                        if let Some(ev) = link_state_rib.update(peer, nlri, entry) {
+                            log_linkstate_event(&ev);
                         }
                     }
                 }
@@ -3159,6 +3288,49 @@ fn log_srpolicy_event(ev: &SrPolicyRibEvent) {
     }
 }
 
+/// The MP_REACH_NLRI carrying BGP-LS objects (SAFI 71, RFC 7752): the Link-State
+/// NLRI (owned). The next hop is not a forwarding hop for BGP-LS.
+fn mp_reach_linkstate(update: &Update) -> Option<Vec<LinkStateNlri>> {
+    update.attributes.iter().find_map(|a| match a {
+        PathAttribute::MpReachLinkState { nlri, .. } => Some(nlri.clone()),
+        _ => None,
+    })
+}
+
+/// The MP_UNREACH_NLRI BGP-LS withdrawals of an UPDATE (SAFI 71, RFC 7752).
+fn mp_unreach_linkstate(update: &Update) -> Vec<LinkStateNlri> {
+    update
+        .attributes
+        .iter()
+        .find_map(|a| match a {
+            PathAttribute::MpUnreachLinkState { withdrawn } => Some(withdrawn.clone()),
+            _ => None,
+        })
+        .unwrap_or_default()
+}
+
+/// The BGP-LS Attribute (type 29, RFC 7752 §3.3) carried in an UPDATE — a Link-State
+/// object's node/link/prefix attribute TLVs.
+fn linkstate_attr_of(update: &Update) -> Option<BgpLsAttribute> {
+    update.attributes.iter().find_map(|a| match a {
+        PathAttribute::BgpLs(attr) => Some(attr.clone()),
+        _ => None,
+    })
+}
+
+/// Log a BGP-LS Loc-RIB change (RFC 7752). The wren-side deliverable stops at the RIB
+/// and its `show`; a controller consumes the topology to compute paths.
+fn log_linkstate_event(ev: &LinkStateRibEvent) {
+    match ev {
+        LinkStateRibEvent::Best { nlri, entry } => {
+            info!(kind = %nlri.kind, from = %entry.path.peer_addr, "BGP-LS object installed");
+        }
+        LinkStateRibEvent::Withdrawn(nlri) => {
+            info!(kind = %nlri.kind, "BGP-LS object withdrawn");
+        }
+    }
+}
+
 /// Log a FlowSpec Loc-RIB change (RFC 8955). The wren-side deliverable stops at the
 /// RIB and its `show`; installing the selected rule into a forwarding datapath (the
 /// fabric eBPF flow classifier) is a separate, privileged step done elsewhere.
@@ -3386,6 +3558,7 @@ async fn accept_loop(listener: TcpListener, local: Arc<Local>, tx: mpsc::Sender<
                     evpn: props.evpn,
                     flowspec: props.flowspec,
                     srpolicy: props.srpolicy,
+                    link_state: props.link_state,
                     role: props.role,
                 };
                 let local = local.clone();
@@ -3945,6 +4118,8 @@ async fn drive_session(
         mp_flowspec: false,
         srpolicy_cfg: peer.srpolicy,
         mp_srpolicy: false,
+        link_state_cfg: peer.link_state,
+        mp_link_state: false,
         add_path_cfg: peer.add_path,
         add_path_send: false,
         add_path_recv: false,
@@ -4018,6 +4193,10 @@ async fn drive_session(
                             sess.mp_srpolicy = sess.srpolicy_cfg
                                 && (o.supports_multiprotocol(AFI_IPV4, SAFI_SR_POLICY)
                                     || o.supports_multiprotocol(AFI_IPV6, SAFI_SR_POLICY));
+                            // Send BGP-LS NLRI only if the peer negotiated AFI 16388 /
+                            // SAFI 71 AND it is configured here (RFC 7752).
+                            sess.mp_link_state = sess.link_state_cfg
+                                && o.supports_multiprotocol(AFI_LINK_STATE, SAFI_LINK_STATE);
                             // ADD-PATH (RFC 7911 §4): the directions in effect are the
                             // intersection of what we offered (Send+Receive when
                             // configured) and what the peer advertised. We may SEND when
@@ -4172,6 +4351,12 @@ async fn drive_session(
             Step::Cmd(SessionCmd::AdvertiseSrPolicy(policies)) => {
                 if sess.established && sess.mp_srpolicy {
                     sess.advertise_srpolicy(&policies).await?;
+                }
+            }
+            // BGP-LS (RFC 7752): only act once Established and the family negotiated.
+            Step::Cmd(SessionCmd::AdvertiseLinkState(objects)) => {
+                if sess.established && sess.mp_link_state {
+                    sess.advertise_link_state(&objects).await?;
                 }
             }
             Step::Handled => {}
@@ -4413,6 +4598,12 @@ struct Session<'a> {
     /// Whether the peer advertised an SR Policy Multiprotocol capability (SAFI 73,
     /// AFI 1 or 2) — only then do we send it SR Policy NLRI.
     mp_srpolicy: bool,
+    /// Whether this peer is BGP-LS-activated in our config (RFC 7752) — we then
+    /// advertise the BGP-LS Multiprotocol capability (AFI 16388 · SAFI 71) in our OPEN.
+    link_state_cfg: bool,
+    /// Whether the peer advertised the BGP-LS Multiprotocol capability (AFI 16388 ·
+    /// SAFI 71) — only then do we send it Link-State NLRI.
+    mp_link_state: bool,
     /// Whether ADD-PATH (RFC 7911) is configured for this peer — we then advertise
     /// the ADD-PATH capability (Send+Receive, IPv4 unicast) in our OPEN.
     add_path_cfg: bool,
@@ -4513,6 +4704,14 @@ impl Session<'_> {
                         open.capabilities.push(Capability::Multiprotocol {
                             afi: AFI_IPV6,
                             safi: SAFI_SR_POLICY,
+                        });
+                    }
+                    // BGP-LS (RFC 7752 + RFC 4760): advertise the Link-State
+                    // Multiprotocol capability when this peer is BGP-LS-activated.
+                    if self.link_state_cfg {
+                        open.capabilities.push(Capability::Multiprotocol {
+                            afi: AFI_LINK_STATE,
+                            safi: SAFI_LINK_STATE,
                         });
                     }
                     // Keep the encoded OPEN for the BMP Peer Up (RFC 7854 §4.10).
@@ -5179,6 +5378,32 @@ impl Session<'_> {
                 afi,
                 next_hop: vec![],
                 nlri: vec![*nlri],
+            });
+            self.send(&Message::Update(Update {
+                attributes,
+                ..Default::default()
+            }))
+            .await?;
+        }
+        Ok(())
+    }
+
+    /// Advertise static BGP-LS objects (RFC 7752, SAFI 71) to this peer. Each object
+    /// is one UPDATE: an MP_REACH_NLRI (AFI 16388 / SAFI 71) with the Link-State NLRI,
+    /// plus a BGP-LS Attribute (type 29) carrying its attribute TLVs. BGP-LS has no
+    /// forwarding next hop, so the MP_REACH next-hop field carries our router-id.
+    async fn advertise_link_state(
+        &mut self,
+        objects: &[(LinkStateNlri, BgpLsAttribute)],
+    ) -> Result<()> {
+        for (nlri, attr) in objects {
+            let mut attributes = self.base_path_attrs();
+            if !attr.tlvs.is_empty() {
+                attributes.push(PathAttribute::BgpLs(attr.clone()));
+            }
+            attributes.push(PathAttribute::MpReachLinkState {
+                next_hop: self.local_ip.octets().to_vec(),
+                nlri: vec![nlri.clone()],
             });
             self.send(&Message::Update(Update {
                 attributes,

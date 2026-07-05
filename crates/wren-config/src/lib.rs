@@ -692,6 +692,12 @@ pub struct Bgp {
     /// `srpolicy = true`.
     #[serde(default, rename = "srpolicy")]
     pub srpolicy: Vec<BgpSrPolicy>,
+    /// Static BGP-LS (RFC 7752) Link-State objects this speaker originates over
+    /// SAFI 71. Exporting the *live* OSPF/IS-IS topology into BGP-LS is future work;
+    /// these static objects let a controller be fed a topology (and drive the smoke).
+    /// Advertised to neighbours that set `link-state = true`.
+    #[serde(default, rename = "link-state")]
+    pub link_state: Vec<BgpLinkState>,
 }
 
 /// One `[[bgp.srpolicy]]`: an SR Policy candidate path this speaker originates
@@ -723,6 +729,44 @@ pub struct BgpSrPolicy {
     pub segment_list: Vec<String>,
     /// The load-balancing weight for this segment list. Optional.
     pub weight: Option<u32>,
+}
+
+/// One `[[bgp.link-state]]`: a static BGP-LS object (RFC 7752) this speaker
+/// originates — a Node, Link or Prefix, with the descriptors and attributes given.
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct BgpLinkState {
+    /// The object kind: `node`, `link` or `prefix`.
+    #[serde(rename = "type")]
+    pub kind: String,
+    /// The IGP the object is attributed to: `ospf` (default), `ospfv3`, `isis-l1`,
+    /// `isis-l2`, `direct` or `static`.
+    pub protocol: Option<String>,
+    /// The local node's IGP Router-ID (a dotted quad — an OSPF router-id).
+    #[serde(rename = "router-id")]
+    pub router_id: String,
+    /// The local node's Autonomous System, if any.
+    #[serde(rename = "as")]
+    pub autonomous_system: Option<u32>,
+    /// Node Name attribute (a `node` object).
+    pub name: Option<String>,
+    /// IGP Metric attribute (a `link` or `prefix` object).
+    #[serde(rename = "igp-metric")]
+    pub igp_metric: Option<u32>,
+    /// Administrative Group / colour bitmask attribute (a `link` object).
+    #[serde(rename = "admin-group")]
+    pub admin_group: Option<u32>,
+    /// The remote node's IGP Router-ID (a `link` object, a dotted quad).
+    #[serde(rename = "remote-router-id")]
+    pub remote_router_id: Option<String>,
+    /// The link's local interface IPv4 address (a `link` object).
+    #[serde(rename = "local-interface")]
+    pub local_interface: Option<String>,
+    /// The link's remote (neighbor) interface IPv4 address (a `link` object).
+    #[serde(rename = "remote-interface")]
+    pub remote_interface: Option<String>,
+    /// The reachable prefix (a `prefix` object), as `addr/len`.
+    pub prefix: Option<String>,
 }
 
 /// The `[bgp.evpn]` section: this VTEP's identity plus the EVPN instances
@@ -952,6 +996,11 @@ pub struct BgpNeighbor {
     /// Policies it advertises into the SR Policy RIB. Defaults to false.
     #[serde(default)]
     pub srpolicy: bool,
+    /// Negotiate the BGP-LS address family (AFI 16388 · SAFI 71, RFC 7752) with this
+    /// neighbour: advertise the static `[[bgp.link-state]]` objects to it, and install
+    /// the Link-State objects it advertises into the BGP-LS RIB. Defaults to false.
+    #[serde(default, rename = "link-state")]
+    pub link_state: bool,
     /// Inbound route policy: the name of a `[[filter]]` applied to every route received
     /// from this neighbour before it enters the RIB (an import route-map). Reject drops
     /// the route; accept admits it, with any set-metric (→MED), set-preference
