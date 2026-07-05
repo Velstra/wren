@@ -21,6 +21,10 @@ use wren_core::Prefix;
 
 use crate::evpn::{decode_evpn_nlris, encode_evpn_nlri, EvpnNlri, AFI_L2VPN, SAFI_EVPN};
 use crate::flowspec::{decode_nlris as decode_flowspec_nlris, FlowSpec, SAFI_FLOWSPEC};
+use crate::sr_policy::{
+    decode_nlris as decode_sr_policy_nlris, decode_tunnel_encap, encode_tunnel_encap, SrPolicyNlri,
+    TunnelTlv, SAFI_SR_POLICY,
+};
 use crate::srv6::{decode_prefix_sid, encode_srv6_service_tlv, Srv6ServiceTlv};
 use crate::{as_trans_fit, decode_prefix, decode_prefix_v6, encode_prefix_any, AFI_IPV6};
 
@@ -276,6 +280,30 @@ pub enum PathAttribute {
         /// preserved as `(type, value)` for faithful re-advertisement.
         other: Vec<(u8, Vec<u8>)>,
     },
+    /// MP_REACH_NLRI carrying SR Policy candidate paths (SAFI 73,
+    /// draft-ietf-idr-segment-routing-te-policy) — a separate variant because SR
+    /// Policy NLRI are `(distinguisher, colour, endpoint)` tuples, not IP prefixes.
+    /// The candidate contents ride in the Tunnel Encapsulation attribute (type 23)
+    /// on the same UPDATE.
+    MpReachSrPolicy {
+        /// The Address Family Identifier of the endpoint: IPv4 or IPv6.
+        afi: u16,
+        /// The next hop, raw octets (4 or 16) — ignored for SR Policy but carried.
+        next_hop: Vec<u8>,
+        /// The SR Policy candidate-path NLRI being advertised.
+        nlri: Vec<SrPolicyNlri>,
+    },
+    /// MP_UNREACH_NLRI carrying SR Policy withdrawals (SAFI 73).
+    MpUnreachSrPolicy {
+        /// The Address Family Identifier of the endpoint: IPv4 or IPv6.
+        afi: u16,
+        /// The SR Policy candidate-path NLRI being withdrawn.
+        withdrawn: Vec<SrPolicyNlri>,
+    },
+    /// Tunnel Encapsulation (type 23, optional transitive, RFC 9012) — a set of
+    /// tunnel TLVs. Used here to carry the SR Policy (Tunnel-Type 15) contents of
+    /// an SR Policy route; other tunnel types are kept opaque.
+    TunnelEncap(Vec<TunnelTlv>),
     /// Only-To-Customer (OTC, type 35, optional transitive) — the RFC 9234 §4.1
     /// route-leak-prevention marker, carrying the AS number that first set it. A
     /// route bearing OTC must not be advertised to a Provider, Peer or RS (§5).
@@ -308,6 +336,7 @@ impl PathAttribute {
     const AS4_PATH: u8 = 17;
     const AS4_AGGREGATOR: u8 = 18;
     const LARGE_COMMUNITIES: u8 = 32;
+    const TUNNEL_ENCAP: u8 = 23;
     const ONLY_TO_CUSTOMER: u8 = 35;
     const PREFIX_SID: u8 = 40;
 
@@ -325,16 +354,19 @@ impl PathAttribute {
             PathAttribute::ExtendedCommunities(_) => Self::EXTENDED_COMMUNITIES,
             PathAttribute::MpReachNlri { .. }
             | PathAttribute::MpReachEvpn { .. }
-            | PathAttribute::MpReachFlowSpec { .. } => Self::MP_REACH_NLRI,
+            | PathAttribute::MpReachFlowSpec { .. }
+            | PathAttribute::MpReachSrPolicy { .. } => Self::MP_REACH_NLRI,
             PathAttribute::MpUnreachNlri { .. }
             | PathAttribute::MpUnreachEvpn { .. }
-            | PathAttribute::MpUnreachFlowSpec { .. } => Self::MP_UNREACH_NLRI,
+            | PathAttribute::MpUnreachFlowSpec { .. }
+            | PathAttribute::MpUnreachSrPolicy { .. } => Self::MP_UNREACH_NLRI,
             PathAttribute::OriginatorId(_) => Self::ORIGINATOR_ID,
             PathAttribute::ClusterList(_) => Self::CLUSTER_LIST,
             PathAttribute::LargeCommunities(_) => Self::LARGE_COMMUNITIES,
             PathAttribute::As4Path(_) => Self::AS4_PATH,
             PathAttribute::As4Aggregator { .. } => Self::AS4_AGGREGATOR,
             PathAttribute::PrefixSid { .. } => Self::PREFIX_SID,
+            PathAttribute::TunnelEncap(_) => Self::TUNNEL_ENCAP,
             PathAttribute::OnlyToCustomer(_) => Self::ONLY_TO_CUSTOMER,
             PathAttribute::Unknown { type_code, .. } => *type_code,
         }
@@ -351,6 +383,8 @@ impl PathAttribute {
             | PathAttribute::MpUnreachEvpn { .. }
             | PathAttribute::MpReachFlowSpec { .. }
             | PathAttribute::MpUnreachFlowSpec { .. }
+            | PathAttribute::MpReachSrPolicy { .. }
+            | PathAttribute::MpUnreachSrPolicy { .. }
             | PathAttribute::OriginatorId(_)
             | PathAttribute::ClusterList(_) => FLAG_OPTIONAL,
             PathAttribute::Aggregator { .. }
@@ -360,6 +394,7 @@ impl PathAttribute {
             | PathAttribute::As4Path(_)
             | PathAttribute::As4Aggregator { .. }
             | PathAttribute::PrefixSid { .. }
+            | PathAttribute::TunnelEncap(_)
             | PathAttribute::OnlyToCustomer(_) => FLAG_OPTIONAL | FLAG_TRANSITIVE,
             PathAttribute::Unknown { flags, .. } => *flags,
             _ => FLAG_TRANSITIVE,
@@ -448,6 +483,24 @@ impl PathAttribute {
                     n.encode(out);
                 }
             }
+            PathAttribute::MpReachSrPolicy { afi, next_hop, nlri } => {
+                out.extend_from_slice(&afi.to_be_bytes());
+                out.push(SAFI_SR_POLICY);
+                out.push(next_hop.len() as u8);
+                out.extend_from_slice(next_hop);
+                out.push(0); // Reserved (SNPA count, unused)
+                for n in nlri {
+                    n.encode(out);
+                }
+            }
+            PathAttribute::MpUnreachSrPolicy { afi, withdrawn } => {
+                out.extend_from_slice(&afi.to_be_bytes());
+                out.push(SAFI_SR_POLICY);
+                for n in withdrawn {
+                    n.encode(out);
+                }
+            }
+            PathAttribute::TunnelEncap(tlvs) => out.extend_from_slice(&encode_tunnel_encap(tlvs)),
             PathAttribute::OriginatorId(id) => out.extend_from_slice(&id.octets()),
             PathAttribute::ClusterList(ids) => {
                 for id in ids {
@@ -605,6 +658,9 @@ impl PathAttribute {
                 } else if safi == SAFI_FLOWSPEC {
                     let nlri = decode_flowspec_nlris(&value[nh_end + 1..])?;
                     PathAttribute::MpReachFlowSpec { afi, next_hop, nlri }
+                } else if safi == SAFI_SR_POLICY {
+                    let nlri = decode_sr_policy_nlris(&value[nh_end + 1..], afi)?;
+                    PathAttribute::MpReachSrPolicy { afi, next_hop, nlri }
                 } else {
                     let nlri = decode_mp_prefixes(&value[nh_end + 1..], afi)?;
                     PathAttribute::MpReachNlri { afi, safi, next_hop, nlri }
@@ -622,6 +678,9 @@ impl PathAttribute {
                 } else if safi == SAFI_FLOWSPEC {
                     let withdrawn = decode_flowspec_nlris(&value[3..])?;
                     PathAttribute::MpUnreachFlowSpec { afi, withdrawn }
+                } else if safi == SAFI_SR_POLICY {
+                    let withdrawn = decode_sr_policy_nlris(&value[3..], afi)?;
+                    PathAttribute::MpUnreachSrPolicy { afi, withdrawn }
                 } else {
                     let withdrawn = decode_mp_prefixes(&value[3..], afi)?;
                     PathAttribute::MpUnreachNlri { afi, safi, withdrawn }
@@ -652,6 +711,16 @@ impl PathAttribute {
                 PathAttribute::As4Aggregator { asn, id }
             }
             Self::ONLY_TO_CUSTOMER => PathAttribute::OnlyToCustomer(read_u32(value)?),
+            Self::TUNNEL_ENCAP => match decode_tunnel_encap(value) {
+                Some(tlvs) => PathAttribute::TunnelEncap(tlvs),
+                // A malformed Tunnel Encapsulation attribute is optional-transitive:
+                // keep it opaque (RFC 7606) rather than failing the UPDATE.
+                None => PathAttribute::Unknown {
+                    flags,
+                    type_code,
+                    value: value.to_vec(),
+                },
+            },
             Self::PREFIX_SID => match decode_prefix_sid(value) {
                 Some((srv6, other)) => PathAttribute::PrefixSid { srv6, other },
                 // A malformed Prefix-SID is optional-transitive: keep it opaque

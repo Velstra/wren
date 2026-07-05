@@ -663,6 +663,42 @@ pub struct Bgp {
     /// this router's flow rules; the family is spoken only with neighbours that set
     /// `flowspec = true`.
     pub flowspec: Option<BgpFlowSpec>,
+    /// SR Policies (RFC 9256) this speaker originates over BGP SR Policy (SAFI 73).
+    /// Each is advertised as one candidate path to neighbours that set
+    /// `srpolicy = true`.
+    #[serde(default, rename = "srpolicy")]
+    pub srpolicy: Vec<BgpSrPolicy>,
+}
+
+/// One `[[bgp.srpolicy]]`: an SR Policy candidate path this speaker originates
+/// (RFC 9256). Advertised as a BGP SR Policy route (SAFI 73) with a Tunnel
+/// Encapsulation attribute carrying the segment list.
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct BgpSrPolicy {
+    /// The policy colour — the intent a steering route's Color extended community
+    /// matches against.
+    pub color: u32,
+    /// The policy endpoint (tail-end), an IPv4 or IPv6 address.
+    pub endpoint: String,
+    /// The candidate-path distinguisher (defaults to 1).
+    pub distinguisher: Option<u32>,
+    /// The candidate-path preference — higher wins (defaults to 100).
+    pub preference: Option<u32>,
+    /// The candidate's binding SID: an SRv6 SID (IPv6 address) or an MPLS label
+    /// (a bare integer). Optional.
+    #[serde(rename = "binding-sid")]
+    pub binding_sid: Option<String>,
+    /// The candidate-path priority (used on topology changes). Optional.
+    pub priority: Option<u8>,
+    /// A symbolic policy name. Optional.
+    pub name: Option<String>,
+    /// The ordered segment list — each entry an SRv6 SID (IPv6 address) or an MPLS
+    /// label (a bare integer). Pushed onto steered packets in order.
+    #[serde(default, rename = "segment-list")]
+    pub segment_list: Vec<String>,
+    /// The load-balancing weight for this segment list. Optional.
+    pub weight: Option<u32>,
 }
 
 /// The `[bgp.evpn]` section: this VTEP's identity plus the EVPN instances
@@ -887,6 +923,11 @@ pub struct BgpNeighbor {
     /// install the ones this neighbour advertises. Defaults to false.
     #[serde(default)]
     pub flowspec: bool,
+    /// Negotiate the SR Policy address family (AFI 1/2 · SAFI 73, RFC 9256) with this
+    /// neighbour: advertise the `[[bgp.srpolicy]]` policies to it, and install the SR
+    /// Policies it advertises into the SR Policy RIB. Defaults to false.
+    #[serde(default)]
+    pub srpolicy: bool,
     /// Inbound route policy: the name of a `[[filter]]` applied to every route received
     /// from this neighbour before it enters the RIB (an import route-map). Reject drops
     /// the route; accept admits it, with any set-metric (→MED), set-preference

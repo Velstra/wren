@@ -45,6 +45,10 @@ use wren_bgp::evpn_rib::{EviChange, EviTable, EvpnRib, EvpnRibEvent};
 use wren_bgp::ext_community::format_ext_community;
 use wren_bgp::flowspec::{Action as FsAction, FlowSpec};
 use wren_bgp::flowspec_rib::{actions_of, FlowSpecNlri, FlowSpecRib, FlowSpecRibEvent};
+use wren_bgp::sr_policy::{
+    SrPolicyEncoding, SrPolicyNlri, TunnelTlv, SAFI_SR_POLICY,
+};
+use wren_bgp::sr_policy_rib::{SrPolicyEntry, SrPolicyRib, SrPolicyRibEvent};
 use wren_bgp::fsm::{Action, BgpFsm, Event, State, CODE_CEASE, CODE_OPEN_MESSAGE};
 use wren_bgp::large_community::format_large_community;
 use wren_bgp::message::{AddPath, Message, Notification, Open, Update};
@@ -154,6 +158,11 @@ pub struct BgpConfig {
     /// negotiate SAFI 133 (and are configured with `flowspec = true`). Received rules
     /// are installed into the FlowSpec RIB regardless of whether any are originated.
     pub flowspec: Option<FlowSpecConfig>,
+    /// SR Policies (RFC 9256) this speaker originates over SAFI 73: each a candidate
+    /// path `(NLRI, encoding)`. Advertised to neighbours configured with
+    /// `srpolicy = true`. Received policies are installed into the SR Policy RIB
+    /// regardless of whether any are originated.
+    pub srpolicy_originate: Vec<(SrPolicyNlri, SrPolicyEncoding)>,
 }
 
 /// Resolved FlowSpec (RFC 8955) configuration: the flow rules this speaker
@@ -314,6 +323,10 @@ pub struct BgpPeerCfg {
     /// peer — advertise the FlowSpec Multiprotocol capability, originate the configured
     /// rules to it, and install the rules it advertises into the FlowSpec RIB.
     pub flowspec: bool,
+    /// Negotiate the SR Policy address family (AFI 1/2 · SAFI 73, RFC 9256) with this
+    /// peer — advertise the SR Policy Multiprotocol capability, originate the configured
+    /// policies to it, and install the policies it advertises into the SR Policy RIB.
+    pub srpolicy: bool,
 }
 
 impl BgpPeerCfg {
@@ -418,6 +431,8 @@ struct PeerProps {
     evpn: bool,
     /// Whether the FlowSpec family (RFC 8955) is configured for this peer.
     flowspec: bool,
+    /// Whether the SR Policy family (RFC 9256, SAFI 73) is configured for this peer.
+    srpolicy: bool,
     /// This local speaker's BGP Role toward this peer (RFC 9234 §4), if configured —
     /// drives the Only-To-Customer route-leak procedures on received routes.
     role: Option<BgpRole>,
@@ -500,6 +515,9 @@ enum SessionCmd {
     /// Advertise these locally-originated FlowSpec rules (RFC 8955 §4) to a
     /// FlowSpec-activated peer, each with its traffic-filtering action ext-community.
     AdvertiseFlowSpec(Vec<FlowSpecRuleCfg>),
+    /// Advertise these locally-originated SR Policies (RFC 9256, SAFI 73) to an
+    /// SR-Policy-activated peer: each an NLRI plus its Tunnel Encapsulation contents.
+    AdvertiseSrPolicy(Vec<(SrPolicyNlri, SrPolicyEncoding)>),
 }
 
 /// One locally-originated EVPN route the central task asks a session to advertise:
@@ -593,6 +611,8 @@ struct PeerInfo {
     evpn: bool,
     /// Whether the FlowSpec family (RFC 8955) is configured for this peer.
     flowspec: bool,
+    /// Whether the SR Policy family (RFC 9256, SAFI 73) is configured for this peer.
+    srpolicy: bool,
     /// This local speaker's BGP Role toward this peer (RFC 9234 §4), if configured.
     role: Option<BgpRole>,
 }
@@ -683,6 +703,9 @@ pub enum BgpQuery {
     EvpnVnis,
     /// The FlowSpec Loc-RIB installed rules (RFC 8955) — `show bgp flowspec`.
     FlowSpec,
+    /// The SR Policy Loc-RIB installed policies (RFC 9256, SAFI 73) — `show bgp
+    /// sr-policy` / `show sr-policy`.
+    SrPolicy,
     /// Dynamically originate (or withdraw) a type-2 EVPN MAC/IP route at runtime —
     /// `evpn advertise|withdraw <vni> <mac> [ip]`. The write-side counterpart to the
     /// `monitor evpn` read feed: the fabric datapath calls this when it learns (or
@@ -930,6 +953,60 @@ pub fn render_bgp_flowspec(rib: &FlowSpecRib) -> String {
         let _ = writeln!(out, "{nlri}  ->  {action}  from {}", path.peer_addr);
     }
     out
+}
+
+/// Render the selected SR Policies (RFC 9256 §2.9) — `show bgp sr-policy` /
+/// `show sr-policy`. One line per active `(colour, endpoint)` policy, with the
+/// winning candidate's preference, binding SID, name and segment list. The
+/// wren-side deliverable stops at the RIB and its `show`; programming the SID list
+/// into a forwarding datapath (the fabric eBPF steering) is done elsewhere.
+pub fn render_bgp_srpolicy(rib: &SrPolicyRib) -> String {
+    let installed = rib.installed();
+    if installed.is_empty() {
+        return "no sr policies\n".to_string();
+    }
+    let mut out = String::new();
+    for p in installed {
+        let enc = &p.encoding;
+        let segs: Vec<String> = enc
+            .segment_lists
+            .iter()
+            .flat_map(|sl| sl.segments.iter())
+            .map(render_segment)
+            .collect();
+        let name = enc.policy_name.as_deref().unwrap_or("-");
+        let bsid = render_binding_sid(&enc.binding_sid);
+        let _ = writeln!(
+            out,
+            "color {} endpoint {} pref {} bsid {} name {} segments [{}]",
+            p.color,
+            p.endpoint,
+            enc.effective_preference(),
+            bsid,
+            name,
+            segs.join(", "),
+        );
+    }
+    out
+}
+
+/// Render one SR Policy segment for `show`.
+fn render_segment(seg: &wren_bgp::sr_policy::Segment) -> String {
+    use wren_bgp::sr_policy::Segment;
+    match seg {
+        Segment::Srv6Sid { sid, .. } => std::net::Ipv6Addr::from(*sid).to_string(),
+        Segment::MplsLabel(label) => format!("label:{label}"),
+    }
+}
+
+/// Render an SR Policy binding SID for `show`.
+fn render_binding_sid(bsid: &wren_bgp::sr_policy::BindingSid) -> String {
+    use wren_bgp::sr_policy::BindingSid;
+    match bsid {
+        BindingSid::None => "-".to_string(),
+        BindingSid::Srv6Sid(sid) => std::net::Ipv6Addr::from(*sid).to_string(),
+        BindingSid::MplsLabel(label) => format!("label:{label}"),
+    }
 }
 
 /// Render the per-EVI MAC-VRF views (RFC 7432 §9): each instance's remote-MAC table
@@ -1392,6 +1469,7 @@ pub async fn run(
                         ext_nexthop: p.ext_nexthop,
                         evpn: p.evpn,
                         flowspec: p.flowspec,
+                        srpolicy: p.srpolicy,
                         role: p.role,
                     },
                 )
@@ -1450,6 +1528,7 @@ pub async fn run(
             ext_nexthop: peer.ext_nexthop,
             evpn: peer.evpn,
             flowspec: peer.flowspec,
+            srpolicy: peer.srpolicy,
             role: peer.role,
         };
         let auth = peer.tcp_auth();
@@ -1524,6 +1603,12 @@ pub async fn run(
         .as_ref()
         .map(|f| f.rules.clone())
         .unwrap_or_default();
+    // The SR Policy RIB (RFC 9256, SAFI 73): received candidate paths with best
+    // selection per (colour, endpoint). Like the FlowSpec RIB, the wren-side
+    // deliverable stops here — programming the SID lists into the fabric eBPF
+    // steering datapath is a separate, privileged step done elsewhere.
+    let mut srpolicy_rib = SrPolicyRib::new();
+    let srpolicy_originate = cfg.srpolicy_originate.clone();
 
     let mut rib = BgpRib::with_max_paths(cfg.max_paths);
     loop {
@@ -1587,6 +1672,7 @@ pub async fn run(
                     BgpQuery::Evpn => render_bgp_evpn(&evpn_rib),
                     BgpQuery::EvpnVnis => render_evpn_vnis(&evis),
                     BgpQuery::FlowSpec => render_bgp_flowspec(&flowspec_rib),
+                    BgpQuery::SrPolicy => render_bgp_srpolicy(&srpolicy_rib),
                     // Dynamic type-2 origination/withdrawal (`evpn advertise|withdraw`).
                     // Update the persistent origination set (so peers that connect later
                     // still get it) then push to every established EVPN-activated session.
@@ -1854,6 +1940,17 @@ pub async fn run(
                         .send(SessionCmd::AdvertiseFlowSpec(flowspec_originated.clone()))
                         .await;
                 }
+                // SR Policy (RFC 9256, SAFI 73): to an SR-Policy-activated peer,
+                // advertise our configured policies. Received policies live in the SR
+                // Policy RIB and are not reflected onward here — origination is
+                // controller-driven.
+                if local.peers.get(&p).map(|pp| pp.srpolicy) == Some(true)
+                    && !srpolicy_originate.is_empty()
+                {
+                    let _ = cmd_tx
+                        .send(SessionCmd::AdvertiseSrPolicy(srpolicy_originate.clone()))
+                        .await;
+                }
                 // Initial advertisement done: send the End-of-RIB marker so a helper
                 // on the peer's side knows our re-advertisement is complete (RFC 4724
                 // §2). Queued after Advertise/Propagate, so it arrives last.
@@ -1965,6 +2062,10 @@ pub async fn run(
                 // FlowSpec (RFC 8955): drop every rule this peer taught us.
                 for ev in flowspec_rib.withdraw_peer(p) {
                     log_flowspec_event(&ev);
+                }
+                // SR Policy (RFC 9256): drop every candidate this peer taught us.
+                for ev in srpolicy_rib.withdraw_peer(p) {
+                    log_srpolicy_event(&ev);
                 }
                 for pfx in addpath_affected {
                     propagate_addpath(pfx, &rib, &local, &mut addpath, &addpath_send, &sessions)
@@ -2292,6 +2393,29 @@ pub async fn run(
                         let nlri = FlowSpecNlri { afi, spec };
                         if let Some(ev) = flowspec_rib.update(peer, nlri, path.clone()) {
                             log_flowspec_event(&ev);
+                        }
+                    }
+                }
+                // SR Policy withdrawals (MP_UNREACH_NLRI, SAFI 73, RFC 9256).
+                for nlri in mp_unreach_srpolicy(&update) {
+                    if let Some(ev) = srpolicy_rib.withdraw(peer, nlri) {
+                        log_srpolicy_event(&ev);
+                    }
+                }
+                // SR Policy reachability (MP_REACH_NLRI, SAFI 73): install each
+                // candidate into the SR Policy RIB. The candidate's contents ride in the
+                // Tunnel Encapsulation attribute (type 23) on the same UPDATE. SR Policy
+                // has no forwarding next hop, so the path's next hop is the peer.
+                if let Some(nlris) = mp_reach_srpolicy(&update) {
+                    let path = build_path(&update, peer, None, facts);
+                    let encoding = srpolicy_from_update(&update).unwrap_or_default();
+                    for nlri in nlris {
+                        let entry = SrPolicyEntry {
+                            path: path.clone(),
+                            encoding: encoding.clone(),
+                        };
+                        if let Some(ev) = srpolicy_rib.update(peer, nlri, entry) {
+                            log_srpolicy_event(&ev);
                         }
                     }
                 }
@@ -2980,6 +3104,61 @@ fn mp_unreach_flowspec(update: &Update) -> Vec<FlowSpecNlri> {
         .unwrap_or_default()
 }
 
+/// The MP_REACH_NLRI carrying SR Policy candidate paths (SAFI 73, RFC 9256): the
+/// candidate NLRI (owned, so the caller can install them while `update` stays
+/// borrowed). The next hop is ignored for SR Policy.
+fn mp_reach_srpolicy(update: &Update) -> Option<Vec<SrPolicyNlri>> {
+    update.attributes.iter().find_map(|a| match a {
+        PathAttribute::MpReachSrPolicy { nlri, .. } => Some(nlri.clone()),
+        _ => None,
+    })
+}
+
+/// The MP_UNREACH_NLRI SR Policy withdrawals of an UPDATE (SAFI 73, RFC 9256).
+fn mp_unreach_srpolicy(update: &Update) -> Vec<SrPolicyNlri> {
+    update
+        .attributes
+        .iter()
+        .find_map(|a| match a {
+            PathAttribute::MpUnreachSrPolicy { withdrawn, .. } => Some(withdrawn.clone()),
+            _ => None,
+        })
+        .unwrap_or_default()
+}
+
+/// The SR Policy contents carried in an UPDATE's Tunnel Encapsulation attribute
+/// (type 23, RFC 9012) — the candidate's preference, binding SID and segment lists.
+fn srpolicy_from_update(update: &Update) -> Option<SrPolicyEncoding> {
+    update.attributes.iter().find_map(|a| match a {
+        PathAttribute::TunnelEncap(tlvs) => {
+            wren_bgp::sr_policy::sr_policy_of(tlvs).cloned()
+        }
+        _ => None,
+    })
+}
+
+/// Log an SR Policy Loc-RIB change (RFC 9256). The wren-side deliverable stops at
+/// the RIB and its `show`; programming the selected SID list into a forwarding
+/// datapath (the fabric eBPF steering) is a separate, privileged step done
+/// elsewhere.
+fn log_srpolicy_event(ev: &SrPolicyRibEvent) {
+    match ev {
+        SrPolicyRibEvent::Best { nlri, entry } => {
+            info!(
+                color = nlri.color,
+                endpoint = %nlri.endpoint,
+                distinguisher = nlri.distinguisher,
+                pref = entry.encoding.effective_preference(),
+                from = %entry.path.peer_addr,
+                "SR Policy candidate installed"
+            );
+        }
+        SrPolicyRibEvent::Withdrawn(nlri) => {
+            info!(color = nlri.color, endpoint = %nlri.endpoint, distinguisher = nlri.distinguisher, "SR Policy candidate withdrawn");
+        }
+    }
+}
+
 /// Log a FlowSpec Loc-RIB change (RFC 8955). The wren-side deliverable stops at the
 /// RIB and its `show`; installing the selected rule into a forwarding datapath (the
 /// fabric eBPF flow classifier) is a separate, privileged step done elsewhere.
@@ -3206,6 +3385,7 @@ async fn accept_loop(listener: TcpListener, local: Arc<Local>, tx: mpsc::Sender<
                     ext_nexthop: props.ext_nexthop,
                     evpn: props.evpn,
                     flowspec: props.flowspec,
+                    srpolicy: props.srpolicy,
                     role: props.role,
                 };
                 let local = local.clone();
@@ -3763,6 +3943,8 @@ async fn drive_session(
         mp_evpn: false,
         flowspec_cfg: peer.flowspec,
         mp_flowspec: false,
+        srpolicy_cfg: peer.srpolicy,
+        mp_srpolicy: false,
         add_path_cfg: peer.add_path,
         add_path_send: false,
         add_path_recv: false,
@@ -3831,6 +4013,11 @@ async fn drive_session(
                             sess.mp_flowspec = sess.flowspec_cfg
                                 && (o.supports_multiprotocol(AFI_IPV4, SAFI_FLOWSPEC)
                                     || o.supports_multiprotocol(AFI_IPV6, SAFI_FLOWSPEC));
+                            // Send SR Policy NLRI only if the peer negotiated SAFI 73
+                            // (for either AFI) AND it is configured here (RFC 9256).
+                            sess.mp_srpolicy = sess.srpolicy_cfg
+                                && (o.supports_multiprotocol(AFI_IPV4, SAFI_SR_POLICY)
+                                    || o.supports_multiprotocol(AFI_IPV6, SAFI_SR_POLICY));
                             // ADD-PATH (RFC 7911 §4): the directions in effect are the
                             // intersection of what we offered (Send+Receive when
                             // configured) and what the peer advertised. We may SEND when
@@ -3979,6 +4166,12 @@ async fn drive_session(
             Step::Cmd(SessionCmd::AdvertiseFlowSpec(rules)) => {
                 if sess.established && sess.mp_flowspec {
                     sess.advertise_flowspec(&rules).await?;
+                }
+            }
+            // SR Policy (RFC 9256): only act once Established and the family negotiated.
+            Step::Cmd(SessionCmd::AdvertiseSrPolicy(policies)) => {
+                if sess.established && sess.mp_srpolicy {
+                    sess.advertise_srpolicy(&policies).await?;
                 }
             }
             Step::Handled => {}
@@ -4213,6 +4406,13 @@ struct Session<'a> {
     /// Whether the peer advertised a FlowSpec Multiprotocol capability (SAFI 133,
     /// AFI 1 or 2) — only then do we send it FlowSpec NLRI.
     mp_flowspec: bool,
+    /// Whether this peer is SR-Policy-activated in our config (RFC 9256) — we then
+    /// advertise the SR Policy Multiprotocol capability (AFI 1 and 2 · SAFI 73) in
+    /// our OPEN.
+    srpolicy_cfg: bool,
+    /// Whether the peer advertised an SR Policy Multiprotocol capability (SAFI 73,
+    /// AFI 1 or 2) — only then do we send it SR Policy NLRI.
+    mp_srpolicy: bool,
     /// Whether ADD-PATH (RFC 7911) is configured for this peer — we then advertise
     /// the ADD-PATH capability (Send+Receive, IPv4 unicast) in our OPEN.
     add_path_cfg: bool,
@@ -4300,6 +4500,19 @@ impl Session<'_> {
                         open.capabilities.push(Capability::Multiprotocol {
                             afi: AFI_IPV6,
                             safi: SAFI_FLOWSPEC,
+                        });
+                    }
+                    // SR Policy (RFC 9256 + RFC 4760): advertise the SR Policy
+                    // Multiprotocol capability for both IPv4 (AFI 1) and IPv6 (AFI 2)
+                    // endpoints when this peer is SR-Policy-activated.
+                    if self.srpolicy_cfg {
+                        open.capabilities.push(Capability::Multiprotocol {
+                            afi: AFI_IPV4,
+                            safi: SAFI_SR_POLICY,
+                        });
+                        open.capabilities.push(Capability::Multiprotocol {
+                            afi: AFI_IPV6,
+                            safi: SAFI_SR_POLICY,
                         });
                     }
                     // Keep the encoded OPEN for the BMP Peer Up (RFC 7854 §4.10).
@@ -4934,6 +5147,38 @@ impl Session<'_> {
                 afi,
                 next_hop: vec![],
                 nlri,
+            });
+            self.send(&Message::Update(Update {
+                attributes,
+                ..Default::default()
+            }))
+            .await?;
+        }
+        Ok(())
+    }
+
+    /// Advertise locally-originated SR Policies (RFC 9256, SAFI 73) to this peer.
+    /// Each candidate is one UPDATE: an MP_REACH_NLRI (SAFI 73) with the candidate's
+    /// NLRI, plus a Tunnel Encapsulation attribute (type 23) carrying its contents.
+    async fn advertise_srpolicy(
+        &mut self,
+        policies: &[(SrPolicyNlri, SrPolicyEncoding)],
+    ) -> Result<()> {
+        for (nlri, encoding) in policies {
+            // The endpoint's family fixes the AFI (RFC 9256 §2.1).
+            let afi = if nlri.endpoint.is_ipv6() {
+                AFI_IPV6
+            } else {
+                AFI_IPV4
+            };
+            let mut attributes = self.base_path_attrs();
+            attributes.push(PathAttribute::TunnelEncap(vec![TunnelTlv::SrPolicy(
+                encoding.clone(),
+            )]));
+            attributes.push(PathAttribute::MpReachSrPolicy {
+                afi,
+                next_hop: vec![],
+                nlri: vec![*nlri],
             });
             self.send(&Message::Update(Update {
                 attributes,

@@ -60,6 +60,8 @@ pub mod nexthop;
 pub mod rib;
 pub mod rpki;
 pub mod rtr;
+pub mod sr_policy;
+pub mod sr_policy_rib;
 pub mod srv6;
 
 pub use nexthop::{decode_v6_next_hop, encode_v6_next_hop};
@@ -109,6 +111,9 @@ pub use evpn::{AFI_L2VPN, SAFI_EVPN};
 /// Subsequent Address Family Identifier: FlowSpec (RFC 8955) — re-exported from
 /// [`flowspec`]. Rides under AFI 1 (IPv4) and AFI 2 (IPv6).
 pub use flowspec::SAFI_FLOWSPEC;
+/// Subsequent Address Family Identifier: SR Policy (SAFI 73) — re-exported from
+/// [`sr_policy`]. Rides under AFI 1 (IPv4) and AFI 2 (IPv6) endpoints.
+pub use sr_policy::SAFI_SR_POLICY;
 
 /// The reserved 2-octet AS number that stands in for a 4-octet AS in any field a
 /// legacy (2-octet) speaker reads — the OPEN `my_as` and a 2-octet AS_PATH /

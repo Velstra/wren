@@ -1578,6 +1578,7 @@ fn build_bgp_config(
             ext_nexthop: n.extended_nexthop,
             evpn: n.evpn,
             flowspec: n.flowspec,
+            srpolicy: n.srpolicy,
             import,
             export,
             role,
@@ -1695,6 +1696,15 @@ fn build_bgp_config(
     if flowspec.is_some() && !bgp.neighbor.iter().any(|n| n.flowspec) {
         warn!("bgp `[bgp.flowspec]` is configured but no neighbor has `flowspec = true`; no peer will carry FlowSpec");
     }
+    // SR Policy (RFC 9256, SAFI 73): resolve each `[[bgp.srpolicy]]` into an NLRI plus
+    // its Tunnel Encapsulation contents.
+    let mut srpolicy_originate = Vec::with_capacity(bgp.srpolicy.len());
+    for p in &bgp.srpolicy {
+        srpolicy_originate.push(build_srpolicy(p)?);
+    }
+    if !srpolicy_originate.is_empty() && !bgp.neighbor.iter().any(|n| n.srpolicy) {
+        warn!("bgp `[[bgp.srpolicy]]` is configured but no neighbor has `srpolicy = true`; no peer will carry SR Policy");
+    }
     Ok(bgp::BgpConfig {
         local_as: bgp.local_as,
         router_id,
@@ -1717,7 +1727,76 @@ fn build_bgp_config(
         vrf_device,
         evpn,
         flowspec,
+        srpolicy_originate,
     })
+}
+
+/// Resolve one `[[bgp.srpolicy]]` into an SR Policy NLRI plus its Tunnel
+/// Encapsulation contents (RFC 9256). A segment / binding-SID that parses as an
+/// IPv6 address is an SRv6 SID; a bare integer is an MPLS label.
+fn build_srpolicy(
+    p: &wren_config::BgpSrPolicy,
+) -> Result<(
+    wren_bgp::sr_policy::SrPolicyNlri,
+    wren_bgp::sr_policy::SrPolicyEncoding,
+)> {
+    use wren_bgp::sr_policy::{
+        BindingSid, Segment, SegmentList, SrPolicyEncoding, SrPolicyNlri,
+    };
+    let endpoint: std::net::IpAddr = p
+        .endpoint
+        .parse()
+        .with_context(|| format!("bgp srpolicy endpoint {:?} must be an IP address", p.endpoint))?;
+    let nlri = SrPolicyNlri {
+        color: p.color,
+        endpoint,
+        distinguisher: p.distinguisher.unwrap_or(1),
+    };
+    let binding_sid = match &p.binding_sid {
+        Some(s) => parse_sid_or_label(s)
+            .with_context(|| format!("bgp srpolicy binding-sid {s:?}"))
+            .map(|seg| match seg {
+                Segment::Srv6Sid { sid, .. } => BindingSid::Srv6Sid(sid),
+                Segment::MplsLabel(l) => BindingSid::MplsLabel(l),
+            })?,
+        None => BindingSid::None,
+    };
+    let mut segments = Vec::with_capacity(p.segment_list.len());
+    for s in &p.segment_list {
+        segments.push(parse_sid_or_label(s).with_context(|| format!("bgp srpolicy segment {s:?}"))?);
+    }
+    let encoding = SrPolicyEncoding {
+        preference: p.preference,
+        binding_sid,
+        priority: p.priority,
+        policy_name: p.name.clone(),
+        segment_lists: if segments.is_empty() {
+            vec![]
+        } else {
+            vec![SegmentList {
+                weight: p.weight,
+                segments,
+            }]
+        },
+    };
+    Ok((nlri, encoding))
+}
+
+/// Parse an SR Policy segment / binding SID: an IPv6 address is an SRv6 SID; a bare
+/// integer is an MPLS label (RFC 9256).
+fn parse_sid_or_label(s: &str) -> Result<wren_bgp::sr_policy::Segment> {
+    use wren_bgp::sr_policy::Segment;
+    if let Ok(v6) = s.parse::<std::net::Ipv6Addr>() {
+        return Ok(Segment::Srv6Sid {
+            sid: v6.octets(),
+            behavior: None,
+            structure: None,
+        });
+    }
+    if let Ok(label) = s.parse::<u32>() {
+        return Ok(Segment::MplsLabel(label));
+    }
+    anyhow::bail!("{s:?} is neither an IPv6 SRv6 SID nor an MPLS label")
 }
 
 /// Resolve `[bgp.evpn]` into a [`bgp::EvpnConfig`]: parse the VTEP IP, and for each
