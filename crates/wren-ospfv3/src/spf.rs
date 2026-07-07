@@ -54,14 +54,30 @@ enum Vertex {
     Network(Ipv4Addr, u32),
 }
 
+/// A resolved OSPFv3 next hop: a link-local gateway address paired with the
+/// local **Interface ID** it is reachable over. The interface is the root's own
+/// Interface ID on the first-hop link toward the neighbour whose link-local
+/// address is the gateway — determined during SPF, so a multi-interface router
+/// gets the right interface per next hop. In the daemon the Interface ID equals
+/// the Linux ifindex, which the announce path maps to the interface name a
+/// kernel route needs: a link-local gateway with no outgoing interface is
+/// rejected by netlink with `EINVAL`.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+pub struct SpfNextHop {
+    /// The neighbour's link-local gateway address.
+    pub gateway: Ipv6Addr,
+    /// The local Interface ID the gateway is reachable over (the ifindex).
+    pub iface_id: u32,
+}
+
 /// What is known about a settled (or candidate) vertex: its distance from the
-/// root and the link-local next-hop gateways to reach it. An empty gateway set
-/// means the vertex is directly attached to the root (a connected/on-link next
-/// hop).
+/// root and the next hops (link-local gateway + local interface) to reach it. An
+/// empty next-hop set means the vertex is directly attached to the root (a
+/// connected/on-link next hop).
 #[derive(Clone, Debug)]
 struct VertexInfo {
     dist: u32,
-    gateways: Vec<Ipv6Addr>,
+    gateways: Vec<SpfNextHop>,
 }
 
 /// One destination produced by the SPF: an intra-area (or, via the helper
@@ -72,17 +88,21 @@ pub struct SpfRoute {
     pub prefix: Prefix,
     /// The total OSPF cost from the root.
     pub cost: u32,
-    /// The link-local next-hop gateway addresses. Empty means the destination is
-    /// directly attached to the root (a connected/on-link route whose outgoing
-    /// interface the runner resolves).
-    pub gateways: Vec<Ipv6Addr>,
+    /// The link-local next hops (gateway + local interface). Empty means the
+    /// destination is directly attached to the root (a connected/on-link route
+    /// whose outgoing interface the runner resolves).
+    pub gateways: Vec<SpfNextHop>,
 }
 
 impl SpfRoute {
     /// Convert into a [`wren_core::Route`] tagged [`Protocol::Ospf`], with the
-    /// cost as the metric. An empty gateway set becomes a single on-link next hop
-    /// (gateway and interface unset — the runner fills the interface in).
-    pub fn to_route(&self) -> Route {
+    /// cost as the metric. Each next-hop gateway is pinned to its outgoing
+    /// interface, whose name `resolve_iface` maps from the SPF-computed Interface
+    /// ID (a link-local gateway without an outgoing interface is unroutable). An
+    /// empty next-hop set becomes a single on-link next hop (gateway and
+    /// interface unset — the runner fills the interface in). If a next hop's
+    /// interface cannot be named it falls back to an unpinned gateway.
+    pub fn to_route(&self, resolve_iface: impl Fn(u32) -> Option<String>) -> Route {
         let nexthops: Vec<NextHop> = if self.gateways.is_empty() {
             vec![NextHop {
                 gateway: None,
@@ -92,7 +112,10 @@ impl SpfRoute {
         } else {
             self.gateways
                 .iter()
-                .map(|g| NextHop::via(IpAddr::V6(*g)))
+                .map(|nh| match resolve_iface(nh.iface_id) {
+                    Some(name) => NextHop::via_dev(IpAddr::V6(nh.gateway), name),
+                    None => NextHop::via(IpAddr::V6(nh.gateway)),
+                })
                 .collect()
         };
         Route::new(self.prefix, Protocol::Ospf, nexthops, self.cost)
@@ -108,10 +131,10 @@ pub struct SpfResult {
     /// cost 0). Inter-area and AS-external route calculation reads this to find
     /// the distance to an ABR/ASBR.
     pub routers: BTreeMap<Ipv4Addr, u32>,
-    /// The next-hop gateways to reach each router vertex (empty for the root and
-    /// for directly-attached routers). Inter-area routes inherit these to reach
-    /// the destination via the originating ABR.
-    pub router_nexthops: BTreeMap<Ipv4Addr, Vec<Ipv6Addr>>,
+    /// The next hops to reach each router vertex (empty for the root and for
+    /// directly-attached routers). Inter-area routes inherit these to reach the
+    /// destination via the originating ABR.
+    pub router_nexthops: BTreeMap<Ipv4Addr, Vec<SpfNextHop>>,
 }
 
 /// Run the intra-area SPF over the area database `area`, using `links` (the
@@ -120,12 +143,19 @@ pub fn compute(area: &Lsdb, links: &Lsdb, root: Ipv4Addr) -> SpfResult {
     Spf { area, links, root }.run()
 }
 
-/// Convenience: run the SPF and hand back ready-to-announce [`wren_core::Route`]s.
-pub fn routes(area: &Lsdb, links: &Lsdb, root: Ipv4Addr) -> Vec<Route> {
+/// Convenience: run the SPF and hand back ready-to-announce [`wren_core::Route`]s,
+/// naming each next hop's outgoing interface via `resolve_iface` (see
+/// [`SpfRoute::to_route`]).
+pub fn routes(
+    area: &Lsdb,
+    links: &Lsdb,
+    root: Ipv4Addr,
+    resolve_iface: impl Fn(u32) -> Option<String> + Copy,
+) -> Vec<Route> {
     compute(area, links, root)
         .routes
         .iter()
-        .map(SpfRoute::to_route)
+        .map(|r| r.to_route(resolve_iface))
         .collect()
 }
 
@@ -309,33 +339,52 @@ impl Spf<'_> {
         out
     }
 
-    /// The next-hop gateways for child `w` reached from parent `v` (§4.8.2).
-    /// A parent with gateways already set passes them down unchanged; a parent
-    /// that is the root or a directly-attached network resolves a fresh gateway —
-    /// the neighbour's own link-local address, read from its Link-LSA.
-    fn initial_gateways(&self, v: Vertex, v_gateways: &[Ipv6Addr], w: Vertex) -> Vec<Ipv6Addr> {
+    /// The next hops for child `w` reached from parent `v` (§4.8.2). A parent with
+    /// next hops already set passes them down unchanged; a parent that is the root
+    /// or a directly-attached network resolves a fresh next hop — the neighbour's
+    /// own link-local address (from its Link-LSA) paired with the *root's* own
+    /// Interface ID on the first-hop link, which is the outgoing interface the
+    /// route must be pinned to.
+    fn initial_gateways(&self, v: Vertex, v_gateways: &[SpfNextHop], w: Vertex) -> Vec<SpfNextHop> {
         if !v_gateways.is_empty() {
             return v_gateways.to_vec();
         }
         match (v, w) {
-            // Root reaches a point-to-point neighbour: its gateway is that
-            // neighbour's link-local address on the shared link. The link is named
-            // by the neighbour's Interface ID, which the root's own link records.
+            // Root reaches a point-to-point neighbour: the gateway is that
+            // neighbour's link-local address on the shared link (named by the
+            // neighbour's Interface ID, which the root's own link records), reached
+            // over the root's own interface on that link.
             (Vertex::Router(rid), Vertex::Router(w_id)) if rid == self.root => self
-                .root_neighbor_interface_id(w_id)
-                .and_then(|if_id| self.link_local_of(w_id, if_id))
-                .map(|a| vec![a])
+                .root_link_to(w_id)
+                .and_then(|(nbr_if, local_if)| {
+                    let gateway = self.link_local_of(w_id, nbr_if)?;
+                    Some(vec![SpfNextHop {
+                        gateway,
+                        iface_id: local_if,
+                    }])
+                })
                 .unwrap_or_default(),
             // A network one hop from the root: connected (no gateway).
             (Vertex::Router(rid), Vertex::Network(..)) if rid == self.root => vec![],
-            // A router across a directly-attached network: its gateway is its own
+            // A router across a directly-attached network: the gateway is its own
             // link-local address on that network (from its Link-LSA, keyed by the
-            // interface ID it uses on the network).
-            (Vertex::Network(dr_rid, dr_if), Vertex::Router(w_id)) => self
-                .router_interface_on_network(w_id, dr_rid, dr_if)
-                .and_then(|if_id| self.link_local_of(w_id, if_id))
-                .map(|a| vec![a])
-                .unwrap_or_default(),
+            // interface ID it uses on the network), reached over the root's own
+            // interface onto that network.
+            (Vertex::Network(dr_rid, dr_if), Vertex::Router(w_id)) => {
+                let Some(local_if) = self.router_interface_on_network(self.root, dr_rid, dr_if)
+                else {
+                    return vec![];
+                };
+                self.router_interface_on_network(w_id, dr_rid, dr_if)
+                    .and_then(|if_id| self.link_local_of(w_id, if_id))
+                    .map(|gateway| {
+                        vec![SpfNextHop {
+                            gateway,
+                            iface_id: local_if,
+                        }]
+                    })
+                    .unwrap_or_default()
+            }
             _ => vec![],
         }
     }
@@ -347,7 +396,7 @@ impl Spf<'_> {
     fn harvest(&self, tree: &BTreeMap<Vertex, VertexInfo>) -> SpfResult {
         let mut by_prefix: BTreeMap<Prefix, SpfRoute> = BTreeMap::new();
         let mut routers: BTreeMap<Ipv4Addr, u32> = BTreeMap::new();
-        let mut router_nexthops: BTreeMap<Ipv4Addr, Vec<Ipv6Addr>> = BTreeMap::new();
+        let mut router_nexthops: BTreeMap<Ipv4Addr, Vec<SpfNextHop>> = BTreeMap::new();
 
         for (vertex, info) in tree {
             if let Vertex::Router(rid) = vertex {
@@ -482,9 +531,11 @@ impl Spf<'_> {
             .is_some_and(|nl| nl.attached_routers.contains(&rid))
     }
 
-    /// The neighbour's Interface ID on the point-to-point link from the root to
-    /// `w` — the Interface ID that names `w`'s Link-LSA on the shared link.
-    fn root_neighbor_interface_id(&self, w: Ipv4Addr) -> Option<u32> {
+    /// The point-to-point link from the root to `w`, as `(neighbour Interface ID,
+    /// root's own Interface ID)`. The neighbour's Interface ID names `w`'s
+    /// Link-LSA on the shared link (for the gateway address); the root's own
+    /// Interface ID is the outgoing interface the route is pinned to.
+    fn root_link_to(&self, w: Ipv4Addr) -> Option<(u32, u32)> {
         self.router_links(self.root)
             .iter()
             .find(|l| {
@@ -493,7 +544,7 @@ impl Spf<'_> {
                     RouterLinkType::PointToPoint | RouterLinkType::Virtual
                 ) && l.neighbor_router_id == w
             })
-            .map(|l| l.neighbor_interface_id)
+            .map(|l| (l.neighbor_interface_id, l.interface_id))
     }
 
     /// Router `w`'s own Interface ID on the transit network whose DR is
@@ -538,7 +589,7 @@ fn to_core_prefix(p: &crate::lsa::Prefix) -> Option<Prefix> {
 
 /// Insert or fold a route into the by-prefix table: a strictly lower cost
 /// replaces, an equal cost merges next hops (ECMP), a higher cost is dropped.
-fn add_route(map: &mut BTreeMap<Prefix, SpfRoute>, prefix: Prefix, cost: u32, gateways: &[Ipv6Addr]) {
+fn add_route(map: &mut BTreeMap<Prefix, SpfRoute>, prefix: Prefix, cost: u32, gateways: &[SpfNextHop]) {
     match map.get_mut(&prefix) {
         None => {
             map.insert(
@@ -561,8 +612,10 @@ fn add_route(map: &mut BTreeMap<Prefix, SpfRoute>, prefix: Prefix, cost: u32, ga
     }
 }
 
-/// Union `extra` into `into`, preserving order and dropping duplicates.
-fn merge_gateways(into: &mut Vec<Ipv6Addr>, extra: &[Ipv6Addr]) {
+/// Union `extra` into `into`, preserving order and dropping duplicates. Two next
+/// hops differing only in outgoing interface are distinct (ECMP across
+/// interfaces), so the whole `(gateway, iface_id)` pair is compared.
+fn merge_gateways(into: &mut Vec<SpfNextHop>, extra: &[SpfNextHop]) {
     for g in extra {
         if !into.contains(g) {
             into.push(*g);
@@ -696,6 +749,12 @@ mod tests {
         Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, n)
     }
 
+    /// Just the gateway addresses of a next-hop set (drops the pinned interface),
+    /// for assertions that only care which neighbour a route points at.
+    fn gws(nhs: &[SpfNextHop]) -> Vec<Ipv6Addr> {
+        nhs.iter().map(|nh| nh.gateway).collect()
+    }
+
     #[test]
     fn point_to_point_reaches_neighbour_prefix_via_link_local() {
         let mut area = Lsdb::new();
@@ -724,7 +783,7 @@ mod tests {
         // The far prefix: cost 10, via R2's link-local address.
         let far = find(&res, "2001:db8:2::/64");
         assert_eq!(far.cost, 10);
-        assert_eq!(far.gateways, vec![ll(2)]);
+        assert_eq!(gws(&far.gateways), vec![ll(2)]);
 
         assert_eq!(res.routers.get(&rid([2, 2, 2, 2])), Some(&10));
         assert_eq!(res.routers.get(&rid([1, 1, 1, 1])), Some(&0));
@@ -772,7 +831,7 @@ mod tests {
         // R2's prefix: 1 (root->net) + 0 (net->R2) + 5, via R2's link-local addr.
         let far = find(&res, "2001:db8:2::/64");
         assert_eq!(far.cost, 6);
-        assert_eq!(far.gateways, vec![ll(2)]);
+        assert_eq!(gws(&far.gateways), vec![ll(2)]);
         assert_eq!(res.routers.get(&rid([2, 2, 2, 2])), Some(&1));
     }
 
@@ -878,8 +937,8 @@ mod tests {
         let far = find(&res, "2001:db8:3::/64");
         assert_eq!(far.cost, 16);
         assert_eq!(far.gateways.len(), 2);
-        assert!(far.gateways.contains(&ll(2)));
-        assert!(far.gateways.contains(&ll(4)));
+        assert!(gws(&far.gateways).contains(&ll(2)));
+        assert!(gws(&far.gateways).contains(&ll(4)));
     }
 
     #[test]
@@ -898,7 +957,7 @@ mod tests {
         ));
         links.install(link_lsa([2, 2, 2, 2], 2, ll(2)));
 
-        let rts = routes(&area, &links, rid([1, 1, 1, 1]));
+        let rts = routes(&area, &links, rid([1, 1, 1, 1]), |_| Some("if1".to_string()));
         let far = rts
             .iter()
             .find(|r| r.prefix == p("2001:db8:2::/64"))
@@ -906,7 +965,10 @@ mod tests {
         assert_eq!(far.protocol, Protocol::Ospf);
         assert_eq!(far.metric, 10);
         assert_eq!(far.preference, Protocol::Ospf.default_preference());
-        assert_eq!(far.nexthops, vec![NextHop::via(IpAddr::V6(ll(2)))]);
+        assert_eq!(
+            far.nexthops,
+            vec![NextHop::via_dev(IpAddr::V6(ll(2)), "if1")]
+        );
 
         // The connected prefix maps to a single on-link next hop.
         let local = rts
@@ -960,7 +1022,7 @@ mod tests {
             .find(|r| r.prefix == p("2001:db8:99::/64"))
             .expect("inter-area route present");
         assert_eq!(r.cost, 15); // 10 (to ABR) + 5 (summary)
-        assert_eq!(r.gateways, vec![ll(2)]);
+        assert_eq!(gws(&r.gateways), vec![ll(2)]);
     }
 
     #[test]
@@ -1053,7 +1115,7 @@ mod tests {
             .find(|r| r.prefix == p("2001:db8:aa::/64"))
             .expect("external route present");
         assert_eq!(r.cost, 20); // E2: the metric alone
-        assert_eq!(r.gateways, vec![ll(2)]);
+        assert_eq!(gws(&r.gateways), vec![ll(2)]);
     }
 
     #[test]

@@ -35,6 +35,7 @@ mod query;
 mod rip;
 #[cfg(feature = "rip")]
 mod ripng;
+mod reload;
 mod router;
 mod rtr;
 #[cfg(feature = "vrrp")]
@@ -344,6 +345,12 @@ async fn main() -> Result<()> {
     // diffs against the running set and applies only the delta. The `_tx` end is held
     // for the whole run so the router's reload select arm never sees a closed channel.
     let (reload_tx, reload_rx) = mpsc::channel::<router::ReloadRoutes>(QUERY_QUEUE);
+    // SIGHUP route-filter hot-reload → the router loop. On SIGHUP the reload task
+    // re-compiles the filters and sends the new import + FIB-export set here; the
+    // router swaps its live filter set wholesale (re-evaluated on the next update each
+    // affects). The `_tx` end is held for the whole run so the router's filter-reload
+    // select arm never sees a closed channel.
+    let (filter_reload_tx, filter_reload_rx) = mpsc::channel::<router::FilterReload>(QUERY_QUEUE);
     // SIGHUP BGP neighbour hot-reload → the BGP task. On SIGHUP the reload task diffs the
     // re-read neighbour set against the running one and sends the add/remove delta here;
     // the BGP engine starts the added peers and tears the removed ones down, leaving
@@ -430,6 +437,14 @@ async fn main() -> Result<()> {
     const GRACEFUL_SHUTDOWN_SECS: u64 = 2;
     let (shutdown_tx, _) = tokio::sync::watch::channel(false);
     let mut proto_handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+
+    // Full-configuration hot-reload (SIGHUP): supervises the dynamic protocol engines
+    // (OSPF/OSPFv3, RIP/RIPng, Babel, IS-IS, VRRP) so a later SIGHUP can start a
+    // newly-enabled one, stop a newly-disabled one, or restart one whose interface set
+    // changed — each by (re)spawning just that engine's task, never the whole daemon.
+    // Startup-spawned engines call `mark_started` below (getting their stop signal from
+    // it); their respawn closures are registered just before the reload task.
+    let mut supervisor = reload::Supervisor::new(shutdown_tx.clone());
 
     // Spawn the single BFD engine if any protocol enables it; protocols register
     // their peers over `bfd_register` once their sessions warrant it.
@@ -559,7 +574,7 @@ async fn main() -> Result<()> {
         match build_vrrp_instances(&cfg) {
             Ok(instances) => {
                 let qrx = vrrp_queries_rx.take().expect("vrrp queries rx taken once");
-                let shutdown = shutdown_tx.subscribe();
+                let shutdown = supervisor.mark_started("vrrp", vrrp_sig(&cfg));
                 proto_handles.push(tokio::spawn(async move {
                     if let Err(e) = vrrp::run(instances, qrx, shutdown).await {
                         error!(error = %e, "VRRP engine stopped");
@@ -613,7 +628,7 @@ async fn main() -> Result<()> {
         let breg = bfd_register_tx.clone();
         let bnotify = rip_bfd_tx.clone();
         let bdrx = rip_bfd_rx.take().expect("rip bfd rx taken once");
-        let sd = shutdown_tx.subscribe();
+        let sd = supervisor.mark_started("rip", rip_sig(&cfg));
         proto_handles.push(tokio::spawn(async move {
             if let Err(e) = rip::run(
                 interfaces,
@@ -669,7 +684,7 @@ async fn main() -> Result<()> {
         let qrx = ripng_queries_rx
             .take()
             .expect("ripng queries rx taken once");
-        let sd = shutdown_tx.subscribe();
+        let sd = supervisor.mark_started("ripng", ripng_sig(&cfg));
         proto_handles.push(tokio::spawn(async move {
             if let Err(e) =
                 ripng::run(interfaces, tx, redist_rx, redistribute_metric, qrx, sd).await
@@ -714,7 +729,7 @@ async fn main() -> Result<()> {
                 let breg = bfd_register_tx.clone();
                 let bnotify = ospf_bfd_tx.clone();
                 let bdrx = ospf_bfd_rx.take().expect("ospf bfd rx taken once");
-                let sd = shutdown_tx.subscribe();
+                let sd = supervisor.mark_started("ospf", ospf_sig(&cfg));
                 proto_handles.push(tokio::spawn(async move {
                     if let Err(e) =
                         ospf::run(run_cfg, tx, redist_rx, qrx, breg, bnotify, bdrx, sd).await
@@ -745,7 +760,7 @@ async fn main() -> Result<()> {
                 let breg = bfd_register_tx.clone();
                 let bnotify = ospf3_bfd_tx.clone();
                 let bdrx = ospf3_bfd_rx.take().expect("ospf3 bfd rx taken once");
-                let sd = shutdown_tx.subscribe();
+                let sd = supervisor.mark_started("ospf3", ospf3_sig(&cfg));
                 proto_handles.push(tokio::spawn(async move {
                     if let Err(e) = ospf3::run(run_cfg, tx, qrx, breg, bnotify, bdrx, sd).await {
                         error!(error = %e, "OSPFv3 engine stopped");
@@ -948,7 +963,7 @@ async fn main() -> Result<()> {
                 let breg = bfd_register_tx.clone();
                 let bnotify = babel_bfd_tx.clone();
                 let bdrx = babel_bfd_rx.take().expect("babel bfd rx taken once");
-                let sd = shutdown_tx.subscribe();
+                let sd = supervisor.mark_started("babel", babel_sig(&cfg));
                 proto_handles.push(tokio::spawn(async move {
                     if let Err(e) = babel::run(run_cfg, tx, redist_rx, qrx, breg, bnotify, bdrx, sd).await {
                         error!(error = %e, "Babel engine stopped");
@@ -1029,7 +1044,7 @@ async fn main() -> Result<()> {
                 let breg = bfd_register_tx.clone();
                 let bnotify = isis_bfd_tx.clone();
                 let bdrx = isis_bfd_rx.take().expect("isis bfd rx taken once");
-                let sd = shutdown_tx.subscribe();
+                let sd = supervisor.mark_started("isis", isis_sig(&cfg));
                 proto_handles.push(tokio::spawn(async move {
                     if let Err(e) =
                         isis::run(run_cfg, tx, redist_rx, qrx, breg, bnotify, bdrx, sd).await
@@ -1046,121 +1061,359 @@ async fn main() -> Result<()> {
     // they were installed directly above, bypassing the router loop's fan-out.
     router::redistribute_seed(&redist_targets, &rib).await;
 
-    // SIGHUP: re-read the configuration and hot-apply the delta — the static routes and
-    // the BGP neighbour set (add/remove) — without restarting the daemon or disturbing any
-    // unchanged session or adjacency. A reload that fails to parse (or names a bad filter)
-    // is logged and ignored so the running configuration is kept rather than a broken one
-    // applied. Live reconfiguration beyond this — per-neighbour BGP attribute changes,
-    // enabling a protocol, swapping filters on other protocols — is still future work; see
-    // the daemon docs. The task holds clones of `reload_tx` / `bgp_reload_tx`; the
-    // originals stay in scope so the router's and BGP engine's reload arms never see a
-    // closed channel.
+    // Register each dynamic protocol's hot-reload behaviour with the supervisor: how to
+    // read its reload signature and how to (re)spawn its engine task from a freshly-read
+    // config. A protocol that is *off* at startup is registered too, so a later SIGHUP
+    // can start it. A supervisor-spawned generation runs with fresh internal channels;
+    // it therefore has no `show <proto>` control-socket route and does not re-register
+    // `redistribute` (documented deferrals — see `reload.rs`).
+    #[cfg(feature = "ospf")]
     {
-        let config_path = args.config.clone();
-        let reload_tx = reload_tx.clone();
-        let bgp_reload_tx = bgp_reload_tx.clone();
-        // Only diff BGP neighbours when BGP is running: the engine is spawned only when it
-        // was enabled at startup, so an added neighbour has an engine to bring it up.
-        let bgp_reconfig_enabled = bgp_enabled;
-        // The neighbour set the running BGP engine currently holds, by transport address —
-        // the baseline the next reload diffs against. Seeded from the startup config.
-        let mut known_bgp_peers: std::collections::HashSet<std::net::IpAddr> = cfg
-            .bgp
-            .as_ref()
-            .filter(|b| b.enabled)
-            .map(|b| {
-                b.neighbor
-                    .iter()
-                    .filter_map(|n| parse_neighbor_addr(&n.address).ok().map(|(addr, _)| addr))
-                    .collect()
-            })
-            .unwrap_or_default();
-        tokio::spawn(async move {
-            let mut hup = match tokio::signal::unix::signal(
-                tokio::signal::unix::SignalKind::hangup(),
-            ) {
-                Ok(s) => s,
-                Err(e) => {
-                    warn!(error = %e, "cannot install SIGHUP handler; config hot-reload disabled");
-                    return;
-                }
-            };
-            while hup.recv().await.is_some() {
-                info!("SIGHUP received; reloading configuration");
-                let reloaded = match reload_config(&config_path) {
-                    Ok(r) => r,
+        let updates_tx = updates_tx.clone();
+        let breg = bfd_register_tx.clone();
+        let bnotify = ospf_bfd_tx.clone();
+        supervisor.register(
+            "ospf",
+            Box::new(ospf_sig),
+            Box::new(move |cfg, stop| {
+                let ospfcfg = cfg.ospf.as_ref().filter(|o| o.enabled)?;
+                let run_cfg = match build_ospf_config(cfg, ospfcfg) {
+                    Ok(c) => c,
                     Err(e) => {
-                        error!(error = %e, "config reload failed; keeping the running configuration");
-                        continue;
+                        error!(error = %e, "OSPF hot-reload config invalid; not started");
+                        return None;
                     }
                 };
-                let count = reloaded.statics.len();
-                if reload_tx
-                    .send(router::ReloadRoutes {
-                        statics: reloaded.statics,
-                    })
-                    .await
-                    .is_err()
-                {
-                    break; // router loop gone; nothing more to reload
-                }
-                info!(statics = count, "configuration reloaded");
-                // BGP neighbour hot-reload: diff the re-read neighbour set against the
-                // running one and send the add/remove delta to the BGP engine.
-                if bgp_reconfig_enabled {
-                    if let Some(new_peers) = reloaded.bgp_peers {
-                        let new_set: std::collections::HashSet<std::net::IpAddr> =
-                            new_peers.iter().map(|p| p.addr).collect();
-                        let add: Vec<bgp::BgpPeerCfg> = new_peers
-                            .into_iter()
-                            .filter(|p| !known_bgp_peers.contains(&p.addr))
-                            .collect();
-                        let remove: Vec<std::net::IpAddr> = known_bgp_peers
-                            .iter()
-                            .copied()
-                            .filter(|a| !new_set.contains(a))
-                            .collect();
-                        if add.is_empty() && remove.is_empty() {
-                            known_bgp_peers = new_set;
-                        } else {
-                            let (added, removed) = (add.len(), remove.len());
-                            if bgp_reload_tx
-                                .send(bgp::BgpReconfig { add, remove })
-                                .await
-                                .is_err()
-                            {
-                                warn!("BGP engine gone; neighbour hot-reload skipped");
-                            } else {
-                                info!(added, removed, "BGP neighbours hot-reloaded");
-                                known_bgp_peers = new_set;
-                            }
-                        }
+                let (rtx, redist_rx) = mpsc::channel(REDIST_QUEUE);
+                let (qtx, qrx) = mpsc::channel(QUERY_QUEUE);
+                let (bdtx, bdrx) = mpsc::channel(QUERY_QUEUE);
+                let tx = updates_tx.clone();
+                let breg = breg.clone();
+                let bnotify = bnotify.clone();
+                let join = tokio::spawn(async move {
+                    if let Err(e) =
+                        ospf::run(run_cfg, tx, redist_rx, qrx, breg, bnotify, bdrx, stop).await
+                    {
+                        error!(error = %e, "OSPF engine stopped");
                     }
+                });
+                Some(reload::SpawnOut {
+                    join,
+                    parked: vec![Box::new(rtx), Box::new(qtx), Box::new(bdtx)],
+                })
+            }),
+        );
+    }
+    #[cfg(feature = "ospf3")]
+    {
+        let updates_tx = updates_tx.clone();
+        let breg = bfd_register_tx.clone();
+        let bnotify = ospf3_bfd_tx.clone();
+        supervisor.register(
+            "ospf3",
+            Box::new(ospf3_sig),
+            Box::new(move |cfg, stop| {
+                let ospf3cfg = cfg.ospf3.as_ref().filter(|o| o.enabled)?;
+                let run_cfg = match build_ospf3_config(cfg, ospf3cfg) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        error!(error = %e, "OSPFv3 hot-reload config invalid; not started");
+                        return None;
+                    }
+                };
+                let (qtx, qrx) = mpsc::channel(QUERY_QUEUE);
+                let (bdtx, bdrx) = mpsc::channel(QUERY_QUEUE);
+                let tx = updates_tx.clone();
+                let breg = breg.clone();
+                let bnotify = bnotify.clone();
+                let join = tokio::spawn(async move {
+                    if let Err(e) = ospf3::run(run_cfg, tx, qrx, breg, bnotify, bdrx, stop).await {
+                        error!(error = %e, "OSPFv3 engine stopped");
+                    }
+                });
+                Some(reload::SpawnOut {
+                    join,
+                    parked: vec![Box::new(qtx), Box::new(bdtx)],
+                })
+            }),
+        );
+    }
+    #[cfg(feature = "rip")]
+    {
+        let updates_tx = updates_tx.clone();
+        let breg = bfd_register_tx.clone();
+        let bnotify = rip_bfd_tx.clone();
+        supervisor.register(
+            "rip",
+            Box::new(rip_sig),
+            Box::new(move |cfg, stop| {
+                let ripcfg = cfg.rip.as_ref().filter(|r| r.enabled)?;
+                let rip_table = match &ripcfg.vrf {
+                    Some(name) => match cfg.vrf_table(name) {
+                        Some(t) => t,
+                        None => {
+                            error!(vrf = %name, "RIP hot-reload references unknown vrf; not started");
+                            return None;
+                        }
+                    },
+                    None => wren_core::RT_TABLE_MAIN,
+                };
+                let interfaces = ripcfg.interfaces.clone();
+                let ripcfg_bfd = ripcfg.bfd;
+                let metric = ripcfg.redistribute_metric.unwrap_or(1);
+                let (rtx, redist_rx) = mpsc::channel(REDIST_QUEUE);
+                let (qtx, qrx) = mpsc::channel(QUERY_QUEUE);
+                let (bdtx, bdrx) = mpsc::channel(QUERY_QUEUE);
+                let tx = updates_tx.clone();
+                let breg = breg.clone();
+                let bnotify = bnotify.clone();
+                let join = tokio::spawn(async move {
+                    if let Err(e) = rip::run(
+                        interfaces, rip_table, tx, redist_rx, metric, qrx, ripcfg_bfd, breg,
+                        bnotify, bdrx, stop,
+                    )
+                    .await
+                    {
+                        error!(error = %e, "RIP engine stopped");
+                    }
+                });
+                Some(reload::SpawnOut {
+                    join,
+                    parked: vec![Box::new(rtx), Box::new(qtx), Box::new(bdtx)],
+                })
+            }),
+        );
+    }
+    #[cfg(feature = "rip")]
+    {
+        let updates_tx = updates_tx.clone();
+        supervisor.register(
+            "ripng",
+            Box::new(ripng_sig),
+            Box::new(move |cfg, stop| {
+                let ripngcfg = cfg.ripng.as_ref().filter(|r| r.enabled)?;
+                let interfaces = ripngcfg.interfaces.clone();
+                let metric = ripngcfg.redistribute_metric.unwrap_or(1);
+                let (rtx, redist_rx) = mpsc::channel(REDIST_QUEUE);
+                let (qtx, qrx) = mpsc::channel(QUERY_QUEUE);
+                let tx = updates_tx.clone();
+                let join = tokio::spawn(async move {
+                    if let Err(e) = ripng::run(interfaces, tx, redist_rx, metric, qrx, stop).await {
+                        error!(error = %e, "RIPng engine stopped");
+                    }
+                });
+                Some(reload::SpawnOut {
+                    join,
+                    parked: vec![Box::new(rtx), Box::new(qtx)],
+                })
+            }),
+        );
+    }
+    #[cfg(feature = "babel")]
+    {
+        let updates_tx = updates_tx.clone();
+        let breg = bfd_register_tx.clone();
+        let bnotify = babel_bfd_tx.clone();
+        supervisor.register(
+            "babel",
+            Box::new(babel_sig),
+            Box::new(move |cfg, stop| {
+                let babelcfg = cfg.babel.as_ref().filter(|b| b.enabled)?;
+                let run_cfg = match build_babel_config(cfg, babelcfg) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        error!(error = %e, "Babel hot-reload config invalid; not started");
+                        return None;
+                    }
+                };
+                let (rtx, redist_rx) = mpsc::channel(REDIST_QUEUE);
+                let (qtx, qrx) = mpsc::channel(QUERY_QUEUE);
+                let (bdtx, bdrx) = mpsc::channel(QUERY_QUEUE);
+                let tx = updates_tx.clone();
+                let breg = breg.clone();
+                let bnotify = bnotify.clone();
+                let join = tokio::spawn(async move {
+                    if let Err(e) =
+                        babel::run(run_cfg, tx, redist_rx, qrx, breg, bnotify, bdrx, stop).await
+                    {
+                        error!(error = %e, "Babel engine stopped");
+                    }
+                });
+                Some(reload::SpawnOut {
+                    join,
+                    parked: vec![Box::new(rtx), Box::new(qtx), Box::new(bdtx)],
+                })
+            }),
+        );
+    }
+    #[cfg(feature = "isis")]
+    {
+        let updates_tx = updates_tx.clone();
+        let breg = bfd_register_tx.clone();
+        let bnotify = isis_bfd_tx.clone();
+        supervisor.register(
+            "isis",
+            Box::new(isis_sig),
+            Box::new(move |cfg, stop| {
+                let isiscfg = cfg.isis.as_ref().filter(|i| i.enabled)?;
+                let run_cfg = match build_isis_config(cfg, isiscfg) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        error!(error = %e, "IS-IS hot-reload config invalid; not started");
+                        return None;
+                    }
+                };
+                let (rtx, redist_rx) = mpsc::channel(REDIST_QUEUE);
+                let (qtx, qrx) = mpsc::channel(QUERY_QUEUE);
+                let (bdtx, bdrx) = mpsc::channel(QUERY_QUEUE);
+                let tx = updates_tx.clone();
+                let breg = breg.clone();
+                let bnotify = bnotify.clone();
+                let join = tokio::spawn(async move {
+                    if let Err(e) =
+                        isis::run(run_cfg, tx, redist_rx, qrx, breg, bnotify, bdrx, stop).await
+                    {
+                        error!(error = %e, "IS-IS engine stopped");
+                    }
+                });
+                Some(reload::SpawnOut {
+                    join,
+                    parked: vec![Box::new(rtx), Box::new(qtx), Box::new(bdtx)],
+                })
+            }),
+        );
+    }
+    #[cfg(feature = "vrrp")]
+    {
+        supervisor.register(
+            "vrrp",
+            Box::new(vrrp_sig),
+            Box::new(move |cfg, stop| {
+                if cfg.vrrp.is_empty() {
+                    return None;
                 }
-            }
-        });
+                let instances = match build_vrrp_instances(cfg) {
+                    Ok(i) => i,
+                    Err(e) => {
+                        error!(error = %e, "VRRP hot-reload config invalid; not started");
+                        return None;
+                    }
+                };
+                let (qtx, qrx) = mpsc::channel(QUERY_QUEUE);
+                let join = tokio::spawn(async move {
+                    if let Err(e) = vrrp::run(instances, qrx, stop).await {
+                        error!(error = %e, "VRRP engine stopped");
+                    }
+                });
+                Some(reload::SpawnOut {
+                    join,
+                    parked: vec![Box::new(qtx)],
+                })
+            }),
+        );
     }
 
-    info!("wren is running; press Ctrl-C to stop");
-    tokio::select! {
-        _ = router::run(&mut rib, &fib, updates_rx, &imports, fib_export.as_ref(), &redist_targets, &vrfs, queries_rx, subscribe_rx, &seeded_statics, reload_rx) => {
-            warn!("router loop ended (all protocol senders dropped)");
+    // SIGHUP: re-read the whole configuration and hot-apply the delta without a daemon
+    // restart. Static routes and route filters reconcile live in the router; BGP
+    // neighbours (add/remove) reconcile live in the BGP engine; the dynamic protocol
+    // engines (OSPF/OSPFv3, RIP/RIPng, Babel, IS-IS, VRRP) are started/stopped/restarted
+    // by the `supervisor`. A reload that fails to parse (or names a bad filter) is logged
+    // and ignored so the running configuration is kept rather than a broken one applied.
+    let config_path = args.config.clone();
+    // Only diff BGP neighbours when BGP is running: the engine is spawned only when it was
+    // enabled at startup, so an added neighbour has an engine to bring it up.
+    let bgp_reconfig_enabled = bgp_enabled;
+    // The neighbour set the running BGP engine holds, by transport address — the baseline
+    // the next reload diffs against. Seeded from the startup config.
+    let mut known_bgp_peers: std::collections::HashSet<std::net::IpAddr> = cfg
+        .bgp
+        .as_ref()
+        .filter(|b| b.enabled)
+        .map(|b| {
+            b.neighbor
+                .iter()
+                .filter_map(|n| parse_neighbor_addr(&n.address).ok().map(|(addr, _)| addr))
+                .collect()
+        })
+        .unwrap_or_default();
+    // Install the SIGHUP stream up front; a failure disables hot-reload but the daemon
+    // runs on. `None` leaves the reload select arm parked forever (never fires).
+    let mut hup = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup()) {
+        Ok(s) => Some(s),
+        Err(e) => {
+            warn!(error = %e, "cannot install SIGHUP handler; config hot-reload disabled");
+            None
         }
-        r = tokio::signal::ctrl_c() => {
-            r.context("waiting for shutdown signal")?;
-            info!("shutting down; notifying peers");
-            // Tell every wired engine to send its protocol goodbye, then give
-            // them a bounded grace window to flush it before the process exits
-            // (M10). Routes are deliberately left installed in the FIB so traffic
-            // keeps flowing across a restart.
-            let _ = shutdown_tx.send(true);
-            let deadline = tokio::time::Instant::now()
-                + std::time::Duration::from_secs(GRACEFUL_SHUTDOWN_SECS);
-            for handle in proto_handles {
-                if tokio::time::timeout_at(deadline, handle).await.is_err() {
-                    warn!("graceful-shutdown grace period elapsed; exiting anyway");
-                    break;
+    };
+
+    info!("wren is running; press Ctrl-C to stop");
+    // The router loop runs for the whole process. Pin it so the reload/shutdown `select!`
+    // below can be re-entered on every SIGHUP without ever restarting it.
+    let router_fut = router::run(
+        &mut rib,
+        &fib,
+        updates_rx,
+        &imports,
+        fib_export.as_ref(),
+        &redist_targets,
+        &vrfs,
+        queries_rx,
+        subscribe_rx,
+        &seeded_statics,
+        reload_rx,
+        filter_reload_rx,
+    );
+    tokio::pin!(router_fut);
+    loop {
+        // A daemon whose SIGHUP handler failed to install still needs a live future for
+        // that arm; `pending()` never fires, so reload is simply inert.
+        let hup_wait = async {
+            match hup.as_mut() {
+                Some(h) => {
+                    h.recv().await;
                 }
+                None => std::future::pending::<()>().await,
+            }
+        };
+        tokio::select! {
+            _ = &mut router_fut => {
+                warn!("router loop ended (all protocol senders dropped)");
+                break;
+            }
+            _ = hup_wait => {
+                info!("SIGHUP received; reloading configuration");
+                apply_reload(
+                    &config_path,
+                    &reload_tx,
+                    &filter_reload_tx,
+                    &bgp_reload_tx,
+                    bgp_reconfig_enabled,
+                    &mut known_bgp_peers,
+                    &mut supervisor,
+                )
+                .await;
+            }
+            r = tokio::signal::ctrl_c() => {
+                r.context("waiting for shutdown signal")?;
+                info!("shutting down; notifying peers");
+                // Tell every wired engine to send its protocol goodbye, then give them a
+                // bounded grace window to flush it before the process exits (M10). Routes
+                // are deliberately left installed in the FIB so traffic keeps flowing
+                // across a restart.
+                let _ = shutdown_tx.send(true);
+                let deadline = tokio::time::Instant::now()
+                    + std::time::Duration::from_secs(GRACEFUL_SHUTDOWN_SECS);
+                for handle in std::mem::take(&mut proto_handles) {
+                    if tokio::time::timeout_at(deadline, handle).await.is_err() {
+                        warn!("graceful-shutdown grace period elapsed; exiting anyway");
+                        break;
+                    }
+                }
+                // Await any engines the supervisor (re)started on a SIGHUP within the
+                // same window — their goodbye rides the same shutdown signal via the
+                // per-engine stop relay.
+                supervisor.join_all(deadline).await;
+                break;
             }
         }
     }
@@ -1516,13 +1769,100 @@ fn vrf_routemap(
     }
 }
 
+// --- Reload signatures (hot-reload) -----------------------------------------------
+//
+// Each dynamic protocol's [`reload::Sig`] captures the two things a SIGHUP acts on for
+// it: whether it is enabled, and its interface set. A restart is triggered only when
+// one of those changes, so an unrelated edit elsewhere in the file never bounces an
+// adjacency. Other per-protocol knobs still need a full daemon restart to take effect.
+
+#[cfg(feature = "ospf")]
+fn ospf_sig(cfg: &wren_config::Config) -> reload::Sig {
+    match cfg.ospf.as_ref() {
+        Some(o) => reload::Sig::new(
+            o.enabled,
+            o.interfaces
+                .iter()
+                .cloned()
+                .chain(o.interface.iter().map(|i| i.name.clone())),
+        ),
+        None => reload::Sig::new(false, Vec::<String>::new()),
+    }
+}
+
+#[cfg(feature = "ospf3")]
+fn ospf3_sig(cfg: &wren_config::Config) -> reload::Sig {
+    match cfg.ospf3.as_ref() {
+        Some(o) => reload::Sig::new(
+            o.enabled,
+            o.interfaces
+                .iter()
+                .cloned()
+                .chain(o.interface.iter().map(|i| i.name.clone())),
+        ),
+        None => reload::Sig::new(false, Vec::<String>::new()),
+    }
+}
+
+#[cfg(feature = "rip")]
+fn rip_sig(cfg: &wren_config::Config) -> reload::Sig {
+    match cfg.rip.as_ref() {
+        Some(r) => reload::Sig::new(r.enabled, r.interfaces.clone()),
+        None => reload::Sig::new(false, Vec::<String>::new()),
+    }
+}
+
+#[cfg(feature = "rip")]
+fn ripng_sig(cfg: &wren_config::Config) -> reload::Sig {
+    match cfg.ripng.as_ref() {
+        Some(r) => reload::Sig::new(r.enabled, r.interfaces.clone()),
+        None => reload::Sig::new(false, Vec::<String>::new()),
+    }
+}
+
+#[cfg(feature = "babel")]
+fn babel_sig(cfg: &wren_config::Config) -> reload::Sig {
+    match cfg.babel.as_ref() {
+        Some(b) => reload::Sig::new(b.enabled, b.interfaces.clone()),
+        None => reload::Sig::new(false, Vec::<String>::new()),
+    }
+}
+
+#[cfg(feature = "isis")]
+fn isis_sig(cfg: &wren_config::Config) -> reload::Sig {
+    match cfg.isis.as_ref() {
+        Some(i) => reload::Sig::new(i.enabled, i.interfaces.clone()),
+        None => reload::Sig::new(false, Vec::<String>::new()),
+    }
+}
+
+#[cfg(feature = "vrrp")]
+fn vrrp_sig(cfg: &wren_config::Config) -> reload::Sig {
+    // VRRP has no single `enabled` flag: it runs when any `[[vrrp]]` instance is
+    // defined. Each instance keys the signature by `interface/vrid` so adding or
+    // removing an instance restarts the engine.
+    reload::Sig::new(
+        !cfg.vrrp.is_empty(),
+        cfg.vrrp
+            .iter()
+            .map(|v| format!("{}/{}", v.interface, v.vrid)),
+    )
+}
+
 /// The parts of a re-read configuration a SIGHUP hot-reload hands the running daemon:
 /// the resolved static routes (for the router) and, when BGP is enabled, the resolved
 /// neighbour set (for the BGP engine's neighbour delta).
 struct ReloadedConfig {
+    /// The freshly-parsed configuration, handed to the protocol supervisor so it can
+    /// diff each dynamic engine's signature and start/stop/restart the ones that changed.
+    cfg: wren_config::Config,
     /// Static routes, each already run through its VRF's import route-map — the same
     /// baseline the router holds, so it can diff and apply only the delta.
     statics: Vec<wren_core::Route>,
+    /// The recompiled per-protocol import filters (for the router's live filter swap).
+    imports: router::ImportFilters,
+    /// The recompiled FIB export filter, or `None` (for the router's live filter swap).
+    fib_export: Option<Filter>,
     /// The configured BGP peers, or `None` when BGP is disabled/absent (the reload then
     /// carries no neighbour delta).
     bgp_peers: Option<Vec<bgp::BgpPeerCfg>>,
@@ -1539,6 +1879,8 @@ fn reload_config(path: &std::path::Path) -> Result<ReloadedConfig> {
     let cfg = wren_config::Config::load(path)
         .with_context(|| format!("reloading {}", path.display()))?;
     let by_name = compile_named_filters(&cfg).context("compiling filters")?;
+    let imports = resolve_import_filters(&cfg, &by_name).context("resolving import filters")?;
+    let fib_export = resolve_fib_export(&cfg, &by_name).context("resolving export filters")?;
     let (vrf_imports, _vrf_exports) =
         build_vrf_routemaps(&cfg, &by_name).context("resolving vrf route-maps")?;
     let mut statics = Vec::new();
@@ -1556,9 +1898,92 @@ fn reload_config(path: &std::path::Path) -> Result<ReloadedConfig> {
         None => None,
     };
     Ok(ReloadedConfig {
+        cfg,
         statics,
+        imports,
+        fib_export,
         bgp_peers,
     })
+}
+
+/// Apply one SIGHUP config hot-reload: re-read the file and reconcile the running
+/// daemon to it. Static routes and route filters reconcile live in the router; BGP
+/// neighbours (add/remove) reconcile live in the BGP engine; the dynamic protocol
+/// engines are started/stopped/restarted by the `supervisor`. A reload that fails to
+/// parse or resolve is logged and dropped, keeping the running configuration.
+#[allow(clippy::too_many_arguments)] // one reload step wires every hot-reloadable sink
+async fn apply_reload(
+    config_path: &std::path::Path,
+    reload_tx: &mpsc::Sender<router::ReloadRoutes>,
+    filter_reload_tx: &mpsc::Sender<router::FilterReload>,
+    bgp_reload_tx: &mpsc::Sender<bgp::BgpReconfig>,
+    bgp_reconfig_enabled: bool,
+    known_bgp_peers: &mut std::collections::HashSet<std::net::IpAddr>,
+    supervisor: &mut reload::Supervisor,
+) {
+    let reloaded = match reload_config(config_path) {
+        Ok(r) => r,
+        Err(e) => {
+            error!(error = %e, "config reload failed; keeping the running configuration");
+            return;
+        }
+    };
+    let static_count = reloaded.statics.len();
+    if reload_tx
+        .send(router::ReloadRoutes {
+            statics: reloaded.statics,
+        })
+        .await
+        .is_err()
+    {
+        warn!("router loop gone; static hot-reload skipped");
+    }
+    if filter_reload_tx
+        .send(router::FilterReload {
+            imports: reloaded.imports,
+            fib_export: reloaded.fib_export,
+        })
+        .await
+        .is_err()
+    {
+        warn!("router loop gone; filter hot-reload skipped");
+    }
+    info!(statics = static_count, "configuration reloaded");
+    // BGP neighbour hot-reload: diff the re-read neighbour set against the running one
+    // and send the add/remove delta to the BGP engine.
+    if bgp_reconfig_enabled {
+        if let Some(new_peers) = reloaded.bgp_peers {
+            let new_set: std::collections::HashSet<std::net::IpAddr> =
+                new_peers.iter().map(|p| p.addr).collect();
+            let add: Vec<bgp::BgpPeerCfg> = new_peers
+                .into_iter()
+                .filter(|p| !known_bgp_peers.contains(&p.addr))
+                .collect();
+            let remove: Vec<std::net::IpAddr> = known_bgp_peers
+                .iter()
+                .copied()
+                .filter(|a| !new_set.contains(a))
+                .collect();
+            if add.is_empty() && remove.is_empty() {
+                *known_bgp_peers = new_set;
+            } else {
+                let (added, removed) = (add.len(), remove.len());
+                if bgp_reload_tx
+                    .send(bgp::BgpReconfig { add, remove })
+                    .await
+                    .is_err()
+                {
+                    warn!("BGP engine gone; neighbour hot-reload skipped");
+                } else {
+                    info!(added, removed, "BGP neighbours hot-reloaded");
+                    *known_bgp_peers = new_set;
+                }
+            }
+        }
+    }
+    // Dynamic protocol engines (OSPF/OSPFv3, RIP/RIPng, Babel, IS-IS, VRRP): start,
+    // stop, or restart just the ones whose enable flag or interface set changed.
+    supervisor.apply(&reloaded.cfg);
 }
 
 /// Resolve each VRF's `import` / `export` route-maps to compiled filters, keyed by the

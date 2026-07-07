@@ -1536,8 +1536,17 @@ impl Ospf {
         }
 
         let new_prefixes: HashSet<Prefix> = chosen.keys().copied().collect();
+        // Map each SPF-computed Interface ID (the ifindex) to its interface name,
+        // so `to_route` can pin every link-local next hop to an outgoing device —
+        // a v6 route with a fe80:: gateway and no RTA_OIF is rejected by netlink.
+        let iface_name: std::collections::HashMap<u32, String> = self
+            .ifaces
+            .iter()
+            .map(|i| (i.interface_id, i.name.clone()))
+            .collect();
         for r in chosen.values() {
-            let _ = self.updates.send(RouteUpdate::Announce(r.to_route())).await;
+            let route = r.to_route(|id| iface_name.get(&id).cloned());
+            let _ = self.updates.send(RouteUpdate::Announce(route)).await;
         }
         let gone: Vec<Prefix> = self.announced.difference(&new_prefixes).copied().collect();
         for prefix in gone {

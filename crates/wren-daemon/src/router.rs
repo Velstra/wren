@@ -186,6 +186,21 @@ pub struct ReloadRoutes {
     pub statics: Vec<Route>,
 }
 
+/// A request to swap the router's live filter set from a freshly-read configuration
+/// (the SIGHUP hot-reload path). Carries the complete new import filters (per-protocol,
+/// applied as a route enters the RIB) and FIB export filter (RIB → kernel). The router
+/// replaces its working set wholesale; the change takes effect on the next route update
+/// each affects — no session or adjacency is disturbed. Withdrawing an already-installed
+/// route when a stricter export filter now rejects it is handled the next time that
+/// prefix changes; the periodic reconcile does not re-run export policy on its own.
+#[derive(Debug)]
+pub struct FilterReload {
+    /// The new per-protocol import filters (replaces the running set wholesale).
+    pub imports: ImportFilters,
+    /// The new FIB export filter, or `None` to clear it.
+    pub fib_export: Option<Filter>,
+}
+
 /// Capacity of each route-export subscriber channel. Bounds the memory a single
 /// slow/stuck `monitor routes` client can cause the router to hold.
 pub(crate) const SUBSCRIBER_CAP: usize = 1024;
@@ -209,7 +224,12 @@ pub async fn run(
     mut subscribes: mpsc::Receiver<RouteSubscribe>,
     statics: &[Route],
     mut reloads: mpsc::Receiver<ReloadRoutes>,
+    mut filter_reloads: mpsc::Receiver<FilterReload>,
 ) {
+    // Own working copies of the filter set so a SIGHUP hot-reload can swap them live
+    // (`filter_reloads` arm below). Seeded from the startup filters the caller resolved.
+    let mut imports = imports.clone();
+    let mut fib_export = fib_export.cloned();
     // The best-path routes we have actually programmed into the FIB, keyed by
     // (vrf, prefix). Doubles as the route-export snapshot source, and lets the
     // export filter's accept→reject transition withdraw a previously-installed
@@ -250,7 +270,7 @@ pub async fn run(
                     // steady state `try_recv` returns empty immediately, so a lone
                     // update behaves exactly as before with no added latency.
                     let mut coalesced: BTreeMap<(u32, Prefix), FibChange> = BTreeMap::new();
-                    if let Some(change) = ingest(rib, first, imports) {
+                    if let Some(change) = ingest(rib, first, &imports) {
                         coalesced.insert(fib_key(&change), change);
                     }
                     let mut drained = 0;
@@ -258,7 +278,7 @@ pub async fn run(
                         match updates.try_recv() {
                             Ok(u) => {
                                 drained += 1;
-                                if let Some(change) = ingest(rib, u, imports) {
+                                if let Some(change) = ingest(rib, u, &imports) {
                                     coalesced.insert(fib_key(&change), change);
                                 }
                             }
@@ -267,7 +287,7 @@ pub async fn run(
                     }
                     for (_key, change) in coalesced {
                         let event = redist_event(&change);
-                        program_fib(fib, change, fib_export, &mut exported, &mut subscribers, &mut failed).await;
+                        program_fib(fib, change, fib_export.as_ref(), &mut exported, &mut subscribers, &mut failed).await;
                         redistribute(redist, &event).await;
                     }
                 }
@@ -281,12 +301,36 @@ pub async fn run(
             }
             Some(reload) = reloads.recv() => {
                 reload_statics(
-                    rib, fib, fib_export, &mut exported, &mut subscribers,
+                    rib, fib, fib_export.as_ref(), &mut exported, &mut subscribers,
                     &mut failed, &mut current_statics, reload.statics,
                 ).await;
             }
+            Some(fr) = filter_reloads.recv() => {
+                // Swap the live filter set (SIGHUP hot-reload). Re-evaluated on the next
+                // route update each filter affects; running sessions are untouched. Report
+                // the per-protocol delta (added / removed / changed import filters) so an
+                // operator sees exactly what the reload changed.
+                let old_named: BTreeMap<&str, &Filter> =
+                    imports.iter().map(|(p, f)| (p.name(), f)).collect();
+                let new_named: BTreeMap<&str, &Filter> =
+                    fr.imports.iter().map(|(p, f)| (p.name(), f)).collect();
+                let delta = crate::reload::diff_keyed(&old_named, &new_named);
+                imports = fr.imports;
+                fib_export = fr.fib_export;
+                if delta.is_empty() {
+                    info!(fib_export = fib_export.is_some(), "route filters reloaded (import set unchanged)");
+                } else {
+                    info!(
+                        added = ?delta.added,
+                        removed = ?delta.removed,
+                        changed = ?delta.changed,
+                        fib_export = fib_export.is_some(),
+                        "route filters reloaded",
+                    );
+                }
+            }
             _ = reconcile.tick() => {
-                retry_failed(rib, fib, fib_export, &mut exported, &mut subscribers, &mut failed).await;
+                retry_failed(rib, fib, fib_export.as_ref(), &mut exported, &mut subscribers, &mut failed).await;
             }
         }
     }
@@ -1132,6 +1176,7 @@ mod tests {
         let (qtx, qrx) = mpsc::channel::<QueryRequest>(16);
         let (stx, srx) = mpsc::channel::<RouteSubscribe>(16);
         let (_rtx, rrx) = mpsc::channel::<ReloadRoutes>(16);
+        let (_frtx, frrx) = mpsc::channel::<FilterReload>(16);
 
         // `run` borrows a `&mut Rib` for its whole lifetime, so it can't be
         // `tokio::spawn`ed (production runs it in `select!`, not spawned). Drive it
@@ -1142,7 +1187,7 @@ mod tests {
             let mut rib = Rib::new();
             let fib = crate::fib::spawn(Box::new(MemoryFib::default()));
             let imports = ImportFilters::new();
-            run(&mut rib, &fib, urx, &imports, None, &[], &[], qrx, srx, &[], rrx).await;
+            run(&mut rib, &fib, urx, &imports, None, &[], &[], qrx, srx, &[], rrx, frrx).await;
         };
 
         let driver = async move {
