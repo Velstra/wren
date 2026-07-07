@@ -273,6 +273,26 @@ fn classify(local_as: u32, members: &[u32], remote_as: u32) -> PeerType {
     }
 }
 
+/// The My-AS to place in the OPEN we send a peer: the effective external AS for a true
+/// eBGP peer (RFC 5065 §4.2 — the Confederation Identifier when in a confederation), else
+/// the effective (Member-)AS. Both inputs already fold in any per-neighbour `local-as`
+/// override, so an override fully replaces the AS this session presents. Pulled out as a
+/// pure function so the override wiring is unit-testable without a live socket.
+fn open_my_as(peer_type: PeerType, eff_local_as: u32, eff_external_as: u32) -> u32 {
+    if peer_type == PeerType::Ebgp {
+        eff_external_as
+    } else {
+        eff_local_as
+    }
+}
+
+/// Whether Wren initiates (dials) a session to a peer: yes unless it is `passive` (we
+/// wait for it to connect) or administratively `shutdown` (we never bring it up). A
+/// pure predicate so the connector-spawn gate is unit-testable.
+fn should_initiate(passive: bool, shutdown: bool) -> bool {
+    !passive && !shutdown
+}
+
 /// One configured BGP peer.
 pub struct BgpPeerCfg {
     /// The peer's transport address — IPv4, or IPv6 for an unnumbered/RFC 5549
@@ -342,6 +362,25 @@ pub struct BgpPeerCfg {
     /// peer — advertise the BGP-LS Multiprotocol capability, originate the static
     /// Link-State objects to it, and install the objects it advertises into the RIB.
     pub link_state: bool,
+    /// Override this speaker's AS for this session only (`local-as`): a full replacement
+    /// used as the OPEN My-AS, in the eBGP/iBGP classification, and as the eBGP AS_PATH
+    /// prepend toward this peer. `None` uses the global `local_as`.
+    pub local_as: Option<u32>,
+    /// Bind the outgoing TCP connection to this source address before dialling
+    /// (`update-source`). Same family as [`Self::addr`]. `None` lets the kernel choose.
+    /// Applies only to the connection we initiate, not a `passive` peer's inbound one.
+    pub update_source: Option<IpAddr>,
+    /// The session TTL for a multihop eBGP peer (`ebgp-multihop`, 1–255). Mutually
+    /// exclusive with [`Self::ttl_security`] (GTSM). `None` leaves the default TTL.
+    pub ebgp_multihop: Option<u8>,
+    /// A free-form label shown in `show bgp neighbors` (`description`). No wire effect.
+    pub description: Option<String>,
+    /// Administratively shut this neighbour down (`shutdown`): never dial it, refuse its
+    /// inbound connections, and show it as `admin-shutdown`. `false` is a live session.
+    pub shutdown: bool,
+    /// The Hold Time proposed in the OPEN to this peer (`hold-time`), overriding the
+    /// global default for this session. `None` uses [`BgpConfig::hold_time`].
+    pub hold_time: Option<u16>,
 }
 
 impl BgpPeerCfg {
@@ -452,6 +491,16 @@ struct PeerProps {
     /// This local speaker's BGP Role toward this peer (RFC 9234 §4), if configured —
     /// drives the Only-To-Customer route-leak procedures on received routes.
     role: Option<BgpRole>,
+    /// Per-session AS override (`local-as`), applied to an inbound session's OPEN My-AS
+    /// and eBGP AS_PATH prepend just as for a dialled one. `None` uses the global AS.
+    local_as: Option<u32>,
+    /// Multihop eBGP TTL (`ebgp-multihop`) for this peer, applied to the accepted socket.
+    ebgp_multihop: Option<u8>,
+    /// Per-session Hold Time override (`hold-time`) proposed in the OPEN. `None` = global.
+    hold_time: Option<u16>,
+    /// Whether this neighbour is administratively shut down (`shutdown`): its inbound
+    /// connections are refused.
+    shutdown: bool,
 }
 
 /// One prefix this speaker originates, with the COMMUNITIES to attach. The central
@@ -641,6 +690,16 @@ struct PeerInfo {
     link_state: bool,
     /// This local speaker's BGP Role toward this peer (RFC 9234 §4), if configured.
     role: Option<BgpRole>,
+    /// Per-session AS override (`local-as`): the OPEN My-AS, the eBGP/iBGP classification
+    /// and the eBGP AS_PATH prepend all use it in place of the global AS. `None` = global.
+    local_as: Option<u32>,
+    /// Bind the dialled connection to this source address (`update-source`). `None` lets
+    /// the kernel pick. Ignored on an accepted (inbound) session.
+    update_source: Option<IpAddr>,
+    /// Multihop eBGP session TTL (`ebgp-multihop`), if set. `None` uses the default TTL.
+    ebgp_multihop: Option<u8>,
+    /// Per-session Hold Time override (`hold-time`) proposed in the OPEN. `None` = global.
+    hold_time: Option<u16>,
 }
 
 /// A message from a per-peer session task to the central RIB task.
@@ -673,6 +732,10 @@ enum PeerMsg {
         sent_open: Vec<u8>,
         /// The OPEN we received (a full BGP PDU), for the BMP Peer Up.
         received_open: Vec<u8>,
+        /// The Hold Time negotiated for this session (the minimum of our proposed
+        /// `hold-time` and the peer's OPEN, RFC 4271 §4.2) — shown in `show bgp
+        /// neighbors` so a per-neighbour override is observable.
+        neg_hold: u16,
     },
     /// The session left Established / went down — flush the peer's routes, but only
     /// if `conn_id` is still the current connection (a stale loser's Down is
@@ -762,6 +825,14 @@ struct NeighborState {
     /// How many ROUTE-REFRESH requests this peer has sent us (RFC 2918) — a visible
     /// signal in `show bgp neighbors` that a refresh was honoured.
     refreshes_received: u64,
+    /// The operator's free-form label for this neighbour (`description`), if any.
+    description: Option<String>,
+    /// Whether this neighbour is administratively shut down (`shutdown`).
+    shutdown: bool,
+    /// The Hold Time negotiated with this peer on the current session (the minimum of
+    /// our proposed `hold-time` and the peer's), shown in `show bgp neighbors`. `None`
+    /// while the session is not Established.
+    negotiated_hold: Option<u16>,
 }
 
 /// A neighbour summary handed to the (pure) renderer.
@@ -775,6 +846,12 @@ pub struct NeighborSummary {
     pub established: bool,
     /// How many ROUTE-REFRESH requests this peer has sent us (RFC 2918).
     pub refreshes_received: u64,
+    /// The operator's free-form label for this neighbour (`description`), if any.
+    pub description: Option<String>,
+    /// Whether this neighbour is administratively shut down (`shutdown`).
+    pub shutdown: bool,
+    /// The Hold Time negotiated on the current session, if Established (`None` otherwise).
+    pub negotiated_hold: Option<u16>,
 }
 
 /// One prefix in the central task's origination set, with the COMMUNITIES to
@@ -859,6 +936,9 @@ fn neighbor_summaries(neighbors: &BTreeMap<IpAddr, NeighborState>) -> Vec<Neighb
             remote_as: n.remote_as,
             established: n.established,
             refreshes_received: n.refreshes_received,
+            description: n.description.clone(),
+            shutdown: n.shutdown,
+            negotiated_hold: n.negotiated_hold,
         })
         .collect()
 }
@@ -1304,10 +1384,26 @@ pub fn render_bgp_neighbors(neighbors: &[NeighborSummary]) -> String {
     }
     let mut out = String::new();
     for n in neighbors {
-        let state = if n.established { "Established" } else { "Idle" };
+        // An administratively shut-down neighbour is reported as `admin-shutdown`
+        // regardless of session state; otherwise it is Established or Idle.
+        let state = if n.shutdown {
+            "admin-shutdown"
+        } else if n.established {
+            "Established"
+        } else {
+            "Idle"
+        };
         let _ = write!(out, "{} AS {} {}", n.addr, n.remote_as, state);
+        // The Hold Time negotiated on the live session (RFC 4271 §4.2) — visible only
+        // while Established, so an operator can confirm a per-neighbour `hold-time` took.
+        if let Some(hold) = n.negotiated_hold {
+            let _ = write!(out, " hold {hold}");
+        }
         if n.refreshes_received > 0 {
             let _ = write!(out, " refreshes {}", n.refreshes_received);
+        }
+        if let Some(desc) = &n.description {
+            let _ = write!(out, " \"{desc}\"");
         }
         out.push('\n');
     }
@@ -1457,6 +1553,9 @@ pub async fn run(
                     remote_as: p.remote_as,
                     established: false,
                     refreshes_received: 0,
+                    description: p.description.clone(),
+                    shutdown: p.shutdown,
+                    negotiated_hold: None,
                 },
             )
         })
@@ -1558,7 +1657,14 @@ pub async fn run(
                     PeerProps {
                         remote_as: p.remote_as,
                         rr_client: p.rr_client,
-                        peer_type: classify(cfg.local_as, &members, p.remote_as),
+                        // Classify against this peer's effective local AS (the `local-as`
+                        // override if set, else the global one), so an override flips the
+                        // eBGP/iBGP determination for the session (RFC 4271 §1.1).
+                        peer_type: classify(
+                            p.local_as.unwrap_or(cfg.local_as),
+                            &members,
+                            p.remote_as,
+                        ),
                         ttl_security: p.ttl_security,
                         max_prefix: p.max_prefix,
                         add_path: p.add_path,
@@ -1568,6 +1674,10 @@ pub async fn run(
                         srpolicy: p.srpolicy,
                         link_state: p.link_state,
                         role: p.role,
+                        local_as: p.local_as,
+                        ebgp_multihop: p.ebgp_multihop,
+                        hold_time: p.hold_time,
+                        shutdown: p.shutdown,
                     },
                 )
             })
@@ -1617,9 +1727,11 @@ pub async fn run(
     // The cancel handle for each active connector, keyed by peer, so a de-configured
     // neighbour's connector can be stopped (flip to `true`) on a live reload.
     let mut connector_cancels: HashMap<IpAddr, tokio::sync::watch::Sender<bool>> = HashMap::new();
-    // One active connector per non-passive peer.
+    // One active connector per non-passive peer. An administratively shut-down peer
+    // (`shutdown`) is never dialled — and the accept loop refuses its inbound
+    // connections — so it stays down until the operator clears the flag.
     for peer in &cfg.peers {
-        if peer.passive {
+        if !should_initiate(peer.passive, peer.shutdown) {
             continue;
         }
         let cancel = spawn_bgp_connector(peer, cfg.local_as, &members, local.clone(), conn_tx.clone());
@@ -1975,6 +2087,9 @@ pub async fn run(
                             remote_as: peer.remote_as,
                             established: false,
                             refreshes_received: 0,
+                            description: peer.description.clone(),
+                            shutdown: peer.shutdown,
+                            negotiated_hold: None,
                         },
                     );
                     if peer.default_originate {
@@ -1992,7 +2107,11 @@ pub async fn run(
                         PeerProps {
                             remote_as: peer.remote_as,
                             rr_client: peer.rr_client,
-                            peer_type: classify(local.local_as, &members, peer.remote_as),
+                            peer_type: classify(
+                                peer.local_as.unwrap_or(local.local_as),
+                                &members,
+                                peer.remote_as,
+                            ),
                             ttl_security: peer.ttl_security,
                             max_prefix: peer.max_prefix,
                             add_path: peer.add_path,
@@ -2002,6 +2121,10 @@ pub async fn run(
                             srpolicy: peer.srpolicy,
                             link_state: peer.link_state,
                             role: peer.role,
+                            local_as: peer.local_as,
+                            ebgp_multihop: peer.ebgp_multihop,
+                            hold_time: peer.hold_time,
+                            shutdown: peer.shutdown,
                         },
                     );
                     if let Some(f) = peer.export.clone() {
@@ -2010,8 +2133,11 @@ pub async fn run(
                     local = Arc::new(local_with_peers(&local, peers, exports));
                     // Dial the peer (active). A passive added peer would rely on the accept
                     // loop, which holds the startup `Local` snapshot and does not know it —
-                    // a documented limitation of live neighbour add.
-                    if peer.passive {
+                    // a documented limitation of live neighbour add. An admin-shutdown peer
+                    // is added to state but never dialled.
+                    if peer.shutdown {
+                        info!(peer = %addr, "BGP reconfig: neighbour is admin-shutdown; not dialling");
+                    } else if peer.passive {
                         warn!(peer = %addr, "BGP reconfig: adding a passive neighbour at runtime is unsupported; not dialling");
                     } else {
                         let cancel = spawn_bgp_connector(
@@ -2041,6 +2167,7 @@ pub async fn run(
                 remote_port,
                 sent_open,
                 received_open,
+                neg_hold,
             } => {
                 // A peer damped for exceeding its max-prefix limit is kept down: shut
                 // any reconnection straight back down without advertising to it.
@@ -2072,6 +2199,7 @@ pub async fn run(
                 info!(peer = %p, "BGP session established");
                 if let Some(n) = neighbors.get_mut(&p) {
                     n.established = true;
+                    n.negotiated_hold = Some(neg_hold);
                 }
                 // BMP Peer Up (RFC 7854 §4.10): tell the monitoring station this
                 // session is up, with both OPENs. Best-effort — never block routing.
@@ -2227,6 +2355,7 @@ pub async fn run(
                 info!(peer = %p, "BGP session down");
                 if let Some(n) = neighbors.get_mut(&p) {
                     n.established = false;
+                    n.negotiated_hold = None;
                 }
                 // BMP Peer Down (RFC 7854 §4.9), named with the id the peer reported
                 // at Established. Best-effort.
@@ -2465,6 +2594,7 @@ pub async fn run(
                         }
                         if let Some(n) = neighbors.get_mut(&peer) {
                             n.established = false;
+                            n.negotiated_hold = None;
                         }
                         est_inbound.remove(&peer);
                         current_conn.remove(&peer);
@@ -3659,16 +3789,19 @@ async fn connector(
         // Bind every dial to the VRF (L3 master) device, if any, so the connection
         // uses the VRF's routing table to reach the peer.
         let vrf = local.vrf_device.as_deref();
+        // Bind the dial to this neighbour's `update-source` address, if configured, so the
+        // session's local endpoint is that address (e.g. a loopback).
+        let source = peer.update_source;
         let dial = async {
             match peer.addr {
                 // An authenticated (TCP-MD5/AO) peer — IPv4 or IPv6 — needs its key
                 // installed on the socket before the SYN, so it gets a hand-built connect.
                 _ if auth.is_enabled() => {
-                    connect_authed(peer.addr, peer.scope_id, &auth, vrf).await
+                    connect_authed(peer.addr, peer.scope_id, &auth, vrf, source).await
                 }
                 // Everything else — plain IPv4, or an IPv6 (unnumbered) peer, whose
                 // link-local address carries a scope id (interface) to dial it on.
-                _ => connect_bound(peer.addr, peer.scope_id, vrf).await,
+                _ => connect_bound(peer.addr, peer.scope_id, vrf, source).await,
             }
         };
         // Race the dial against cancellation: a de-configure while we are connecting (no
@@ -3716,7 +3849,8 @@ fn spawn_bgp_connector(
         scope_id: peer.scope_id,
         remote_as: peer.remote_as,
         rr_client: peer.rr_client,
-        peer_type: classify(local_as, members, peer.remote_as),
+        // Classify against the effective local AS (the `local-as` override if set).
+        peer_type: classify(peer.local_as.unwrap_or(local_as), members, peer.remote_as),
         ttl_security: peer.ttl_security,
         add_path: peer.add_path,
         ext_nexthop: peer.ext_nexthop,
@@ -3725,6 +3859,10 @@ fn spawn_bgp_connector(
         srpolicy: peer.srpolicy,
         link_state: peer.link_state,
         role: peer.role,
+        local_as: peer.local_as,
+        update_source: peer.update_source,
+        ebgp_multihop: peer.ebgp_multihop,
+        hold_time: peer.hold_time,
     };
     let auth = peer.tcp_auth();
     let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
@@ -3778,10 +3916,16 @@ async fn accept_loop(listener: TcpListener, local: Arc<Local>, tx: mpsc::Sender<
                 // (`::ffff:a.b.c.d`); normalise back to a plain IPv4 address so it
                 // matches the configured peer key. IPv6 (unnumbered) peers pass through.
                 let ip = normalize_ip(addr.ip());
-                let Some(&props) = local.peers.get(&ip) else {
+                let Some(props) = local.peers.get(&ip).copied() else {
                     debug!(peer = %ip, "inbound BGP from unconfigured peer; dropping");
                     continue;
                 };
+                // An administratively shut-down neighbour (`shutdown`) refuses inbound
+                // connections just as it never initiates one; drop the socket.
+                if props.shutdown {
+                    debug!(peer = %ip, "inbound BGP from admin-shutdown peer; dropping");
+                    continue;
+                }
                 let peer = PeerInfo {
                     addr: ip,
                     scope_id: None,
@@ -3796,6 +3940,12 @@ async fn accept_loop(listener: TcpListener, local: Arc<Local>, tx: mpsc::Sender<
                     srpolicy: props.srpolicy,
                     link_state: props.link_state,
                     role: props.role,
+                    local_as: props.local_as,
+                    // The accepted connection is not one we dial, so `update-source` (a
+                    // bind-before-connect knob) does not apply to it.
+                    update_source: None,
+                    ebgp_multihop: props.ebgp_multihop,
+                    hold_time: props.hold_time,
                 };
                 let local = local.clone();
                 let tx = tx.clone();
@@ -4009,6 +4159,7 @@ async fn connect_authed(
     scope_id: Option<u32>,
     auth: &TcpAuth,
     vrf_device: Option<&str>,
+    source: Option<IpAddr>,
 ) -> std::io::Result<TcpStream> {
     use std::os::fd::FromRawFd;
     let family = match peer {
@@ -4023,6 +4174,7 @@ async fn connect_authed(
     let prepared = (|| -> std::io::Result<()> {
         auth.install(fd, peer)?;
         bind_to_vrf(fd, vrf_device)?;
+        bind_source(fd, source)?;
         set_nonblocking(fd)?;
         let rc = match peer {
             IpAddr::V4(v4) => {
@@ -4089,6 +4241,40 @@ fn bind_to_vrf(fd: i32, device: Option<&str>) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Bind a socket to a local `source` address (port 0) before `connect`, so the session's
+/// local endpoint is that address (`update-source`). A no-op when `source` is `None`. The
+/// source family must match the peer's — validated at config resolution — so an IPv4
+/// source binds an IPv4 socket and an IPv6 source an IPv6 one.
+fn bind_source(fd: i32, source: Option<IpAddr>) -> std::io::Result<()> {
+    let Some(src) = source else { return Ok(()) };
+    let rc = match src {
+        IpAddr::V4(v4) => {
+            let sin = sockaddr_in_v4(v4, 0);
+            unsafe {
+                libc::bind(
+                    fd,
+                    std::ptr::addr_of!(sin) as *const libc::sockaddr,
+                    std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+                )
+            }
+        }
+        IpAddr::V6(v6) => {
+            let sin6 = sockaddr_in6_v6(v6, 0, 0);
+            unsafe {
+                libc::bind(
+                    fd,
+                    std::ptr::addr_of!(sin6) as *const libc::sockaddr,
+                    std::mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t,
+                )
+            }
+        }
+    };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 /// Dial a (non-authenticated) peer, optionally bound to a VRF device. With no VRF it
 /// is just tokio's `TcpStream::connect`; with one the socket is hand-built so
 /// `SO_BINDTODEVICE` can be set before the SYN (tokio's connect exposes no pre-connect
@@ -4097,8 +4283,11 @@ async fn connect_bound(
     addr: IpAddr,
     scope_id: Option<u32>,
     vrf_device: Option<&str>,
+    source: Option<IpAddr>,
 ) -> std::io::Result<TcpStream> {
-    if vrf_device.is_none() {
+    // With neither a VRF nor an `update-source` there is nothing to set before the SYN,
+    // so tokio's ordinary connect is used; either one needs the hand-built socket below.
+    if vrf_device.is_none() && source.is_none() {
         return TcpStream::connect(peer_sockaddr(addr, scope_id)).await;
     }
     use std::os::fd::FromRawFd;
@@ -4112,6 +4301,7 @@ async fn connect_bound(
     }
     let prepared = (|| -> std::io::Result<()> {
         bind_to_vrf(fd, vrf_device)?;
+        bind_source(fd, source)?;
         set_nonblocking(fd)?;
         let rc = match addr {
             IpAddr::V4(v4) => {
@@ -4340,6 +4530,24 @@ fn apply_gtsm(stream: &TcpStream, hops: u8) {
     }
 }
 
+/// Set the session send TTL for a multihop eBGP peer (`ebgp-multihop`): a
+/// non-directly-connected eBGP neighbour is several hops away, so the default TTL
+/// (which BGP normally leaves at the system default) would not reach it. Raises the
+/// outgoing TTL (`IP_TTL` for IPv4, `IPV6_UNICAST_HOPS` for IPv6) to the configured
+/// value. Mutually exclusive with GTSM (`ttl-security`), which is rejected together
+/// with this at config resolution. A failure is logged but not fatal.
+fn apply_multihop_ttl(stream: &TcpStream, ttl: u8) {
+    use std::os::fd::AsRawFd;
+    let fd = stream.as_raw_fd();
+    let (level, name) = match stream.peer_addr().map(|a| a.ip()) {
+        Ok(IpAddr::V6(_)) => (libc::IPPROTO_IPV6, libc::IPV6_UNICAST_HOPS),
+        _ => (libc::IPPROTO_IP, libc::IP_TTL),
+    };
+    if let Err(e) = setsockopt_i32(fd, level, name, ttl as i32) {
+        debug!(error = %e, "ebgp-multihop: could not set send TTL {ttl}");
+    }
+}
+
 /// The per-peer session: the TCP socket is already connected, so the FSM starts at
 /// OpenSent and is driven to Established and back by received messages and timers.
 async fn drive_session(
@@ -4352,9 +4560,13 @@ async fn drive_session(
     stream.set_nodelay(true).ok();
     // GTSM (RFC 5082): if configured for this peer, send with TTL 255 and reject
     // packets that arrive with a too-low TTL. Applied here so both the inbound
-    // (accepted) and outbound (dialled) connection get it.
+    // (accepted) and outbound (dialled) connection get it. Mutually exclusive with
+    // `ebgp-multihop` (rejected at config resolution), which instead just raises the
+    // session send TTL so a non-directly-connected eBGP peer is reachable.
     if let Some(hops) = peer.ttl_security {
         apply_gtsm(&stream, hops);
+    } else if let Some(ttl) = peer.ebgp_multihop {
+        apply_multihop_ttl(&stream, ttl);
     }
     let local_full = normalize_ip(stream.local_addr()?.ip());
     // Capture the transport addressing for the BMP Peer Up (RFC 7854 §4.10) before
@@ -4376,6 +4588,10 @@ async fn drive_session(
         IpAddr::V6(a) => crate::connected::resolve_link6(a),
     };
     let (mut rd, wr) = stream.into_split();
+
+    // The Hold Time to propose in our OPEN: this neighbour's `hold-time` override if set,
+    // else the global default.
+    let local_hold = peer.hold_time.unwrap_or(local.hold_time);
 
     // The central task pushes origination commands (advertise/withdraw) down this
     // channel once we report Established; we hand it the sender then.
@@ -4403,8 +4619,13 @@ async fn drive_session(
         sent_open: Vec::new(),
         received_open: Vec::new(),
         conn_id: NEXT_CONN_ID.fetch_add(1, Ordering::Relaxed),
-        neg_hold: local.hold_time,
-        keepalive_int: (local.hold_time / 3).max(1),
+        local_as_override: peer.local_as,
+        // The Hold Time we propose in our OPEN: the per-neighbour `hold-time` override
+        // if set, else the global default. `neg_hold` starts here and is lowered to the
+        // negotiated minimum with the peer once its OPEN arrives (RFC 4271 §4.2).
+        local_hold,
+        neg_hold: local_hold,
+        keepalive_int: (local_hold / 3).max(1),
         // A placeholder until the peer's OPEN supplies its real BGP Identifier.
         peer_id: Ipv4Addr::UNSPECIFIED,
         four_octet: false,
@@ -4517,7 +4738,7 @@ async fn drive_session(
                             sess.peer_gr = o
                                 .gr_forwarding_preserved(AFI_IPV4, SAFI_UNICAST)
                                 .then(|| o.gr_restart_time().unwrap_or(0));
-                            sess.neg_hold = sess.local.hold_time.min(o.hold_time);
+                            sess.neg_hold = sess.local_hold.min(o.hold_time);
                             sess.keepalive_int = (sess.neg_hold / 3).max(1);
                             Step::Event(Event::OpenReceived)
                         }
@@ -4880,6 +5101,14 @@ struct Session<'a> {
     /// This connection's unique id, so the central task can distinguish the
     /// surviving session's Established/Down from a stale loser's.
     conn_id: u64,
+    /// The per-session AS override (`local-as`): when `Some`, it fully replaces this
+    /// speaker's AS for this session — the OPEN My-AS and the eBGP AS_PATH prepend use
+    /// it in place of the global (external) AS. `None` uses the global AS.
+    local_as_override: Option<u32>,
+    /// The Hold Time we propose in our OPEN (the per-neighbour `hold-time` override, or
+    /// the global default) — distinct from `neg_hold`, which is the value negotiated with
+    /// the peer once its OPEN arrives.
+    local_hold: u16,
     neg_hold: u16,
     keepalive_int: u16,
     peer_id: Ipv4Addr,
@@ -4943,6 +5172,20 @@ struct Session<'a> {
 }
 
 impl Session<'_> {
+    /// This session's effective local AS: the per-neighbour `local-as` override if set,
+    /// else this speaker's (Member-)AS. Used as the OPEN My-AS toward an interior peer.
+    fn eff_local_as(&self) -> u32 {
+        self.local_as_override.unwrap_or(self.local.local_as)
+    }
+
+    /// The AS this session presents to a true external (eBGP) peer: the per-neighbour
+    /// `local-as` override if set, else the externally visible AS (the Confederation
+    /// Identifier when in a confederation, else this speaker's AS). Used as the OPEN
+    /// My-AS and the eBGP AS_PATH prepend / AGGREGATOR / OTC AS toward an eBGP peer.
+    fn eff_external_as(&self) -> u32 {
+        self.local_as_override.unwrap_or(self.local.external_as())
+    }
+
     /// Carry out the FSM's actions; returns `true` if the TCP connection must be
     /// torn down (the caller then ends the session).
     async fn apply(&mut self, acts: &[Action]) -> Result<bool> {
@@ -4953,13 +5196,10 @@ impl Session<'_> {
                     // RFC 5065 §4.2: present the Confederation Identifier to a true
                     // external peer, but the Member-AS to a confederation peer (iBGP
                     // or confed-eBGP). Without a confederation both are `local_as`.
-                    let my_as = if self.peer_type == PeerType::Ebgp {
-                        self.local.external_as()
-                    } else {
-                        self.local.local_as
-                    };
+                    let my_as =
+                        open_my_as(self.peer_type, self.eff_local_as(), self.eff_external_as());
                     let mut open =
-                        Open::new(VERSION, my_as, self.local.hold_time, self.local.router_id);
+                        Open::new(VERSION, my_as, self.local_hold, self.local.router_id);
                     // ADD-PATH (RFC 7911): when configured for this peer, advertise the
                     // ability to both send and receive multiple IPv4-unicast paths.
                     if self.add_path_cfg {
@@ -5067,6 +5307,7 @@ impl Session<'_> {
                             remote_port: self.remote_port,
                             sent_open: self.sent_open.clone(),
                             received_open: self.received_open.clone(),
+                            neg_hold: self.neg_hold,
                         })
                         .await;
                 }
@@ -5217,7 +5458,7 @@ impl Session<'_> {
             }
             let mut base = self.base_path_attrs();
             base.push(PathAttribute::AtomicAggregate);
-            let agg_as = self.local.external_as();
+            let agg_as = self.eff_external_as();
             if !self.four_octet && agg_as > u16::MAX as u32 {
                 base.push(PathAttribute::Aggregator {
                     asn: AS_TRANS as u32,
@@ -5262,9 +5503,10 @@ impl Session<'_> {
         let mut base = vec![PathAttribute::Origin(Origin::Igp)];
         match self.peer_type {
             PeerType::Ebgp => {
-                // True eBGP: prepend the externally visible AS (the Confederation
-                // Identifier if we are in a confederation, else our AS).
-                let ext = self.local.external_as();
+                // True eBGP: prepend the externally visible AS (the per-neighbour
+                // `local-as` override if set, else the Confederation Identifier when in a
+                // confederation, else our AS).
+                let ext = self.eff_external_as();
                 base.push(PathAttribute::AsPath(vec![AsPathSegment::Sequence(vec![
                     ext,
                 ])]));
@@ -5294,7 +5536,7 @@ impl Session<'_> {
         // RFC 9234 §5 egress rule 1: a locally-originated route advertised to a
         // Customer, Peer or RS-Client is tagged with OTC = our (externally visible) AS.
         if self.otc_egress_add() {
-            base.push(PathAttribute::OnlyToCustomer(self.local.external_as()));
+            base.push(PathAttribute::OnlyToCustomer(self.eff_external_as()));
         }
         base
     }
@@ -5440,7 +5682,7 @@ impl Session<'_> {
             // Peer or RS-Client add OTC = our AS when it has none (egress rule 1).
             if let Some(otc) = path
                 .otc
-                .or_else(|| self.otc_egress_add().then_some(self.local.external_as()))
+                .or_else(|| self.otc_egress_add().then_some(self.eff_external_as()))
             {
                 attributes.push(PathAttribute::OnlyToCustomer(otc));
             }
@@ -5738,7 +5980,7 @@ impl Session<'_> {
                 // and prepend the externally visible AS (the Confederation Identifier
                 // when in a confederation, else our AS).
                 strip_confed_segments(&mut as_path);
-                prepend_as(&mut as_path, self.local.external_as());
+                prepend_as(&mut as_path, self.eff_external_as());
                 attrs.push(PathAttribute::AsPath(as_path));
             }
             PeerType::Confed => {
@@ -6003,17 +6245,37 @@ mod tests {
                 remote_as: 65002,
                 established: true,
                 refreshes_received: 2,
+                description: Some("transit uplink".to_string()),
+                shutdown: false,
+                negotiated_hold: Some(90),
             },
             NeighborSummary {
                 addr: ip([10, 0, 0, 3]),
                 remote_as: 4_200_000_000,
                 established: false,
                 refreshes_received: 0,
+                description: None,
+                shutdown: false,
+                negotiated_hold: None,
+            },
+            // An admin-shutdown peer is reported as `admin-shutdown` even if a stale
+            // `established` flag were set — shutdown wins.
+            NeighborSummary {
+                addr: ip([10, 0, 0, 4]),
+                remote_as: 65004,
+                established: false,
+                refreshes_received: 0,
+                description: None,
+                shutdown: true,
+                negotiated_hold: None,
             },
         ];
         let out = render_bgp_neighbors(&n);
-        assert!(out.contains("10.0.0.2 AS 65002 Established refreshes 2"));
+        assert!(
+            out.contains("10.0.0.2 AS 65002 Established hold 90 refreshes 2 \"transit uplink\"")
+        );
         assert!(out.contains("10.0.0.3 AS 4200000000 Idle"));
+        assert!(out.contains("10.0.0.4 AS 65004 admin-shutdown"));
         // A peer with no refreshes does not show the counter.
         assert!(!out
             .lines()
@@ -6031,12 +6293,18 @@ mod tests {
                 remote_as: 65002,
                 established: true,
                 refreshes_received: 3,
+                description: None,
+                shutdown: false,
+                negotiated_hold: Some(90),
             },
             NeighborSummary {
                 addr: ip([10, 0, 0, 3]),
                 remote_as: 65003,
                 established: false,
                 refreshes_received: 0,
+                description: None,
+                shutdown: false,
+                negotiated_hold: None,
             },
         ];
         let out = render_bgp_metrics(&n, 4);
@@ -6061,6 +6329,70 @@ mod tests {
         assert!(out.contains("wren_bgp_neighbors_configured 0"));
         assert!(out.contains("wren_bgp_neighbors_established 0"));
         assert!(out.contains("wren_bgp_rib_routes 0"));
+    }
+
+    #[test]
+    fn local_as_override_flips_classification() {
+        // With a `local-as` of 65099, a peer whose remote-as is 65099 is iBGP, and one
+        // whose remote-as equals the *global* AS (65001) becomes eBGP — a full
+        // per-session replacement of the speaker's AS.
+        let members: &[u32] = &[];
+        assert_eq!(classify(65099, members, 65099), PeerType::Ibgp);
+        assert_eq!(classify(65099, members, 65001), PeerType::Ebgp);
+        // Without an override the global AS classifies normally.
+        assert_eq!(classify(65001, members, 65001), PeerType::Ibgp);
+        assert_eq!(classify(65001, members, 65002), PeerType::Ebgp);
+    }
+
+    /// The daemon's per-session "override or global default" resolution (`local-as`,
+    /// `hold-time`), as a generic so a test exercises it on an opaque value.
+    fn or_default<T: Copy>(over: Option<T>, global: T) -> T {
+        over.unwrap_or(global)
+    }
+
+    #[test]
+    fn open_carries_local_as_override_and_hold_time() {
+        // The effective external/local AS fold in the `local-as` override; the OPEN
+        // My-AS is that AS, and the proposed Hold Time is the per-neighbour override.
+        let global_as = 65001u32;
+        let override_as: Option<u32> = Some(65099);
+        let eff_local = or_default(override_as, global_as);
+        let eff_external = or_default(override_as, global_as);
+
+        // Toward an eBGP peer, the OPEN advertises the overridden AS as My-AS.
+        let ebgp_my_as = open_my_as(PeerType::Ebgp, eff_local, eff_external);
+        assert_eq!(ebgp_my_as, 65099);
+        // Toward an iBGP peer likewise (the peer shares the overridden AS).
+        assert_eq!(open_my_as(PeerType::Ibgp, eff_local, eff_external), 65099);
+
+        // Build the actual OPEN the daemon sends: My-AS = override, Hold Time = the
+        // per-neighbour `hold-time` override (30s here), so both ride the wire.
+        let per_neighbor_hold = or_default(Some(30u16), wren_bgp::DEFAULT_HOLD_TIME);
+        let open = Open::new(VERSION, ebgp_my_as, per_neighbor_hold, Ipv4Addr::new(10, 0, 0, 1));
+        assert_eq!(open.effective_as(), 65099);
+        assert_eq!(open.hold_time, 30);
+    }
+
+    #[test]
+    fn open_without_override_uses_global_as_and_default_hold() {
+        let global_as = 65001u32;
+        let eff = or_default(None::<u32>, global_as);
+        assert_eq!(open_my_as(PeerType::Ebgp, eff, eff), 65001);
+        // No `hold-time` override → the global default is proposed.
+        let hold = or_default(None::<u16>, wren_bgp::DEFAULT_HOLD_TIME);
+        let open = Open::new(VERSION, open_my_as(PeerType::Ebgp, eff, eff), hold, Ipv4Addr::new(10, 0, 0, 1));
+        assert_eq!(open.effective_as(), 65001);
+        assert_eq!(open.hold_time, wren_bgp::DEFAULT_HOLD_TIME);
+    }
+
+    #[test]
+    fn shutdown_prevents_session_initiation() {
+        // An admin-shutdown neighbour is never dialled (nor is a passive one); a plain
+        // neighbour is. This gates the connector-spawn loop.
+        assert!(should_initiate(false, false)); // ordinary peer: dial it
+        assert!(!should_initiate(false, true)); // shutdown: never initiate
+        assert!(!should_initiate(true, false)); // passive: wait for it
+        assert!(!should_initiate(true, true)); // shutdown wins over passive too
     }
 
     fn learned_path(from_ebgp: bool, from_peer: [u8; 4]) -> Path {

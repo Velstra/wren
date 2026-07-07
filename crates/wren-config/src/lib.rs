@@ -921,10 +921,51 @@ pub struct BgpNeighbor {
     /// 4-octet (RFC 6793).
     #[serde(rename = "remote-as")]
     pub remote_as: u32,
+    /// Override the speaker's Autonomous System for **this session only** (like FRR/IOS
+    /// `neighbor X local-as`): the given AS is used as the My-AS in the OPEN we send this
+    /// peer, in the eBGP/iBGP classification of the session (a peer whose `remote-as`
+    /// equals it becomes iBGP), and — for an eBGP session — as the AS prepended to the
+    /// AS_PATH of routes advertised to it, in place of the global `[bgp] local-as`. A
+    /// simple *full replacement* of the session AS; the FRR `no-prepend` / `replace-as`
+    /// refinements are not modelled (a plain override always fully replaces). Unset uses
+    /// the global `[bgp] local-as`.
+    #[serde(rename = "local-as")]
+    pub local_as: Option<u32>,
     /// Whether to wait for the peer to connect rather than initiating the TCP
     /// connection ourselves. Defaults to false (we actively connect).
     #[serde(default)]
     pub passive: bool,
+    /// Bind the outgoing TCP connection to this **source address** before dialling the
+    /// peer (like FRR/IOS `neighbor X update-source`) — for example a loopback used as a
+    /// stable session endpoint. Its address family must match the neighbour's: an IPv4
+    /// neighbour needs an IPv4 source, an IPv6 neighbour an IPv6 source. Applies only to
+    /// the connection we initiate (not a `passive` peer's inbound one). Unset lets the
+    /// kernel pick the source per the outgoing route.
+    #[serde(rename = "update-source")]
+    pub update_source: Option<String>,
+    /// The session IP TTL for a **multihop eBGP** peer (RFC-style `ebgp-multihop`), 1–255:
+    /// a non-directly-connected eBGP neighbour is reached over several hops, so the
+    /// session packets are sent with this TTL instead of the default. Mutually exclusive
+    /// with `ttl-security` (GTSM) — the two use opposite TTL disciplines, so configuring
+    /// both on one neighbour is a configuration error (RFC 5082 practice). Unset leaves
+    /// the system default TTL.
+    #[serde(rename = "ebgp-multihop")]
+    pub ebgp_multihop: Option<u8>,
+    /// A free-form label for this neighbour, shown in `show bgp neighbors`. Purely
+    /// descriptive; it has no effect on the session. Unset shows no description.
+    pub description: Option<String>,
+    /// Administratively shut this neighbour **down**: Wren never initiates a session to
+    /// it and refuses any inbound connection from it, and it is shown as
+    /// `admin-shutdown` in `show bgp neighbors`. Clearing it (back to the default false)
+    /// re-enables the session. Defaults to false.
+    #[serde(default)]
+    pub shutdown: bool,
+    /// The Hold Time (seconds) proposed in the OPEN to **this** peer, overriding the
+    /// global `[bgp] hold-time` for this session; the KeepAlive interval is derived from
+    /// the negotiated hold time as usual (a third of it). 0 disables the Hold and
+    /// KeepAlive timers for the session (RFC 4271 §4.2). Unset uses the global default.
+    #[serde(rename = "hold-time")]
+    pub hold_time: Option<u16>,
     /// Whether this (iBGP) peer is a **route-reflector client** (RFC 4456): routes
     /// learned from it are reflected to all other iBGP peers, and routes from other
     /// iBGP peers are reflected to it. Ignored for eBGP peers. Defaults to false.
@@ -1499,6 +1540,58 @@ mod tests {
         .expect("valid config");
         let bgp = cfg.bgp.expect("bgp present");
         assert_eq!(bgp.neighbor[0].password.as_deref(), Some("s3cr3t"));
+    }
+
+    #[test]
+    fn parses_bgp_neighbor_session_options() {
+        let cfg = Config::from_toml(
+            r#"
+            router-id = "10.0.0.1"
+            [bgp]
+            enabled = true
+            local-as = 65001
+            [[bgp.neighbor]]
+            address = "10.0.0.2"
+            remote-as = 65002
+            local-as = 65099
+            update-source = "10.0.0.9"
+            ebgp-multihop = 5
+            description = "transit uplink"
+            shutdown = true
+            hold-time = 30
+            "#,
+        )
+        .expect("valid config");
+        let n = &cfg.bgp.expect("bgp present").neighbor[0];
+        assert_eq!(n.local_as, Some(65099));
+        assert_eq!(n.update_source.as_deref(), Some("10.0.0.9"));
+        assert_eq!(n.ebgp_multihop, Some(5));
+        assert_eq!(n.description.as_deref(), Some("transit uplink"));
+        assert!(n.shutdown);
+        assert_eq!(n.hold_time, Some(30));
+    }
+
+    #[test]
+    fn bgp_neighbor_session_options_default_unset() {
+        let cfg = Config::from_toml(
+            r#"
+            router-id = "10.0.0.1"
+            [bgp]
+            enabled = true
+            local-as = 65001
+            [[bgp.neighbor]]
+            address = "10.0.0.2"
+            remote-as = 65002
+            "#,
+        )
+        .expect("valid config");
+        let n = &cfg.bgp.expect("bgp present").neighbor[0];
+        assert_eq!(n.local_as, None);
+        assert_eq!(n.update_source, None);
+        assert_eq!(n.ebgp_multihop, None);
+        assert_eq!(n.description, None);
+        assert!(!n.shutdown);
+        assert_eq!(n.hold_time, None);
     }
 
     #[test]

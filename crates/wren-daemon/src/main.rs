@@ -1718,6 +1718,39 @@ fn build_bgp_config(
             })?),
             None => None,
         };
+        // ebgp-multihop (raised session TTL) and ttl-security (GTSM) drive the TTL in
+        // opposite directions, so a neighbour may configure at most one (RFC 5082).
+        if n.ttl_security.is_some() && n.ebgp_multihop.is_some() {
+            anyhow::bail!(
+                "bgp neighbor {addr} cannot set both ttl-security (GTSM) and ebgp-multihop"
+            );
+        }
+        if let Some(ttl) = n.ebgp_multihop {
+            if ttl == 0 {
+                anyhow::bail!("bgp neighbor {addr} ebgp-multihop must be 1..=255");
+            }
+        }
+        // update-source: bind the dialled connection to this local address. Its family
+        // must match the neighbour's transport address (a v4 neighbour needs a v4 source).
+        let update_source = match &n.update_source {
+            Some(s) => {
+                let src: std::net::IpAddr = s
+                    .parse()
+                    .with_context(|| format!("bgp neighbor {addr} update-source {s:?} must be an IP address"))?;
+                if src.is_ipv4() != addr.is_ipv4() {
+                    anyhow::bail!(
+                        "bgp neighbor {addr} update-source {s:?} address family must match the neighbour's"
+                    );
+                }
+                Some(src)
+            }
+            None => None,
+        };
+        // local-as: a full per-session AS override. It must be non-zero; keeping it equal
+        // to the global local-as is harmless (the session behaves as an ordinary one).
+        if let Some(0) = n.local_as {
+            anyhow::bail!("bgp neighbor {addr} local-as must be non-zero");
+        }
         peers.push(bgp::BgpPeerCfg {
             addr,
             scope_id,
@@ -1739,6 +1772,12 @@ fn build_bgp_config(
             import,
             export,
             role,
+            local_as: n.local_as,
+            update_source,
+            ebgp_multihop: n.ebgp_multihop,
+            description: n.description.clone(),
+            shutdown: n.shutdown,
+            hold_time: n.hold_time,
         });
     }
 
@@ -2763,6 +2802,102 @@ fn build_vrrp_instances(cfg: &wren_config::Config) -> Result<Vec<vrrp::InstanceC
 mod tests {
     use super::*;
     use std::net::Ipv6Addr;
+
+    /// Resolve a `[bgp]` block from TOML through [`build_bgp_config`] with no named
+    /// filters, returning the resolved config (or the resolution error).
+    fn resolve_bgp(toml: &str) -> Result<bgp::BgpConfig> {
+        let cfg = wren_config::Config::from_toml(toml).expect("valid toml");
+        let bgp = cfg.bgp.clone().expect("bgp present");
+        let by_name = std::collections::HashMap::new();
+        build_bgp_config(&cfg, &bgp, &by_name)
+    }
+
+    #[test]
+    fn bgp_neighbor_session_options_resolve() {
+        let resolved = resolve_bgp(
+            r#"
+            router-id = "10.0.0.1"
+            [bgp]
+            enabled = true
+            local-as = 65001
+            [[bgp.neighbor]]
+            address = "10.0.0.2"
+            remote-as = 65002
+            local-as = 65099
+            update-source = "10.0.0.9"
+            ebgp-multihop = 5
+            description = "transit"
+            shutdown = true
+            hold-time = 30
+            "#,
+        )
+        .expect("resolves");
+        let p = &resolved.peers[0];
+        assert_eq!(p.local_as, Some(65099));
+        assert_eq!(p.update_source, Some(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 9))));
+        assert_eq!(p.ebgp_multihop, Some(5));
+        assert_eq!(p.description.as_deref(), Some("transit"));
+        assert!(p.shutdown);
+        assert_eq!(p.hold_time, Some(30));
+    }
+
+    #[test]
+    fn bgp_ttl_security_and_ebgp_multihop_are_mutually_exclusive() {
+        // Configuring GTSM and multihop on one neighbour is rejected (RFC 5082 practice).
+        let err = resolve_bgp(
+            r#"
+            router-id = "10.0.0.1"
+            [bgp]
+            enabled = true
+            local-as = 65001
+            [[bgp.neighbor]]
+            address = "10.0.0.2"
+            remote-as = 65002
+            ttl-security = 1
+            ebgp-multihop = 4
+            "#,
+        )
+        .err().expect("must reject both");
+        assert!(err.to_string().contains("ttl-security"));
+        assert!(err.to_string().contains("ebgp-multihop"));
+    }
+
+    #[test]
+    fn bgp_update_source_family_must_match_neighbor() {
+        // An IPv6 update-source on an IPv4 neighbour is a configuration error.
+        let err = resolve_bgp(
+            r#"
+            router-id = "10.0.0.1"
+            [bgp]
+            enabled = true
+            local-as = 65001
+            [[bgp.neighbor]]
+            address = "10.0.0.2"
+            remote-as = 65002
+            update-source = "2001:db8::9"
+            "#,
+        )
+        .err().expect("family mismatch rejected");
+        assert!(err.to_string().contains("address family"));
+    }
+
+    #[test]
+    fn bgp_local_as_must_be_non_zero() {
+        let err = resolve_bgp(
+            r#"
+            router-id = "10.0.0.1"
+            [bgp]
+            enabled = true
+            local-as = 65001
+            [[bgp.neighbor]]
+            address = "10.0.0.2"
+            remote-as = 65002
+            local-as = 0
+            "#,
+        )
+        .err().expect("zero local-as rejected");
+        assert!(err.to_string().contains("local-as"));
+    }
 
     #[test]
     fn parse_mac_ip_without_ip() {
