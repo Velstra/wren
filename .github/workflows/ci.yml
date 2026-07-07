@@ -39,6 +39,79 @@ jobs:
       - name: Test (workspace)
         run: cargo test --workspace
 
+  # The rootless `unshare -Urn` convergence smokes — the "live-verified" proof
+  # that the protocol runners actually form adjacencies and install routes. They
+  # need only unprivileged user + network namespaces (CAP_NET_RAW/ADMIN are held
+  # by the netns-root inside `unshare -Urn`), which GitHub-hosted runners allow.
+  # We run a curated, representative subset — not all of scripts/*smoke*.sh — to
+  # keep CI time sane; extend the `smokes` array below to cover more.
+  smokes:
+    name: rootless netns smokes
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      # The smoke scripts invoke ./target/debug/wren (and build it themselves if
+      # missing); build it once up front so each script just runs.
+      - name: Build the daemon (debug)
+        run: cargo build -p wren-daemon
+
+      # GitHub's ubuntu-24.04 runners ship AppArmor's
+      # `kernel.apparmor_restrict_unprivileged_userns=1`, which blocks the rootless
+      # `unshare -Urn` the smokes rely on. Relax it (best-effort — passwordless
+      # sudo is available on the runner; the guard below skips cleanly if it stays
+      # blocked on some future image).
+      - name: Allow unprivileged user namespaces
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+
+      - name: Check user-namespace support
+        id: userns
+        run: |
+          if unshare -Urn true 2>/dev/null; then
+            echo "supported=yes" >> "$GITHUB_OUTPUT"
+            echo "unprivileged user + network namespaces work; running the smokes."
+          else
+            echo "supported=no" >> "$GITHUB_OUTPUT"
+            echo "::warning::unprivileged user namespaces are unavailable on this runner; skipping the rootless netns smokes (not a failure)."
+          fi
+
+      - name: Run rootless convergence smokes
+        if: steps.userns.outputs.supported == 'yes'
+        run: |
+          set -uo pipefail
+          # A representative subset — one per major protocol path — kept small so
+          # CI stays fast. Add more scripts/*smoke*.sh here as needed.
+          smokes=(
+            bgp-redistribute-smoke.sh      # BGP
+            ospf-redistribute-smoke.sh     # OSPFv2
+            ospf3-show-smoke.sh            # OSPFv3
+            rip-redistribute-smoke.sh      # RIPv2
+            ripng-redistribute-smoke.sh    # RIPng
+            config-hotreload-smoke.sh      # full-config SIGHUP hot-reload
+            pim-sm-smoke.sh                # PIM-SM sparse-mode multicast
+          )
+          failed=()
+          for s in "${smokes[@]}"; do
+            echo "::group::$s"
+            if bash "scripts/$s"; then
+              echo "PASS: $s"
+            else
+              echo "FAIL: $s"
+              failed+=("$s")
+            fi
+            echo "::endgroup::"
+          done
+          if (( ${#failed[@]} )); then
+            echo "Failed smokes: ${failed[*]}"
+            exit 1
+          fi
+          echo "All ${#smokes[@]} smokes passed."
+
   # `rustfmt --check` is deliberately omitted: parts of the codebase use
   # intentional hand-formatting that newer rustfmt would rewrite. Run
   # `cargo fmt` locally if you want, but it is not a CI gate.

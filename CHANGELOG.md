@@ -4,6 +4,45 @@ All notable changes to Wren are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and from `0.1.0` the project
 follows [Semantic Versioning](https://semver.org/).
 
+## [0.3.0] — 2026-07-07
+
+Per-neighbour BGP session control, IPv6 BGP authentication, live configuration
+reload, and **PIM-SM** sparse-mode multicast routing. A feature release with no
+breaking API changes; every slice ships with unit tests and, where it touches the
+wire, a rootless `unshare -Urn` smoke.
+
+### BGP
+
+- **Per-neighbour session options** — `local-as`, `update-source`,
+  `ebgp-multihop`, `description`, `shutdown` and `hold-time`, configured per peer.
+- **TCP-AO / TCP-MD5 over IPv6 transport** — the authenticated-session support
+  that previously covered only IPv4 BGP now applies to IPv6 peers too (closing the
+  0.2.0 deferred item).
+- **Live neighbour hot-reload** — `SIGHUP` adds, removes and reconfigures BGP
+  neighbours on a running daemon, without dropping the sessions that did not change.
+
+### OSPF
+
+- **OSPFv3 link-local next-hop fix** — pin the outgoing interface when the next hop
+  is a link-local address, so IPv6 SPF routes install into the kernel FIB correctly
+  on multi-interface routers.
+
+### Multicast
+
+- **PIM-SM sparse mode** (RFC 7761, static RP) — a new dependency-free
+  **`wren-pim`** crate (wire codec, neighbour/Hello table and the `(*,G)`/`(S,G)`
+  shared-/source-tree state machine) plus a daemon runner over a raw IP-protocol-103
+  socket that programs the kernel multicast forwarding cache (`MRT_*`). Consumes the
+  IGMP membership feed, delivering real inter-router multicast forwarding.
+
+### Platform
+
+- **Full-configuration `SIGHUP` hot-reload** — reload the whole running
+  configuration live, starting with static routes and BGP neighbours, without
+  restarting the daemon.
+- **Fuzz targets** — libFuzzer targets for the newer wire parsers, run out of the
+  standalone `fuzz/` cargo-fuzz workspace (E7).
+
 ## [0.2.0] — 2026-07-05
 
 A broad Track-A expansion: BGP gains four new address families and route-leak
@@ -162,6 +201,7 @@ the job of BIRD/FRR, rebuilt with a dependency-free, embeddable core.
   **smoke scripts** under `scripts/` (each runs in a throwaway `unshare -Urn`
   network namespace).
 
+[0.3.0]: https://github.com/velstra/wren/releases/tag/v0.3.0
 [0.2.0]: https://github.com/velstra/wren/releases/tag/v0.2.0
 [0.1.0]: https://github.com/velstra/wren/releases/tag/v0.1.0
 [0.0.1]: https://github.com/velstra/wren/releases/tag/v0.0.1
