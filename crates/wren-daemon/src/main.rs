@@ -26,6 +26,10 @@ mod isis;
 #[cfg(feature = "igmp")]
 mod mld;
 mod metrics;
+#[cfg(feature = "pim")]
+mod mroute;
+#[cfg(feature = "pim")]
+mod pim;
 #[cfg(feature = "ospf")]
 mod ospf;
 #[cfg(feature = "ospf3")]
@@ -538,6 +542,24 @@ async fn main() -> Result<()> {
     let mut vrrp_queries_rx = Some(vrrp_queries_rx);
     #[cfg(feature = "vrrp")]
     let vrrp_enabled = !cfg.vrrp.is_empty();
+    // PIM-SM (`show pim …`) query channel, and the IGMP→PIM membership feed. Both
+    // exist only when PIM is enabled in `[multicast.pim]`.
+    #[cfg(feature = "pim")]
+    let pim_enabled = cfg
+        .multicast
+        .as_ref()
+        .filter(|m| m.enabled)
+        .and_then(|m| m.pim.as_ref())
+        .map(|p| p.enabled)
+        .unwrap_or(false);
+    #[cfg(feature = "pim")]
+    let (pim_queries_tx, pim_queries_rx) = mpsc::channel(QUERY_QUEUE);
+    #[cfg(feature = "pim")]
+    let mut pim_queries_rx = Some(pim_queries_rx);
+    #[cfg(feature = "pim")]
+    let (pim_membership_tx, pim_membership_rx) = mpsc::channel::<igmp::MembershipUpdate>(QUERY_QUEUE);
+    #[cfg(feature = "pim")]
+    let mut pim_membership_rx = Some(pim_membership_rx);
     {
         let socket = args.socket.clone();
         let channels = control::Channels {
@@ -560,6 +582,8 @@ async fn main() -> Result<()> {
             ripng: ripng_enabled.then(|| ripng_queries_tx.clone()),
             #[cfg(feature = "vrrp")]
             vrrp: vrrp_enabled.then(|| vrrp_queries_tx.clone()),
+            #[cfg(feature = "pim")]
+            pim: pim_enabled.then(|| pim_queries_tx.clone()),
         };
         tokio::spawn(async move {
             if let Err(e) = control::serve(socket, channels).await {
@@ -981,7 +1005,13 @@ async fn main() -> Result<()> {
     #[cfg(feature = "igmp")]
     if let Some(mccfg) = cfg.multicast.as_ref().filter(|m| m.enabled) {
         match build_querier_config(mccfg) {
-            Ok(run_cfg) => {
+            Ok(mut run_cfg) => {
+                // When PIM-SM is enabled, the IGMP querier feeds membership changes to
+                // the PIM runner so it can build the multicast trees.
+                #[cfg(feature = "pim")]
+                if pim_enabled {
+                    run_cfg.pim_feed = Some(pim_membership_tx.clone());
+                }
                 // IGMP (IPv4) — on by default; MLD (IPv6) — off by default. Both run
                 // the same querier over their address family on the same interfaces.
                 if mccfg.igmp.unwrap_or(true) {
@@ -1003,6 +1033,28 @@ async fn main() -> Result<()> {
                 }
             }
             Err(e) => error!(error = %e, "IGMP/MLD not started"),
+        }
+    }
+
+    // Spawn the PIM-SM router (RFC 7761, static RP) if `[multicast.pim]` is enabled.
+    // It consumes the IGMP membership feed wired above and programs the kernel
+    // multicast forwarding cache directly (not the RIB/FIB).
+    #[cfg(feature = "pim")]
+    if pim_enabled {
+        if let Some(mccfg) = cfg.multicast.as_ref().filter(|m| m.enabled) {
+            match build_pim_config(mccfg) {
+                Ok(run_cfg) => {
+                    let sd = shutdown_tx.subscribe();
+                    let mrx = pim_membership_rx.take().expect("pim membership rx taken once");
+                    let qrx = pim_queries_rx.take().expect("pim queries rx taken once");
+                    proto_handles.push(tokio::spawn(async move {
+                        if let Err(e) = pim::run(run_cfg, mrx, qrx, sd).await {
+                            error!(error = %e, "PIM-SM router stopped");
+                        }
+                    }));
+                }
+                Err(e) => error!(error = %e, "PIM-SM not started"),
+            }
         }
     }
 
@@ -2881,6 +2933,38 @@ fn build_querier_config(mc: &wren_config::Multicast) -> Result<igmp::QuerierConf
             mc.query_response_interval.unwrap_or(10) as u64,
         ),
         igmp_version: mc.igmp_version.unwrap_or(3),
+        // Wired by the caller when PIM-SM is enabled (see the multicast spawn block).
+        pim_feed: None,
+    })
+}
+
+/// Resolve the `[multicast.pim]` config into the PIM-SM runner's [`pim::PimConfig`].
+/// The RP address is required; the interfaces default to every multicast interface if
+/// none are listed explicitly.
+#[cfg(feature = "pim")]
+fn build_pim_config(mc: &wren_config::Multicast) -> Result<pim::PimConfig> {
+    let p = mc
+        .pim
+        .as_ref()
+        .filter(|p| p.enabled)
+        .ok_or_else(|| anyhow::anyhow!("[multicast.pim] not enabled"))?;
+    let rp = p
+        .rp_address
+        .ok_or_else(|| anyhow::anyhow!("[multicast.pim] requires rp-address (static RP)"))?;
+    let interfaces = if p.interfaces.is_empty() {
+        mc.interfaces.iter().map(|i| i.name.clone()).collect()
+    } else {
+        p.interfaces.clone()
+    };
+    if interfaces.is_empty() {
+        anyhow::bail!("[multicast.pim] has no interfaces");
+    }
+    Ok(pim::PimConfig {
+        interfaces,
+        rp,
+        hello_interval: std::time::Duration::from_secs(
+            p.hello_interval.unwrap_or(wren_pim::DEFAULT_HELLO_PERIOD_SECS) as u64,
+        ),
     })
 }
 

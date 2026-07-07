@@ -24,7 +24,7 @@
 #![forbid(unsafe_code)]
 
 use std::fmt;
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv4Addr};
 use std::path::Path;
 
 use serde::Deserialize;
@@ -134,6 +134,46 @@ pub struct Multicast {
     /// The interfaces multicast runs on, each with a role.
     #[serde(default, rename = "interface")]
     pub interfaces: Vec<MulticastInterface>,
+    /// PIM-SM (RFC 7761) sparse-mode inter-router multicast routing, static RP.
+    /// When absent, only the IGMP/MLD querier + RFC 4605 proxy above run.
+    #[serde(default)]
+    pub pim: Option<Pim>,
+}
+
+/// The `[multicast.pim]` block: PIM-SM (RFC 7761) sparse mode with a statically
+/// configured Rendezvous Point (BSR/Auto-RP are deferred). PIM runs the shared tree
+/// `(*,G)` toward the RP and the source tree `(S,G)` toward a source, programming the
+/// kernel multicast forwarding cache so multicast is routed between routers.
+///
+/// ```toml
+/// [multicast.pim]
+/// enabled = true
+/// rp-address = "10.0.9.9"     # the static Rendezvous Point
+/// interface = ["lan0", "wan0"]
+/// ```
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct Pim {
+    /// Whether PIM-SM is enabled.
+    #[serde(default)]
+    pub enabled: bool,
+    /// The statically configured Rendezvous Point address (the root of the shared
+    /// tree). Required when `enabled`.
+    #[serde(rename = "rp-address")]
+    pub rp_address: Option<Ipv4Addr>,
+    /// The interfaces PIM speaks on (sends Hello, Join/Prune; RPF candidates). Each
+    /// must also be a multicast interface (typically a `querier`/`downstream` LAN and
+    /// the transit link toward other PIM routers).
+    #[serde(default, rename = "interface")]
+    pub interfaces: Vec<String>,
+    /// The Hello period in seconds (RFC 7761 §4.11). Defaults to 30.
+    #[serde(rename = "hello-interval")]
+    pub hello_interval: Option<u16>,
+    /// The SPT-switchover threshold in kbps: an ASM `(*,G)` flow above this switches
+    /// to the source tree. `0` means "switch on the first packet"; when unset the
+    /// shared tree is kept (ASM SPT switchover deferred — see the `wren-pim` docs).
+    #[serde(rename = "spt-threshold")]
+    pub spt_threshold: Option<u32>,
 }
 
 /// One `[[multicast.interface]]`: an interface and the role it plays.
@@ -1401,6 +1441,31 @@ mod tests {
         assert_eq!(mc.interfaces[1].role, MulticastRole::Upstream);
         assert_eq!(mc.interfaces[1].igmp_version, Some(3));
         assert_eq!(mc.interfaces[2].role, MulticastRole::Downstream);
+    }
+
+    #[test]
+    fn parses_multicast_pim_static_rp() {
+        let cfg = Config::from_toml(
+            r#"
+            router-id = "10.0.0.1"
+            [multicast]
+            enabled = true
+            [[multicast.interface]]
+            name = "lan0"
+            role = "querier"
+            [multicast.pim]
+            enabled = true
+            rp-address = "10.0.9.9"
+            interface = ["lan0", "wan0"]
+            hello-interval = 30
+            "#,
+        )
+        .expect("valid config");
+        let pim = cfg.multicast.unwrap().pim.expect("pim block present");
+        assert!(pim.enabled);
+        assert_eq!(pim.rp_address, Some("10.0.9.9".parse().unwrap()));
+        assert_eq!(pim.interfaces, vec!["lan0", "wan0"]);
+        assert_eq!(pim.hello_interval, Some(30));
     }
 
     #[test]

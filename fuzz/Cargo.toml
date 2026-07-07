@@ -33,6 +33,7 @@ wren-bfd = { path = "../crates/wren-bfd" }
 wren-vrrp = { path = "../crates/wren-vrrp" }
 wren-babel = { path = "../crates/wren-babel" }
 wren-igmp = { path = "../crates/wren-igmp" }
+wren-pim = { path = "../crates/wren-pim" }
 
 # Detach from the parent workspace: the fuzz crate is its own root.
 [workspace]
@@ -134,6 +135,13 @@ bench = false
 [[bin]]
 name = "mld_wire"
 path = "fuzz_targets/mld_wire.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "pim_wire"
+path = "fuzz_targets/pim_wire.rs"
 test = false
 doc = false
 bench = false

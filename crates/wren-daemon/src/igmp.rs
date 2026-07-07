@@ -40,7 +40,7 @@ use tokio::time::MissedTickBehavior;
 use tracing::{debug, info, warn};
 
 use wren_igmp::election::{ElectionEvent, QuerierState};
-use wren_igmp::membership::{MembershipEvent, MembershipTable, TimerConfig};
+use wren_igmp::membership::{FilterMode, MembershipEvent, MembershipTable, TimerConfig};
 use wren_igmp::proxy::{ForwardingEntry, IgmpProxy, ProxyAction};
 use wren_igmp::wire::{encode_float, GroupRecord, Message, Query, RecordType};
 use wren_igmp::{is_link_local_control, ALL_HOSTS, IGMPV3_ALL_ROUTERS, IGMP_PROTO};
@@ -66,6 +66,23 @@ struct QueryParams {
     v3: bool,
 }
 
+/// A membership change fed from the IGMP querier to the PIM-SM runner (when PIM is
+/// enabled): a receiver joined or left group `G` on interface `ifindex`. `source` is
+/// `None` for an ASM `(*,G)` membership (build the shared tree) or `Some(S)` for an
+/// IGMPv3 source-specific membership (build the `(S,G)` source tree). PIM turns this
+/// into the corresponding Join/Prune toward the RP or source.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MembershipUpdate {
+    /// The interface index the membership is on (a PIM outgoing interface).
+    pub ifindex: u32,
+    /// The multicast group.
+    pub group: Ipv4Addr,
+    /// The source for an IGMPv3 source-specific membership, else `None` (ASM).
+    pub source: Option<Ipv4Addr>,
+    /// Whether the group is now present (joined) or gone (left).
+    pub present: bool,
+}
+
 /// The resolved runner configuration, built by the daemon from `[multicast]`.
 #[derive(Debug, Clone)]
 pub struct QuerierConfig {
@@ -83,6 +100,9 @@ pub struct QuerierConfig {
     pub query_response_interval: Duration,
     /// IGMP version to speak (2 or 3). 3 is the default.
     pub igmp_version: u8,
+    /// When PIM-SM is enabled, the channel membership changes are fed to the PIM
+    /// runner over (so it can build the multicast trees). `None` disables the feed.
+    pub pim_feed: Option<mpsc::Sender<MembershipUpdate>>,
 }
 
 /// One IGMP-speaking interface: its socket, membership table and role.
@@ -112,6 +132,7 @@ pub async fn run(cfg: QuerierConfig, mut shutdown: watch::Receiver<bool>) -> Res
         last_member_query_count: cfg.robustness.max(1),
         ..TimerConfig::default()
     };
+    let pim_feed = cfg.pim_feed.clone();
 
     // Every querier and every proxy-downstream interface tracks membership and
     // queries its LAN. Downstream interfaces additionally feed the proxy.
@@ -205,7 +226,7 @@ pub async fn run(cfg: QuerierConfig, mut shutdown: watch::Receiver<bool>) -> Res
                         info!(iface = %iface.name, "IGMP: resuming querier role (other querier gone)");
                     }
                     let events = iface.table.expire(now);
-                    handle_events(iface, &events, &mut proxy, &qp).await;
+                    handle_events(iface, &events, &mut proxy, &qp, &pim_feed).await;
                 }
             }
             Some(pkt) = pkt_rx.recv() => {
@@ -218,7 +239,7 @@ pub async fn run(cfg: QuerierConfig, mut shutdown: watch::Receiver<bool>) -> Res
                         | Message::V1Report(_)
                         | Message::V2Leave(_))) => {
                         let events = iface.table.apply(now, &msg);
-                        handle_events(iface, &events, &mut proxy, &qp).await;
+                        handle_events(iface, &events, &mut proxy, &qp, &pim_feed).await;
                     }
                     // Another querier on the link: run querier election (lowest source
                     // IP wins). If it is lower than ours we step down and stop querying.
@@ -254,6 +275,7 @@ async fn handle_events(
     events: &[MembershipEvent<Ipv4Addr>],
     proxy: &mut Option<(Arc<UdpSocket>, IgmpProxy)>,
     qp: &QueryParams,
+    pim_feed: &Option<mpsc::Sender<MembershipUpdate>>,
 ) {
     if events.is_empty() {
         return;
@@ -278,6 +300,52 @@ async fn handle_events(
                 }
             }
             MembershipEvent::Updated(_) => {}
+        }
+    }
+
+    // Feed membership changes to the PIM-SM runner (when enabled), so it builds the
+    // multicast trees. `try_send` keeps IGMP from ever back-pressuring on PIM. This
+    // runs for every interface (a plain querier LAN is a PIM outgoing interface too),
+    // before the RFC 4605 proxy early-return below.
+    if let Some(feed) = pim_feed {
+        for ev in events {
+            let g = ev.group();
+            match ev {
+                MembershipEvent::Joined(_) | MembershipEvent::Updated(_) => {
+                    // An IGMPv3 INCLUDE-mode group with sources is a source-specific
+                    // (SSM) membership → one `(S,G)` per source; anything else is an
+                    // ASM `(*,G)` membership.
+                    match iface.table.get(g) {
+                        Some(m) if m.mode == FilterMode::Include && !m.sources.is_empty() => {
+                            for s in &m.sources {
+                                let _ = feed.try_send(MembershipUpdate {
+                                    ifindex: iface.ifindex,
+                                    group: g,
+                                    source: Some(*s),
+                                    present: true,
+                                });
+                            }
+                        }
+                        _ => {
+                            let _ = feed.try_send(MembershipUpdate {
+                                ifindex: iface.ifindex,
+                                group: g,
+                                source: None,
+                                present: true,
+                            });
+                        }
+                    }
+                }
+                MembershipEvent::Left(_) => {
+                    let _ = feed.try_send(MembershipUpdate {
+                        ifindex: iface.ifindex,
+                        group: g,
+                        source: None,
+                        present: false,
+                    });
+                }
+                MembershipEvent::Querying(_) => {}
+            }
         }
     }
 

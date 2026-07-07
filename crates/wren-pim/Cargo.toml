@@ -1,0 +1,17 @@
+[package]
+name = "wren-pim"
+description = "PIM-SM (RFC 7761 sparse mode, static RP): wire codec, neighbour/Hello table and (*,G)/(S,G) shared-/source-tree state machine."
+keywords = ["routing", "pim", "multicast", "networking"]
+categories = ["network-programming"]
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+# Deliberately dependency-free (std only), like `wren-igmp` / `wren-core`: PIM-SM is
+# host-address arithmetic on `Ipv4Addr` plus a small set of state machines, needs no
+# RIB types, and the pure codec + logic must be embeddable and fully unit-testable
+# with no sockets. The async raw-socket runner lives in `wren-daemon` (`pim.rs`).
+[dependencies]

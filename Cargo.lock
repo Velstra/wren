@@ -599,6 +599,7 @@ dependencies = [
  "wren-netlink",
  "wren-ospf",
  "wren-ospfv3",
+ "wren-pim",
  "wren-rip",
  "wren-vrrp",
 ]
@@ -642,6 +643,10 @@ version = "0.2.0"
 dependencies = [
  "wren-core",
 ]
+
+[[package]]
+name = "wren-pim"
+version = "0.2.0"
 
 [[package]]
 name = "wren-rip"

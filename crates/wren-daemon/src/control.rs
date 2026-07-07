@@ -28,6 +28,8 @@ use crate::bgp::{BgpQuery, BgpQueryRequest, EvpnEvent, EvpnSubscribe};
 use crate::isis::{IsisQuery, IsisQueryRequest};
 #[cfg(feature = "ospf")]
 use crate::ospf::{OspfQuery, OspfQueryRequest};
+#[cfg(feature = "pim")]
+use crate::pim::{PimQuery, PimQueryRequest};
 #[cfg(feature = "ospf3")]
 use crate::ospf3::{Ospf3Query, Ospf3QueryRequest};
 use crate::query::OwnedQuery;
@@ -75,6 +77,9 @@ pub struct Channels {
     /// To the VRRP task (`show vrrp`), if any virtual router is configured.
     #[cfg(feature = "vrrp")]
     pub vrrp: Option<mpsc::Sender<VrrpQueryRequest>>,
+    /// To the PIM-SM task (`show pim`), if PIM is running.
+    #[cfg(feature = "pim")]
+    pub pim: Option<mpsc::Sender<PimQueryRequest>>,
 }
 
 /// Serve the control socket at `path`, forwarding queries to the owning tasks.
@@ -218,6 +223,12 @@ async fn handle_conn(stream: UnixStream, channels: Channels) -> Result<()> {
             response = Some(ask_opt(&channels.vrrp, query, "vrrp").await);
         }
     }
+    #[cfg(feature = "pim")]
+    if response.is_none() {
+        if let Some(query) = parse_pim_query(line) {
+            response = Some(ask_opt(&channels.pim, query, "pim").await);
+        }
+    }
     if response.is_none() {
         if let Some(query) = parse_query(line) {
             response = Some(ask(&channels.router, query, "router").await);
@@ -230,7 +241,7 @@ async fn handle_conn(stream: UnixStream, channels: Channels) -> Result<()> {
              show evpn | bgp refresh <peer> | evpn advertise|withdraw <vni> <mac> [ip] | \
              show ospf [neighbors|interfaces|database] | show ospf3 [neighbors|interfaces] | \
              show isis [neighbors|interfaces|database] | show babel [neighbors|routes] | \
-             show bfd | show rip | show ripng | show vrrp | show vrf | \
+             show bfd | show rip | show ripng | show vrrp | show pim [neighbors|mroute] | show vrf | \
              show metrics | monitor routes | monitor evpn\n"
         )
     });
@@ -527,6 +538,27 @@ fn parse_mac(s: &str) -> Option<[u8; 6]> {
         mac[i] = u8::from_str_radix(p, 16).ok()?;
     }
     Some(mac)
+}
+
+/// Parse a `show pim [neighbors|mroute]` command into a [`PimQuery`]. A bare `show
+/// pim` defaults to the neighbours view. Returns `None` for anything else (so the
+/// caller can fall through to the other query parsers).
+#[cfg(feature = "pim")]
+pub fn parse_pim_query(line: &str) -> Option<PimQuery> {
+    let mut tokens = line.split_whitespace();
+    if tokens.next()? != "show" || tokens.next()? != "pim" {
+        return None;
+    }
+    let query = match tokens.next() {
+        None | Some("neighbors") | Some("neighbours") => PimQuery::Neighbors,
+        Some("mroute") | Some("mroutes") | Some("tree") => PimQuery::Mroute,
+        Some(_) => return None,
+    };
+    // A trailing extra token is a malformed command.
+    if tokens.next().is_some() {
+        return None;
+    }
+    Some(query)
 }
 
 /// Parse a `show bfd` command into a [`BfdQuery`]. BFD keeps only session state,
