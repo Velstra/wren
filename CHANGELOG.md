@@ -4,6 +4,24 @@ All notable changes to Wren are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and from `0.1.0` the project
 follows [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+## [0.3.1] — 2026-07-11
+
+A bug-fix release: graceful shutdown now runs under an init system, not only on
+an interactive Ctrl-C.
+
+### Fixed
+
+- **Graceful shutdown on `SIGTERM`, not just `SIGINT`.** The shutdown path — the
+  protocol goodbyes (M10) and VRRP relinquishing mastership + releasing its
+  virtual IP — previously fired only on `SIGINT`. `systemctl stop` (and container
+  runtimes) send `SIGTERM`, which that path never caught, so the daemon was
+  hard-killed and none of it ran. It now shuts down cleanly on either signal: a
+  VRRP master stopped via systemd hands its virtual IP to the backup in about a
+  second (a priority-0 advertisement) instead of waiting out the master-down
+  timeout.
+
 ## [0.3.0] — 2026-07-07
 
 Per-neighbour BGP session control, IPv6 BGP authentication, live configuration
