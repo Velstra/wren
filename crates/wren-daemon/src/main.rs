@@ -1397,8 +1397,22 @@ async fn main() -> Result<()> {
             None
         }
     };
+    // SIGTERM is what an init system (systemd `stop`, a container runtime) sends to
+    // ask for shutdown — Ctrl-C only delivers SIGINT. Without this, a `systemctl
+    // stop wren` hard-kills the process and NONE of the graceful-shutdown work runs
+    // (protocol goodbyes, and VRRP relinquishing mastership + releasing its VIP), so
+    // a backup only takes over on the master-down timeout. Install it alongside
+    // SIGINT; a failure just leaves SIGINT as the only graceful path.
+    let mut term = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+    {
+        Ok(s) => Some(s),
+        Err(e) => {
+            warn!(error = %e, "cannot install SIGTERM handler; only SIGINT/Ctrl-C will shut down");
+            None
+        }
+    };
 
-    info!("wren is running; press Ctrl-C to stop");
+    info!("wren is running; send SIGINT (Ctrl-C) or SIGTERM to stop");
     // The router loop runs for the whole process. Pin it so the reload/shutdown `select!`
     // below can be re-entered on every SIGHUP without ever restarting it.
     let router_fut = router::run(
@@ -1445,7 +1459,16 @@ async fn main() -> Result<()> {
                 )
                 .await;
             }
-            r = tokio::signal::ctrl_c() => {
+            r = async {
+                // Shut down on either SIGINT (Ctrl-C) or SIGTERM (systemd `stop`).
+                match term.as_mut() {
+                    Some(t) => tokio::select! {
+                        r = tokio::signal::ctrl_c() => r,
+                        _ = t.recv() => Ok(()),
+                    },
+                    None => tokio::signal::ctrl_c().await,
+                }
+            } => {
                 r.context("waiting for shutdown signal")?;
                 info!("shutting down; notifying peers");
                 // Tell every wired engine to send its protocol goodbye, then give them a
