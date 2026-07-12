@@ -54,6 +54,9 @@ const RT_TABLE_UNSPEC: u8 = 0;
 const RTN_UNICAST: u8 = 1;
 const RT_SCOPE_UNIVERSE: u8 = 0;
 const RT_SCOPE_LINK: u8 = 253;
+/// The "nowhere" scope (255): a wildcard on a delete request — it matches a
+/// stored route of any scope, exactly as `ip route del` sends it.
+const RT_SCOPE_NOWHERE: u8 = 255;
 
 const RTA_DST: u16 = 1;
 const RTA_OIF: u16 = 4;
@@ -75,6 +78,9 @@ const RTA_VIA: u16 = 18;
 const RTNH_HDR_LEN: usize = 8;
 
 // Standard Linux route-origin protocol ids (`/usr/include/linux/rtnetlink.h`).
+/// The "unspecified" origin (0): a wildcard on a delete request — it matches a
+/// stored route of any protocol, exactly as `ip route del` sends it.
+const RTPROT_UNSPEC: u8 = 0;
 const RTPROT_KERNEL: u8 = 2;
 const RTPROT_STATIC: u8 = 4;
 const RTPROT_BABEL: u8 = 42;
@@ -504,17 +510,34 @@ fn build_route_msg(
     } else {
         RT_TABLE_UNSPEC
     };
-    buf[21] = route.map(|r| rtprot(r.protocol)).unwrap_or(RTPROT_STATIC); // rtm_protocol
-                                                                          // Universe scope if any next-hop has a gateway; link scope for purely
-                                                                          // on-link routes (a connected/dev route the kernel forwards directly).
-    let any_gateway = route
-        .map(|r| r.nexthops.iter().any(|n| n.gateway.is_some()))
-        .unwrap_or(false);
-    buf[22] = if any_gateway {
-        RT_SCOPE_UNIVERSE
-    } else {
-        RT_SCOPE_LINK
-    }; // rtm_scope
+    // On a delete the kernel matches the stored route by these fields: any that
+    // we set non-wildcard must equal the *installed* route or the delete is a
+    // silent no-op. We install routes with their real origin protocol (bgp /
+    // ospf / rip / isis / babel) and — for gatewayed routes — universe scope, so
+    // a delete must NOT pin protocol or scope to a fixed value. Mirror
+    // `ip route del`: send the wildcards RTPROT_UNSPEC (matches any protocol) and
+    // RT_SCOPE_NOWHERE (matches any scope). (Previously this sent RTPROT_STATIC +
+    // RT_SCOPE_LINK, so every non-static or gatewayed route was undeletable —
+    // leaving a stale FIB entry / blackhole after the prefix was withdrawn.)
+    // A single best route exists per (table, prefix), so the (family, dst, table)
+    // key still identifies it uniquely.
+    match route {
+        Some(r) => {
+            buf[21] = rtprot(r.protocol); // rtm_protocol
+            // Universe scope if any next-hop has a gateway; link scope for purely
+            // on-link routes (a connected/dev route the kernel forwards directly).
+            let any_gateway = r.nexthops.iter().any(|n| n.gateway.is_some());
+            buf[22] = if any_gateway {
+                RT_SCOPE_UNIVERSE
+            } else {
+                RT_SCOPE_LINK
+            }; // rtm_scope
+        }
+        None => {
+            buf[21] = RTPROT_UNSPEC; // rtm_protocol — wildcard on delete
+            buf[22] = RT_SCOPE_NOWHERE; // rtm_scope — wildcard on delete
+        }
+    }
     buf[23] = RTN_UNICAST; // rtm_type
                            // 24..28 rtm_flags = 0
 
@@ -916,6 +939,29 @@ mod tests {
         assert!(has_attr(&msg, RTA_DST, &[10, 20, 0, 0]));
         assert!(has_attr(&msg, RTA_GATEWAY, &[192, 0, 2, 1]));
         assert!(has_attr(&msg, RTA_PRIORITY, &7u32.to_ne_bytes()));
+    }
+
+    #[test]
+    fn delete_message_wildcards_protocol_and_scope() {
+        // A delete (route == None) must NOT pin protocol/scope to a fixed value:
+        // routes are installed with their real origin (bgp/ospf/…) and universe
+        // scope, and the kernel matches a delete on any field we set non-wildcard.
+        // Mirror `ip route del`: RTPROT_UNSPEC (0) + RT_SCOPE_NOWHERE (255) match a
+        // stored route of any protocol and scope. (Sending RTPROT_STATIC here left
+        // every non-static route undeletable → a stale FIB blackhole.)
+        let msg = build_route_msg(
+            RTM_DELROUTE,
+            NLM_F_REQUEST | NLM_F_ACK,
+            9,
+            &p("10.20.0.0/16"),
+            RT_TABLE_MAIN as u32,
+            None,
+        );
+        assert_eq!(u16::from_ne_bytes([msg[4], msg[5]]), RTM_DELROUTE);
+        assert_eq!(msg[21], RTPROT_UNSPEC); // rtm_protocol — wildcard
+        assert_eq!(msg[22], RT_SCOPE_NOWHERE); // rtm_scope — wildcard
+        // The destination key is still present so the kernel can find the route.
+        assert!(has_attr(&msg, RTA_DST, &[10, 20, 0, 0]));
     }
 
     #[test]
