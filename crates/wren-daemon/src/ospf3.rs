@@ -58,8 +58,8 @@ use wren_ospfv3::packet::{
 };
 use wren_ospfv3::spf::{self, SpfRoute};
 use wren_ospfv3::{
-    ALL_D_ROUTERS, ALL_SPF_ROUTERS, INITIAL_SEQUENCE_NUMBER, IP_PROTOCOL, MAX_AGE, OPT_E, OPT_R,
-    OPT_V6,
+    ALL_D_ROUTERS, ALL_SPF_ROUTERS, INITIAL_SEQUENCE_NUMBER, IP_PROTOCOL, LS_REFRESH_TIME, MAX_AGE,
+    OPT_E, OPT_R, OPT_V6,
 };
 
 use crate::sockopt::{setsockopt_int, setsockopt_struct};
@@ -442,6 +442,18 @@ pub async fn run(
     hello.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let mut housekeeping = tokio::time::interval(Duration::from_secs(HOUSEKEEPING_SECS));
     housekeeping.tick().await;
+    // Periodic self-LSA refresh (RFC 2328 §12.4 / §14.1, applied to OSPFv3 by
+    // RFC 5340). Without it our LSAs keep their original age and every neighbour
+    // ages them out at MaxAge (3600 s) even on a stable, Full adjacency —
+    // withdrawing all our prefixes AS-wide. Re-originate every LSRefreshTime
+    // (1800 s) with a fresh age 0 and a higher sequence number. The immediate
+    // first tick is consumed since startup already originated above.
+    let mut refresh = tokio::time::interval(Duration::from_secs(LS_REFRESH_TIME as u64));
+    refresh.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    refresh.tick().await;
+    // The wall-clock second at which the LSDBs were last aged, so a delayed or
+    // coalesced housekeeping tick advances age by the true elapsed time.
+    let mut last_aged: u64 = 0;
 
     loop {
         tokio::select! {
@@ -468,6 +480,18 @@ pub async fn run(
                 ospf.age_neighbors(now).await;
                 ospf.fire_wait_timers(now).await;
                 ospf.retransmit_init_dds().await;
+                // Advance LSDB age by the true elapsed seconds and reap any LSA
+                // that has reached MaxAge (a dead neighbour's LSAs, or ones we
+                // flushed) so the database stays bounded and SPF drops them.
+                let elapsed = now.saturating_sub(last_aged);
+                if elapsed > 0 {
+                    last_aged = now;
+                    ospf.age_lsdbs(elapsed.min(MAX_AGE as u64) as u16).await;
+                }
+            }
+            _ = refresh.tick() => {
+                ospf.originate_externals();
+                ospf.reoriginate_and_flood().await;
             }
             Some(req) = queries.recv() => {
                 let resp = match req.query {
@@ -1473,6 +1497,31 @@ impl Ospf {
     }
 
     // --- SPF → RIB --------------------------------------------------------
+
+    /// Advance every LSDB's age by `secs` (RFC 2328 §14, RFC 5340) and remove any
+    /// LSA that has thereby reached MaxAge — a foreign LSA whose originator
+    /// stopped refreshing it, or one we deliberately flushed. Re-runs SPF when a
+    /// removal changed the topology. Our own LSAs are refreshed by the
+    /// LSRefreshTime timer before they can age out, so this only reaps
+    /// genuinely-dead LSAs and keeps the database bounded across neighbour churn.
+    async fn age_lsdbs(&mut self, secs: u16) {
+        let mut changed = false;
+        let areas: Vec<Ipv4Addr> = self.areas.keys().copied().collect();
+        for area in areas {
+            let maxaged = self.areas.get_mut(&area).unwrap().lsdb.age(secs);
+            for key in maxaged {
+                self.areas.get_mut(&area).unwrap().lsdb.remove(&key);
+                changed = true;
+            }
+        }
+        for key in self.external_lsdb.age(secs) {
+            self.external_lsdb.remove(&key);
+            changed = true;
+        }
+        if changed {
+            self.run_spf_and_announce().await;
+        }
+    }
 
     /// Run an SPF per area, fold in the inter-area and AS-external routes, and
     /// reconcile the announced routes with the router. Intra-area beats inter-area

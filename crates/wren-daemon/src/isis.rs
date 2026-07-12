@@ -855,10 +855,17 @@ impl Isis {
                 .or(Some((w.system_id, 0))),
         };
 
-        let changed = self.ifaces[idx].dis[li] != lan_id || self.ifaces[idx].is_dis[li] != is_dis;
+        let dis_changed =
+            self.ifaces[idx].dis[li] != lan_id || self.ifaces[idx].is_dis[li] != is_dis;
         self.ifaces[idx].dis[li] = lan_id;
         self.ifaces[idx].is_dis[li] = is_dis;
-        if changed {
+        // Re-originate the pseudonode LSP when the DIS identity changed *or* we are
+        // the DIS: run_dis runs on every adjacency up/down, and the pseudonode LSP
+        // lists our up neighbours, so if we stay DIS while the neighbour set shifts
+        // a stale list would misrepresent the LAN in every SPF until the next
+        // refresh. (A no-op flood-wise when nothing actually changed is acceptable;
+        // adjacency transitions are rare.)
+        if dis_changed || self.ifaces[idx].is_dis[li] {
             self.reoriginate_pseudonode(idx, level).await;
         }
     }
@@ -1329,6 +1336,7 @@ impl Isis {
 
         // Age the databases and refresh our own LSPs before they expire.
         let mut refresh: Vec<IsLevel> = Vec::new();
+        let mut refresh_pn: Vec<(usize, IsLevel)> = Vec::new();
         for level in self.active_levels() {
             let li = lidx(level);
             self.dbs[li].age(HOUSEKEEPING_SECS as u16);
@@ -1338,9 +1346,30 @@ impl Isis {
             if low {
                 refresh.push(level);
             }
+            // Every pseudonode LSP we originate (one per LAN where we are DIS) must
+            // be refreshed on the same schedule as our own LSP. Otherwise the
+            // pseudonode ages out at LSP_LIFETIME (1200 s) even on a stable LAN and
+            // SPF loses every node reachable *through* that pseudonode — a LAN-wide
+            // blackhole. reoriginate_pseudonode already only fires on DIS *identity*
+            // changes, never periodically, so without this the refresh never runs.
+            for idx in 0..self.ifaces.len() {
+                if !self.ifaces[idx].is_dis[li] {
+                    continue;
+                }
+                let pn_id = LspId::new(self.cfg.system_id, self.ifaces[idx].local_circuit_id, 0);
+                let low = self.dbs[li]
+                    .get(&pn_id)
+                    .is_some_and(|l| l.remaining_lifetime < LSP_REFRESH_BELOW);
+                if low {
+                    refresh_pn.push((idx, level));
+                }
+            }
         }
         for level in refresh {
             self.reoriginate(level).await;
+        }
+        for (idx, level) in refresh_pn {
+            self.reoriginate_pseudonode(idx, level).await;
         }
     }
 
