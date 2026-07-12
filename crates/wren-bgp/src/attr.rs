@@ -858,6 +858,12 @@ fn decode_as_segments(value: &[u8], four_octet: bool) -> Option<Vec<AsPathSegmen
     let mut off = 0;
     while off < value.len() {
         let (seg, used) = AsPathSegment::decode(&value[off..], four_octet)?;
+        // RFC 7607: AS 0 is reserved and must never appear in an AS_PATH /
+        // AS4_PATH; reject the attribute (→ the UPDATE is treated as malformed)
+        // rather than propagate a path routed through the reserved AS.
+        if seg.asns().contains(&0) {
+            return None;
+        }
         segs.push(seg);
         off += used;
     }
@@ -1356,6 +1362,18 @@ mod tests {
     }
 
     #[test]
+    fn as_path_with_as_zero_is_rejected_rfc7607() {
+        // AS 0 is reserved and must not appear in an AS_PATH.
+        let mut zero = Vec::new();
+        PathAttribute::AsPath(vec![AsPathSegment::Sequence(vec![0])]).encode(&mut zero, true);
+        assert!(PathAttribute::decode(&zero, true).is_none());
+        // A normal AS_PATH still decodes.
+        let mut ok = Vec::new();
+        PathAttribute::AsPath(vec![AsPathSegment::Sequence(vec![65001])]).encode(&mut ok, true);
+        assert!(PathAttribute::decode(&ok, true).is_some());
+    }
+
+    #[test]
     fn fixed_length_attributes_reject_wrong_length_rfc7606() {
         // ORIGIN is exactly 1 octet, NEXT_HOP exactly 4, MED/LOCAL_PREF exactly 4
         // (RFC 7606 §5). A longer value is malformed, not silently truncated.
@@ -1381,7 +1399,8 @@ mod tests {
     #[test]
     fn extended_length_used_for_long_values() {
         // A long AS_PATH forces the extended-length encoding (>255 value bytes).
-        let big: Vec<u32> = (0..200).collect();
+        // ASes start at 1 — AS 0 is reserved and rejected by decode (RFC 7607).
+        let big: Vec<u32> = (1..201).collect();
         let attr = PathAttribute::AsPath(vec![AsPathSegment::Sequence(big)]);
         let mut buf = Vec::new();
         attr.encode(&mut buf, true);

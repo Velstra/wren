@@ -31,6 +31,11 @@ const RECONNECT_BACKOFF: Duration = Duration::from_secs(10);
 const DEFAULT_REFRESH_SECS: u64 = 3600;
 /// A sane upper bound on a single PDU, to reject a corrupt/hostile length field.
 const MAX_PDU_LEN: usize = 65535;
+/// The most ROAs we retain from one cache. The real global RPKI is on the order of
+/// a million VRPs, so this is set well above any legitimate full table and only
+/// bounds a malicious or malfunctioning cache streaming endless distinct
+/// announcements (which would otherwise exhaust memory).
+const MAX_ROAS: usize = 2_000_000;
 
 /// One configured RTR cache to fetch ROAs from.
 pub struct RtrConfig {
@@ -84,7 +89,10 @@ async fn session(cfg: &RtrConfig, roas_tx: &mpsc::Sender<Vec<Roa>>) -> std::io::
             Pdu::IPv4Prefix { .. } | Pdu::IPv6Prefix { .. } => {
                 if let Some((roa, announce)) = pdu.to_roa() {
                     if announce {
-                        roas.insert(roa);
+                        // Bound the set so a misbehaving cache cannot exhaust memory.
+                        if roas.len() < MAX_ROAS {
+                            roas.insert(roa);
+                        }
                     } else {
                         roas.remove(&roa);
                     }

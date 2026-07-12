@@ -174,6 +174,20 @@ fn md5_auth_digest(packet: &[u8], key: &[u8]) -> [u8; 16] {
     crate::md5::md5(&buf)
 }
 
+/// Constant-time equality for two byte slices — the MD5 authentication digest is
+/// compared this way so a wrong digest leaks no timing signal about how many of
+/// its leading bytes were correct.
+fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
 /// A Hello packet body (§A.3.2): the parameters two routers must agree on to
 /// become neighbours, plus the sender's current view of the link's neighbours
 /// and its elected DR/BDR.
@@ -536,7 +550,7 @@ impl Packet {
                     return Err(DecodeError::BadAuth);
                 }
                 let digest = md5_auth_digest(&buf[..body_end], key);
-                if buf[body_end..body_end + MD5_LEN] != digest {
+                if !ct_eq(&buf[body_end..body_end + MD5_LEN], &digest) {
                     return Err(DecodeError::BadAuth);
                 }
             }
