@@ -34,6 +34,10 @@ const ENC_SOURCE_LEN: usize = 8;
 
 /// The fixed 4-byte PIM header (version/type, reserved, 16-bit checksum).
 const HEADER_LEN: usize = 4;
+/// The number of leading octets a PIM **Register** checksum covers: the 4-octet
+/// header plus the 32-bit flags field (RFC 7761 §4.9) — deliberately NOT the
+/// encapsulated multicast datagram that follows.
+const REGISTER_CSUM_LEN: usize = 8;
 
 /// Source-flags bit (§4.9.5.1): S — the sparse-mode bit, set on every entry here.
 const SRC_FLAG_SPARSE: u8 = 0x04;
@@ -461,7 +465,15 @@ impl Message {
                 source.encode_into(&mut out);
             }
         }
-        let sum = super::wire::checksum(&out);
+        // RFC 7761 §4.9: a Register's checksum covers only the first 8 octets
+        // (header + flags), NOT the encapsulated data; every other message type
+        // checksums the whole PIM message.
+        let csum_end = if matches!(self, Message::Register { .. }) {
+            REGISTER_CSUM_LEN.min(out.len())
+        } else {
+            out.len()
+        };
+        let sum = super::wire::checksum(&out[..csum_end]);
         out[2..4].copy_from_slice(&sum.to_be_bytes());
         out
     }
@@ -475,7 +487,16 @@ impl Message {
         if version != PIM_VERSION {
             return Err(DecodeError::BadVersion(version));
         }
-        if checksum(buf) != 0 {
+        // RFC 7761 §4.9: verify a Register's checksum over only the first 8 octets
+        // (header + flags); every other type covers the whole message. A compliant
+        // DR/RP computes the header-only Register checksum, so covering the whole
+        // buffer here would reject every real Register as BadChecksum.
+        let csum_end = if buf[0] & 0x0f == TYPE_REGISTER {
+            REGISTER_CSUM_LEN.min(buf.len())
+        } else {
+            buf.len()
+        };
+        if checksum(&buf[..csum_end]) != 0 {
             return Err(DecodeError::BadChecksum);
         }
         let body = &buf[HEADER_LEN..];
@@ -703,7 +724,10 @@ mod tests {
         };
         let bytes = msg.encode();
         assert_eq!(bytes[0], 0x21); // version 2, type 1
-        assert_eq!(checksum(&bytes), 0);
+        // RFC 7761 §4.9: the Register checksum covers only the first 8 octets
+        // (header + flags), so *that* prefix sums to zero (not the whole message,
+        // which includes the encapsulated data).
+        assert_eq!(checksum(&bytes[..8]), 0);
         assert_eq!(Message::decode(&bytes).unwrap(), msg);
     }
 
