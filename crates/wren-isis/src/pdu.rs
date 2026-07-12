@@ -400,8 +400,14 @@ impl Pdu {
                 tlvs,
             }),
             PduType::L1Lsp | PduType::L2Lsp => {
-                // Verify the Fletcher checksum over the LSP ID field onward.
-                if !fletcher16_valid(&buf[12..stated]) {
+                let remaining_lifetime = u16::from_be_bytes([buf[10], buf[11]]);
+                // A purge (Remaining Lifetime 0) is flooded with a zeroed body and
+                // checksum to withdraw an LSP from the domain (ISO 10589 §7.3.16.4),
+                // so its checksum must NOT be verified — real routers (FRR, IOS)
+                // zero the checksum field on a purge. Verifying it unconditionally
+                // rejected every standard neighbour's purge as BadChecksum, leaving
+                // the dead LSP in the database indefinitely (a domain-wide blackhole).
+                if remaining_lifetime != 0 && !fletcher16_valid(&buf[12..stated]) {
                     return Err(DecodeError::BadChecksum);
                 }
                 let level = if pt == PduType::L1Lsp {
@@ -412,7 +418,7 @@ impl Pdu {
                 let flags = buf[26];
                 PduBody::Lsp(Lsp {
                     level,
-                    remaining_lifetime: u16::from_be_bytes([buf[10], buf[11]]),
+                    remaining_lifetime,
                     lsp_id: LspId::decode(&buf[12..20]).ok_or(DecodeError::TooShort)?,
                     sequence_number: u32::from_be_bytes([buf[20], buf[21], buf[22], buf[23]]),
                     checksum: u16::from_be_bytes([buf[24], buf[25]]),
@@ -612,6 +618,38 @@ mod tests {
         let last = bytes.len() - 1;
         bytes[last] ^= 0xff;
         assert_eq!(Pdu::decode(&bytes), Err(DecodeError::BadChecksum));
+    }
+
+    #[test]
+    fn purge_lsp_zero_lifetime_skips_checksum() {
+        // A purge (Remaining Lifetime 0) withdraws an LSP and is flooded with a
+        // zeroed checksum (ISO 10589 §7.3.16.4) — FRR/IOS do this. It must decode
+        // without a checksum error, or every neighbour's purge is dropped and the
+        // dead LSP lingers in the database forever (a domain-wide blackhole).
+        let pdu = Pdu {
+            max_area_addresses: 0,
+            body: PduBody::Lsp(Lsp {
+                level: IsLevel::L2,
+                remaining_lifetime: 0,
+                lsp_id: LspId::new(sid([4, 4, 4, 4, 4, 4]), 0, 0),
+                sequence_number: 7,
+                checksum: 0,
+                partition: false,
+                attached: 0,
+                overload: false,
+                is_type: IsLevel::L1L2,
+                tlvs: sample_tlvs(),
+            }),
+        };
+        let mut bytes = pdu.encode();
+        // Zero the checksum field (buf[24..26]) so a checksum verification would
+        // fail — the zero lifetime must make decode skip that verification.
+        bytes[24] = 0;
+        bytes[25] = 0;
+        match Pdu::decode(&bytes).expect("purge decodes despite zero checksum").body {
+            PduBody::Lsp(l) => assert_eq!(l.remaining_lifetime, 0),
+            _ => panic!("not an LSP"),
+        }
     }
 
     #[test]
