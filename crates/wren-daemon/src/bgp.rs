@@ -4695,6 +4695,14 @@ async fn drive_session(
                         } else if role_mismatch {
                             warn!(peer = %sess.peer.addr, mine = ?sess.role, theirs = ?o.role(), "BGP OPEN role mismatch (RFC 9234)");
                             Step::RoleMismatch
+                        } else if o.hold_time == 1 || o.hold_time == 2 {
+                            // RFC 4271 §6.2: a Hold Time of 1 or 2 seconds is
+                            // unacceptable — it forces a 1-second keepalive and
+                            // chronic Hold-Timer-Expired flaps on any scheduler
+                            // hiccup. 0 is fine (keepalives disabled), and is
+                            // handled by the negotiation below.
+                            warn!(peer = %sess.peer.addr, hold = o.hold_time, "BGP OPEN unacceptable hold time");
+                            Step::Event(Event::OpenError)
                         } else {
                             sess.peer_id = o.identifier;
                             // Keep the encoded OPEN for the BMP Peer Up (RFC 7854 §4.10).

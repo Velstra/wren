@@ -576,8 +576,17 @@ fn decode_prefixes(mut buf: &[u8], add_path: bool) -> Result<(Vec<Prefix>, Vec<u
 
 fn decode_attributes(mut buf: &[u8], four_octet: bool) -> Result<Vec<PathAttribute>, DecodeError> {
     let mut out = Vec::new();
+    // RFC 7606 §3(g): a path attribute (any type) that appears more than once in
+    // one UPDATE makes the UPDATE malformed — reject it rather than silently
+    // keeping the first or last copy.
+    let mut seen = [false; 256];
     while !buf.is_empty() {
         let (a, used) = PathAttribute::decode(buf, four_octet).ok_or(DecodeError::Malformed)?;
+        let tc = a.type_code() as usize;
+        if seen[tc] {
+            return Err(DecodeError::Malformed);
+        }
+        seen[tc] = true;
         out.push(a);
         buf = &buf[used..];
     }
@@ -608,6 +617,14 @@ mod tests {
     use super::*;
     use crate::attr::{AsPathSegment, Origin, PathAttribute};
     use crate::DEFAULT_HOLD_TIME;
+
+    #[test]
+    fn duplicate_attribute_is_rejected_rfc7606() {
+        // A single ORIGIN decodes; two ORIGINs in one attribute list make the
+        // UPDATE malformed (RFC 7606 §3(g)) rather than silently first/last-wins.
+        assert!(decode_attributes(&[0x40, 1, 1, 0], false).is_ok());
+        assert!(decode_attributes(&[0x40, 1, 1, 0, 0x40, 1, 1, 0], false).is_err());
+    }
 
     fn ip(o: [u8; 4]) -> Ipv4Addr {
         Ipv4Addr::from(o)

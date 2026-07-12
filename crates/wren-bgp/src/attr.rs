@@ -630,13 +630,19 @@ impl PathAttribute {
         let value = &buf[header..end];
         let attr = match type_code {
             Self::ORIGIN => {
-                let o = Origin::from_u8(*value.first()?)?;
+                // RFC 4271 §4.3 / RFC 7606 §5: ORIGIN is a fixed 1-octet attribute.
+                if value.len() != 1 {
+                    return None;
+                }
+                let o = Origin::from_u8(value[0])?;
                 PathAttribute::Origin(o)
             }
             Self::AS_PATH => PathAttribute::AsPath(decode_as_segments(value, four_octet)?),
             Self::AS4_PATH => PathAttribute::As4Path(decode_as_segments(value, true)?),
             Self::NEXT_HOP => {
-                if value.len() < 4 {
+                // RFC 7606 §5: NEXT_HOP is exactly 4 octets — an over-long value is
+                // malformed, not silently truncated to its first four bytes.
+                if value.len() != 4 {
                     return None;
                 }
                 PathAttribute::NextHop(Ipv4Addr::new(value[0], value[1], value[2], value[3]))
@@ -820,7 +826,10 @@ impl PathAttribute {
 }
 
 fn read_u32(b: &[u8]) -> Option<u32> {
-    if b.len() < 4 {
+    // MED / LOCAL_PREF / OTC are all fixed 4-octet attributes (RFC 4271 §5, RFC
+    // 9234); a value of any other length is malformed (RFC 7606 §5), not a u32
+    // read from the first four bytes of an over-long field.
+    if b.len() != 4 {
         return None;
     }
     Some(u32::from_be_bytes([b[0], b[1], b[2], b[3]]))
@@ -1344,6 +1353,19 @@ mod tests {
             PathAttribute::decode(&[FLAG_OPTIONAL | FLAG_TRANSITIVE, 4, 4, 0, 0, 0, 5], true)
                 .is_none()
         );
+    }
+
+    #[test]
+    fn fixed_length_attributes_reject_wrong_length_rfc7606() {
+        // ORIGIN is exactly 1 octet, NEXT_HOP exactly 4, MED/LOCAL_PREF exactly 4
+        // (RFC 7606 §5). A longer value is malformed, not silently truncated.
+        assert!(PathAttribute::decode(&[FLAG_TRANSITIVE, 1, 2, 0, 0], true).is_none()); // ORIGIN len 2
+        assert!(
+            PathAttribute::decode(&[FLAG_TRANSITIVE, 3, 5, 192, 0, 2, 1, 9], true).is_none()
+        ); // NEXT_HOP len 5
+        assert!(
+            PathAttribute::decode(&[FLAG_OPTIONAL, 4, 5, 0, 0, 0, 5, 0], true).is_none()
+        ); // MED len 5
     }
 
     #[test]
