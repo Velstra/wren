@@ -77,6 +77,12 @@ pub struct CsnpSync {
     pub send: Vec<LspId>,
 }
 
+/// The most LSPs one level's database will hold. IS-IS has no LSP-origination
+/// authentication yet, so an attacker could otherwise inject distinct LSP-IDs to
+/// grow the database without bound (OOM). Set far above any real domain's LSP
+/// count so it only ever bounds abuse.
+const MAX_LSPS: usize = 65_536;
+
 /// An IS-IS link-state database for one level.
 #[derive(Clone, Default)]
 pub struct Lsdb {
@@ -124,6 +130,12 @@ impl Lsdb {
         let id = lsp.lsp_id;
         match self.entries.get(&id) {
             None => {
+                // Bound the database: once full, refuse a brand-new LSP rather than
+                // grow without limit. `HaveNewer` keeps the caller from flooding it
+                // on (its `changed()` is false), the same as a stale offer.
+                if self.entries.len() >= MAX_LSPS {
+                    return Install::HaveNewer;
+                }
                 self.entries.insert(id, lsp);
                 Install::New
             }

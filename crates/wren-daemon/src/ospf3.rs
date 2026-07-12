@@ -963,6 +963,7 @@ impl Ospf {
             None => return,
         };
         let mut installed = false;
+        let mut reclaim_self = false;
         let mut ack_headers = Vec::new();
         let mut reflood_area = Vec::new();
         let mut reflood_ext = Vec::new();
@@ -996,15 +997,32 @@ impl Ospf {
                             self.ifaces[idx].link_lsdb.install(lsa);
                         }
                         wren_ospfv3::lsa::Scope::As => {
-                            if third_party {
-                                reflood_ext.push(lsa.clone());
+                            if !third_party {
+                                // RFC 2328 §13.4 (RFC 5340): reclaim our own LSA
+                                // rather than install a foreign more-recent copy —
+                                // advance our sequence past it and re-originate.
+                                let slot = self
+                                    .lsa_seqs
+                                    .entry((AS_SCOPE, key))
+                                    .or_insert(INITIAL_SEQUENCE_NUMBER);
+                                *slot = lsa.header.ls_seq.wrapping_add(1);
+                                reclaim_self = true;
+                                continue;
                             }
+                            reflood_ext.push(lsa.clone());
                             self.external_lsdb.install(lsa);
                         }
                         _ => {
-                            if third_party {
-                                reflood_area.push(lsa.clone());
+                            if !third_party {
+                                let slot = self
+                                    .lsa_seqs
+                                    .entry((area, key))
+                                    .or_insert(INITIAL_SEQUENCE_NUMBER);
+                                *slot = lsa.header.ls_seq.wrapping_add(1);
+                                reclaim_self = true;
+                                continue;
                             }
+                            reflood_area.push(lsa.clone());
                             self.areas.get_mut(&area).unwrap().lsdb.install(lsa);
                         }
                     }
@@ -1035,6 +1053,12 @@ impl Ospf {
         }
         for lsa in &reflood_ext {
             self.flood_external_except(lsa, src_addr).await;
+        }
+        if reclaim_self {
+            // Re-originate our LSAs with the advanced sequence numbers so the fresh
+            // instances supersede the foreign copies of our own LSAs.
+            self.originate_externals();
+            self.reoriginate_and_flood().await;
         }
 
         let loading_done = {

@@ -62,6 +62,11 @@ use crate::router::{Redistribution, RouteUpdate};
 
 /// How often (seconds) the housekeeping timer advances dead/wait timers.
 const HOUSEKEEPING_SECS: u64 = 1;
+/// The longest graceful-restart grace period we will honour as a helper (RFC 3623
+/// §3 lets the helper cap the requested value). A neighbour asking for more —
+/// up to the 32-bit maximum of ~136 years — would otherwise pin our adjacency
+/// against both inactivity and BFD-down teardown for that long.
+const MAX_GRACE_PERIOD: u64 = 1800;
 /// Receive buffer: the raw socket delivers the IP header too, and an LSU can be
 /// link-MTU sized.
 const RECV_BUF: usize = 9000;
@@ -1185,20 +1190,38 @@ impl Ospf {
             }
             return;
         }
+        // Only a Full neighbour may put us into helper mode, and only for a
+        // bounded period. Without the Full check any on-link speaker could bloat
+        // the `helping` map with forged router-IDs; without the clamp a requested
+        // `grace_period` of up to u32::MAX seconds (~136 years) would freeze the
+        // adjacency against inactivity and BFD-down teardown for that long.
+        if !self.neighbor_is_full(nbr_id) {
+            debug!(neighbor = %nbr_id, "ignoring Grace-LSA from a non-Full neighbour");
+            return;
+        }
+        let period = (grace.grace_period as u64).min(MAX_GRACE_PERIOD);
         let seen_at_entry = self.neighbor_last_seen(nbr_id).unwrap_or(0);
-        let deadline = now + grace.grace_period as u64;
+        let deadline = now + period;
         let fresh = self
             .helping
             .insert(nbr_id, GrHelper { deadline, seen_at_entry })
             .is_none();
         if fresh {
-            info!(neighbor = %nbr_id, grace_period = grace.grace_period, reason = ?grace.reason, "OSPF graceful-restart helper: entering helper mode");
+            info!(neighbor = %nbr_id, grace_period = period, reason = ?grace.reason, "OSPF graceful-restart helper: entering helper mode");
         }
     }
 
     /// The `last_seen` timestamp of the neighbour `nbr_id`, if known on any interface.
     fn neighbor_last_seen(&self, nbr_id: Ipv4Addr) -> Option<u64> {
         self.ifaces.iter().find_map(|i| i.neighbors.get(&nbr_id).map(|n| n.last_seen))
+    }
+
+    /// Whether `nbr_id` currently has a Full adjacency on any interface — the
+    /// precondition for honouring its Grace-LSA (RFC 3623 §2.2).
+    fn neighbor_is_full(&self, nbr_id: Ipv4Addr) -> bool {
+        self.ifaces
+            .iter()
+            .any(|i| i.neighbors.get(&nbr_id).is_some_and(|n| n.fsm.state == NeighborState::Full))
     }
 
     /// Process a Link State Update (§13): install newer LSAs into the area
@@ -1211,6 +1234,7 @@ impl Ospf {
             None => return,
         };
         let mut installed = false;
+        let mut reclaim_self = false;
         let mut ack_headers = Vec::new();
         let mut reflood_area = Vec::new();
         let mut reflood_ext = Vec::new();
@@ -1258,15 +1282,29 @@ impl Ospf {
                     ack_headers.push(lsa.header);
                     let key = lsa.key();
                     let third_party = lsa.header.advertising_router != self_id;
+                    if !third_party {
+                        // RFC 2328 §13.4: this is a more-recent instance of one of
+                        // OUR OWN LSAs — a stale copy from before a restart, or a
+                        // forged/purged one. Never install the foreign copy over
+                        // ours; advance our sequence past it so the re-origination
+                        // after this batch supersedes it across the domain and we
+                        // reclaim ownership. (Without this a spoofed high-sequence
+                        // purge of our LSA-ID would erase us until our own sequence
+                        // caught up, which it never would.)
+                        let scope = if is_ext { AS_SCOPE } else { area };
+                        let slot = self
+                            .lsa_seqs
+                            .entry((scope, key))
+                            .or_insert(INITIAL_SEQUENCE_NUMBER);
+                        *slot = lsa.header.ls_seq.wrapping_add(1);
+                        reclaim_self = true;
+                        continue;
+                    }
                     if is_ext {
-                        if third_party {
-                            reflood_ext.push(lsa.clone());
-                        }
+                        reflood_ext.push(lsa.clone());
                         self.external_lsdb.install(lsa);
                     } else {
-                        if third_party {
-                            reflood_area.push(lsa.clone());
-                        }
+                        reflood_area.push(lsa.clone());
                         self.areas.get_mut(&area).unwrap().lsdb.install(lsa);
                     }
                     self.drop_from_request_lists(&key);
@@ -1292,6 +1330,13 @@ impl Ospf {
         }
         for lsa in &reflood_ext {
             self.flood_external_except(lsa, src_addr).await;
+        }
+        if reclaim_self {
+            // Re-originate our LSAs with the now-advanced sequence numbers so the
+            // fresh instances flood out and supersede the foreign copies of our
+            // own LSAs that this batch carried.
+            self.originate_externals().await;
+            self.reoriginate_and_flood().await;
         }
 
         let loading_done = {

@@ -189,7 +189,13 @@ fn external_routes_of_type(
     self_id: Ipv4Addr,
     ls_type: LsType,
 ) -> Vec<SpfRoute> {
-    let mut by_prefix: BTreeMap<Prefix, SpfRoute> = BTreeMap::new();
+    // Type-1 and Type-2 externals are kept apart: RFC 2328 §16.4(6) makes a
+    // Type-1 route *always* preferred over a Type-2 for the same prefix regardless
+    // of cost, so they must not compete in one lowest-cost map (which would let an
+    // E2 with a small metric beat an E1 with a larger total). Within each type the
+    // usual lowest-cost / ECMP merge applies.
+    let mut e1: BTreeMap<Prefix, SpfRoute> = BTreeMap::new();
+    let mut e2: BTreeMap<Prefix, SpfRoute> = BTreeMap::new();
     for lsa in lsdb.iter_type(ls_type) {
         let LsaBody::AsExternal(ext) = &lsa.body else {
             continue;
@@ -205,19 +211,26 @@ fn external_routes_of_type(
         let Some(&cost_to_asbr) = intra.routers.get(&asbr) else {
             continue;
         };
-        let total = if ext.external_type2 {
-            ext.metric
+        // Type-2 cost is the advertised metric alone (the ASBR distance is only a
+        // tiebreak, deferred); Type-1 cost adds the intra-area path to the ASBR.
+        let (total, map) = if ext.external_type2 {
+            (ext.metric, &mut e2)
         } else {
-            cost_to_asbr.saturating_add(ext.metric)
+            (cost_to_asbr.saturating_add(ext.metric), &mut e1)
         };
         let plen = mask_len(ext.network_mask);
         let Ok(prefix) = Prefix::new(IpAddr::V4(lsa.header.link_state_id), plen) else {
             continue;
         };
         let gateways = intra.router_nexthops.get(&asbr).cloned().unwrap_or_default();
-        add_route(&mut by_prefix, prefix, total, &gateways);
+        add_route(map, prefix, total, &gateways);
     }
-    by_prefix.into_values().collect()
+    // Merge: an E1 route wins outright, so only take an E2 route for a prefix no
+    // E1 route covers.
+    for (prefix, route) in e2 {
+        e1.entry(prefix).or_insert(route);
+    }
+    e1.into_values().collect()
 }
 
 struct Spf<'a> {
@@ -1024,6 +1037,43 @@ mod tests {
         let r = routes.iter().find(|r| r.prefix.to_string() == "203.0.113.0/24").unwrap();
         // E1: 10 (to the ASBR) + 20 (metric).
         assert_eq!(r.cost, 30);
+    }
+
+    #[test]
+    fn type1_external_always_beats_type2_for_same_prefix() {
+        // Two ASBRs both reach 203.0.113.0/24: 2.2.2.2 advertises it as an E1
+        // (10 to the ASBR + 20 = 30) and 3.3.3.3 as an E2 (metric 5). RFC 2328
+        // §16.4(6): the E1 wins outright despite its much higher cost — a plain
+        // lowest-cost merge would wrongly pick the E2.
+        let mut db = Lsdb::new();
+        db.install(router_lsa(
+            [1, 1, 1, 1],
+            0,
+            vec![
+                p2p([2, 2, 2, 2], [10, 0, 12, 1], 10),
+                p2p([3, 3, 3, 3], [10, 0, 13, 1], 10),
+            ],
+            1,
+        ));
+        db.install(router_lsa(
+            [2, 2, 2, 2],
+            crate::lsa::RTR_FLAG_E,
+            vec![p2p([1, 1, 1, 1], [10, 0, 12, 2], 10)],
+            1,
+        ));
+        db.install(router_lsa(
+            [3, 3, 3, 3],
+            crate::lsa::RTR_FLAG_E,
+            vec![p2p([1, 1, 1, 1], [10, 0, 13, 2], 10)],
+            1,
+        ));
+        let intra = compute(&db, ip([1, 1, 1, 1]));
+        let mut ext = Lsdb::new();
+        ext.install(external_lsa([2, 2, 2, 2], [203, 0, 113, 0], [255, 255, 255, 0], 20, false));
+        ext.install(external_lsa([3, 3, 3, 3], [203, 0, 113, 0], [255, 255, 255, 0], 5, true));
+        let routes = external_routes(&ext, &intra, ip([1, 1, 1, 1]));
+        let r = routes.iter().find(|r| r.prefix.to_string() == "203.0.113.0/24").unwrap();
+        assert_eq!(r.cost, 30, "the E1 route must win over the cheaper E2");
     }
 
     #[test]

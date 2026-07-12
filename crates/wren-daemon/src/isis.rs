@@ -68,6 +68,11 @@ use crate::router::{Redistribution, RouteUpdate};
 
 /// The lifetime stamped on an originated LSP (seconds). Refreshed before expiry.
 const LSP_LIFETIME: u16 = 1200;
+/// The most neighbours we record per interface. IS-IS has no adjacency
+/// authentication yet, so an on-link attacker spoofing a stream of distinct
+/// system IDs could otherwise grow the neighbour table without bound (OOM). A
+/// real LAN has far fewer than this.
+const MAX_NEIGHBORS_PER_IFACE: usize = 1024;
 /// Re-originate our LSPs once their remaining lifetime drops below this.
 const LSP_REFRESH_BELOW: u16 = 300;
 /// How often (seconds) the housekeeping timer ages the database and the holding
@@ -700,6 +705,14 @@ impl Isis {
         let bfd_addr = neighbor_bfd_addr(&h.tlvs, self.ifaces[idx].ifindex);
         let changed = {
             let iface = &mut self.ifaces[idx];
+            // Bound the neighbour table: refuse a brand-new neighbour once it is
+            // full, so an on-link attacker spoofing distinct system IDs cannot grow
+            // it without limit (IS-IS adjacency auth is not yet implemented).
+            if !iface.neighbors.contains_key(&h.source_id)
+                && iface.neighbors.len() >= MAX_NEIGHBORS_PER_IFACE
+            {
+                return;
+            }
             let nbr = iface
                 .neighbors
                 .entry(h.source_id)
@@ -737,6 +750,12 @@ impl Isis {
             }
             let li = lidx(level);
             let iface = &mut self.ifaces[idx];
+            // Bound the neighbour table (see MAX_NEIGHBORS_PER_IFACE).
+            if !iface.neighbors.contains_key(&h.source_id)
+                && iface.neighbors.len() >= MAX_NEIGHBORS_PER_IFACE
+            {
+                return;
+            }
             let nbr = iface
                 .neighbors
                 .entry(h.source_id)
@@ -767,6 +786,19 @@ impl Isis {
             return;
         }
         let li = lidx(level);
+        // ISO 10589 §7.3.16.1: reclaim our own LSP rather than let a more-recent
+        // foreign instance displace it. A stale pre-restart copy, or a forged
+        // high-sequence purge of our own LSP-ID, would otherwise erase us from the
+        // topology — our next refresh at `own_seq + 1` could not beat it. Adopt the
+        // higher sequence and re-originate so our real LSP (a fresh, full-lifetime
+        // instance) supersedes the foreign one. The pseudonode LSP is refreshed by
+        // the DIS housekeeping path.
+        if lsp.lsp_id == LspId::new(self.cfg.system_id, 0, 0) && lsp.sequence_number > self.own_seq[li]
+        {
+            self.own_seq[li] = lsp.sequence_number;
+            self.reoriginate(level).await;
+            return;
+        }
         if self.dbs[li].install(lsp).changed() {
             // Flood the new LSP out of every other interface running this level.
             self.flood(level, raw, Some(idx)).await;
