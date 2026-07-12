@@ -527,7 +527,11 @@ fn decode_lsu(body: &[u8]) -> Result<LinkStateUpdate, DecodeError> {
         return Err(DecodeError::TooShort);
     }
     let count = u32::from_be_bytes([body[0], body[1], body[2], body[3]]) as usize;
-    let mut lsas = Vec::with_capacity(count);
+    // Never size the allocation from the wire count directly: each LSA occupies
+    // at least an LSA header, so the remaining body can hold at most this many.
+    // Otherwise a crafted count (up to 2^32) drives a multi-GB pre-allocation
+    // (abort/OOM) before a single LSA is validated.
+    let mut lsas = Vec::with_capacity(count.min((body.len() - 4) / LSA_HEADER_LEN));
     let mut off = 4;
     for _ in 0..count {
         let (lsa, used) = Lsa::decode(&body[off..]).ok_or(DecodeError::BadLsa)?;
@@ -828,5 +832,14 @@ mod tests {
         assert!(hello.as_database_description().is_none());
         assert!(hello.as_link_state_update().is_none());
         assert!(hello.as_hello().is_some());
+    }
+
+    #[test]
+    fn lsu_with_huge_count_errors_without_oom() {
+        // A crafted LSA count (here u32::MAX) must never size the allocation: with
+        // no LSA bytes following, decode returns an error immediately instead of
+        // attempting a multi-GB pre-allocation (which would abort the process).
+        let body = [0xff, 0xff, 0xff, 0xff]; // count = 4_294_967_295, no LSA data
+        assert_eq!(decode_lsu(&body), Err(DecodeError::BadLsa));
     }
 }

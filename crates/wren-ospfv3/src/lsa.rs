@@ -785,7 +785,9 @@ fn decode_link(b: &[u8]) -> Option<LinkLsa> {
     let mut lla = [0u8; 16];
     lla.copy_from_slice(&b[4..20]);
     let count = u32::from_be_bytes([b[20], b[21], b[22], b[23]]) as usize;
-    let mut prefixes = Vec::with_capacity(count);
+    // Cap the pre-allocation by what the remaining body can hold (each prefix is
+    // at least 4 bytes); a crafted count must not drive a huge alloc (abort/OOM).
+    let mut prefixes = Vec::with_capacity(count.min((b.len() - 24) / 4));
     let mut p = 24;
     for _ in 0..count {
         let (prefix, _mid, used) = Prefix::decode(&b[p..])?;
