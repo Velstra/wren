@@ -62,6 +62,12 @@ use crate::router::{Redistribution, RouteUpdate};
 
 /// How often (seconds) the housekeeping timer advances dead/wait timers.
 const HOUSEKEEPING_SECS: u64 = 1;
+/// The retransmission interval RxmtInterval (RFC 2328 §C.5): an LSA on a
+/// neighbour's link-state retransmission list, or an unanswered Link State
+/// Request, is resent every this-many seconds until it is acknowledged. 5 s is
+/// the standard default; kept well above the sub-millisecond ack latency of a
+/// healthy adjacency so only genuinely lost packets are retransmitted.
+const RXMT_INTERVAL_SECS: u64 = 5;
 /// The longest graceful-restart grace period we will honour as a helper (RFC 3623
 /// §3 lets the helper cap the requested value). A neighbour asking for more —
 /// up to the 32-bit maximum of ~136 years — would otherwise pin our adjacency
@@ -182,6 +188,14 @@ struct OspfNeighbor {
     summary_sent: bool,
     /// The LSAs we still need from this neighbour (§10.9 request list).
     request_list: Vec<LsaKey>,
+    /// The link-state retransmission list (RFC 2328 §13.5 / §10): every LSA we
+    /// have flooded to this neighbour that it has not yet acknowledged, keyed by
+    /// LSA identity and holding the exact instance we sent. The [`RXMT_INTERVAL_SECS`]
+    /// timer resends everything on this list; a matching Link State Acknowledgment
+    /// removes an entry. Without it a single lost flooded LSU is never re-sent, so
+    /// the neighbour's database diverges permanently (there is no other repair path
+    /// on a stable adjacency).
+    retransmit_list: HashMap<LsaKey, Lsa>,
 }
 
 impl OspfNeighbor {
@@ -194,6 +208,7 @@ impl OspfNeighbor {
             master: false,
             summary_sent: false,
             request_list: Vec::new(),
+            retransmit_list: HashMap::new(),
         }
     }
 }
@@ -598,6 +613,13 @@ pub async fn run(
     let mut refresh = tokio::time::interval(Duration::from_secs(LS_REFRESH_TIME as u64));
     refresh.set_missed_tick_behavior(MissedTickBehavior::Delay);
     refresh.tick().await;
+    // Retransmission (RFC 2328 §13.5): resend any LSA still on a neighbour's
+    // retransmission list, and any unanswered Link State Request, every
+    // RxmtInterval until it is acknowledged — the self-healing path for a lost
+    // flooded LSU or LSR.
+    let mut rxmt = tokio::time::interval(Duration::from_secs(RXMT_INTERVAL_SECS));
+    rxmt.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    rxmt.tick().await;
     // The wall-clock second at which the LSDBs were last aged, so a delayed or
     // coalesced housekeeping tick advances age by the true elapsed time.
     let mut last_aged: u64 = 0;
@@ -646,6 +668,9 @@ pub async fn run(
             _ = refresh.tick() => {
                 ospf.originate_externals().await;
                 ospf.reoriginate_and_flood().await;
+            }
+            _ = rxmt.tick() => {
+                ospf.retransmit_pending().await;
             }
             Some(r) = redist.recv() => {
                 ospf.apply_redistribution(r).await;
@@ -796,7 +821,18 @@ impl Ospf {
             Body::DatabaseDescription(dd) => self.handle_dd(idx, nbr_id, &dd).await,
             Body::LinkStateRequest(req) => self.handle_lsr(idx, nbr_id, &req).await,
             Body::LinkStateUpdate(upd) => self.handle_lsu(idx, nbr_id, upd, now).await,
-            Body::LinkStateAck(_) => debug!(src = %pkt.src, "OSPF LSAck received"),
+            Body::LinkStateAck(ack) => self.handle_lsack(idx, nbr_id, &ack),
+        }
+    }
+
+    /// Process a Link State Acknowledgment (§13.7): clear from the neighbour's
+    /// retransmission list every LSA the acknowledged headers confirm as the same
+    /// instance we sent, so it is no longer retransmitted. An ack for an *older*
+    /// instance than the one we hold pending is ignored (we keep retransmitting the
+    /// newer one).
+    fn handle_lsack(&mut self, idx: usize, nbr_id: Ipv4Addr, ack: &LinkStateAck) {
+        if let Some(n) = self.ifaces[idx].neighbors.get_mut(&nbr_id) {
+            clear_acked_lsas(&mut n.retransmit_list, &ack.lsa_headers);
         }
     }
 
@@ -941,6 +977,7 @@ impl Ospf {
                 NeighborAction::ClearAdjacency => {
                     if let Some(n) = self.ifaces[idx].neighbors.get_mut(&nbr_id) {
                         n.request_list.clear();
+                        n.retransmit_list.clear();
                         n.summary_sent = false;
                     }
                 }
@@ -965,6 +1002,7 @@ impl Ospf {
             n.master = true; // tentatively, until negotiation
             n.summary_sent = false;
             n.request_list.clear();
+            n.retransmit_list.clear();
             let dd = DatabaseDescription {
                 interface_mtu: 1500,
                 options,
@@ -1922,45 +1960,64 @@ impl Ospf {
     }
 
     /// Flood one LSA to every Full neighbour on an interface in `area`.
-    async fn flood_lsa(&self, area: Ipv4Addr, lsa: &Lsa) {
+    async fn flood_lsa(&mut self, area: Ipv4Addr, lsa: &Lsa) {
         self.flood_lsa_except(area, lsa, Ipv4Addr::UNSPECIFIED)
             .await;
     }
 
-    /// Flood one LSA to every Full neighbour in `area` except the one at `except`.
-    async fn flood_lsa_except(&self, area: Ipv4Addr, lsa: &Lsa, except: Ipv4Addr) {
+    /// Flood one LSA to every Full neighbour in `area` except the one at `except`,
+    /// recording it on each recipient's retransmission list (§13.5) so it is
+    /// resent until acknowledged.
+    async fn flood_lsa_except(&mut self, area: Ipv4Addr, lsa: &Lsa, except: Ipv4Addr) {
         let bytes = self.packet(
             area,
             Body::LinkStateUpdate(LinkStateUpdate {
                 lsas: vec![lsa.clone()],
             }),
         );
-        for iface in self.ifaces.iter().filter(|i| i.area == area) {
-            for n in iface.neighbors.values() {
+        let key = lsa.key();
+        for iface in self.ifaces.iter_mut().filter(|i| i.area == area) {
+            for n in iface.neighbors.values_mut() {
                 if n.fsm.state == NeighborState::Full && n.addr != except {
                     send(&iface.sock, n.addr, &bytes).await;
+                    n.retransmit_list.insert(key, lsa.clone());
                 }
             }
         }
     }
 
     /// Flood an AS-external (type-5) LSA AS-wide: to every Full neighbour in every
-    /// area except the one at `except`.
-    async fn flood_external_except(&self, lsa: &Lsa, except: Ipv4Addr) {
-        for iface in &self.ifaces {
-            // Stub and NSSA areas never receive AS-external (type-5) LSAs.
-            if self.no_externals(iface.area) {
+    /// area except the one at `except`, recording it on each recipient's
+    /// retransmission list (§13.5).
+    async fn flood_external_except(&mut self, lsa: &Lsa, except: Ipv4Addr) {
+        let key = lsa.key();
+        // Build the per-interface packet bytes up front (stub/NSSA areas carry no
+        // type-5 LSAs and get `None`), so the mutable neighbour loop below need not
+        // borrow `&self`.
+        let prepared: Vec<Option<Vec<u8>>> = self
+            .ifaces
+            .iter()
+            .map(|iface| {
+                if self.no_externals(iface.area) {
+                    None
+                } else {
+                    Some(self.packet(
+                        iface.area,
+                        Body::LinkStateUpdate(LinkStateUpdate {
+                            lsas: vec![lsa.clone()],
+                        }),
+                    ))
+                }
+            })
+            .collect();
+        for (iface, bytes_opt) in self.ifaces.iter_mut().zip(prepared) {
+            let Some(bytes) = bytes_opt else {
                 continue;
-            }
-            let bytes = self.packet(
-                iface.area,
-                Body::LinkStateUpdate(LinkStateUpdate {
-                    lsas: vec![lsa.clone()],
-                }),
-            );
-            for n in iface.neighbors.values() {
+            };
+            for n in iface.neighbors.values_mut() {
                 if n.fsm.state == NeighborState::Full && n.addr != except {
                     send(&iface.sock, n.addr, &bytes).await;
+                    n.retransmit_list.insert(key, lsa.clone());
                 }
             }
         }
@@ -2214,6 +2271,49 @@ impl Ospf {
                         lsa_headers: vec![],
                     };
                     out.push((iface.sock.clone(), n.addr, self.dd_packet(iface.area, dd)));
+                }
+            }
+        }
+        for (sock, dst, bytes) in out {
+            send(&sock, dst, &bytes).await;
+        }
+    }
+
+    /// Retransmit everything a neighbour has not acknowledged (RFC 2328 §13.5,
+    /// §10.9): every LSA still on its link-state retransmission list, resent as one
+    /// LSU, and — while it is still synchronising — its outstanding Link State
+    /// Request list. Runs every RxmtInterval; a matching LSAck empties the
+    /// retransmission list and a received LSU empties the request list, so a
+    /// converged, lossless adjacency retransmits nothing.
+    async fn retransmit_pending(&mut self) {
+        let mut out = Vec::new();
+        for iface in &self.ifaces {
+            for n in iface.neighbors.values() {
+                if n.fsm.state == NeighborState::Full && !n.retransmit_list.is_empty() {
+                    let lsas: Vec<Lsa> = n.retransmit_list.values().cloned().collect();
+                    let bytes =
+                        self.packet(iface.area, Body::LinkStateUpdate(LinkStateUpdate { lsas }));
+                    out.push((iface.sock.clone(), n.addr, bytes));
+                }
+                if matches!(
+                    n.fsm.state,
+                    NeighborState::Exchange | NeighborState::Loading
+                ) && !n.request_list.is_empty()
+                {
+                    let entries = n
+                        .request_list
+                        .iter()
+                        .map(|(ls_type, lsid, advr)| LsRequest {
+                            ls_type: *ls_type,
+                            link_state_id: *lsid,
+                            advertising_router: *advr,
+                        })
+                        .collect();
+                    let bytes = self.packet(
+                        iface.area,
+                        Body::LinkStateRequest(LinkStateRequest { entries }),
+                    );
+                    out.push((iface.sock.clone(), n.addr, bytes));
                 }
             }
         }
@@ -2642,6 +2742,22 @@ fn iface_ipv4(ifname: &str) -> Option<(Ipv4Addr, u8)> {
     result
 }
 
+/// Remove from a neighbour's retransmission list every LSA the acknowledged
+/// headers confirm (RFC 2328 §13.7). An entry is cleared only when the ack is for
+/// the same or a newer instance than the one we hold pending — an ack for a stale
+/// instance (lower sequence) leaves the newer copy on the list so it keeps being
+/// retransmitted.
+fn clear_acked_lsas(retransmit_list: &mut HashMap<LsaKey, Lsa>, acked: &[LsaHeader]) {
+    for hdr in acked {
+        let key = (hdr.ls_type, hdr.link_state_id, hdr.advertising_router);
+        if let Some(pending) = retransmit_list.get(&key) {
+            if hdr.ls_seq >= pending.header.ls_seq {
+                retransmit_list.remove(&key);
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2680,5 +2796,45 @@ mod tests {
         assert_eq!(strip_ip_header(&pkt), Some(&[0xaa, 0xbb][..]));
         assert_eq!(strip_ip_header(&[0x60; 20]), None);
         assert_eq!(strip_ip_header(&[0x45; 10]), None);
+    }
+
+    fn router_lsa(id: [u8; 4], adv: [u8; 4], seq: i32) -> Lsa {
+        Lsa {
+            header: LsaHeader {
+                ls_age: 0,
+                options: 0,
+                ls_type: LsType::Router,
+                link_state_id: Ipv4Addr::from(id),
+                advertising_router: Ipv4Addr::from(adv),
+                ls_seq: seq,
+                ls_checksum: 0,
+                length: wren_ospf::lsa::LSA_HEADER_LEN as u16,
+            },
+            body: LsaBody::Router(wren_ospf::lsa::RouterLsa { flags: 0, links: vec![] }),
+        }
+    }
+
+    #[test]
+    fn lsack_clears_matching_instance_but_keeps_stale_ack() {
+        // A neighbour has two LSAs pending on its retransmission list.
+        let a = router_lsa([1, 1, 1, 1], [1, 1, 1, 1], 5);
+        let b = router_lsa([2, 2, 2, 2], [2, 2, 2, 2], 9);
+        let mut rxmt: HashMap<LsaKey, Lsa> = HashMap::new();
+        rxmt.insert(a.key(), a.clone());
+        rxmt.insert(b.key(), b.clone());
+
+        // An ack for A's current instance clears it; a *stale* ack for B (an
+        // earlier sequence than the one we flooded) must NOT clear B.
+        let ack_a = a.header;
+        let mut stale_b = b.header;
+        stale_b.ls_seq = 3; // older than the pending seq 9
+        clear_acked_lsas(&mut rxmt, &[ack_a, stale_b]);
+
+        assert!(!rxmt.contains_key(&a.key()), "current-instance ack clears the entry");
+        assert!(rxmt.contains_key(&b.key()), "stale ack keeps the newer pending instance");
+
+        // A fresh ack for B's real instance now clears it.
+        clear_acked_lsas(&mut rxmt, &[b.header]);
+        assert!(rxmt.is_empty(), "matching ack for B clears the last entry");
     }
 }
