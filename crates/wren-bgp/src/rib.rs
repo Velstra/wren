@@ -249,8 +249,28 @@ impl BgpRib {
 
 /// The best path among `paths` per the decision order, or `None` if empty.
 fn select_best<'a>(paths: impl Iterator<Item = &'a Path>) -> Option<&'a Path> {
-    let mut best: Option<&Path> = None;
+    // Deterministic MED. `is_better` only compares MED between paths from the same
+    // neighbouring AS (RFC 4271 §9.1.2.2), which makes the relation non-transitive:
+    // a plain single-pass reduction then depends on iteration order, so two routers
+    // whose peers sort differently can pick different best paths for one prefix —
+    // inconsistent forwarding / micro-loops. Impose a stable two-level order
+    // (equivalent to Cisco `bgp deterministic-med`): first reduce within each
+    // neighbour-AS group (MED meaningful there), then reduce across the group
+    // winners (different ASes, so `is_better` skips the MED step). Each level is a
+    // total order, so the outcome is independent of the input order.
+    let mut best_per_as: BTreeMap<u32, &Path> = BTreeMap::new();
     for p in paths {
+        best_per_as
+            .entry(p.peer_as)
+            .and_modify(|b| {
+                if is_better(p, b) {
+                    *b = p;
+                }
+            })
+            .or_insert(p);
+    }
+    let mut best: Option<&Path> = None;
+    for (_, p) in best_per_as {
         match best {
             Some(b) if !is_better(p, b) => {}
             _ => best = Some(p),
@@ -301,6 +321,41 @@ mod tests {
             srv6_sid: None,
             otc: None,
         }
+    }
+
+    #[test]
+    fn select_best_is_deterministic_under_intransitive_med() {
+        // MED is compared only within the same neighbour AS, so is_better is
+        // non-transitive: within AS100, C(med10) beats A(med20); across ASes the
+        // MED step is skipped and router-id decides. A naive single-pass reduction
+        // would pick a different winner depending on input order — deterministic
+        // MED must pick the same winner regardless of order.
+        let mk = |peer_as: u32, med: u32, o: u8| {
+            let mut p = path(DEFAULT_LOCAL_PREF, [10, 0, 0, o]);
+            p.peer_as = peer_as;
+            p.med = med;
+            p.peer_id = id([0, 0, 0, o]);
+            p.peer_addr = ip([10, 0, 0, o]);
+            p
+        };
+        let a = mk(100, 20, 1);
+        let b = mk(200, 0, 2);
+        let c = mk(100, 10, 3);
+        let orders = [
+            vec![&a, &b, &c],
+            vec![&c, &b, &a],
+            vec![&b, &a, &c],
+            vec![&a, &c, &b],
+            vec![&c, &a, &b],
+        ];
+        let winners: Vec<Ipv4Addr> = orders
+            .iter()
+            .map(|o| select_best(o.iter().copied()).unwrap().peer_id)
+            .collect();
+        assert!(
+            winners.iter().all(|w| *w == winners[0]),
+            "best path depends on iteration order: {winners:?}"
+        );
     }
 
     #[test]

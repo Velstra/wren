@@ -3286,6 +3286,13 @@ fn build_path(
     if let Some(as4) = as4_path {
         as_path = reconstruct_as_path(&as_path, &as4);
     }
+    // RFC 4271 §5.1.5: LOCAL_PREF must not cross a true-eBGP boundary. A value
+    // received from a true-eBGP peer is ignored (reset to the default), so a
+    // hostile or misconfigured neighbour cannot set our #1 best-path tiebreak and
+    // steer traffic. iBGP and confed-eBGP peers keep it (RFC 5065 §4.2).
+    if peer.from_ebgp {
+        local_pref = DEFAULT_LOCAL_PREF;
+    }
     Path {
         origin,
         as_path,

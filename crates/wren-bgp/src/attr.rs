@@ -799,6 +799,22 @@ impl PathAttribute {
                 value: value.to_vec(),
             },
         };
+        // RFC 7606 §4: validate the attribute flags against the canonical value
+        // for this (known) attribute. The Optional and Transitive bits must match
+        // exactly, and the Partial bit must be clear unless the attribute is
+        // optional-transitive; the Extended-Length bit is free. Reject a mismatch
+        // (e.g. an ORIGIN marked Optional, or a well-known attribute with the
+        // Partial bit) instead of silently installing it. Unknown attributes carry
+        // their received flags as their canonical value, so they always pass.
+        let canonical = attr.canonical_flags();
+        let defining = FLAG_OPTIONAL | FLAG_TRANSITIVE;
+        if flags & defining != canonical & defining {
+            return None;
+        }
+        let optional_transitive = canonical & defining == FLAG_OPTIONAL | FLAG_TRANSITIVE;
+        if !optional_transitive && flags & FLAG_PARTIAL != 0 {
+            return None;
+        }
         Some((attr, end))
     }
 }
@@ -1306,6 +1322,28 @@ mod tests {
     fn communities_reject_non_multiple_of_four() {
         // 8,len=3,[..] — a COMMUNITIES value not a multiple of 4 octets.
         assert!(PathAttribute::decode(&[0xC0, 8, 3, 1, 2, 3], true).is_none());
+    }
+
+    #[test]
+    fn attribute_flags_are_validated_rfc7606() {
+        // A canonical ORIGIN (well-known transitive) decodes; the same value with
+        // the Optional bit set, or with the Partial bit set on a well-known
+        // attribute, is rejected (RFC 7606 §4) instead of silently accepted.
+        assert!(PathAttribute::decode(&[FLAG_TRANSITIVE, 1, 1, 0], true).is_some());
+        assert!(PathAttribute::decode(&[FLAG_OPTIONAL | FLAG_TRANSITIVE, 1, 1, 0], true).is_none());
+        assert!(PathAttribute::decode(&[FLAG_TRANSITIVE | FLAG_PARTIAL, 1, 1, 0], true).is_none());
+        // NEXT_HOP (type 3) is well-known transitive: the Partial bit is illegal.
+        assert!(PathAttribute::decode(&[FLAG_TRANSITIVE, 3, 4, 192, 0, 2, 1], true).is_some());
+        assert!(
+            PathAttribute::decode(&[FLAG_TRANSITIVE | FLAG_PARTIAL, 3, 4, 192, 0, 2, 1], true)
+                .is_none()
+        );
+        // MED (type 4) is optional non-transitive: the Transitive bit is illegal.
+        assert!(PathAttribute::decode(&[FLAG_OPTIONAL, 4, 4, 0, 0, 0, 5], true).is_some());
+        assert!(
+            PathAttribute::decode(&[FLAG_OPTIONAL | FLAG_TRANSITIVE, 4, 4, 0, 0, 0, 5], true)
+                .is_none()
+        );
     }
 
     #[test]
