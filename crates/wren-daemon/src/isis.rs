@@ -137,6 +137,10 @@ pub struct IsisConfig {
     /// (`[isis] vrf = "…"`) keeps its routes in the VRF's table instead of the main
     /// table. Defaults to [`wren_core::RT_TABLE_MAIN`] for the default VRF.
     pub vrf_table: u32,
+    /// The cleartext authentication password (ISO 10589 §9.8), as raw bytes. When
+    /// `Some`, every PDU we send carries a matching Authentication TLV and every
+    /// received PDU must too, or it is dropped. `None` disables authentication.
+    pub auth_password: Option<Vec<u8>>,
 }
 
 /// Map a single level to its database / per-neighbour-array index.
@@ -674,12 +678,39 @@ impl Isis {
                 return;
             }
         };
+        // Authentication (ISO 10589 §9.8): when a password is configured, every PDU
+        // must carry a matching cleartext Authentication TLV or it is dropped —
+        // without this any on-link host could form adjacencies and inject LSPs.
+        if !self.pdu_auth_ok(&pdu.body) {
+            debug!("dropping IS-IS PDU with missing/invalid authentication");
+            return;
+        }
         match pdu.body {
             PduBody::LanHello(h) => self.process_lan_hello(frame.idx, h, frame.src, now).await,
             PduBody::P2pHello(h) => self.process_p2p_hello(frame.idx, h, frame.src, now).await,
             PduBody::Lsp(l) => self.process_lsp(frame.idx, l, pdu_bytes).await,
             PduBody::Csnp(c) => self.process_csnp(frame.idx, c).await,
             PduBody::Psnp(p) => self.process_psnp(frame.idx, p).await,
+        }
+    }
+
+    /// Whether a received PDU body satisfies the configured authentication.
+    fn pdu_auth_ok(&self, body: &PduBody) -> bool {
+        verify_pdu_auth(self.cfg.auth_password.as_deref(), body)
+    }
+
+    /// Prepend a cleartext Authentication TLV (ISO 10589 §9.8: it is the first TLV)
+    /// when a password is configured, so every PDU we send is authenticated. A
+    /// no-op for an unauthenticated instance.
+    fn push_auth(&self, tlvs: &mut Vec<Tlv>) {
+        if let Some(pw) = &self.cfg.auth_password {
+            tlvs.insert(
+                0,
+                Tlv::Authentication {
+                    auth_type: 1,
+                    data: pw.clone(),
+                },
+            );
         }
     }
 
@@ -980,7 +1011,11 @@ impl Isis {
                 attached: 0,
                 overload: false,
                 is_type: self.cfg.level,
-                tlvs: vec![Tlv::ExtendedIsReachability(reach)],
+                tlvs: {
+                    let mut tlvs = vec![Tlv::ExtendedIsReachability(reach)];
+                    self.push_auth(&mut tlvs);
+                    tlvs
+                },
             };
             self.store_and_flood(level, lsp).await;
         } else if self.dbs[li].contains(&pn_id) {
@@ -1131,7 +1166,11 @@ impl Isis {
             attached,
             overload: false,
             is_type: self.cfg.level,
-            tlvs,
+            tlvs: {
+                let mut tlvs = tlvs;
+                self.push_auth(&mut tlvs);
+                tlvs
+            },
         }
     }
 
@@ -1272,6 +1311,7 @@ impl Isis {
         if !iface.v6.is_empty() {
             tlvs.push(Tlv::Ipv6InterfaceAddresses(iface.v6.clone()));
         }
+        self.push_auth(&mut tlvs);
         tlvs
     }
 
@@ -1295,7 +1335,11 @@ impl Isis {
                         source_id: (self.cfg.system_id, iface.local_circuit_id),
                         start_lsp_id: LspId::new(SystemId::ZERO, 0, 0),
                         end_lsp_id: LspId::new(SystemId::new([0xff; 6]), 0xff, 0xff),
-                        tlvs: vec![Tlv::LspEntries(self.dbs[li].summary())],
+                        tlvs: {
+                            let mut tlvs = vec![Tlv::LspEntries(self.dbs[li].summary())];
+                            self.push_auth(&mut tlvs);
+                            tlvs
+                        },
                     }),
                 };
                 to_send.push((idx, level_mac(level), pdu.encode()));
@@ -1326,7 +1370,11 @@ impl Isis {
             body: PduBody::Psnp(Psnp {
                 level,
                 source_id: (self.cfg.system_id, 0),
-                tlvs: vec![Tlv::LspEntries(entries)],
+                tlvs: {
+                    let mut tlvs = vec![Tlv::LspEntries(entries)];
+                    self.push_auth(&mut tlvs);
+                    tlvs
+                },
             }),
         }
         .encode()
@@ -2018,9 +2066,67 @@ fn strip_llc(payload: &[u8]) -> Option<&[u8]> {
     Some(&payload[3..])
 }
 
+/// Whether `body` satisfies the authentication `password` (ISO 10589 §9.8): with no
+/// password every PDU passes; with a password the PDU must carry a cleartext
+/// Authentication TLV (type 1) whose data equals it. Pulled out of the runner so
+/// the accept/reject logic is unit-testable without a live IS-IS instance.
+fn verify_pdu_auth(password: Option<&[u8]>, body: &PduBody) -> bool {
+    let Some(expected) = password else {
+        return true;
+    };
+    let tlvs = match body {
+        PduBody::LanHello(h) => &h.tlvs,
+        PduBody::P2pHello(h) => &h.tlvs,
+        PduBody::Lsp(l) => &l.tlvs,
+        PduBody::Csnp(c) => &c.tlvs,
+        PduBody::Psnp(p) => &p.tlvs,
+    };
+    tlvs.iter()
+        .any(|t| matches!(t, Tlv::Authentication { auth_type: 1, data } if data == expected))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn isis_authentication_accepts_match_rejects_others() {
+        // An LSP whose only TLV is a cleartext Authentication (type 1) for "s3cret".
+        let auth_lsp = |pw: &[u8]| PduBody::Lsp(Lsp {
+            level: IsLevel::L2,
+            remaining_lifetime: 1000,
+            lsp_id: LspId::new(SystemId::new([1, 1, 1, 1, 1, 1]), 0, 0),
+            sequence_number: 1,
+            checksum: 0,
+            partition: false,
+            attached: 0,
+            overload: false,
+            is_type: IsLevel::L2,
+            tlvs: vec![Tlv::Authentication {
+                auth_type: 1,
+                data: pw.to_vec(),
+            }],
+        });
+        let no_auth = PduBody::Lsp(Lsp {
+            level: IsLevel::L2,
+            remaining_lifetime: 1000,
+            lsp_id: LspId::new(SystemId::new([1, 1, 1, 1, 1, 1]), 0, 0),
+            sequence_number: 1,
+            checksum: 0,
+            partition: false,
+            attached: 0,
+            overload: false,
+            is_type: IsLevel::L2,
+            tlvs: vec![],
+        });
+        // No password configured: every PDU passes, authenticated or not.
+        assert!(verify_pdu_auth(None, &auth_lsp(b"s3cret")));
+        assert!(verify_pdu_auth(None, &no_auth));
+        // Password configured: only a PDU carrying the matching TLV passes.
+        assert!(verify_pdu_auth(Some(b"s3cret"), &auth_lsp(b"s3cret")));
+        assert!(!verify_pdu_auth(Some(b"s3cret"), &auth_lsp(b"wrong")));
+        assert!(!verify_pdu_auth(Some(b"s3cret"), &no_auth));
+    }
 
     #[test]
     fn parses_system_id() {

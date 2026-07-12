@@ -3273,6 +3273,7 @@ fn build_isis_config(
         leak_l2_to_l1: isis.l2_to_l1_leaking,
         bfd: isis.bfd,
         vrf_table,
+        auth_password: isis.password.clone().map(String::into_bytes),
     })
 }
 

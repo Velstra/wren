@@ -1221,6 +1221,11 @@ pub struct Isis {
     /// installed into the VRF's kernel table instead of the main table. Unset runs
     /// IS-IS in the default VRF (main table).
     pub vrf: Option<String>,
+    /// A cleartext authentication password (ISO 10589 §9.8 / RFC 1195). When set,
+    /// every PDU we send carries an Authentication TLV with this password and every
+    /// PDU we receive must carry a matching one, or it is dropped — so an on-link
+    /// attacker cannot form adjacencies or inject LSPs. Unset ⇒ no authentication.
+    pub password: Option<String>,
 }
 
 /// A named route filter (`[[filter]]`): an ordered list of rules plus a default
