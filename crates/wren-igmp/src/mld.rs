@@ -349,7 +349,10 @@ fn decode_v2_report(buf: &[u8]) -> Result<Vec<MldRecord>, DecodeError> {
         return Err(DecodeError::Truncated);
     }
     let m = u16::from_be_bytes([buf[6], buf[7]]) as usize;
-    let mut records = Vec::with_capacity(m);
+    // Never size the allocation from the wire count alone: each MLDv2 record is at
+    // least 20 bytes (type + aux-len + num-sources + 128-bit group), so the body
+    // can hold at most this many — a crafted count must not drive a huge alloc.
+    let mut records = Vec::with_capacity(m.min(buf.len().saturating_sub(V2_REPORT_MIN) / 20));
     let mut off = V2_REPORT_MIN;
     for _ in 0..m {
         let (rec, used) = MldRecord::decode(&buf[off..])?;

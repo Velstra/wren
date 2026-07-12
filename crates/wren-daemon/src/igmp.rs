@@ -23,7 +23,7 @@
 //! IGMP has no IPv6 twin here — that is MLDv2 (RFC 3810), deferred (see the
 //! `wren-igmp` crate docs).
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::ffi::CString;
 use std::io;
 use std::mem;
@@ -115,6 +115,11 @@ struct Iface {
     querier: QuerierState<Ipv4Addr>,
     /// True if this interface feeds the RFC 4605 proxy (a downstream interface).
     proxy_downstream: bool,
+    /// The SSM `(S,G)` sources we have advertised to PIM per group, so a leave (or
+    /// a shrinking source set) can withdraw exactly them — the membership table has
+    /// usually already dropped the group by the time its `Left` fires, so we cannot
+    /// recover the sources from it.
+    advertised_sources: HashMap<Ipv4Addr, BTreeSet<Ipv4Addr>>,
 }
 
 /// A datagram received on one interface, tagged with its arrival interface.
@@ -161,6 +166,7 @@ pub async fn run(cfg: QuerierConfig, mut shutdown: watch::Receiver<bool>) -> Res
                         name: name.clone(),
                         ifindex,
                         sock,
+                        advertised_sources: HashMap::new(),
                         table: MembershipTable::new(timers),
                         querier: QuerierState::new(own, &timers),
                         proxy_downstream: is_downstream,
@@ -308,37 +314,78 @@ async fn handle_events(
     // runs for every interface (a plain querier LAN is a PIM outgoing interface too),
     // before the RFC 4605 proxy early-return below.
     if let Some(feed) = pim_feed {
+        let ifindex = iface.ifindex;
         for ev in events {
             let g = ev.group();
             match ev {
                 MembershipEvent::Joined(_) | MembershipEvent::Updated(_) => {
-                    // An IGMPv3 INCLUDE-mode group with sources is a source-specific
-                    // (SSM) membership → one `(S,G)` per source; anything else is an
-                    // ASM `(*,G)` membership.
-                    match iface.table.get(g) {
+                    // The SSM source set now in effect: an IGMPv3 INCLUDE membership
+                    // with sources is source-specific (one `(S,G)` per source);
+                    // anything else is an ASM `(*,G)` membership. Collect it owned so
+                    // the table borrow ends before we touch `advertised_sources`.
+                    let current: BTreeSet<Ipv4Addr> = match iface.table.get(g) {
                         Some(m) if m.mode == FilterMode::Include && !m.sources.is_empty() => {
-                            for s in &m.sources {
-                                let _ = feed.try_send(MembershipUpdate {
-                                    ifindex: iface.ifindex,
-                                    group: g,
-                                    source: Some(*s),
-                                    present: true,
-                                });
-                            }
+                            m.sources.iter().copied().collect()
                         }
-                        _ => {
+                        _ => BTreeSet::new(),
+                    };
+                    let prev = iface.advertised_sources.remove(&g).unwrap_or_default();
+                    if current.is_empty() {
+                        // ASM, or an SSM→ASM transition: withdraw any `(S,G)` we held
+                        // for this group, then advertise the `(*,G)`.
+                        for s in &prev {
                             let _ = feed.try_send(MembershipUpdate {
-                                ifindex: iface.ifindex,
+                                ifindex,
                                 group: g,
-                                source: None,
+                                source: Some(*s),
+                                present: false,
+                            });
+                        }
+                        let _ = feed.try_send(MembershipUpdate {
+                            ifindex,
+                            group: g,
+                            source: None,
+                            present: true,
+                        });
+                    } else {
+                        // SSM: advertise newly-present sources and withdraw ones that
+                        // dropped out of the set, then remember the current set.
+                        for s in current.difference(&prev) {
+                            let _ = feed.try_send(MembershipUpdate {
+                                ifindex,
+                                group: g,
+                                source: Some(*s),
                                 present: true,
                             });
                         }
+                        for s in prev.difference(&current) {
+                            let _ = feed.try_send(MembershipUpdate {
+                                ifindex,
+                                group: g,
+                                source: Some(*s),
+                                present: false,
+                            });
+                        }
+                        iface.advertised_sources.insert(g, current);
                     }
                 }
                 MembershipEvent::Left(_) => {
+                    // Withdraw every SSM `(S,G)` we advertised for this group first,
+                    // then the `(*,G)`: without the per-source withdrawal the source
+                    // trees and their kernel MFC entries leak after the last receiver
+                    // leaves (the group is already gone from the table by now, so the
+                    // sources come from our own record).
+                    let prev = iface.advertised_sources.remove(&g).unwrap_or_default();
+                    for s in &prev {
+                        let _ = feed.try_send(MembershipUpdate {
+                            ifindex,
+                            group: g,
+                            source: Some(*s),
+                            present: false,
+                        });
+                    }
                     let _ = feed.try_send(MembershipUpdate {
-                        ifindex: iface.ifindex,
+                        ifindex,
                         group: g,
                         source: None,
                         present: false,

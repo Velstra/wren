@@ -403,7 +403,11 @@ fn decode_v3_report(buf: &[u8]) -> Result<Vec<GroupRecord>, DecodeError> {
         return Err(DecodeError::Truncated);
     }
     let m = u16::from_be_bytes([buf[6], buf[7]]) as usize;
-    let mut records = Vec::with_capacity(m);
+    // Never size the allocation from the wire count alone: each group record is at
+    // least 8 bytes (type + aux-len + num-sources + group address), so the body can
+    // hold at most this many. Otherwise a crafted count (up to 65535) drives a
+    // multi-MB pre-allocation from an 8-byte packet.
+    let mut records = Vec::with_capacity(m.min(buf.len().saturating_sub(V3_REPORT_MIN) / 8));
     let mut off = V3_REPORT_MIN;
     for _ in 0..m {
         let (rec, used) = GroupRecord::decode(&buf[off..])?;
