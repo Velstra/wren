@@ -176,9 +176,14 @@ pub fn is_better(a: &Path, b: &Path) -> bool {
     if a.cluster_list.len() != b.cluster_list.len() {
         return a.cluster_list.len() < b.cluster_list.len();
     }
-    // 8. Lowest peer BGP identifier.
-    if a.peer_id != b.peer_id {
-        return u32::from(a.peer_id) < u32::from(b.peer_id);
+    // 8. Lowest BGP identifier — for a reflected route this is its ORIGINATOR_ID
+    //    (RFC 4456 §9), which stands in for the BGP identifier so every reflector
+    //    client tie-breaks on the *true* origin rather than on whichever reflector
+    //    happened to pass it on; falls back to the peer's own id when unreflected.
+    let ida = a.originator_id.unwrap_or(a.peer_id);
+    let idb = b.originator_id.unwrap_or(b.peer_id);
+    if ida != idb {
+        return u32::from(ida) < u32::from(idb);
     }
     // 9. Lowest peer address (IPv4 sorts before IPv6, then numerically).
     a.peer_addr < b.peer_addr
@@ -314,6 +319,25 @@ mod tests {
         let lo = Path { peer_id: ip([10, 0, 0, 1]), ..base() };
         let hi = Path { peer_id: ip([10, 0, 0, 9]), ..base() };
         assert!(is_better(&lo, &hi));
+    }
+
+    #[test]
+    fn originator_id_stands_in_for_the_bgp_identifier_tie_break() {
+        // Two reflected paths, equal up to the identifier step. The path whose
+        // ORIGINATOR_ID is lower wins even though its *peer* id is higher — the
+        // tie-break must follow the true origin, not the passing reflector.
+        let a = Path {
+            peer_id: ip([10, 0, 0, 9]),
+            originator_id: Some(ip([1, 1, 1, 1])),
+            ..base()
+        };
+        let b = Path {
+            peer_id: ip([10, 0, 0, 1]),
+            originator_id: Some(ip([2, 2, 2, 2])),
+            ..base()
+        };
+        assert!(is_better(&a, &b));
+        assert!(!is_better(&b, &a));
     }
 
     #[test]

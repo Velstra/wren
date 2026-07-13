@@ -3094,9 +3094,14 @@ impl AddPathState {
         self.next
     }
 
-    /// Forget everything advertised to `peer` (its session went down).
+    /// Forget everything tied to `peer` when its session goes down: both what we
+    /// advertised *to* it (its Adj-RIB-Out) and the stable send Path Identifiers we
+    /// assigned to paths learned *from* it. The latter would otherwise accumulate
+    /// across peer flaps — every reconnect re-learns the same sources under fresh
+    /// ids while the old ones are never referenced again (unbounded growth).
     fn drop_peer(&mut self, peer: IpAddr) {
         self.out.remove(&peer);
+        self.ids.retain(|(src_peer, _), _| *src_peer != peer);
     }
 }
 
