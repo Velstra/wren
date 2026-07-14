@@ -295,6 +295,12 @@ struct Ospf {
     /// The next sequence number to use for each LSA we originate, keyed by
     /// `(area, LSA identity)` — the same LSA key recurs across areas.
     lsa_seqs: HashMap<(Ipv4Addr, LsaKey), i32>,
+    /// When we last installed each LSA instance, in monotonic seconds since start
+    /// and keyed by `(scope, LSA identity)` (`scope` is the area, or `AS_SCOPE` for
+    /// type-5). Drives the MinLSArrival rate limit (RFC 2328 §13 step 5a): a newer
+    /// instance received less than `MIN_LS_ARRIVAL` after the last install is
+    /// discarded so a flapping neighbour cannot force a flooding storm.
+    lsa_installed_at: HashMap<(Ipv4Addr, LsaKey), u64>,
     /// A counter handing out fresh DD sequence numbers per adjacency.
     next_dd_seq: u32,
     /// The prefixes we currently have announced to the RIB (for reconciliation).
@@ -590,6 +596,7 @@ pub async fn run(
         originated_externals: HashSet::new(),
         originated_translated: HashSet::new(),
         lsa_seqs: HashMap::new(),
+        lsa_installed_at: HashMap::new(),
         next_dd_seq: 0x0100_0000,
         announced: HashSet::new(),
         updates,
@@ -1313,12 +1320,19 @@ impl Ospf {
                 .get(&nbr_id)
                 .map(|n| n.request_list.contains(&lsa.key()))
                 .unwrap_or(false);
+            // Seconds since we last installed this LSA identity, clamped to u16, so
+            // decide_flood can apply the MinLSArrival rate limit (§13 step 5a).
+            let scope = if is_ext { AS_SCOPE } else { area };
+            let db_copy_age_since_install = self
+                .lsa_installed_at
+                .get(&(scope, lsa.key()))
+                .map(|&at| now.saturating_sub(at).min(u16::MAX as u64) as u16);
             let decision = {
                 let input = FloodInput {
                     lsdb: self.lsdb_for(area, lsa.header.ls_type),
                     received: &lsa,
                     self_router_id: self_id,
-                    db_copy_age_since_install: None,
+                    db_copy_age_since_install,
                     on_request_list,
                     on_retransmit_list: false,
                     any_neighbor_exchanging: self.any_neighbor_exchanging(),
@@ -1339,7 +1353,6 @@ impl Ospf {
                         // reclaim ownership. (Without this a spoofed high-sequence
                         // purge of our LSA-ID would erase us until our own sequence
                         // caught up, which it never would.)
-                        let scope = if is_ext { AS_SCOPE } else { area };
                         let slot = self
                             .lsa_seqs
                             .entry((scope, key))
@@ -1355,6 +1368,9 @@ impl Ospf {
                         reflood_area.push(lsa.clone());
                         self.areas.get_mut(&area).unwrap().lsdb.install(lsa);
                     }
+                    // Stamp the install time so a subsequent instance arriving within
+                    // MinLSArrival is rate-limited (§13 step 5a).
+                    self.lsa_installed_at.insert((scope, key), now);
                     self.drop_from_request_lists(&key);
                     installed = true;
                 }

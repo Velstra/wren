@@ -228,6 +228,12 @@ struct Ospf {
     /// The next sequence number to use for each LSA we originate, keyed by
     /// `(scope, LSA identity)` — the same key recurs across areas.
     lsa_seqs: HashMap<(Ipv4Addr, LsaKey), i32>,
+    /// When we last installed each flooded (area / AS-scope) LSA instance, in
+    /// monotonic seconds since start. Drives the MinLSArrival rate limit (RFC 2328
+    /// §13 step 5a, RFC 5340): a newer instance received within `MIN_LS_ARRIVAL`
+    /// of the last install is discarded. Link-local LSAs are single-hop and not
+    /// tracked here.
+    lsa_installed_at: HashMap<(Ipv4Addr, LsaKey), u64>,
     /// Stable Link State IDs for the Inter-Area-Prefix-LSAs we originate per area.
     summary_ids: HashMap<(Ipv4Addr, Prefix), Ipv4Addr>,
     /// Stable Link State IDs for the AS-external LSAs we originate.
@@ -433,6 +439,7 @@ pub async fn run(
         external_lsdb: Lsdb::new(),
         originated_externals: HashSet::new(),
         lsa_seqs: HashMap::new(),
+        lsa_installed_at: HashMap::new(),
         summary_ids: HashMap::new(),
         external_ids: HashMap::new(),
         next_lsid: 1,
@@ -601,7 +608,7 @@ impl Ospf {
             Body::Hello(h) => self.handle_hello(idx, nbr_id, pkt.src, &h, now).await,
             Body::DatabaseDescription(dd) => self.handle_dd(idx, nbr_id, &dd).await,
             Body::LinkStateRequest(req) => self.handle_lsr(idx, nbr_id, &req).await,
-            Body::LinkStateUpdate(upd) => self.handle_lsu(idx, nbr_id, upd).await,
+            Body::LinkStateUpdate(upd) => self.handle_lsu(idx, nbr_id, upd, now).await,
             Body::LinkStateAck(ack) => self.handle_lsack(idx, nbr_id, &ack),
         }
     }
@@ -991,7 +998,7 @@ impl Ospf {
 
     /// Process a Link State Update (§13): install newer LSAs into the scoped
     /// database, acknowledge, pull the request list down, re-flood and re-run SPF.
-    async fn handle_lsu(&mut self, idx: usize, nbr_id: Ipv4Addr, upd: LinkStateUpdate) {
+    async fn handle_lsu(&mut self, idx: usize, nbr_id: Ipv4Addr, upd: LinkStateUpdate, now: u64) {
         let self_id = self.cfg.router_id;
         let area = self.ifaces[idx].area;
         let src_addr = match self.ifaces[idx].neighbors.get(&nbr_id) {
@@ -1005,17 +1012,32 @@ impl Ospf {
         let mut reflood_ext = Vec::new();
         for lsa in upd.lsas {
             let scope = lsa.header.ls_type.scope();
+            // MinLSArrival (RFC 2328 §13 step 5a, RFC 5340) protects the flooded
+            // scopes: an install-time slot keyed exactly like `lsa_seqs`
+            // (`(area, key)` / `(AS_SCOPE, key)`). Link-local LSAs are single-hop
+            // and never reflooded, so they are not a storm vector and are left
+            // unthrottled.
+            let arrival_scope = match scope {
+                wren_ospfv3::lsa::Scope::As => Some(AS_SCOPE),
+                wren_ospfv3::lsa::Scope::LinkLocal => None,
+                _ => Some(area),
+            };
             let on_request_list = self.ifaces[idx]
                 .neighbors
                 .get(&nbr_id)
                 .map(|n| n.request_list.contains(&lsa.key()))
                 .unwrap_or(false);
+            let db_copy_age_since_install = arrival_scope.and_then(|s| {
+                self.lsa_installed_at
+                    .get(&(s, lsa.key()))
+                    .map(|&at| now.saturating_sub(at).min(u16::MAX as u64) as u16)
+            });
             let decision = {
                 let input = FloodInput {
                     lsdb: self.lsdb_for(idx, lsa.header.ls_type),
                     received: &lsa,
                     self_router_id: self_id,
-                    db_copy_age_since_install: None,
+                    db_copy_age_since_install,
                     on_request_list,
                     on_retransmit_list: false,
                     any_neighbor_exchanging: self.any_neighbor_exchanging(),
@@ -1047,6 +1069,7 @@ impl Ospf {
                             }
                             reflood_ext.push(lsa.clone());
                             self.external_lsdb.install(lsa);
+                            self.lsa_installed_at.insert((AS_SCOPE, key), now);
                         }
                         _ => {
                             if !third_party {
@@ -1060,6 +1083,7 @@ impl Ospf {
                             }
                             reflood_area.push(lsa.clone());
                             self.areas.get_mut(&area).unwrap().lsdb.install(lsa);
+                            self.lsa_installed_at.insert((area, key), now);
                         }
                     }
                     self.drop_from_request_lists(&key);
