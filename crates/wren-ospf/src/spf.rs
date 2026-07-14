@@ -537,8 +537,15 @@ fn merge_gateways(into: &mut Vec<Ipv4Addr>, extra: &[Ipv4Addr]) {
 }
 
 /// The CIDR prefix length of a contiguous IPv4 netmask.
+/// The prefix length of an OSPF network mask, i.e. its number of *leading* ones.
+///
+/// RFC 2328 masks are contiguous, for which `leading_ones` equals the bit
+/// population. A malformed non-contiguous mask (e.g. `255.0.255.0`) must not be
+/// interpreted by its bit count — `count_ones` there yields a length that maps to
+/// no real prefix boundary and would fabricate a bogus route. Taking the leading
+/// run instead keeps the derived prefix at the only meaningful boundary.
 fn mask_len(mask: Ipv4Addr) -> u8 {
-    u32::from(mask).count_ones() as u8
+    u32::from(mask).leading_ones() as u8
 }
 
 #[cfg(test)]
@@ -1089,5 +1096,17 @@ mod tests {
         ours.install(external_lsa([2, 2, 2, 2], [203, 0, 113, 0], [255, 255, 255, 0], 20, true));
         let intra2 = compute(&area, ip([2, 2, 2, 2]));
         assert!(external_routes(&ours, &intra2, ip([2, 2, 2, 2])).is_empty());
+    }
+
+    #[test]
+    fn mask_len_uses_the_leading_run_not_the_bit_count() {
+        // Contiguous masks: leading_ones == count_ones, the ordinary case.
+        assert_eq!(mask_len(Ipv4Addr::new(255, 255, 255, 0)), 24);
+        assert_eq!(mask_len(Ipv4Addr::new(255, 255, 0, 0)), 16);
+        assert_eq!(mask_len(Ipv4Addr::new(0, 0, 0, 0)), 0);
+        assert_eq!(mask_len(Ipv4Addr::new(255, 255, 255, 255)), 32);
+        // A malformed non-contiguous mask has bit count 16 but only 8 leading ones;
+        // the prefix must stop at the real boundary, not the population count.
+        assert_eq!(mask_len(Ipv4Addr::new(255, 0, 255, 0)), 8);
     }
 }
