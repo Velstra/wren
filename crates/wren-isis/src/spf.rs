@@ -49,6 +49,12 @@ use crate::pdu::Lsp;
 use crate::tlv::Tlv;
 use crate::{IsLevel, SystemId, NLPID_IPV4, NLPID_IPV6};
 
+/// The maximum wide (Extended IS Reachability) metric, 2^24 - 1. RFC 5305 §3
+/// reserves it as a "do not use for transit" marker: a link advertised with this
+/// metric is drained (maintenance) and MUST be excluded from the SPF, even though
+/// the adjacency still exists in the LSP.
+const MAX_LINK_METRIC: u32 = 0x00ff_ffff;
+
 /// A node of the shortest-path graph: a 6-byte System ID plus a one-byte
 /// pseudonode number (0 for a real router, non-zero for a LAN's pseudonode).
 pub type NodeId = [u8; 7];
@@ -210,6 +216,13 @@ impl Spf<'_> {
         }
         let mut out = Vec::new();
         for (w, metric) in self.is_reach(node) {
+            // RFC 5305 §3: a link at the maximum wide metric is a drained
+            // "do not use for transit" link — excluded from the SPF (the adjacency
+            // still exists for the two-way check in `has_reach_to`, so a normal
+            // reverse edge over the same link is unaffected).
+            if metric == MAX_LINK_METRIC {
+                continue;
+            }
             if self.node_alive(w) && self.has_reach_to(w, node) {
                 out.push((w, metric));
             }
@@ -552,6 +565,42 @@ mod tests {
 
         assert_eq!(res.nodes.get(&nid(2, 0)), Some(&10));
         assert_eq!(res.nodes.get(&nid(1, 0)), Some(&0));
+    }
+
+    #[test]
+    fn max_metric_link_is_excluded_from_the_spf() {
+        let mut db = Lsdb::new();
+        // R1 <--drained--> R2: both ends advertise the link at the maximum wide
+        // metric (RFC 5305 §3 "do not use"). The adjacency still exists in the LSPs,
+        // but the link must not carry transit.
+        db.install(lsp(
+            sid(1),
+            0,
+            0,
+            vec![
+                Tlv::ExtendedIsReachability(vec![is_reach(nid(2, 0), MAX_LINK_METRIC)]),
+                ip4([192, 168, 1, 0], 24, 1),
+                iface4([10, 0, 12, 1]),
+            ],
+        ));
+        db.install(lsp(
+            sid(2),
+            0,
+            0,
+            vec![
+                Tlv::ExtendedIsReachability(vec![is_reach(nid(1, 0), MAX_LINK_METRIC)]),
+                ip4([192, 168, 2, 0], 24, 1),
+                iface4([10, 0, 12, 2]),
+            ],
+        ));
+
+        let res = compute(&db, sid(1), IsLevel::L1);
+
+        // The root's own prefix is still connected.
+        assert_eq!(find(&res, "192.168.1.0/24").cost, 1);
+        // R2 is not reachable over the drained link: no node entry, no route.
+        assert_eq!(res.nodes.get(&nid(2, 0)), None);
+        assert!(!res.routes.iter().any(|r| r.prefix.to_string() == "192.168.2.0/24"));
     }
 
     #[test]
