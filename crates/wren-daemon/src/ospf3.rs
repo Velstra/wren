@@ -856,6 +856,24 @@ impl Ospf {
             let n = &self.ifaces[idx].neighbors[&nbr_id];
             (n.master, n.dd_seq, n.summary_sent)
         };
+        // RFC 2328 §10.6 (RFC 5340): past ExStart, a DD that sets the Init bit or
+        // whose Master/Slave bit contradicts the negotiated roles means the
+        // neighbour restarted its exchange or the roles desynced — generate
+        // SeqNumberMismatch to resynchronise from ExStart now instead of stalling
+        // until the inactivity timer expires. See `dd_seqnum_mismatch`.
+        let recv_master = dd.flags & DD_FLAG_MASTER != 0;
+        let recv_init = dd.flags & DD_FLAG_INIT != 0;
+        if crate::ospf::dd_seqnum_mismatch(recv_init, recv_master, master) {
+            let acts = self
+                .ifaces[idx]
+                .neighbors
+                .get_mut(&nbr_id)
+                .unwrap()
+                .fsm
+                .handle(NeighborEvent::SeqNumberMismatch, NeighborContext::default());
+            self.act_on_neighbor(idx, nbr_id, acts).await;
+            return;
+        }
         if master {
             if dd.dd_sequence != our_seq {
                 return;

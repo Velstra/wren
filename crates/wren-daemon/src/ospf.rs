@@ -1092,6 +1092,26 @@ impl Ospf {
             let n = &self.ifaces[idx].neighbors[&nbr_id];
             (n.master, n.dd_seq, n.summary_sent)
         };
+        // RFC 2328 §10.6: once past ExStart, a DD that sets the Init bit, or whose
+        // Master/Slave bit contradicts the negotiated roles, means the neighbour
+        // restarted its exchange or the roles desynced. Generate SeqNumberMismatch
+        // to drop straight back to ExStart and resynchronise now — otherwise the
+        // adjacency is stuck (the packet is silently ignored) until the inactivity
+        // timer expires, a dead-interval of lost forwarding. We are master ⇒ the
+        // neighbour must be slave (MS=0); we are slave ⇒ it must be master (MS=1).
+        let recv_master = dd.flags & DD_FLAG_MASTER != 0;
+        let recv_init = dd.flags & DD_FLAG_INIT != 0;
+        if dd_seqnum_mismatch(recv_init, recv_master, master) {
+            let acts = self
+                .ifaces[idx]
+                .neighbors
+                .get_mut(&nbr_id)
+                .unwrap()
+                .fsm
+                .handle(NeighborEvent::SeqNumberMismatch, NeighborContext::default());
+            self.act_on_neighbor(idx, nbr_id, acts).await;
+            return;
+        }
         if master {
             if dd.dd_sequence != our_seq {
                 return;
@@ -2674,6 +2694,18 @@ fn len_to_mask(len: u8) -> Ipv4Addr {
     Ipv4Addr::from(bits)
 }
 
+/// Whether a Database Description received in an adjacency-forming state past
+/// ExStart is a SeqNumberMismatch per RFC 2328 §10.6: the Init bit is set (the
+/// neighbour restarted its exchange), or its Master/Slave bit contradicts the
+/// negotiated roles (`we_are_master` ⇒ the neighbour must be slave, and vice
+/// versa). Either means we must drop back to ExStart and resynchronise rather than
+/// wait out the inactivity timer. Deliberately does *not* judge the DD sequence
+/// number itself — telling a benign duplicate from a real desync there needs the
+/// previous-sequence history, which the lockstep in `exchange_dd` already handles.
+pub(crate) fn dd_seqnum_mismatch(recv_init: bool, recv_master: bool, we_are_master: bool) -> bool {
+    recv_init || recv_master == we_are_master
+}
+
 // ---------------------------------------------------------------------------
 // Socket + interface-address setup (libc, like the RIP runner).
 // ---------------------------------------------------------------------------
@@ -2816,6 +2848,23 @@ mod tests {
         assert_eq!(len_to_mask(24), Ipv4Addr::new(255, 255, 255, 0));
         assert_eq!(len_to_mask(0), Ipv4Addr::new(0, 0, 0, 0));
         assert_eq!(len_to_mask(32), Ipv4Addr::new(255, 255, 255, 255));
+    }
+
+    #[test]
+    fn dd_seqnum_mismatch_detects_restart_and_role_desync() {
+        // Consistent roles, no Init bit: normal exchange, not a mismatch.
+        // We are master → neighbour slave (MS=0).
+        assert!(!dd_seqnum_mismatch(false, false, true));
+        // We are slave → neighbour master (MS=1).
+        assert!(!dd_seqnum_mismatch(false, true, false));
+
+        // The Init bit set past ExStart means the neighbour restarted its exchange.
+        assert!(dd_seqnum_mismatch(true, false, true));
+        assert!(dd_seqnum_mismatch(true, true, false));
+
+        // Role desync: both claim master, or both claim slave.
+        assert!(dd_seqnum_mismatch(false, true, true)); // we master, neighbour master
+        assert!(dd_seqnum_mismatch(false, false, false)); // we slave, neighbour slave
     }
 
     #[test]
