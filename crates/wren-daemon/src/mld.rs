@@ -442,6 +442,32 @@ fn open_mld_socket(ifname: &str, join_reports: bool) -> Result<(u32, UdpSocket)>
     setsockopt_int(fd, libc::IPPROTO_IPV6, libc::IPV6_MULTICAST_HOPS, MLD_HOPS)?;
     setsockopt_int(fd, libc::IPPROTO_IPV6, libc::IPV6_UNICAST_HOPS, MLD_HOPS)?;
 
+    // RFC 2711 IPv6 Router Alert (value 0 = MLD) as a hop-by-hop option on every
+    // outgoing MLD packet, so L2 snooping switches intercept our Queries/Reports
+    // rather than forwarding them as plain multicast. 8-octet hop-by-hop header:
+    // next-hdr placeholder (kernel fills), ext-len 0, option 5 (Router Alert)
+    // len 2 value 0x0000, then a PadN(1) len 0 to fill the 8-byte block.
+    // Best-effort: a kernel that rejects the buffer must not stop MLD from running,
+    // so the failure is logged and we fall back to sending without Router Alert.
+    const IPV6_ROUTER_ALERT_HOPOPT: [u8; 8] = [0, 0, 5, 2, 0, 0, 1, 0];
+    // SAFETY: an 8-byte hop-by-hop options buffer whose length matches the option.
+    let rc = unsafe {
+        libc::setsockopt(
+            fd,
+            libc::IPPROTO_IPV6,
+            libc::IPV6_HOPOPTS,
+            IPV6_ROUTER_ALERT_HOPOPT.as_ptr() as *const c_void,
+            IPV6_ROUTER_ALERT_HOPOPT.len() as libc::socklen_t,
+        )
+    };
+    if rc != 0 {
+        warn!(
+            ifname,
+            error = %std::io::Error::last_os_error(),
+            "MLD IPV6_HOPOPTS router-alert not set; some snooping switches may drop MLD"
+        );
+    }
+
     if join_reports {
         for group in [MLDV2_ALL_ROUTERS, ALL_ROUTERS_V6, ALL_NODES_V6] {
             // SAFETY: ipv6_mreq is plain POD; we set the group and interface index.

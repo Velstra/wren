@@ -592,6 +592,26 @@ fn open_igmp_socket(ifname: &str, join_reports: bool) -> Result<(u32, UdpSocket)
     setsockopt_int(fd, libc::IPPROTO_IP, libc::IP_MULTICAST_TTL, IGMP_TTL)?;
     setsockopt_int(fd, libc::IPPROTO_IP, libc::IP_TTL, IGMP_TTL)?;
 
+    // RFC 2113 IP Router Alert on every outgoing IGMP packet. Many L2 snooping
+    // switches only intercept IGMP that carries it; without it Queries/Reports are
+    // forwarded as plain multicast and membership snooping breaks. Set it once so
+    // the kernel prepends it to every datagram from this socket. Bytes: option 148
+    // (Router Alert), length 4, value 0 ("router shall examine this packet").
+    const IP_ROUTER_ALERT_OPT: [u8; 4] = [148, 4, 0, 0];
+    // SAFETY: a 4-byte option buffer whose length exactly matches the option.
+    let rc = unsafe {
+        libc::setsockopt(
+            fd,
+            libc::IPPROTO_IP,
+            libc::IP_OPTIONS,
+            IP_ROUTER_ALERT_OPT.as_ptr() as *const c_void,
+            IP_ROUTER_ALERT_OPT.len() as libc::socklen_t,
+        )
+    };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error()).context("IP_OPTIONS router-alert");
+    }
+
     if join_reports {
         for group in [IGMPV3_ALL_ROUTERS, ALL_HOSTS_ROUTERS, ALL_HOSTS] {
             // SAFETY: ip_mreqn is plain POD; we set the group and interface index.

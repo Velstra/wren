@@ -15,7 +15,7 @@
 
 use std::net::Ipv4Addr;
 
-use crate::lsa::{Lsa, LsType, LsaHeader, LSA_HEADER_LEN};
+use crate::lsa::{checksum_valid, Lsa, LsType, LsaHeader, LSA_HEADER_LEN};
 use crate::{ip_checksum, VERSION};
 
 /// The five OSPF packet types (§A.3.1, the Type field).
@@ -732,7 +732,12 @@ fn decode_lsu(body: &[u8]) -> Result<LinkStateUpdate, DecodeError> {
     let mut off = 4;
     for _ in 0..count {
         let (lsa, used) = Lsa::decode(&body[off..]).ok_or(DecodeError::BadLsa)?;
-        lsas.push(lsa);
+        // RFC 2328 §13 step 1: an LSA whose Fletcher LS checksum is wrong is
+        // discarded (and the next one processed), never installed or flooded. The
+        // bytes are still consumed so the packet stays framed.
+        if checksum_valid(&body[off..off + used]) {
+            lsas.push(lsa);
+        }
         off += used;
     }
     // Every advertised LSA must be accounted for, with nothing dangling.
@@ -804,6 +809,30 @@ mod tests {
                 neighbors: vec![Ipv4Addr::new(10, 0, 0, 2), Ipv4Addr::new(10, 0, 0, 3)],
             },
         )
+    }
+
+    #[test]
+    fn lsu_discards_an_lsa_with_a_bad_checksum() {
+        let lsa = |lsid: [u8; 4]| Lsa {
+            header: sample_lsa_header(lsid),
+            body: LsaBody::Router(RouterLsa { flags: 0, links: vec![] }),
+        };
+        // A two-LSA update; encode stamps each with a valid Fletcher checksum.
+        let mut body = Vec::new();
+        encode_lsu(
+            &LinkStateUpdate { lsas: vec![lsa([1, 1, 1, 1]), lsa([2, 2, 2, 2])] },
+            &mut body,
+        );
+        // Flip a byte of the second LSA's stored ls_checksum field so decoding
+        // still succeeds (the field is not structural) but the checksum no longer
+        // matches. Layout: 4-byte count + LSA1 (20-byte header + 4-byte router body
+        // = 24) then LSA2, whose ls_checksum sits 16 bytes into its header.
+        let lsa2_checksum = 4 + 24 + 16;
+        body[lsa2_checksum] ^= 0xff;
+        let decoded = decode_lsu(&body).expect("packet still frames");
+        // The corrupt LSA is discarded; the intact one survives.
+        assert_eq!(decoded.lsas.len(), 1);
+        assert_eq!(decoded.lsas[0].header.link_state_id, Ipv4Addr::new(1, 1, 1, 1));
     }
 
     #[test]
