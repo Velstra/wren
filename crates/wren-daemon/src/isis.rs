@@ -350,6 +350,13 @@ fn adj_state_name(s: AdjState) -> &'static str {
 }
 
 /// The short name of a level set, as shown by `show isis interfaces`.
+/// Whether a LAN Hello's priority change should re-run the DIS election. Only an
+/// *up* neighbour is a candidate (ISO 10589 §8.4.5), so a priority change on a
+/// neighbour that is not up changes no election input and must not trigger one.
+fn dis_election_input_changed(up: bool, old_priority: u8, new_priority: u8) -> bool {
+    up && old_priority != new_priority
+}
+
 fn level_name(l: IsLevel) -> &'static str {
     match l {
         IsLevel::L1 => "l1",
@@ -734,7 +741,7 @@ impl Isis {
 
         let holding = h.holding_time;
         let bfd_addr = neighbor_bfd_addr(&h.tlvs, self.ifaces[idx].ifindex);
-        let changed = {
+        let (up_changed, dis_input_changed) = {
             let iface = &mut self.ifaces[idx];
             // Bound the neighbour table: refuse a brand-new neighbour once it is
             // full, so an on-link attacker spoofing distinct system IDs cannot grow
@@ -748,6 +755,7 @@ impl Isis {
                 .neighbors
                 .entry(h.source_id)
                 .or_insert_with(|| Nbr::new(src, holding));
+            let old_priority = nbr.priority;
             nbr.snpa = src;
             nbr.priority = h.priority;
             nbr.last_seen = now;
@@ -759,11 +767,22 @@ impl Isis {
             let adj = nbr.adj[li].get_or_insert_with(|| Adjacency::new(h.source_id, level));
             let was_up = adj.is_up();
             adj.handle(event);
-            was_up != adj.is_up()
+            let up_now = adj.is_up();
+            // The DIS election (ISO 10589 §8.4.5) ranks up neighbours by advertised
+            // priority. A priority change on a neighbour that is up — and therefore a
+            // candidate — can move the DIS even though the adjacency stayed up, so it
+            // must trigger a re-election too, not only up/down transitions.
+            let dis_input_changed = dis_election_input_changed(up_now, old_priority, h.priority);
+            (was_up != up_now, dis_input_changed)
         };
 
-        if changed {
+        // A priority change re-runs the election but not LSP re-origination: our own
+        // LSP's neighbour list is unchanged, and run_dis re-originates the pseudonode
+        // LSP itself if the DIS identity moved.
+        if up_changed || dis_input_changed {
             self.run_dis(idx, level).await;
+        }
+        if up_changed {
             self.reoriginate(level).await;
         }
     }
@@ -2097,6 +2116,18 @@ fn verify_pdu_auth(password: Option<&[u8]>, body: &PduBody) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dis_election_reruns_only_on_an_up_neighbours_priority_change() {
+        // An up neighbour raising or lowering its priority moves an election input.
+        assert!(dis_election_input_changed(true, 64, 100));
+        assert!(dis_election_input_changed(true, 100, 0));
+        // Same priority: nothing to re-elect.
+        assert!(!dis_election_input_changed(true, 64, 64));
+        // A neighbour that is not up is not a candidate, so its priority change must
+        // not trigger a re-election.
+        assert!(!dis_election_input_changed(false, 64, 100));
+    }
 
     #[test]
     fn isis_authentication_accepts_match_rejects_others() {
