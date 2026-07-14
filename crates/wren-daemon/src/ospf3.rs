@@ -1028,6 +1028,7 @@ impl Ospf {
         let mut ack_headers = Vec::new();
         let mut implied_acks = Vec::new();
         let mut send_back = Vec::new();
+        let mut bad_ls_req = false;
         let mut reflood_area = Vec::new();
         let mut reflood_ext = Vec::new();
         for lsa in upd.lsas {
@@ -1123,8 +1124,24 @@ impl Ospf {
                 // §13 step 8: our database copy is more recent — send it straight
                 // back to the neighbour (no ack) so it converges immediately.
                 FloodDecision::SendBack => send_back.push(lsa.key()),
+                // §13 step 6: an LSA on the request list that is not newer than our
+                // copy is a Database Exchange error — restart the adjacency (below)
+                // rather than process the rest of this update.
+                FloodDecision::BadLsReq => bad_ls_req = true,
                 _ => {}
             }
+        }
+
+        if bad_ls_req {
+            let acts = self
+                .ifaces[idx]
+                .neighbors
+                .get_mut(&nbr_id)
+                .unwrap()
+                .fsm
+                .handle(NeighborEvent::BadLsReq, NeighborContext::default());
+            self.act_on_neighbor(idx, nbr_id, acts).await;
+            return;
         }
 
         if !implied_acks.is_empty() {

@@ -1313,6 +1313,7 @@ impl Ospf {
         let mut ack_headers = Vec::new();
         let mut implied_acks = Vec::new();
         let mut send_back = Vec::new();
+        let mut bad_ls_req = false;
         let mut reflood_area = Vec::new();
         let mut reflood_ext = Vec::new();
         for lsa in upd.lsas {
@@ -1413,8 +1414,25 @@ impl Ospf {
                 // neighbour sent. Send our copy straight back to it (no ack) so it
                 // converges now instead of waiting for our next periodic reflood.
                 FloodDecision::SendBack => send_back.push(lsa.key()),
+                // §13 step 6: the neighbour sent an LSA that is on its request list
+                // yet is not newer than our copy — a Database Exchange error. The
+                // adjacency is inconsistent; restart it (below) rather than process
+                // the rest of this update.
+                FloodDecision::BadLsReq => bad_ls_req = true,
                 _ => {}
             }
+        }
+
+        if bad_ls_req {
+            let acts = self
+                .ifaces[idx]
+                .neighbors
+                .get_mut(&nbr_id)
+                .unwrap()
+                .fsm
+                .handle(NeighborEvent::BadLsReq, NeighborContext::default());
+            self.act_on_neighbor(idx, nbr_id, acts).await;
+            return;
         }
 
         if !send_back.is_empty() {
