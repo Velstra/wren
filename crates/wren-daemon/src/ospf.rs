@@ -1312,6 +1312,7 @@ impl Ospf {
         let mut reclaim_self = false;
         let mut ack_headers = Vec::new();
         let mut implied_acks = Vec::new();
+        let mut send_back = Vec::new();
         let mut reflood_area = Vec::new();
         let mut reflood_ext = Vec::new();
         for lsa in upd.lsas {
@@ -1408,7 +1409,23 @@ impl Ospf {
                 // retransmitting to it — an implied acknowledgment. Clear it from
                 // the retransmit list (below) and send no explicit ack.
                 FloodDecision::ImpliedAck => implied_acks.push(lsa.header),
+                // §13 step 8: our database copy is more recent than the one the
+                // neighbour sent. Send our copy straight back to it (no ack) so it
+                // converges now instead of waiting for our next periodic reflood.
+                FloodDecision::SendBack => send_back.push(lsa.key()),
                 _ => {}
+            }
+        }
+
+        if !send_back.is_empty() {
+            let lsas: Vec<Lsa> = send_back
+                .iter()
+                .filter_map(|key| self.lsdb_for(area, key.0).get(key).cloned())
+                .collect();
+            if !lsas.is_empty() {
+                let sock = self.ifaces[idx].sock.clone();
+                let bytes = self.packet(area, Body::LinkStateUpdate(LinkStateUpdate { lsas }));
+                send(&sock, src_addr, &bytes).await;
             }
         }
 
