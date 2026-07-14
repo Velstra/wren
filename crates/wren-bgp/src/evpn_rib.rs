@@ -208,6 +208,34 @@ pub enum EviChange {
     },
 }
 
+/// The MAC Mobility extended community's carried state (RFC 7432 §7.7): the move
+/// sequence number and the sticky (static) flag.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+struct MacMobility {
+    seq: u32,
+    sticky: bool,
+}
+
+/// The EVPN MAC Mobility extended community: type 0x06, sub-type 0x00, flags byte
+/// (bit 0 = Sticky/Static), then a 4-octet sequence number (RFC 7432 §7.7).
+const EC_TYPE_EVPN: u8 = 0x06;
+const EC_SUBTYPE_MAC_MOBILITY: u8 = 0x00;
+const MAC_MOBILITY_STICKY: u8 = 0x01;
+
+/// Extract a route's MAC Mobility state from its extended communities, or `None`
+/// when the community is absent (an initial, never-moved advertisement, or a peer
+/// that does not emit it — the two are indistinguishable, so absence is treated as
+/// "no mobility information" rather than an explicit sequence 0).
+fn mac_mobility(path: &Path) -> Option<MacMobility> {
+    path.ext_communities
+        .iter()
+        .find(|ec| ec[0] == EC_TYPE_EVPN && ec[1] == EC_SUBTYPE_MAC_MOBILITY)
+        .map(|ec| MacMobility {
+            seq: u32::from_be_bytes([ec[4], ec[5], ec[6], ec[7]]),
+            sticky: ec[2] & MAC_MOBILITY_STICKY != 0,
+        })
+}
+
 /// One EVPN instance's imported view: the remote-MAC table and the remote-VTEP
 /// flood set, maintained incrementally from [`EvpnRibEvent`]s whose Route
 /// Targets match the EVI's import set (RFC 7432 §9.2).
@@ -223,6 +251,14 @@ pub struct EviTable {
     /// withdrawal of a *different* RD's route for the same MAC does not tear
     /// down a mapping it doesn't own.
     owners: BTreeMap<(u32, [u8; 6]), EvpnNlri>,
+    /// The MAC Mobility state currently in force for each `(eth_tag, mac)` (RFC
+    /// 7432 §7.7), or `None` when the backing route carried no MAC Mobility
+    /// community. A competing route from a different advertiser only displaces the
+    /// incumbent if its sequence is not lower, and a sticky MAC is never displaced
+    /// by a non-sticky one; equal-sequence duplicate detection applies only when
+    /// *both* routes carry the community (otherwise a mover that does not set it —
+    /// common on VXLAN fabrics — must still win, so we fall back to last-writer).
+    mac_mobility: BTreeMap<(u32, [u8; 6]), Option<MacMobility>>,
     /// Remote VTEPs participating in this EVI (from type-3 IMET routes), with
     /// the VNI each advertised — the BUM flood set.
     vteps: BTreeMap<IpAddr, u32>,
@@ -237,6 +273,7 @@ impl EviTable {
             import_rts,
             macs: BTreeMap::new(),
             owners: BTreeMap::new(),
+            mac_mobility: BTreeMap::new(),
             vteps: BTreeMap::new(),
             vtep_owners: BTreeMap::new(),
         }
@@ -264,16 +301,51 @@ impl EviTable {
                     EvpnNlri::MacIp {
                         eth_tag, mac, ip, label1, ..
                     } => {
+                        let key = (*eth_tag, *mac);
+                        let mob = mac_mobility(path);
+                        // MAC Mobility (RFC 7432 §7.7): decide whether this route may
+                        // take over the MAC from whatever currently backs it. Our own
+                        // owner re-advertising always wins (it is the incumbent); a
+                        // *different* advertiser wins only if its sequence number is
+                        // not lower — otherwise a stale pre-move route, applied after
+                        // the post-move one, would re-pin the MAC to its old VTEP
+                        // (blackhole/loop). A sticky (static) MAC is never displaced
+                        // by a non-sticky one, and an equal-sequence route from a
+                        // different VTEP is a duplicate (keep the incumbent rather
+                        // than flap between the two).
+                        let same_owner = self.owners.get(&key) == Some(nlri);
+                        if !same_owner {
+                            if let Some(cur) = self.mac_mobility.get(&key).copied() {
+                                let cur_seq = cur.map_or(0, |m| m.seq);
+                                let cur_sticky = cur.is_some_and(|m| m.sticky);
+                                let new_seq = mob.map_or(0, |m| m.seq);
+                                let new_sticky = mob.is_some_and(|m| m.sticky);
+                                let stale = new_seq < cur_seq;
+                                let sticky_block = cur_sticky && !new_sticky;
+                                // A true duplicate (same MAC, equal sequence, two
+                                // VTEPs) is only meaningful when both routes carry an
+                                // explicit sequence; without it a mover that omits the
+                                // community must still win (last-writer), or a
+                                // legitimate move would blackhole to the old VTEP.
+                                let duplicate = cur.is_some()
+                                    && mob.is_some()
+                                    && new_seq == cur_seq
+                                    && self.macs.get(&key).map(|m| m.vtep) != Some(path.next_hop);
+                                if stale || sticky_block || duplicate {
+                                    return None;
+                                }
+                            }
+                        }
                         let entry = RemoteMac {
                             vtep: path.next_hop,
                             vni: *label1,
                             ip: *ip,
                             srv6_sid: path.srv6_sid.map(|s| s.sid),
                         };
-                        let key = (*eth_tag, *mac);
                         let changed = self.macs.get(&key) != Some(&entry);
                         self.macs.insert(key, entry.clone());
                         self.owners.insert(key, nlri.clone());
+                        self.mac_mobility.insert(key, mob);
                         changed.then_some(EviChange::MacLearned {
                             eth_tag: *eth_tag,
                             mac: *mac,
@@ -308,6 +380,7 @@ impl EviTable {
                 let key = (*eth_tag, *mac);
                 if self.owners.get(&key) == Some(nlri) {
                     self.owners.remove(&key);
+                    self.mac_mobility.remove(&key);
                     self.macs
                         .remove(&key)
                         .map(|_| EviChange::MacForgotten { eth_tag: *eth_tag, mac: *mac })
@@ -385,6 +458,63 @@ mod tests {
             label1: vni,
             label2: None,
         }
+    }
+
+    /// A MAC Mobility extended community with `seq` and the sticky flag.
+    fn mm_ec(seq: u32, sticky: bool) -> [u8; 8] {
+        let s = seq.to_be_bytes();
+        [0x06, 0x00, if sticky { 0x01 } else { 0 }, 0, s[0], s[1], s[2], s[3]]
+    }
+
+    /// A path carrying the import RT and a MAC Mobility community.
+    fn mob_path(peer: [u8; 4], seq: u32, sticky: bool) -> Path {
+        let mut p = path(100, peer, vec![RT]);
+        p.ext_communities.push(mm_ec(seq, sticky));
+        p
+    }
+
+    #[test]
+    fn mac_mobility_higher_sequence_wins_and_stale_is_ignored() {
+        let mut evi = EviTable::new(vec![RT]);
+        let mac = [0x02, 0, 0, 0, 0, 0x01];
+        let a = mac_route(1, 0x01, 10100); // MAC behind PE-A (RD 1)
+        let b = mac_route(2, 0x01, 10100); // same MAC behind PE-B (RD 2)
+
+        // The MAC is first at VTEP .1 (seq 0).
+        let _ = evi.apply(&EvpnRibEvent::Best { nlri: a.clone(), path: mob_path([10, 0, 0, 1], 0, false) });
+        assert_eq!(evi.lookup_mac(0, mac).unwrap().vtep, ip([10, 0, 0, 1]));
+
+        // It moves to VTEP .2, announced with a higher sequence — the move wins.
+        assert!(evi
+            .apply(&EvpnRibEvent::Best { nlri: b, path: mob_path([10, 0, 0, 2], 1, false) })
+            .is_some());
+        assert_eq!(evi.lookup_mac(0, mac).unwrap().vtep, ip([10, 0, 0, 2]));
+
+        // A stale re-advertisement of the pre-move route (lower sequence) is ignored
+        // rather than re-pinning the MAC to the old VTEP.
+        assert!(evi
+            .apply(&EvpnRibEvent::Best { nlri: a, path: mob_path([10, 0, 0, 1], 0, false) })
+            .is_none());
+        assert_eq!(evi.lookup_mac(0, mac).unwrap().vtep, ip([10, 0, 0, 2]));
+    }
+
+    #[test]
+    fn mac_mobility_sticky_mac_is_not_hijacked() {
+        let mut evi = EviTable::new(vec![RT]);
+        let mac = [0x02, 0, 0, 0, 0, 0x01];
+        // A sticky (static) MAC at VTEP .1.
+        let _ = evi.apply(&EvpnRibEvent::Best {
+            nlri: mac_route(1, 0x01, 10100),
+            path: mob_path([10, 0, 0, 1], 0, true),
+        });
+        // A dynamic route with a higher sequence from another VTEP must NOT take it.
+        assert!(evi
+            .apply(&EvpnRibEvent::Best {
+                nlri: mac_route(2, 0x01, 10100),
+                path: mob_path([10, 0, 0, 2], 5, false),
+            })
+            .is_none());
+        assert_eq!(evi.lookup_mac(0, mac).unwrap().vtep, ip([10, 0, 0, 1]));
     }
 
     fn imet(rd_val: u16, orig: [u8; 4]) -> EvpnNlri {
