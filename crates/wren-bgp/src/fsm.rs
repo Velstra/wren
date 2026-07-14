@@ -257,6 +257,26 @@ impl BgpFsm {
                 vec![DropTcp, SessionDown]
             }
 
+            // RFC 4271 §6.5: an OPEN, KEEPALIVE or UPDATE that arrives in a state
+            // where it is not expected — a second OPEN once past OpenSent, a
+            // KEEPALIVE while still in OpenSent, an UPDATE before the session is
+            // Established — is a Finite State Machine Error, not something to
+            // silently ignore. Send NOTIFICATION code 5, drop the connection and
+            // return to Idle (reporting SessionDown if we were Established).
+            (OpenSent, KeepAliveReceived | UpdateReceived)
+            | (OpenConfirm, OpenReceived | UpdateReceived)
+            | (Established, OpenReceived) => {
+                self.state = Idle;
+                let mut acts = vec![
+                    SendNotification { code: CODE_FSM_ERROR, subcode: 0 },
+                    DropTcp,
+                ];
+                if was_established {
+                    acts.push(SessionDown);
+                }
+                acts
+            }
+
             // Anything else is a no-op in the current state.
             _ => vec![],
         }
@@ -288,6 +308,34 @@ mod tests {
         assert_eq!(fsm.handle(KeepAliveReceived), vec![RestartHoldTimer, SessionEstablished]);
         assert_eq!(fsm.state(), Established);
         assert!(fsm.is_established());
+    }
+
+    #[test]
+    fn unexpected_message_in_state_is_a_fsm_error() {
+        // A KEEPALIVE while still in OpenSent (before an OPEN) — FSM error, no
+        // SessionDown (we were not Established), back to Idle.
+        let mut fsm = BgpFsm { state: OpenSent };
+        assert_eq!(
+            fsm.handle(KeepAliveReceived),
+            vec![SendNotification { code: CODE_FSM_ERROR, subcode: 0 }, DropTcp]
+        );
+        assert_eq!(fsm.state(), Idle);
+
+        // An UPDATE in OpenConfirm — FSM error, back to Idle.
+        let mut fsm = BgpFsm { state: OpenConfirm };
+        assert_eq!(
+            fsm.handle(UpdateReceived),
+            vec![SendNotification { code: CODE_FSM_ERROR, subcode: 0 }, DropTcp]
+        );
+        assert_eq!(fsm.state(), Idle);
+
+        // A second OPEN once Established — FSM error, and SessionDown is reported.
+        let mut fsm = BgpFsm { state: Established };
+        assert_eq!(
+            fsm.handle(OpenReceived),
+            vec![SendNotification { code: CODE_FSM_ERROR, subcode: 0 }, DropTcp, SessionDown]
+        );
+        assert_eq!(fsm.state(), Idle);
     }
 
     #[test]
