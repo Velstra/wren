@@ -1026,6 +1026,7 @@ impl Ospf {
         let mut installed = false;
         let mut reclaim_self = false;
         let mut ack_headers = Vec::new();
+        let mut implied_acks = Vec::new();
         let mut reflood_area = Vec::new();
         let mut reflood_ext = Vec::new();
         for lsa in upd.lsas {
@@ -1050,6 +1051,13 @@ impl Ospf {
                     .get(&(s, lsa.key()))
                     .map(|&at| now.saturating_sub(at).min(u16::MAX as u64) as u16)
             });
+            // A duplicate the neighbour floods back while we are retransmitting it
+            // is an implied acknowledgment (§13 step 7a, RFC 5340).
+            let on_retransmit_list = self.ifaces[idx]
+                .neighbors
+                .get(&nbr_id)
+                .map(|n| n.retransmit_list.contains_key(&lsa.key()))
+                .unwrap_or(false);
             let decision = {
                 let input = FloodInput {
                     lsdb: self.lsdb_for(idx, lsa.header.ls_type),
@@ -1057,7 +1065,7 @@ impl Ospf {
                     self_router_id: self_id,
                     db_copy_age_since_install,
                     on_request_list,
-                    on_retransmit_list: false,
+                    on_retransmit_list,
                     any_neighbor_exchanging: self.any_neighbor_exchanging(),
                 };
                 decide_flood(&input)
@@ -1108,10 +1116,18 @@ impl Ospf {
                     installed = true;
                 }
                 FloodDecision::DirectAck => ack_headers.push(lsa.header),
+                // §13 step 7a: an implied acknowledgment — stop retransmitting to
+                // this neighbour (below), send no explicit ack.
+                FloodDecision::ImpliedAck => implied_acks.push(lsa.header),
                 _ => {}
             }
         }
 
+        if !implied_acks.is_empty() {
+            if let Some(n) = self.ifaces[idx].neighbors.get_mut(&nbr_id) {
+                clear_acked_lsas(&mut n.retransmit_list, &implied_acks);
+            }
+        }
         if !ack_headers.is_empty() {
             let (sock, ifindex, bytes) = {
                 let iface = &self.ifaces[idx];
