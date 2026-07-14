@@ -275,11 +275,23 @@ impl Spf<'_> {
                 }
             }
 
-            // Settle the nearest candidate (ties broken by vertex order, so the
-            // result is deterministic).
+            // Settle the nearest candidate. At equal distance settle transit
+            // networks before routers (RFC 2328 §16.1): a router reached over two
+            // equal-cost transit networks sits at the same distance as the second
+            // network (the network→router edge is cost 0), so settling the router
+            // first — as the derived `Router < Network` order would — freezes its
+            // next hops before the second network can relax it and drops that
+            // equal-cost path. Networks-first lets every feeding network merge its
+            // gateway in before the router settles. The final vertex-id compare
+            // keeps the result deterministic.
             let next = cand
                 .iter()
-                .min_by(|a, b| a.1.dist.cmp(&b.1.dist).then_with(|| a.0.cmp(b.0)))
+                .min_by(|a, b| {
+                    a.1.dist
+                        .cmp(&b.1.dist)
+                        .then_with(|| settle_rank(a.0).cmp(&settle_rank(b.0)))
+                        .then_with(|| a.0.cmp(b.0))
+                })
                 .map(|(v, _)| *v);
             let Some(w) = next else { break };
             let info = cand.remove(&w).expect("just selected");
@@ -537,6 +549,16 @@ fn merge_gateways(into: &mut Vec<Ipv4Addr>, extra: &[Ipv4Addr]) {
 }
 
 /// The CIDR prefix length of a contiguous IPv4 netmask.
+/// The settle priority of a vertex when two candidates tie on distance: transit
+/// networks (0) settle before routers (1), so every equal-cost network feeding a
+/// router merges its next hop before the router is frozen (RFC 2328 §16.1 ECMP).
+fn settle_rank(v: &Vertex) -> u8 {
+    match v {
+        Vertex::Network(_) => 0,
+        Vertex::Router(_) => 1,
+    }
+}
+
 /// The prefix length of an OSPF network mask, i.e. its number of *leading* ones.
 ///
 /// RFC 2328 masks are contiguous, for which `leading_ones` equals the bit
@@ -873,6 +895,61 @@ mod tests {
         assert_eq!(far.gateways.len(), 2);
         assert!(far.gateways.contains(&ip([10, 0, 12, 2])));
         assert!(far.gateways.contains(&ip([10, 0, 14, 4])));
+    }
+
+    #[test]
+    fn equal_cost_transit_networks_merge_into_ecmp() {
+        let mut db = Lsdb::new();
+        // R1 (root) sits on two parallel transit LANs, N1 and N2, each cost 10.
+        // R3 sits on both too. R3 is therefore reachable at equal cost via either
+        // network — the classic transit-ECMP case. Because a network→router edge is
+        // cost 0, R3 lands at the same distance as the second network, so a
+        // router-before-network settle order would freeze R3's next hop after only
+        // the first network and lose the second path.
+        db.install(router_lsa(
+            [1, 1, 1, 1],
+            0,
+            vec![
+                transit([10, 0, 1, 1], [10, 0, 1, 1], 10),
+                transit([10, 0, 2, 1], [10, 0, 2, 1], 10),
+            ],
+            1,
+        ));
+        db.install(router_lsa(
+            [3, 3, 3, 3],
+            0,
+            vec![
+                transit([10, 0, 1, 1], [10, 0, 1, 3], 10),
+                transit([10, 0, 2, 1], [10, 0, 2, 3], 10),
+                stub([192, 168, 3, 0], [255, 255, 255, 0], 1),
+            ],
+            1,
+        ));
+        // N1's DR is R1 (10.0.1.1); N2's DR is R1 (10.0.2.1). Both list R1 and R3.
+        db.install(network_lsa(
+            [10, 0, 1, 1],
+            [1, 1, 1, 1],
+            [255, 255, 255, 0],
+            vec![[1, 1, 1, 1], [3, 3, 3, 3]],
+        ));
+        db.install(network_lsa(
+            [10, 0, 2, 1],
+            [1, 1, 1, 1],
+            [255, 255, 255, 0],
+            vec![[1, 1, 1, 1], [3, 3, 3, 3]],
+        ));
+
+        let res = compute(&db, ip([1, 1, 1, 1]));
+        // R3 is reachable at cost 10 (link to a network; network→router is free).
+        assert_eq!(res.routers.get(&ip([3, 3, 3, 3])), Some(&10));
+
+        // R3's stub: 10 (root→net) + 0 (net→R3) + 1 (stub) = 11, reachable via R3's
+        // interface address on BOTH networks — the ECMP that the fix preserves.
+        let far = find(&res, "192.168.3.0/24");
+        assert_eq!(far.cost, 11);
+        assert_eq!(far.gateways.len(), 2, "both transit paths must survive as ECMP");
+        assert!(far.gateways.contains(&ip([10, 0, 1, 3])));
+        assert!(far.gateways.contains(&ip([10, 0, 2, 3])));
     }
 
     #[test]
