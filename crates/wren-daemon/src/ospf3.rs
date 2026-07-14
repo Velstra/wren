@@ -790,6 +790,12 @@ impl Ospf {
             Some(n) => n.fsm.state,
             None => return,
         };
+        // RFC 2328 §10.6 (applied by RFC 5340): reject a DD advertising a larger
+        // Interface MTU than ours — the neighbour could flood LSUs we cannot
+        // receive. MTU 0 is "unspecified" and allowed.
+        if dd.interface_mtu != 0 && dd.interface_mtu > IFACE_MTU {
+            return;
+        }
         let is_init = dd.flags & DD_FLAG_INIT != 0
             && dd.flags & DD_FLAG_MORE != 0
             && dd.flags & DD_FLAG_MASTER != 0

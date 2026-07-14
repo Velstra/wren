@@ -1241,7 +1241,16 @@ impl Isis {
     // --- Hellos & sequence-number PDUs ------------------------------------
 
     async fn send_hellos(&mut self) {
-        let holding = (self.cfg.hello_interval as u16) * self.cfg.holding_multiplier;
+        // HoldingTime = hello_interval × multiplier, carried in a 16-bit field.
+        // Compute in u64 and clamp: the old `(hello_interval as u16) * multiplier`
+        // truncated a large interval and could overflow the product (e.g. 30 s × a
+        // 3000 multiplier = 90000), wrapping to a tiny holding time that tears the
+        // adjacency down almost immediately.
+        let holding = self
+            .cfg
+            .hello_interval
+            .saturating_mul(self.cfg.holding_multiplier as u64)
+            .min(u16::MAX as u64) as u16;
         // Build then send, so we don't hold a borrow across the await.
         let mut to_send: Vec<(usize, [u8; 6], Vec<u8>)> = Vec::new();
         for (idx, iface) in self.ifaces.iter().enumerate() {

@@ -145,6 +145,16 @@ impl Tlv {
     pub fn encode(&self, out: &mut Vec<u8>) {
         let mut value = Vec::new();
         self.encode_value(&mut value);
+        // A TLV value must fit the 1-byte length; callers split oversized content
+        // into multiple TLVs. Assert that contract so a violation is caught in
+        // debug/test rather than silently dropping the overflow on the wire (which
+        // ISO 10589 peers would then read as a malformed or short TLV).
+        debug_assert!(
+            value.len() <= u8::MAX as usize,
+            "IS-IS TLV {:#x} value is {} bytes; caller must split to ≤255",
+            self.type_code(),
+            value.len(),
+        );
         let len = value.len().min(u8::MAX as usize);
         out.push(self.type_code());
         out.push(len as u8);

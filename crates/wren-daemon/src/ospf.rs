@@ -68,6 +68,10 @@ const HOUSEKEEPING_SECS: u64 = 1;
 /// the standard default; kept well above the sub-millisecond ack latency of a
 /// healthy adjacency so only genuinely lost packets are retransmitted.
 const RXMT_INTERVAL_SECS: u64 = 5;
+/// The MTU we advertise in Database Description packets and enforce on received
+/// ones (RFC 2328 §10.6). A neighbour advertising a larger MTU could flood LSUs we
+/// cannot receive, so its DD is rejected and the adjacency does not form.
+const OSPF_IFACE_MTU: u16 = 1500;
 /// The longest graceful-restart grace period we will honour as a helper (RFC 3623
 /// §3 lets the helper cap the requested value). A neighbour asking for more —
 /// up to the 32-bit maximum of ~136 years — would otherwise pin our adjacency
@@ -1004,7 +1008,7 @@ impl Ospf {
             n.request_list.clear();
             n.retransmit_list.clear();
             let dd = DatabaseDescription {
-                interface_mtu: 1500,
+                interface_mtu: OSPF_IFACE_MTU,
                 options,
                 flags: DD_FLAG_INIT | DD_FLAG_MORE | DD_FLAG_MASTER,
                 dd_sequence: seq,
@@ -1022,6 +1026,12 @@ impl Ospf {
             Some(n) => n.fsm.state,
             None => return,
         };
+        // RFC 2328 §10.6: a DD whose advertised Interface MTU is larger than ours is
+        // rejected — accepting it risks LSUs we cannot receive. An MTU of 0 is
+        // "unspecified" (some stacks send it to disable the check) and is allowed.
+        if dd.interface_mtu != 0 && dd.interface_mtu > OSPF_IFACE_MTU {
+            return;
+        }
         let is_init = dd.flags & DD_FLAG_INIT != 0
             && dd.flags & DD_FLAG_MORE != 0
             && dd.flags & DD_FLAG_MASTER != 0
@@ -1115,7 +1125,7 @@ impl Ospf {
                 flags |= DD_FLAG_MASTER;
             }
             let dd = DatabaseDescription {
-                interface_mtu: 1500,
+                interface_mtu: OSPF_IFACE_MTU,
                 options,
                 flags,
                 dd_sequence: n.dd_seq,
@@ -1454,7 +1464,7 @@ impl Ospf {
             flags |= RTR_FLAG_E;
         }
         Lsa {
-            header: self.self_header(LsType::Router, self.cfg.router_id),
+            header: self.self_header(LsType::Router, self.cfg.router_id, self.area_options(area)),
             body: LsaBody::Router(RouterLsa { flags, links }),
         }
     }
@@ -1480,7 +1490,7 @@ impl Ospf {
                 IpAddr::V6(_) => continue, // OSPFv2 is IPv4-only
             };
             let mut lsa = Lsa {
-                header: self.self_header(LsType::AsExternal, net),
+                header: self.self_header(LsType::AsExternal, net, OPT_E),
                 body: LsaBody::AsExternal(AsExternalLsa {
                     network_mask: len_to_mask(prefix.len()),
                     external_type2: true,
@@ -1534,9 +1544,8 @@ impl Ospf {
                 };
                 let mut lsa = Lsa {
                     header: {
-                        let mut h = self.self_header(LsType::Nssa, net);
-                        h.options = OPT_NP; // the N/P-bit marks a type-7 (RFC 3101)
-                        h
+                        // Type-7 (RFC 3101): the N/P-bit, not the E-bit.
+                        self.self_header(LsType::Nssa, net, OPT_NP)
                     },
                     body: LsaBody::AsExternal(AsExternalLsa {
                         network_mask: len_to_mask(prefix.len()),
@@ -1640,7 +1649,7 @@ impl Ospf {
             return None;
         }
         Some(Lsa {
-            header: self.self_header(LsType::Network, iface.addr),
+            header: self.self_header(LsType::Network, iface.addr, self.area_options(iface.area)),
             body: LsaBody::Network(NetworkLsa {
                 network_mask: len_to_mask(iface.mask_len),
                 attached_routers: attached,
@@ -1648,14 +1657,15 @@ impl Ospf {
         })
     }
 
-    /// A type-3 Summary-LSA describing `prefix` at `cost`.
-    fn build_summary_lsa(&self, prefix: Prefix, cost: u32) -> Lsa {
+    /// A type-3 Summary-LSA describing `prefix` at `cost`, flooded into `area`
+    /// (whose external capability sets the Options E-bit).
+    fn build_summary_lsa(&self, prefix: Prefix, cost: u32, area: Ipv4Addr) -> Lsa {
         let net = match prefix.addr() {
             IpAddr::V4(a) => a,
             IpAddr::V6(_) => Ipv4Addr::UNSPECIFIED, // OSPFv2 is IPv4-only
         };
         Lsa {
-            header: self.self_header(LsType::SummaryNetwork, net),
+            header: self.self_header(LsType::SummaryNetwork, net, self.area_options(area)),
             body: LsaBody::Summary(SummaryLsa {
                 network_mask: len_to_mask(prefix.len()),
                 metric: cost,
@@ -1664,10 +1674,15 @@ impl Ospf {
     }
 
     /// A header for an LSA we originate (sequence/checksum/length filled later).
-    fn self_header(&self, ls_type: LsType, link_state_id: Ipv4Addr) -> LsaHeader {
+    fn self_header(&self, ls_type: LsType, link_state_id: Ipv4Addr, options: u8) -> LsaHeader {
         LsaHeader {
             ls_age: 0,
-            options: OPT_E,
+            // The Options E-bit must match the area's external capability (RFC 2328
+            // §12.1.2): 0 in a stub/NSSA area, OPT_E elsewhere. AS-external (type-5)
+            // LSAs are always OPT_E; type-7 carry the N/P-bit. Callers pass the
+            // right value (`area_options` for area-scoped LSAs) rather than a
+            // hardcoded OPT_E, which was wrong for every stub/NSSA self-LSA.
+            options,
             ls_type,
             link_state_id,
             advertising_router: self.cfg.router_id,
@@ -1798,7 +1813,7 @@ impl Ospf {
             let mut to_flood = Vec::new();
             let mut want_keys = HashSet::new();
             for (prefix, cost) in &want_routes {
-                let lsa = self.build_summary_lsa(*prefix, *cost);
+                let lsa = self.build_summary_lsa(*prefix, *cost, dest);
                 want_keys.insert(lsa.key());
                 to_flood.push(self.install_originated(dest, lsa));
             }
@@ -1838,9 +1853,8 @@ impl Ospf {
         for area in areas {
             let lsa = Lsa {
                 header: {
-                    let mut h = self.self_header(LsType::Nssa, Ipv4Addr::UNSPECIFIED);
-                    h.options = 0; // P-bit clear: never translate the default AS-wide
-                    h
+                    // P-bit clear: never translate the default AS-wide.
+                    self.self_header(LsType::Nssa, Ipv4Addr::UNSPECIFIED, 0)
                 },
                 body: LsaBody::AsExternal(AsExternalLsa {
                     network_mask: len_to_mask(0),
@@ -1882,7 +1896,7 @@ impl Ospf {
                     continue;
                 };
                 let mut lsa = Lsa {
-                    header: self.self_header(LsType::AsExternal, seven.header.link_state_id),
+                    header: self.self_header(LsType::AsExternal, seven.header.link_state_id, OPT_E),
                     body: LsaBody::AsExternal(ext),
                 };
                 let key = lsa.key();
@@ -2264,7 +2278,7 @@ impl Ospf {
             for n in iface.neighbors.values() {
                 if n.fsm.state == NeighborState::ExStart {
                     let dd = DatabaseDescription {
-                        interface_mtu: 1500,
+                        interface_mtu: OSPF_IFACE_MTU,
                         options: self.area_options(iface.area),
                         flags: DD_FLAG_INIT | DD_FLAG_MORE | DD_FLAG_MASTER,
                         dd_sequence: n.dd_seq,
