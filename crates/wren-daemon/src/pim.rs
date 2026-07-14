@@ -337,11 +337,20 @@ pub async fn run(
                 match up.msgtype {
                     IGMPMSG_NOCACHE => {
                         // A new (S,G) flow: install its forwarding entry from the tree.
-                        let iif_ifindex = vif_to_index.get(&up.vif).copied();
+                        // The MFC incoming interface MUST be the RPF interface toward
+                        // the source (RFC 7761 §4.2), not the interface the first
+                        // packet happened to arrive on — otherwise the kernel's RPF
+                        // check is programmed against the wrong iif and a packet looped
+                        // in on another interface would be accepted and re-forwarded.
+                        // Fall back to the arrival vif only when RPF cannot resolve (a
+                        // directly-connected or local source), which is exactly what
+                        // the arrival interface already represents.
+                        let rpf_iif = rpf.rpf(up.source).map(|info| info.ifindex);
+                        let iif_ifindex = rpf_iif.or_else(|| vif_to_index.get(&up.vif).copied());
                         if let Some(iif) = iif_ifindex {
                             installed.insert((up.source, up.group), iif);
                             reprogram_sg(&mroute, &tree, &index_to_vif, &mut installed, up.source, up.group);
-                            debug!(source = %up.source, group = %up.group, iif = up.vif, "PIM: NOCACHE upcall, installing (S,G)");
+                            debug!(source = %up.source, group = %up.group, iif, arrival_vif = up.vif, "PIM: NOCACHE upcall, installing (S,G) on RPF iif");
                         }
                     }
                     IGMPMSG_WRONGVIF => {
