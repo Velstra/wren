@@ -80,6 +80,12 @@ const LSP_REFRESH_BELOW: u16 = 300;
 const HOUSEKEEPING_SECS: u64 = 1;
 /// How often the DIS sends a CSNP describing its database (seconds).
 const CSNP_SECS: u64 = 10;
+/// The most LSP Entries to place in one CSNP before starting a new fragment
+/// (ISO 10589 §9.10). Each entry is 16 bytes; at 64 that is ~1 KB of entries plus
+/// the PDU header and an optional authentication TLV — comfortably inside a
+/// 1492-byte 802.2 LLC MTU, with margin so a large database is described across
+/// several CSNPs instead of one oversized (dropped) frame.
+const MAX_CSNP_LSP_ENTRIES: usize = 64;
 /// Receive buffer; an IS-IS PDU fits comfortably in a link MTU.
 const RECV_BUF: usize = 9000;
 
@@ -355,6 +361,59 @@ fn adj_state_name(s: AdjState) -> &'static str {
 /// neighbour that is not up changes no election input and must not trigger one.
 fn dis_election_input_changed(up: bool, old_priority: u8, new_priority: u8) -> bool {
     up && old_priority != new_priority
+}
+
+/// The lowest and highest possible LSP-IDs — the endpoints a CSNP series must span.
+fn lsp_id_min() -> LspId {
+    LspId::new(SystemId::ZERO, 0, 0)
+}
+fn lsp_id_max() -> LspId {
+    LspId::new(SystemId::new([0xff; 6]), 0xff, 0xff)
+}
+
+/// Split a database summary (LSP Entries in ascending LSP-ID order) into CSNP
+/// fragments of at most `max_per` entries each (ISO 10589 §9.10), returning per
+/// fragment its `(start, end, entries)`. A large database does not fit one CSNP —
+/// the PDU would exceed the link MTU and be dropped — so it is described across
+/// several. The fragment ranges are contiguous and span the whole ID space (the
+/// first starts at the minimum LSP-ID, the last ends at the maximum, and each
+/// fragment's end is the next fragment's start), so a neighbour can still detect,
+/// in any range, an LSP it holds that we no longer advertise. An empty database
+/// yields a single empty fragment covering the whole space.
+fn csnp_fragments(
+    entries: Vec<LspEntry>,
+    max_per: usize,
+) -> Vec<(LspId, LspId, Vec<LspEntry>)> {
+    if entries.is_empty() {
+        return vec![(lsp_id_min(), lsp_id_max(), Vec::new())];
+    }
+    let max_per = max_per.max(1);
+    let chunks: Vec<Vec<LspEntry>> = entries
+        .chunks(max_per)
+        .map(<[LspEntry]>::to_vec)
+        .collect();
+    let n = chunks.len();
+    let mut frags = Vec::with_capacity(n);
+    for (i, chunk) in chunks.into_iter().enumerate() {
+        // Start at the previous fragment's last LSP-ID so the ranges join with no
+        // gap; the very first fragment starts at the minimum. End at this chunk's
+        // last LSP-ID; the very last fragment ends at the maximum.
+        let start = if i == 0 {
+            lsp_id_min()
+        } else {
+            frags
+                .last()
+                .map(|(_, prev_end, _): &(LspId, LspId, Vec<LspEntry>)| *prev_end)
+                .unwrap_or_else(lsp_id_min)
+        };
+        let end = if i == n - 1 {
+            lsp_id_max()
+        } else {
+            chunk.last().unwrap().lsp_id
+        };
+        frags.push((start, end, chunk));
+    }
+    frags
 }
 
 fn level_name(l: IsLevel) -> &'static str {
@@ -1356,21 +1415,30 @@ impl Isis {
                 if !send {
                     continue;
                 }
-                let pdu = Pdu {
-                    max_area_addresses: 0,
-                    body: PduBody::Csnp(Csnp {
-                        level,
-                        source_id: (self.cfg.system_id, iface.local_circuit_id),
-                        start_lsp_id: LspId::new(SystemId::ZERO, 0, 0),
-                        end_lsp_id: LspId::new(SystemId::new([0xff; 6]), 0xff, 0xff),
-                        tlvs: {
-                            let mut tlvs = vec![Tlv::LspEntries(self.dbs[li].summary())];
-                            self.push_auth(&mut tlvs);
-                            tlvs
-                        },
-                    }),
-                };
-                to_send.push((idx, level_mac(level), pdu.encode()));
+                // A single CSNP cannot describe a large database — the PDU would
+                // exceed the link MTU (ISO 10589 §9.10). Split the summary into
+                // MTU-sized fragments, each covering a contiguous LSP-ID range; the
+                // ranges tile the whole ID space so a neighbour still detects any
+                // LSP it holds that we have purged.
+                for (start, end, chunk) in
+                    csnp_fragments(self.dbs[li].summary(), MAX_CSNP_LSP_ENTRIES)
+                {
+                    let pdu = Pdu {
+                        max_area_addresses: 0,
+                        body: PduBody::Csnp(Csnp {
+                            level,
+                            source_id: (self.cfg.system_id, iface.local_circuit_id),
+                            start_lsp_id: start,
+                            end_lsp_id: end,
+                            tlvs: {
+                                let mut tlvs = vec![Tlv::LspEntries(chunk)];
+                                self.push_auth(&mut tlvs);
+                                tlvs
+                            },
+                        }),
+                    };
+                    to_send.push((idx, level_mac(level), pdu.encode()));
+                }
             }
         }
         for (idx, mac, bytes) in to_send {
@@ -2116,6 +2184,50 @@ fn verify_pdu_auth(password: Option<&[u8]>, body: &PduBody) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn lsp_entry(sys: u8) -> LspEntry {
+        LspEntry {
+            remaining_lifetime: 1000,
+            lsp_id: LspId::new(SystemId::new([sys, sys, sys, sys, sys, sys]), 0, 0),
+            sequence_number: 1,
+            checksum: 0,
+        }
+    }
+
+    #[test]
+    fn csnp_fragments_tile_the_id_space() {
+        // Empty database: one empty fragment spanning the whole space.
+        let empty = csnp_fragments(vec![], 64);
+        assert_eq!(empty.len(), 1);
+        assert_eq!(empty[0].0, lsp_id_min());
+        assert_eq!(empty[0].1, lsp_id_max());
+        assert!(empty[0].2.is_empty());
+
+        // Fits one fragment: still spans min..max, carries every entry.
+        let few: Vec<LspEntry> = (1..=3).map(lsp_entry).collect();
+        let one = csnp_fragments(few.clone(), 64);
+        assert_eq!(one.len(), 1);
+        assert_eq!((one[0].0, one[0].1), (lsp_id_min(), lsp_id_max()));
+        assert_eq!(one[0].2, few);
+
+        // Larger than the cap: several fragments.
+        let many: Vec<LspEntry> = (1..=10).map(lsp_entry).collect();
+        let frags = csnp_fragments(many.clone(), 4);
+        // 10 entries / 4 per fragment = 3 fragments.
+        assert_eq!(frags.len(), 3);
+        // No fragment exceeds the cap.
+        assert!(frags.iter().all(|(_, _, c)| c.len() <= 4));
+        // Endpoints span the whole space.
+        assert_eq!(frags.first().unwrap().0, lsp_id_min());
+        assert_eq!(frags.last().unwrap().1, lsp_id_max());
+        // Ranges are contiguous: each fragment's end is the next one's start.
+        for pair in frags.windows(2) {
+            assert_eq!(pair[0].1, pair[1].0);
+        }
+        // Every entry survives, in order.
+        let flat: Vec<LspEntry> = frags.into_iter().flat_map(|(_, _, c)| c).collect();
+        assert_eq!(flat, many);
+    }
 
     #[test]
     fn dis_election_reruns_only_on_an_up_neighbours_priority_change() {
