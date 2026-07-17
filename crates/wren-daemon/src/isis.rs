@@ -190,6 +190,11 @@ struct Nbr {
     /// IPv6 link-local one. `None` until a usable address is heard. IS-IS adjacencies
     /// are over SNPA/MAC, so this is the only place a neighbour IP appears.
     bfd_addr: Option<(IpAddr, u32)>,
+    /// The neighbour's Extended Local Circuit ID from its RFC 5303 three-way TLV on
+    /// a point-to-point link, cached so our next Hello can echo it back (letting the
+    /// neighbour confirm the link is bidirectional). `None` on LAN circuits or until
+    /// a three-way Hello is heard.
+    p2p_neighbor_ext_id: Option<u32>,
 }
 
 impl Nbr {
@@ -202,6 +207,7 @@ impl Nbr {
             adj: [None, None],
             lan_id: [None, None],
             bfd_addr: None,
+            p2p_neighbor_ext_id: None,
         }
     }
 
@@ -849,6 +855,20 @@ impl Isis {
     async fn process_p2p_hello(&mut self, idx: usize, h: P2pHello, src: [u8; 6], now: u64) {
         let holding = h.holding_time;
         let bfd_addr = neighbor_bfd_addr(&h.tlvs, self.ifaces[idx].ifindex);
+        // RFC 5303 three-way handshake: the link is bidirectional only once the
+        // neighbour's three-way TLV echoes OUR System ID + Extended Local Circuit
+        // ID (proving it has heard us); until then it is one-way. A neighbour that
+        // omits the TLV is a classic two-way peer (RFC 5303 §3.2 back-compat).
+        let our_ext_id = self.ifaces[idx].local_circuit_id as u32;
+        let our_sysid = self.cfg.system_id.0;
+        let three_way = p2p_three_way(&h.tlvs);
+        let event = match three_way {
+            Some((_, Some((nid, ncid)))) if nid == our_sysid && ncid == our_ext_id => {
+                AdjEvent::HelloTwoWay
+            }
+            Some(_) => AdjEvent::HelloOneWay,
+            None => AdjEvent::HelloTwoWay,
+        };
         let mut changed_levels = Vec::new();
         for level in self.active_levels() {
             if !h.circuit_type.level_active(level) {
@@ -875,11 +895,14 @@ impl Isis {
             if bfd_addr.is_some() {
                 nbr.bfd_addr = bfd_addr;
             }
-            // A point-to-point link comes up classic two-way (the RFC 5303 three-way
-            // TLV is a later refinement).
+            // Cache the neighbour's Extended Local Circuit ID so our next Hello can
+            // echo it back and let it reach two-way.
+            if let Some((their_ext, _)) = three_way {
+                nbr.p2p_neighbor_ext_id = Some(their_ext);
+            }
             let adj = nbr.adj[li].get_or_insert_with(|| Adjacency::new(h.source_id, level));
             let was_up = adj.is_up();
-            adj.handle(AdjEvent::HelloTwoWay);
+            adj.handle(event);
             if was_up != adj.is_up() {
                 changed_levels.push(level);
             }
@@ -1363,6 +1386,25 @@ impl Isis {
                     }
                 }
                 IfaceType::PointToPoint => {
+                    let mut tlvs = self.hello_tlvs(iface);
+                    // RFC 5303 three-way handshake: advertise our adjacency state on
+                    // this circuit and, once we have heard the neighbour, echo its
+                    // System ID + Extended Local Circuit ID so it can confirm the
+                    // link is bidirectional. A p2p circuit has at most one neighbour.
+                    let nbr = iface.neighbors.iter().next();
+                    let adj_state = match nbr {
+                        Some((_, n)) if n.up(0) || n.up(1) => 0, // Up
+                        Some(_) => 1,                            // Initializing
+                        None => 2,                               // Down
+                    };
+                    let neighbor = nbr.and_then(|(sysid, n)| {
+                        n.p2p_neighbor_ext_id.map(|ext| (sysid.0, ext))
+                    });
+                    tlvs.push(Tlv::P2pThreeWay {
+                        adj_state,
+                        ext_local_circuit_id: iface.local_circuit_id as u32,
+                        neighbor,
+                    });
                     let pdu = Pdu {
                         max_area_addresses: 0,
                         body: PduBody::P2pHello(P2pHello {
@@ -1370,7 +1412,7 @@ impl Isis {
                             source_id: self.cfg.system_id,
                             holding_time: holding,
                             local_circuit_id: iface.local_circuit_id,
-                            tlvs: self.hello_tlvs(iface),
+                            tlvs,
                         }),
                     };
                     to_send.push((idx, ALL_L1_ISS, pdu.encode()));
@@ -1788,6 +1830,23 @@ fn lan_neighbors(tlvs: &[Tlv]) -> Vec<[u8; 6]> {
             _ => None,
         })
         .unwrap_or_default()
+}
+
+/// The RFC 5303 three-way fields read off a point-to-point Hello: the sender's
+/// Extended Local Circuit ID and, once it has heard us, the neighbour it echoes
+/// (System ID + Extended Local Circuit ID).
+type P2pThreeWayFields = (u32, Option<([u8; 6], u32)>);
+
+/// Extract the RFC 5303 three-way adjacency fields from a Hello's TLVs, if present.
+fn p2p_three_way(tlvs: &[Tlv]) -> Option<P2pThreeWayFields> {
+    tlvs.iter().find_map(|t| match t {
+        Tlv::P2pThreeWay {
+            ext_local_circuit_id,
+            neighbor,
+            ..
+        } => Some((*ext_local_circuit_id, *neighbor)),
+        _ => None,
+    })
 }
 
 /// The neighbour's IP address for a BFD session, from the IP Interface Address TLVs

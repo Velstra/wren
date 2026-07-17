@@ -25,6 +25,7 @@ const T_IPV4_IFACE_ADDRS: u8 = 132;
 const T_EXTENDED_IP_REACH: u8 = 135;
 const T_IPV6_IFACE_ADDRS: u8 = 232;
 const T_IPV6_REACH: u8 = 236;
+const T_P2P_THREE_WAY: u8 = 240;
 
 /// One entry of an LSP Entries TLV (type 9, ISO 10589 §9.10): the summary of a
 /// single LSP a router holds, as carried in a CSNP/PSNP. 16 bytes on the wire.
@@ -116,6 +117,22 @@ pub enum Tlv {
     Ipv6InterfaceAddresses(Vec<Ipv6Addr>),
     /// IPv6 Reachability (type 236): wide-metric IPv6 prefixes.
     Ipv6Reachability(Vec<Ipv6Reach>),
+    /// Point-to-Point Three-Way Adjacency (type 240, RFC 5303 §3): the three-way
+    /// handshake state on a p2p link. Carries the sender's adjacency state
+    /// (`Up`/`Initializing`/`Down`) and Extended Local Circuit ID, and — once the
+    /// sender has heard the neighbour — the neighbour's System ID and Extended
+    /// Local Circuit ID, so the neighbour can confirm the link is bidirectional.
+    /// On the wire it is 1, 5, or 15 bytes; `neighbor` is `None` until the sender
+    /// has heard the peer.
+    P2pThreeWay {
+        /// The sender's adjacency state: `0` Up, `1` Initializing, `2` Down.
+        adj_state: u8,
+        /// The sender's Extended Local Circuit ID (locally unique per interface).
+        ext_local_circuit_id: u32,
+        /// The neighbour the sender has heard: its System ID and Extended Local
+        /// Circuit ID. `None` until the sender has received a Hello from the peer.
+        neighbor: Option<([u8; 6], u32)>,
+    },
     /// Any TLV type this implementation does not interpret, kept verbatim.
     Unknown { typ: u8, value: Vec<u8> },
 }
@@ -135,6 +152,7 @@ impl Tlv {
             Tlv::ExtendedIpReachability(_) => T_EXTENDED_IP_REACH,
             Tlv::Ipv6InterfaceAddresses(_) => T_IPV6_IFACE_ADDRS,
             Tlv::Ipv6Reachability(_) => T_IPV6_REACH,
+            Tlv::P2pThreeWay { .. } => T_P2P_THREE_WAY,
             Tlv::Unknown { typ, .. } => *typ,
         }
     }
@@ -246,6 +264,18 @@ impl Tlv {
                         v.push(sub.len().min(u8::MAX as usize) as u8);
                         v.extend_from_slice(sub);
                     }
+                }
+            }
+            Tlv::P2pThreeWay {
+                adj_state,
+                ext_local_circuit_id,
+                neighbor,
+            } => {
+                v.push(*adj_state);
+                v.extend_from_slice(&ext_local_circuit_id.to_be_bytes());
+                if let Some((nid, ncid)) = neighbor {
+                    v.extend_from_slice(nid);
+                    v.extend_from_slice(&ncid.to_be_bytes());
                 }
             }
             Tlv::Unknown { value, .. } => v.extend_from_slice(value),
@@ -454,6 +484,32 @@ impl Tlv {
                 }
                 Tlv::Ipv6Reachability(reaches)
             }
+            T_P2P_THREE_WAY => {
+                // RFC 5303 §3: 1 byte (state only), 5 bytes (+ our ext circuit id),
+                // or 15 bytes (+ neighbour system id + neighbour ext circuit id).
+                match v.len() {
+                    1 => Tlv::P2pThreeWay {
+                        adj_state: v[0],
+                        ext_local_circuit_id: 0,
+                        neighbor: None,
+                    },
+                    5 => Tlv::P2pThreeWay {
+                        adj_state: v[0],
+                        ext_local_circuit_id: u32::from_be_bytes([v[1], v[2], v[3], v[4]]),
+                        neighbor: None,
+                    },
+                    15 => {
+                        let mut nid = [0u8; 6];
+                        nid.copy_from_slice(&v[5..11]);
+                        Tlv::P2pThreeWay {
+                            adj_state: v[0],
+                            ext_local_circuit_id: u32::from_be_bytes([v[1], v[2], v[3], v[4]]),
+                            neighbor: Some((nid, u32::from_be_bytes([v[11], v[12], v[13], v[14]]))),
+                        }
+                    }
+                    _ => return None,
+                }
+            }
             other => Tlv::Unknown {
                 typ: other,
                 value: v.to_vec(),
@@ -527,6 +583,44 @@ mod tests {
             AreaAddress(vec![0x49, 0x00, 0x02]),
         ]);
         assert_eq!(roundtrip(&t), t);
+    }
+
+    #[test]
+    fn p2p_three_way_roundtrips_all_three_lengths() {
+        // 1-byte form: state only.
+        let s = Tlv::P2pThreeWay {
+            adj_state: 2,
+            ext_local_circuit_id: 0,
+            neighbor: None,
+        };
+        assert_eq!(roundtrip(&s), s);
+        // 5-byte form: state + our extended circuit id, no neighbour heard yet.
+        let init = Tlv::P2pThreeWay {
+            adj_state: 1,
+            ext_local_circuit_id: 7,
+            neighbor: None,
+        };
+        assert_eq!(roundtrip(&init), init);
+        // 15-byte form: fully up, echoing the neighbour's system id + circuit id.
+        let up = Tlv::P2pThreeWay {
+            adj_state: 0,
+            ext_local_circuit_id: 7,
+            neighbor: Some(([0, 0, 0, 0, 0, 2], 3)),
+        };
+        let back = roundtrip(&up);
+        assert_eq!(back, up);
+        // The framed length is exactly 15 bytes of value (2 header + 15).
+        let mut buf = Vec::new();
+        up.encode(&mut buf);
+        assert_eq!(buf.len(), 2 + 15);
+        assert_eq!(buf[0], T_P2P_THREE_WAY);
+        assert_eq!(buf[1], 15);
+    }
+
+    #[test]
+    fn p2p_three_way_rejects_a_bad_length() {
+        // A type-240 TLV whose length is not 1, 5 or 15 is malformed.
+        assert!(decode_all(&[T_P2P_THREE_WAY, 3, 0, 0, 0]).is_none());
     }
 
     #[test]
