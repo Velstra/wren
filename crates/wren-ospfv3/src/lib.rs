@@ -54,6 +54,7 @@
 use std::net::Ipv6Addr;
 
 pub mod flood;
+pub mod hmac;
 pub mod interface;
 pub mod lsa;
 pub mod lsdb;

@@ -1742,7 +1742,35 @@ fn build_ospf3_config(
         interfaces,
         redistribute,
         bfd: ospf3.bfd,
+        auth: build_ospf3_auth(ospf3)?,
+        auth_replay_protection: ospf3.auth_replay_protection.unwrap_or(true),
     })
+}
+
+/// Resolve the `[ospf3]` authentication config into the runner's RFC 7166
+/// [`Auth`](wren_ospfv3::packet::Auth): `"none"` (or unset) sends plain packets,
+/// `"hmac-sha256"` appends and verifies an HMAC-SHA-256 Authentication Trailer.
+#[cfg(feature = "ospf3")]
+fn build_ospf3_auth(ospf3: &wren_config::Ospf3) -> Result<wren_ospfv3::packet::Auth> {
+    use wren_ospfv3::packet::Auth;
+    match ospf3.auth_type.as_deref() {
+        None | Some("none") => Ok(Auth::None),
+        Some("hmac-sha256") => {
+            let key = ospf3
+                .auth_key
+                .as_deref()
+                .filter(|k| !k.is_empty())
+                .context("ospf3 auth-type \"hmac-sha256\" requires a non-empty auth-key")?;
+            Ok(Auth::Hmac {
+                sa_id: ospf3.auth_sa_id.unwrap_or(1),
+                key: key.as_bytes().to_vec(),
+                seq: 0,
+            })
+        }
+        Some(other) => {
+            anyhow::bail!("unknown ospf3 auth-type {other:?} (want none or hmac-sha256)")
+        }
+    }
 }
 
 /// Resolve the textual `[bgp]` config into the runner's [`bgp::BgpConfig`],

@@ -610,6 +610,25 @@ pub struct Ospf3 {
     /// interval. Requires a peer that also runs BFD; timing comes from `[bfd]`.
     #[serde(default)]
     pub bfd: bool,
+    /// Packet authentication scheme (RFC 7166 Authentication Trailer), applied to
+    /// every OSPFv3 interface: `"none"` (the default) or `"hmac-sha256"` for a
+    /// keyed HMAC-SHA-256 digest. The peers on a link must agree. Unlike OSPFv2,
+    /// OSPFv3 has no cleartext-password mode.
+    #[serde(rename = "auth-type")]
+    pub auth_type: Option<String>,
+    /// The shared HMAC key (`auth-type = "hmac-sha256"`). Any length — it is fed
+    /// straight into HMAC (keys longer than the 64-byte block are hashed first).
+    #[serde(rename = "auth-key")]
+    pub auth_key: Option<String>,
+    /// The RFC 7166 Security Association identifier stamped into the trailer,
+    /// letting keys be rolled. Defaults to 1.
+    #[serde(rename = "auth-sa-id")]
+    pub auth_sa_id: Option<u16>,
+    /// Enforce RFC 7166 anti-replay: drop a received packet whose cryptographic
+    /// sequence number is not greater than the last accepted from that neighbour,
+    /// so a captured packet cannot be replayed. Defaults to true.
+    #[serde(rename = "auth-replay-protection")]
+    pub auth_replay_protection: Option<bool>,
 }
 
 /// BGP-4 protocol configuration (`[bgp]`).
@@ -2214,6 +2233,36 @@ mod tests {
         )
         .expect("valid config");
         assert!(!cfg.ospf3.expect("ospf3 present").bfd);
+    }
+
+    #[test]
+    fn parses_ospf3_authentication() {
+        let cfg = Config::from_toml(
+            r#"
+            router-id = "10.0.0.1"
+            [ospf3]
+            enabled = true
+            interfaces = ["eth1"]
+            auth-type = "hmac-sha256"
+            auth-key = "a-shared-secret"
+            auth-sa-id = 7
+            auth-replay-protection = false
+            "#,
+        )
+        .expect("valid config");
+        let ospf3 = cfg.ospf3.expect("ospf3 present");
+        assert_eq!(ospf3.auth_type.as_deref(), Some("hmac-sha256"));
+        assert_eq!(ospf3.auth_key.as_deref(), Some("a-shared-secret"));
+        assert_eq!(ospf3.auth_sa_id, Some(7));
+        assert_eq!(ospf3.auth_replay_protection, Some(false));
+        // The auth fields default to None when the section omits them.
+        let cfg = Config::from_toml(
+            "router-id = \"10.0.0.1\"\n[ospf3]\nenabled = true\ninterfaces = [\"eth1\"]\n",
+        )
+        .expect("valid config");
+        let ospf3 = cfg.ospf3.expect("ospf3 present");
+        assert_eq!(ospf3.auth_type, None);
+        assert_eq!(ospf3.auth_key, None);
     }
 
     #[test]

@@ -10,13 +10,18 @@
 //! * Link State Update (§A.3.5) — flood full LSAs.
 //! * Link State Acknowledgment (§A.3.6) — acknowledge flooded LSAs by header.
 //!
-//! Unlike OSPFv2 there is no authentication trailer (OSPFv3 relies on IPv6's own
-//! AH/ESP) and the checksum is the standard IPv6 upper-layer checksum, computed
-//! over a pseudo-header built from the packet's IPv6 source and destination. So
+//! The checksum is the standard IPv6 upper-layer checksum, computed over a
+//! pseudo-header built from the packet's IPv6 source and destination, so
 //! [`Packet::encode`] and [`Packet::decode`] take those two addresses.
+//!
+//! OSPFv3 originally delegated authentication to IPv6's own AH/ESP, but RFC 7166
+//! adds a native **Authentication Trailer** appended after the packet.
+//! [`Packet::encode_auth`] / [`Packet::decode_auth`] carry an HMAC-SHA-256 digest
+//! ([`Auth`]) that authenticates each packet against a shared key.
 
 use std::net::{Ipv4Addr, Ipv6Addr};
 
+use crate::hmac;
 use crate::lsa::{checksum_valid, Lsa, LsType, LsaHeader, LSA_HEADER_LEN};
 use crate::{packet_checksum, VERSION};
 
@@ -63,6 +68,63 @@ impl PacketType {
 /// The serialized size of the OSPFv3 common header (8 bytes shorter than v2: no
 /// authentication, and a 1-byte Instance ID in place of the 2-byte AuType).
 pub const HEADER_LEN: usize = 16;
+
+/// RFC 7166 Authentication Type 1 — HMAC Cryptographic Authentication.
+const AUTH_TYPE_HMAC: u16 = 1;
+/// The fixed part of the Authentication Trailer before the digest (§4.1): Auth
+/// Type (2) + Auth Data Len (2) + Reserved (2) + Security Association ID (2) +
+/// the 64-bit Cryptographic Sequence Number (8).
+const AT_FIXED_LEN: usize = 16;
+
+/// The AT-bit in the 24-bit Options field (RFC 7166 §2.1): a Hello / Database
+/// Description sets it to announce that every packet on this link carries an
+/// Authentication Trailer.
+pub const OPTION_AT_BIT: u32 = 0x0000_0400;
+
+/// OSPFv3 cryptographic authentication for a packet (RFC 7166). `None` sends and
+/// expects a plain checksummed packet; `Hmac` appends and verifies an
+/// HMAC-SHA-256 Authentication Trailer keyed by a shared secret.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Auth {
+    /// No authentication — the standard checksummed packet (RFC 5340).
+    None,
+    /// HMAC-SHA-256 cryptographic authentication (RFC 7166), keyed by `key` and
+    /// identified by the Security Association id `sa_id`, with a 64-bit
+    /// monotonically increasing anti-replay `seq`.
+    Hmac {
+        /// Security Association id (maps to the algorithm and key on the peer).
+        sa_id: u16,
+        /// The shared authentication key.
+        key: Vec<u8>,
+        /// The cryptographic sequence number stamped into the trailer on send.
+        seq: u64,
+    },
+}
+
+/// Build the 32-byte Apad for HMAC-SHA-256 (RFC 7166 §4.5): the 16-octet IPv6
+/// source address followed by `0x878FE1F3` repeated `(L-16)/4 = 4` times. The
+/// Authentication Data field is pre-set to this before the digest is computed.
+fn apad(src: Ipv6Addr) -> [u8; hmac::DIGEST_LEN] {
+    let mut a = [0u8; hmac::DIGEST_LEN];
+    a[..16].copy_from_slice(&src.octets());
+    for chunk in a[16..].chunks_exact_mut(4) {
+        chunk.copy_from_slice(&0x878F_E1F3u32.to_be_bytes());
+    }
+    a
+}
+
+/// Constant-time byte-slice equality, so a wrong digest cannot be probed by
+/// timing the compare.
+fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
 
 /// The fields of the OSPFv3 common header the caller supplies; the version
 /// (always [`VERSION`]), the type, the length and the checksum are filled in by
@@ -233,6 +295,9 @@ pub enum DecodeError {
     BadChecksum,
     /// A Link State Update carried an LSA that would not parse.
     BadLsa,
+    /// The RFC 7166 Authentication Trailer was missing, malformed, or its HMAC
+    /// did not verify against the configured key.
+    BadAuth,
 }
 
 impl std::fmt::Display for DecodeError {
@@ -246,6 +311,7 @@ impl std::fmt::Display for DecodeError {
             }
             DecodeError::BadChecksum => write!(f, "checksum mismatch"),
             DecodeError::BadLsa => write!(f, "malformed LSA in update"),
+            DecodeError::BadAuth => write!(f, "authentication trailer missing or invalid"),
         }
     }
 }
@@ -342,7 +408,8 @@ impl Packet {
         if buf[0] != VERSION {
             return Err(DecodeError::BadVersion(buf[0]));
         }
-        let ptype = PacketType::from_u8(buf[1]).ok_or(DecodeError::UnknownType(buf[1]))?;
+        // Validate the type (for error precedence) before the checksum.
+        PacketType::from_u8(buf[1]).ok_or(DecodeError::UnknownType(buf[1]))?;
         let stated = u16::from_be_bytes([buf[2], buf[3]]);
         if stated as usize != buf.len() {
             return Err(DecodeError::BadLength {
@@ -357,7 +424,31 @@ impl Packet {
         if packet_checksum(src, dst, &scratch) != u16::from_be_bytes([buf[12], buf[13]]) {
             return Err(DecodeError::BadChecksum);
         }
+        Self::parse_unchecked(buf)
+    }
 
+    /// Parse the header and body of an OSPFv3 packet **without** verifying the
+    /// checksum (an RFC 7166 authenticated packet leaves the checksum zero, §4.2).
+    /// Validates version, type and the stated length against `buf`. Shared by
+    /// [`decode`] (after its checksum step) and [`decode_auth`] (after the HMAC).
+    ///
+    /// [`decode`]: Packet::decode
+    /// [`decode_auth`]: Packet::decode_auth
+    fn parse_unchecked(buf: &[u8]) -> Result<Packet, DecodeError> {
+        if buf.len() < HEADER_LEN {
+            return Err(DecodeError::TooShort);
+        }
+        if buf[0] != VERSION {
+            return Err(DecodeError::BadVersion(buf[0]));
+        }
+        let ptype = PacketType::from_u8(buf[1]).ok_or(DecodeError::UnknownType(buf[1]))?;
+        let stated = u16::from_be_bytes([buf[2], buf[3]]);
+        if stated as usize != buf.len() {
+            return Err(DecodeError::BadLength {
+                stated,
+                actual: buf.len(),
+            });
+        }
         let header = Header {
             router_id: Ipv4Addr::new(buf[4], buf[5], buf[6], buf[7]),
             area_id: Ipv4Addr::new(buf[8], buf[9], buf[10], buf[11]),
@@ -372,6 +463,107 @@ impl Packet {
             PacketType::LinkStateAck => Body::LinkStateAck(decode_lsack(body)?),
         };
         Ok(Packet { header, body })
+    }
+
+    /// Serialize the packet with an RFC 7166 Authentication Trailer when `auth`
+    /// is [`Auth::Hmac`] — otherwise the plain checksummed [`encode`].
+    ///
+    /// Per RFC 7166 the OSPFv3 checksum is left zero (§4.2 — the HMAC supersedes
+    /// it), the trailer is appended *after* the packet, and the packet's own
+    /// Length field is **not** extended (only the IPv6 payload grows, §2). The
+    /// digest is HMAC-SHA-256 over the checksum-zeroed packet, the trailer's
+    /// 16-byte fixed header, and the Apad placeholder for the Auth Data (§4.5).
+    ///
+    /// [`encode`]: Packet::encode
+    pub fn encode_auth(&self, src: Ipv6Addr, dst: Ipv6Addr, auth: &Auth) -> Vec<u8> {
+        let Auth::Hmac { sa_id, key, seq } = auth else {
+            return self.encode(src, dst);
+        };
+        let mut out = self.encode(src, dst);
+        // §4.2: the checksum is not used alongside the trailer.
+        out[12] = 0;
+        out[13] = 0;
+        // Trailer fixed header; Auth Data Len covers the whole trailer (§4.1).
+        let auth_data_len = (AT_FIXED_LEN + hmac::DIGEST_LEN) as u16;
+        out.extend_from_slice(&AUTH_TYPE_HMAC.to_be_bytes());
+        out.extend_from_slice(&auth_data_len.to_be_bytes());
+        out.extend_from_slice(&[0, 0]); // reserved
+        out.extend_from_slice(&sa_id.to_be_bytes());
+        out.extend_from_slice(&seq.to_be_bytes());
+        // Compute the digest with the Auth Data field pre-set to Apad, then let it
+        // replace that placeholder.
+        let digest_at = out.len();
+        out.extend_from_slice(&apad(src));
+        let digest = hmac::hmac_sha256(key, &out);
+        out[digest_at..].copy_from_slice(&digest);
+        out
+    }
+
+    /// Parse a packet carrying an RFC 7166 Authentication Trailer, verifying its
+    /// HMAC against `auth`. With [`Auth::None`] this is the plain [`decode`].
+    ///
+    /// The trailer follows the OSPFv3 packet, whose Length field does not count
+    /// it, so the packet is `buf[..stated]` and the trailer `buf[stated..]`. The
+    /// checksum is not verified (it is zero, §4.2); integrity rests on the HMAC,
+    /// compared in constant time.
+    ///
+    /// [`decode`]: Packet::decode
+    pub fn decode_auth(
+        buf: &[u8],
+        src: Ipv6Addr,
+        dst: Ipv6Addr,
+        auth: &Auth,
+    ) -> Result<Packet, DecodeError> {
+        let Auth::Hmac { sa_id, key, .. } = auth else {
+            return Packet::decode(buf, src, dst);
+        };
+        if buf.len() < HEADER_LEN {
+            return Err(DecodeError::TooShort);
+        }
+        let stated = u16::from_be_bytes([buf[2], buf[3]]) as usize;
+        if stated < HEADER_LEN || buf.len() != stated + AT_FIXED_LEN + hmac::DIGEST_LEN {
+            return Err(DecodeError::BadAuth);
+        }
+        let trailer = &buf[stated..];
+        if u16::from_be_bytes([trailer[0], trailer[1]]) != AUTH_TYPE_HMAC
+            || u16::from_be_bytes([trailer[2], trailer[3]]) as usize != trailer.len()
+            || u16::from_be_bytes([trailer[6], trailer[7]]) != *sa_id
+        {
+            return Err(DecodeError::BadAuth);
+        }
+        // Recompute the digest over the checksum-zeroed packet + trailer fixed
+        // header + Apad, then compare it against the received digest.
+        let mut scratch = Vec::with_capacity(stated + AT_FIXED_LEN + hmac::DIGEST_LEN);
+        scratch.extend_from_slice(&buf[..stated]);
+        scratch[12] = 0;
+        scratch[13] = 0;
+        scratch.extend_from_slice(&trailer[..AT_FIXED_LEN]);
+        scratch.extend_from_slice(&apad(src));
+        let expected = hmac::hmac_sha256(key, &scratch);
+        if !ct_eq(&expected, &trailer[AT_FIXED_LEN..]) {
+            return Err(DecodeError::BadAuth);
+        }
+        Self::parse_unchecked(&buf[..stated])
+    }
+
+    /// The 64-bit RFC 7166 cryptographic sequence number of an authenticated
+    /// packet, or `None` when `buf` has no well-formed HMAC trailer. Used by the
+    /// daemon for anti-replay (a sequence that fails to advance is a replay).
+    pub fn crypto_seq(buf: &[u8]) -> Option<u64> {
+        if buf.len() < HEADER_LEN {
+            return None;
+        }
+        let stated = u16::from_be_bytes([buf[2], buf[3]]) as usize;
+        if stated < HEADER_LEN || buf.len() < stated + AT_FIXED_LEN {
+            return None;
+        }
+        let t = &buf[stated..];
+        if u16::from_be_bytes([t[0], t[1]]) != AUTH_TYPE_HMAC {
+            return None;
+        }
+        Some(u64::from_be_bytes([
+            t[8], t[9], t[10], t[11], t[12], t[13], t[14], t[15],
+        ]))
     }
 
     /// Borrow the Hello body, if this is a Hello packet.
@@ -662,6 +854,65 @@ mod tests {
         assert_eq!(
             Packet::decode(&bytes, other, ALL_SPF_ROUTERS),
             Err(DecodeError::BadChecksum)
+        );
+    }
+
+    #[test]
+    fn hmac_auth_trailer_roundtrips_and_rejects_tampering() {
+        let pkt = sample_hello();
+        let auth = Auth::Hmac {
+            sa_id: 7,
+            key: b"a-shared-secret".to_vec(),
+            seq: 42,
+        };
+        let bytes = pkt.encode_auth(SRC, ALL_SPF_ROUTERS, &auth);
+
+        // The trailer is appended beyond the packet's own Length field (16-byte
+        // fixed header + 32-byte HMAC-SHA-256 digest) and the checksum is zeroed.
+        let stated = u16::from_be_bytes([bytes[2], bytes[3]]) as usize;
+        assert_eq!(bytes.len(), stated + AT_FIXED_LEN + hmac::DIGEST_LEN);
+        assert_eq!(&bytes[12..14], &[0, 0]);
+        assert_eq!(Packet::crypto_seq(&bytes), Some(42));
+
+        // It round-trips and verifies against the same key.
+        assert_eq!(
+            Packet::decode_auth(&bytes, SRC, ALL_SPF_ROUTERS, &auth).expect("verifies"),
+            pkt
+        );
+
+        // A flipped digest byte is rejected.
+        let mut tampered = bytes.clone();
+        let last = tampered.len() - 1;
+        tampered[last] ^= 0xff;
+        assert_eq!(
+            Packet::decode_auth(&tampered, SRC, ALL_SPF_ROUTERS, &auth),
+            Err(DecodeError::BadAuth)
+        );
+
+        // A flipped body byte is rejected — the HMAC covers the whole packet.
+        let mut body_flip = bytes.clone();
+        body_flip[HEADER_LEN] ^= 0xff;
+        assert_eq!(
+            Packet::decode_auth(&body_flip, SRC, ALL_SPF_ROUTERS, &auth),
+            Err(DecodeError::BadAuth)
+        );
+
+        // The wrong key is rejected.
+        let wrong = Auth::Hmac {
+            sa_id: 7,
+            key: b"different-secret".to_vec(),
+            seq: 42,
+        };
+        assert_eq!(
+            Packet::decode_auth(&bytes, SRC, ALL_SPF_ROUTERS, &wrong),
+            Err(DecodeError::BadAuth)
+        );
+
+        // A different source changes Apad (§4.5), so the digest no longer matches.
+        let other = Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 2);
+        assert_eq!(
+            Packet::decode_auth(&bytes, other, ALL_SPF_ROUTERS, &auth),
+            Err(DecodeError::BadAuth)
         );
     }
 

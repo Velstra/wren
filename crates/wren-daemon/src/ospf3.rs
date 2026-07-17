@@ -53,8 +53,8 @@ use wren_ospfv3::neighbor::{
     Neighbor, NeighborAction, NeighborContext, NeighborEvent, NeighborState,
 };
 use wren_ospfv3::packet::{
-    Body, DatabaseDescription, Header, Hello, LinkStateAck, LinkStateRequest, LinkStateUpdate,
-    LsRequest, Packet, DD_FLAG_INIT, DD_FLAG_MASTER, DD_FLAG_MORE,
+    Auth, Body, DatabaseDescription, Header, Hello, LinkStateAck, LinkStateRequest,
+    LinkStateUpdate, LsRequest, Packet, DD_FLAG_INIT, DD_FLAG_MASTER, DD_FLAG_MORE, OPTION_AT_BIT,
 };
 use wren_ospfv3::spf::{self, SpfRoute};
 use wren_ospfv3::{
@@ -111,6 +111,14 @@ pub struct Ospf3Config {
     /// when BFD reports the path failed (RFC 5882), instead of waiting for the dead
     /// interval. `[ospf3] bfd = true`.
     pub bfd: bool,
+    /// RFC 7166 packet authentication. [`Auth::None`] sends and expects plain
+    /// checksummed packets; [`Auth::Hmac`] appends and verifies an HMAC-SHA-256
+    /// Authentication Trailer on every packet.
+    pub auth: Auth,
+    /// Enforce RFC 7166 anti-replay: drop a received authenticated packet whose
+    /// cryptographic sequence number does not advance past the last accepted from
+    /// that neighbour. Ignored when `auth` is [`Auth::None`].
+    pub auth_replay_protection: bool,
 }
 
 /// One configured OSPFv3 interface and the area it is in.
@@ -255,6 +263,18 @@ struct Ospf {
     bfd_register: mpsc::Sender<crate::bfd::BfdCommand>,
     bfd_notify: mpsc::Sender<IpAddr>,
     bfd_registered: HashSet<(Ipv6Addr, u32)>,
+    /// RFC 7166 anti-replay: the highest cryptographic sequence number accepted
+    /// from each `(interface index, neighbour link-local)`. A received packet
+    /// whose sequence does not exceed the stored one is a replay and is dropped.
+    /// Empty (and unused) when `cfg.auth` is [`Auth::None`].
+    crypto_seqs: HashMap<(u32, Ipv6Addr), u64>,
+    /// The next cryptographic sequence number to stamp on an outgoing
+    /// authenticated packet. Seeded from the wall clock (`seconds << 32`) so it is
+    /// strictly increasing *across restarts* — a peer enforcing anti-replay keeps
+    /// accepting us after we restart. Atomic so the single-choke-point `encode`
+    /// (which is `&self`, held across `.await`) can bump it while `&Ospf` stays
+    /// `Sync`/`Send`.
+    next_crypto_seq: std::sync::atomic::AtomicU64,
 }
 
 /// Run OSPFv3 on the configured interfaces, announcing SPF routes to `updates`.
@@ -449,6 +469,17 @@ pub async fn run(
         bfd_register,
         bfd_notify,
         bfd_registered: HashSet::new(),
+        crypto_seqs: HashMap::new(),
+        // Seed the send sequence from the wall clock so it keeps rising across a
+        // restart (RFC 7166 anti-replay). `seconds << 32` leaves 2^32 packets of
+        // per-second headroom before the next second's base.
+        next_crypto_seq: std::sync::atomic::AtomicU64::new(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0)
+                << 32,
+        ),
     };
     ospf.originate_externals();
     ospf.reoriginate_and_flood().await;
@@ -591,9 +622,9 @@ impl Ospf {
         let dsts = [self.ifaces[idx].link_local, ALL_SPF_ROUTERS, ALL_D_ROUTERS];
         let packet = dsts
             .iter()
-            .find_map(|dst| Packet::decode(&pkt.data, pkt.src, *dst).ok());
+            .find_map(|dst| Packet::decode_auth(&pkt.data, pkt.src, *dst, &self.cfg.auth).ok());
         let Some(packet) = packet else {
-            debug!(src = %pkt.src, "ignoring malformed/unverifiable OSPFv3 packet");
+            debug!(src = %pkt.src, "ignoring malformed/unauthenticated OSPFv3 packet");
             return;
         };
         // Drop our own reflections, the wrong area, or a foreign Instance ID.
@@ -602,6 +633,19 @@ impl Ospf {
             || packet.header.instance_id != self.cfg.instance_id
         {
             return;
+        }
+        // RFC 7166 anti-replay: an authenticated packet's cryptographic sequence
+        // number must strictly exceed the last one accepted from this neighbour,
+        // so a captured packet cannot be replayed.
+        if self.cfg.auth_replay_protection {
+            if let Some(seq) = Packet::crypto_seq(&pkt.data) {
+                let key = (pkt.ifindex, pkt.src);
+                if self.crypto_seqs.get(&key).is_some_and(|&last| seq <= last) {
+                    debug!(src = %pkt.src, seq, "dropping replayed OSPFv3 packet");
+                    return;
+                }
+                self.crypto_seqs.insert(key, seq);
+            }
         }
         let nbr_id = packet.header.router_id;
         match packet.body {
@@ -2131,13 +2175,42 @@ impl Ospf {
     /// Encode a packet from `iface` with its link-local source and the given IPv6
     /// destination (multicast for Hellos/floods to the group, the neighbour's
     /// link-local for unicast) — the destination feeds the pseudo-header checksum.
-    fn encode(&self, iface: &Iface, body: Body, dst: Ipv6Addr) -> Vec<u8> {
+    /// With authentication configured, the AT-bit is set on Hello / Database
+    /// Description packets (RFC 7166 §2.1) and an Authentication Trailer is
+    /// appended to every packet.
+    fn encode(&self, iface: &Iface, mut body: Body, dst: Ipv6Addr) -> Vec<u8> {
+        if !matches!(self.cfg.auth, Auth::None) {
+            match &mut body {
+                Body::Hello(h) => h.options |= OPTION_AT_BIT,
+                Body::DatabaseDescription(d) => d.options |= OPTION_AT_BIT,
+                _ => {}
+            }
+        }
         let header = Header {
             router_id: self.cfg.router_id,
             area_id: iface.area,
             instance_id: self.cfg.instance_id,
         };
-        Packet { header, body }.encode(iface.link_local, dst)
+        Packet { header, body }.encode_auth(iface.link_local, dst, &self.send_auth())
+    }
+
+    /// The authentication to stamp on an outgoing packet: the configured key and
+    /// Security Association with a fresh, strictly increasing cryptographic
+    /// sequence number (RFC 7166 anti-replay). [`Auth::None`] when auth is off.
+    fn send_auth(&self) -> Auth {
+        match &self.cfg.auth {
+            Auth::Hmac { sa_id, key, .. } => {
+                let seq = self
+                    .next_crypto_seq
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                Auth::Hmac {
+                    sa_id: *sa_id,
+                    key: key.clone(),
+                    seq,
+                }
+            }
+            Auth::None => Auth::None,
+        }
     }
 }
 
