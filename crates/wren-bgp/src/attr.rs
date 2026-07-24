@@ -649,7 +649,14 @@ impl PathAttribute {
             }
             Self::MED => PathAttribute::MultiExitDisc(read_u32(value)?),
             Self::LOCAL_PREF => PathAttribute::LocalPref(read_u32(value)?),
-            Self::ATOMIC_AGGREGATE => PathAttribute::AtomicAggregate,
+            Self::ATOMIC_AGGREGATE => {
+                // RFC 7606 §5: ATOMIC_AGGREGATE is a fixed 0-length attribute — a
+                // value-bearing one is malformed, not silently accepted.
+                if !value.is_empty() {
+                    return None;
+                }
+                PathAttribute::AtomicAggregate
+            }
             Self::COMMUNITIES => {
                 if value.len() % 4 != 0 {
                     return None;
@@ -745,7 +752,9 @@ impl PathAttribute {
                 }
             }
             Self::ORIGINATOR_ID => {
-                if value.len() < 4 {
+                // RFC 7606 §5: ORIGINATOR_ID (RFC 4456) is exactly 4 octets — an
+                // over-long value is malformed, not truncated to its first four.
+                if value.len() != 4 {
                     return None;
                 }
                 PathAttribute::OriginatorId(Ipv4Addr::new(value[0], value[1], value[2], value[3]))
@@ -874,7 +883,9 @@ fn decode_as_segments(value: &[u8], four_octet: bool) -> Option<Vec<AsPathSegmen
 /// 4-octet BGP identifier.
 fn decode_aggregator(value: &[u8], four_octet: bool) -> Option<(u32, Ipv4Addr)> {
     let asn_len = if four_octet { 4 } else { 2 };
-    if value.len() < asn_len + 4 {
+    // RFC 7606 §5/§7.7: AGGREGATOR is exactly `asn_len + 4` octets (the AS plus the
+    // 4-octet BGP identifier) — a length mismatch is malformed, not truncated.
+    if value.len() != asn_len + 4 {
         return None;
     }
     let asn = if four_octet {
@@ -1384,6 +1395,33 @@ mod tests {
         assert!(
             PathAttribute::decode(&[FLAG_OPTIONAL, 4, 5, 0, 0, 0, 5, 0], true).is_none()
         ); // MED len 5
+    }
+
+    #[test]
+    fn variable_length_attributes_reject_wrong_length_rfc7606() {
+        // ATOMIC_AGGREGATE (type 6) is exactly 0 octets; the empty canonical form
+        // decodes, a value-bearing one is malformed (RFC 7606 §5).
+        assert!(PathAttribute::decode(&[FLAG_TRANSITIVE, 6, 0], true).is_some());
+        assert!(PathAttribute::decode(&[FLAG_TRANSITIVE, 6, 1, 0], true).is_none());
+        // AGGREGATOR (type 7) is exactly asn_len + 4 (8 octets with a 4-octet AS);
+        // the exact form decodes, a padded one is malformed (RFC 7606 §5/§7.7).
+        assert!(
+            PathAttribute::decode(
+                &[FLAG_OPTIONAL | FLAG_TRANSITIVE, 7, 8, 0, 0, 0, 1, 10, 0, 0, 1],
+                true
+            )
+            .is_some()
+        );
+        assert!(
+            PathAttribute::decode(
+                &[FLAG_OPTIONAL | FLAG_TRANSITIVE, 7, 10, 0, 0, 0, 1, 10, 0, 0, 1, 9, 9],
+                true
+            )
+            .is_none()
+        );
+        // ORIGINATOR_ID (type 9, RFC 4456) is exactly 4 octets.
+        assert!(PathAttribute::decode(&[FLAG_OPTIONAL, 9, 4, 10, 0, 0, 1], true).is_some());
+        assert!(PathAttribute::decode(&[FLAG_OPTIONAL, 9, 5, 10, 0, 0, 1, 0], true).is_none());
     }
 
     #[test]
