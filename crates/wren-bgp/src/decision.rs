@@ -15,7 +15,7 @@ use std::net::{IpAddr, Ipv4Addr};
 
 use wren_core::{NextHop, Prefix, Protocol, Route};
 
-use crate::attr::{AsPathSegment, Origin};
+use crate::attr::{AsPathSegment, Origin, PathAttribute};
 
 /// The default LOCAL_PREF assigned to a path that carries none (i.e. learned from
 /// an eBGP peer, where LOCAL_PREF is not sent across the AS boundary).
@@ -84,6 +84,11 @@ pub struct Path {
     /// procedures (a path with OTC must not be advertised to a Provider/Peer/RS); not
     /// part of the §9.1.2.2 comparison.
     pub otc: Option<u32>,
+    /// Unrecognised optional-transitive path attributes (RFC 7606 §8 / RFC 4271
+    /// §5), kept verbatim so they can be re-advertised to other peers with the
+    /// Partial bit set. Unrecognised non-transitive attributes are dropped, not
+    /// carried here; not part of the §9.1.2.2 comparison.
+    pub pass_through: Vec<PathAttribute>,
 }
 
 impl Path {
@@ -234,6 +239,7 @@ mod tests {
             ext_communities: vec![],
             srv6_sid: None,
             otc: None,
+            pass_through: vec![],
         }
     }
 

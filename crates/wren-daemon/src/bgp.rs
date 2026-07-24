@@ -36,7 +36,10 @@ use tokio::sync::mpsc;
 use tokio::time::{sleep, sleep_until, timeout, Instant};
 use tracing::{debug, info, warn};
 
-use wren_bgp::attr::{reconstruct_as_path, AsPathSegment, Origin, PathAttribute};
+use wren_bgp::attr::{
+    reconstruct_as_path, AsPathSegment, Origin, PathAttribute, FLAG_OPTIONAL, FLAG_PARTIAL,
+    FLAG_TRANSITIVE,
+};
 use wren_bgp::capability::{BgpRole, Capability, ADD_PATH_BOTH, ADD_PATH_RECEIVE, ADD_PATH_SEND};
 use wren_bgp::community::format_community;
 use wren_bgp::decision::{Path, DEFAULT_LOCAL_PREF};
@@ -3341,6 +3344,7 @@ fn build_path(
     let mut cluster_list = Vec::new();
     let mut srv6_sid = None;
     let mut otc = None;
+    let mut pass_through = Vec::new();
     for a in &update.attributes {
         match a {
             PathAttribute::Origin(o) => origin = *o,
@@ -3359,6 +3363,14 @@ fn build_path(
             // Only-To-Customer (RFC 9234 §4.1): carried through so the egress
             // route-leak rules can inspect it on re-advertisement.
             PathAttribute::OnlyToCustomer(a) => otc = Some(*a),
+            // Unrecognised optional-transitive attributes (RFC 7606 §8 / RFC 4271
+            // §5): keep them verbatim to re-advertise onward with the Partial bit;
+            // unrecognised non-transitive attributes are dropped.
+            PathAttribute::Unknown { flags, .. }
+                if flags & FLAG_OPTIONAL != 0 && flags & FLAG_TRANSITIVE != 0 =>
+            {
+                pass_through.push(a.clone());
+            }
             _ => {}
         }
     }
@@ -3395,6 +3407,28 @@ fn build_path(
         ext_communities,
         srv6_sid,
         otc,
+        pass_through,
+    }
+}
+
+/// Append a path's unrecognised optional-transitive attributes to an outgoing
+/// attribute set for re-advertisement, forcing the Partial bit on (RFC 7606 §8 /
+/// RFC 4271 §5): a downstream speaker must see that some router along the path did
+/// not fully process them. Non-`Unknown` entries (there should be none) are ignored.
+fn reflag_pass_through(pass_through: &[PathAttribute], out: &mut Vec<PathAttribute>) {
+    for a in pass_through {
+        if let PathAttribute::Unknown {
+            flags,
+            type_code,
+            value,
+        } = a
+        {
+            out.push(PathAttribute::Unknown {
+                flags: flags | FLAG_PARTIAL,
+                type_code: *type_code,
+                value: value.clone(),
+            });
+        }
     }
 }
 
@@ -6147,6 +6181,10 @@ impl Session<'_> {
                 path.ext_communities.clone(),
             ));
         }
+        // Re-advertise unrecognised optional-transitive attributes with the Partial
+        // bit set (RFC 7606 §8 / RFC 4271 §5), so a downstream speaker learns that
+        // some router along the path did not fully process them.
+        reflag_pass_through(&path.pass_through, &mut attrs);
         attrs
     }
 
@@ -6230,6 +6268,7 @@ mod tests {
             ext_communities: vec![[0x00, 0x02, 0xFD, 0xE9, 0x00, 0x00, 0x00, 0x64]], // rt:65001:100
             srv6_sid: None,
             otc: None,
+            pass_through: vec![],
         };
         rib.update(
             ip([10, 0, 0, 1]),
@@ -6330,6 +6369,7 @@ mod tests {
             ext_communities: vec![],
             srv6_sid: None,
             otc: None,
+            pass_through: vec![],
         };
         rib.update(
             ip([10, 0, 0, 1]),
@@ -6535,6 +6575,7 @@ mod tests {
             ext_communities: vec![],
             srv6_sid: None,
             otc: None,
+            pass_through: vec![],
         }
     }
 
@@ -6607,6 +6648,60 @@ mod tests {
         u.attributes.push(PathAttribute::OnlyToCustomer(65001));
         let path = build_path(&u, ip([10, 0, 0, 2]), None, facts);
         assert_eq!(path.otc, Some(65001));
+    }
+
+    #[test]
+    fn build_path_keeps_unknown_transitive_drops_nontransitive_rfc7606() {
+        // RFC 7606 §8 / RFC 4271 §5: an unrecognised optional-transitive attribute is
+        // carried through for re-advertisement; an unrecognised non-transitive one is
+        // dropped.
+        let facts = PeerFacts {
+            addr: ip([10, 0, 0, 2]),
+            as_: 65001,
+            id: id([10, 0, 0, 2]),
+            from_ebgp: true,
+            from_confed: false,
+            from_client: false,
+        };
+        let mut u = Update::default();
+        u.attributes.push(PathAttribute::Origin(Origin::Igp));
+        u.attributes.push(PathAttribute::Unknown {
+            flags: FLAG_OPTIONAL | FLAG_TRANSITIVE,
+            type_code: 99,
+            value: vec![1, 2, 3],
+        });
+        u.attributes.push(PathAttribute::Unknown {
+            flags: FLAG_OPTIONAL,
+            type_code: 98,
+            value: vec![4, 5],
+        });
+        let path = build_path(&u, ip([10, 0, 0, 2]), None, facts);
+        assert_eq!(path.pass_through.len(), 1);
+        assert!(matches!(
+            path.pass_through[0],
+            PathAttribute::Unknown { type_code: 99, .. }
+        ));
+    }
+
+    #[test]
+    fn reflag_pass_through_sets_the_partial_bit_rfc7606() {
+        // Re-advertised unknown transitives must carry the Partial bit (RFC 7606 §8).
+        let pass = vec![PathAttribute::Unknown {
+            flags: FLAG_OPTIONAL | FLAG_TRANSITIVE,
+            type_code: 99,
+            value: vec![7],
+        }];
+        let mut out = Vec::new();
+        reflag_pass_through(&pass, &mut out);
+        assert_eq!(out.len(), 1);
+        match &out[0] {
+            PathAttribute::Unknown { flags, .. } => {
+                assert_ne!(flags & FLAG_PARTIAL, 0, "Partial bit must be set");
+                assert_ne!(flags & FLAG_OPTIONAL, 0);
+                assert_ne!(flags & FLAG_TRANSITIVE, 0);
+            }
+            _ => panic!("expected Unknown"),
+        }
     }
 
     #[test]
@@ -7168,6 +7263,7 @@ mod tests {
             ext_communities: vec![],
             srv6_sid: None,
             otc: None,
+            pass_through: vec![],
         };
         rib.update(
             ip([10, 0, 0, 2]),
