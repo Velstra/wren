@@ -2605,7 +2605,7 @@ pub async fn run(
                 let import = imports.get(&peer);
                 // RFC 8212 strict default-deny: an eBGP peer with no import policy
                 // accepts no reachability. Withdrawals above are still honoured.
-                let import_deny = require_policy && facts.from_ebgp && import.is_none();
+                let import_deny = rfc8212_deny(require_policy, facts.from_ebgp, import.is_some());
                 // RFC 9234 Only-To-Customer ingress: reject a leaked route, and compute
                 // the OTC value to stamp on an accepted one. The peer's (remote) role is
                 // the complement of our configured role toward it.
@@ -3329,6 +3329,15 @@ fn otc_from_update(update: &Update) -> Option<u32> {
         PathAttribute::OnlyToCustomer(v) => Some(*v),
         _ => None,
     })
+}
+
+/// RFC 8212 strict default-deny: whether routes must be dropped in one direction
+/// because the session is a true-eBGP one with **no** configured policy on that
+/// direction and strict mode is enabled. iBGP and confederation-eBGP (`from_ebgp`
+/// false) are exempt, as is any direction that has a policy (`has_policy`). Shared
+/// by the import (received) and export (advertised) enforcement points.
+fn rfc8212_deny(require_policy: bool, from_ebgp: bool, has_policy: bool) -> bool {
+    require_policy && from_ebgp && !has_policy
 }
 
 /// RFC 9234 §5 ingress Only-To-Customer decision for reachability received from a peer
@@ -5415,7 +5424,11 @@ impl Session<'_> {
     /// filter re-advertises no **transit** routes when strict mode is enabled.
     /// Locally-originated routes are exempt (they do not flow through this gate).
     fn export_deny_all(&self) -> bool {
-        self.local.ebgp_require_policy && self.from_ebgp && self.export.is_none()
+        rfc8212_deny(
+            self.local.ebgp_require_policy,
+            self.from_ebgp,
+            self.export.is_some(),
+        )
     }
 
     /// Advertise originated routes to this peer, building the per-peer attributes
@@ -6476,6 +6489,22 @@ mod tests {
         assert_eq!(otc_from_update(&u), None);
         u.attributes.push(PathAttribute::OnlyToCustomer(65042));
         assert_eq!(otc_from_update(&u), Some(65042));
+    }
+
+    #[test]
+    fn rfc8212_deny_only_a_policyless_true_ebgp_peer_in_strict_mode() {
+        // The one case that denies: strict mode on, true eBGP, no policy.
+        assert!(rfc8212_deny(true, true, false));
+
+        // Every exemption the smoke does not exercise:
+        //   strict mode off  -> permissive default (legacy behaviour).
+        assert!(!rfc8212_deny(false, true, false));
+        //   iBGP / confed-eBGP (from_ebgp == false) -> exempt.
+        assert!(!rfc8212_deny(true, false, false));
+        //   a policy is configured for this direction -> that policy governs.
+        assert!(!rfc8212_deny(true, true, true));
+        //   none of the conditions -> allow.
+        assert!(!rfc8212_deny(false, false, true));
     }
 
     #[test]
