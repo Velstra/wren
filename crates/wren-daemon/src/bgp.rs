@@ -1599,6 +1599,14 @@ pub async fn run(
     let require_policy = cfg.ebgp_require_policy;
     // Established sessions we can push origination changes to, keyed by peer.
     let mut sessions: HashMap<IpAddr, mpsc::Sender<SessionCmd>> = HashMap::new();
+    // Route fan-out to a peer must never block the central task. If a peer's command
+    // queue is full it is `CMD_QUEUE` messages behind — genuinely stuck, not briefly
+    // slow — so the fan-out (`fanout`) drops the peer's address here instead of
+    // awaiting it. The select loop removes that peer from `sessions`, which closes its
+    // command channel; the session then tears itself down and reconnects, resyncing
+    // cleanly. Without this a single slow peer stalls route distribution to *every*
+    // other peer (a self-inflicted denial of service).
+    let (teardown_tx, mut teardown_rx) = mpsc::channel::<IpAddr>(CMD_QUEUE);
     // Whether each established session's connection was inbound, for §6.8 collision
     // detection (which of two racing connections to keep).
     let mut est_inbound: HashMap<IpAddr, bool> = HashMap::new();
@@ -1854,8 +1862,19 @@ pub async fn run(
                 for p in expired {
                     if let Some(s) = stale.remove(&p) {
                         warn!(peer = %p, count = s.prefixes.len(), "BGP graceful restart timer expired; flushing stale routes");
-                        flush_stale(p, s.prefixes, &mut rib, vrf_table, &updates, &sessions).await;
+                        flush_stale(p, s.prefixes, &mut rib, vrf_table, &updates, &sessions, &teardown_tx).await;
                     }
+                }
+                continue;
+            }
+            // A route fan-out found this peer's command queue full and asked (via
+            // `fanout`) for its teardown. Dropping its Sender closes the session's
+            // command channel, so the session tears itself down and reconnects to
+            // resync; the ensuing PeerMsg::Down does the remaining cleanup. Leave
+            // `current_conn` intact so that Down is not mistaken for a superseded one.
+            Some(addr) = teardown_rx.recv() => {
+                if sessions.remove(&addr).is_some() {
+                    warn!(peer = %addr, "BGP peer command queue full; tearing the session down to resync");
                 }
                 continue;
             }
@@ -1952,7 +1971,14 @@ pub async fn run(
                 continue;
             }
             Some(r) = redist.recv() => {
-                apply_redistribution(r, &mut originated, &aggregates, &mut advertised, &sessions)
+                apply_redistribution(
+                    r,
+                    &mut originated,
+                    &aggregates,
+                    &mut advertised,
+                    &sessions,
+                    &teardown_tx,
+                )
                     .await;
                 continue;
             }
@@ -1977,7 +2003,7 @@ pub async fn run(
                     for (peer, pfx) in now_invalid {
                         debug!(%pfx, "RPKI: route became invalid after RTR update; withdrawing");
                         if let Some(ev) = rib.withdraw(peer, pfx) {
-                            apply_event(ev, vrf_table, &updates, &sessions).await;
+                            apply_event(ev, vrf_table, &updates, &sessions, &teardown_tx).await;
                         }
                     }
                 }
@@ -2039,7 +2065,7 @@ pub async fn run(
                     // Withdraw everything this peer taught us across every RIB (no
                     // graceful-restart retention for a de-configured peer).
                     for ev in rib.withdraw_peer(addr) {
-                        apply_event(ev, vrf_table, &updates, &sessions).await;
+                        apply_event(ev, vrf_table, &updates, &sessions, &teardown_tx).await;
                     }
                     for ev in evpn_rib.withdraw_peer(addr) {
                         handle_evpn_event(
@@ -2051,6 +2077,7 @@ pub async fn run(
                             &mut evpn_subscribers,
                             &local,
                             &sessions,
+                            &teardown_tx,
                         )
                         .await;
                     }
@@ -2339,6 +2366,7 @@ pub async fn run(
                             &mut addpath,
                             &addpath_send,
                             &sessions,
+                            &teardown_tx,
                         )
                         .await;
                     }
@@ -2410,7 +2438,7 @@ pub async fn run(
                 };
                 if !retained {
                     for ev in rib.withdraw_peer(p) {
-                        apply_event(ev, vrf_table, &updates, &sessions).await;
+                        apply_event(ev, vrf_table, &updates, &sessions, &teardown_tx).await;
                     }
                 }
                 // EVPN (RFC 7432): drop everything this peer taught us and re-propagate
@@ -2426,6 +2454,7 @@ pub async fn run(
                         &mut evpn_subscribers,
                         &local,
                         &sessions,
+                        &teardown_tx,
                     )
                     .await;
                 }
@@ -2442,7 +2471,15 @@ pub async fn run(
                     log_linkstate_event(&ev);
                 }
                 for pfx in addpath_affected {
-                    propagate_addpath(pfx, &rib, &local, &mut addpath, &addpath_send, &sessions)
+                    propagate_addpath(
+                        pfx,
+                        &rib,
+                        &local,
+                        &mut addpath,
+                        &addpath_send,
+                        &sessions,
+                        &teardown_tx,
+                    )
                         .await;
                 }
             }
@@ -2491,7 +2528,7 @@ pub async fn run(
                     } else {
                         info!(peer = %p, count = s.prefixes.len(), "BGP graceful restart complete; flushing un-refreshed routes");
                     }
-                    flush_stale(p, s.prefixes, &mut rib, vrf_table, &updates, &sessions).await;
+                    flush_stale(p, s.prefixes, &mut rib, vrf_table, &updates, &sessions, &teardown_tx).await;
                 }
             }
             PeerMsg::Update {
@@ -2549,12 +2586,12 @@ pub async fn run(
                 for (i, w) in update.withdrawn.iter().enumerate() {
                     let path_id = update.withdrawn_path_ids.get(i).copied().unwrap_or(0);
                     if let Some(ev) = rib.withdraw_with_id(peer, path_id, *w) {
-                        apply_event(ev, vrf_table, &updates, &sessions).await;
+                        apply_event(ev, vrf_table, &updates, &sessions, &teardown_tx).await;
                     }
                 }
                 for w in mp_unreach_v6(&update) {
                     if let Some(ev) = rib.withdraw(peer, *w) {
-                        apply_event(ev, vrf_table, &updates, &sessions).await;
+                        apply_event(ev, vrf_table, &updates, &sessions, &teardown_tx).await;
                     }
                 }
                 // Confederation loop avoidance (RFC 5065 §5.4): drop reachability
@@ -2587,7 +2624,7 @@ pub async fn run(
                     if prospective.len() as u32 > limit {
                         warn!(peer = %peer, count = prospective.len(), limit, "BGP peer exceeded max-prefix; tearing down");
                         for ev in rib.withdraw_peer(peer) {
-                            apply_event(ev, vrf_table, &updates, &sessions).await;
+                            apply_event(ev, vrf_table, &updates, &sessions, &teardown_tx).await;
                         }
                         if let Some(cmd_tx) = sessions.remove(&peer) {
                             let _ = cmd_tx.send(SessionCmd::CeaseOverLimit).await;
@@ -2641,6 +2678,7 @@ pub async fn run(
                                     vrf_table,
                                     &updates,
                                     &sessions,
+                                    &teardown_tx,
                                 )
                                 .await;
                             }
@@ -2671,6 +2709,7 @@ pub async fn run(
                             vrf_table,
                             &updates,
                             &sessions,
+                            &teardown_tx,
                         )
                         .await;
                     }
@@ -2702,6 +2741,7 @@ pub async fn run(
                             vrf_table,
                             &updates,
                             &sessions,
+                            &teardown_tx,
                         )
                         .await;
                     }
@@ -2718,6 +2758,7 @@ pub async fn run(
                             &mut evpn_subscribers,
                             &local,
                             &sessions,
+                            &teardown_tx,
                         )
                         .await;
                     }
@@ -2742,6 +2783,7 @@ pub async fn run(
                                         &mut evpn_subscribers,
                                         &local,
                                         &sessions,
+                                        &teardown_tx,
                                     )
                                     .await;
                                 }
@@ -2839,6 +2881,7 @@ pub async fn run(
                             &mut addpath,
                             &addpath_send,
                             &sessions,
+                            &teardown_tx,
                         )
                         .await;
                     }
@@ -2855,12 +2898,32 @@ pub async fn run(
 /// IPv4 and IPv6 unicast (the IPv6 prefixes ride MP_REACH_NLRI, RFC 4760); a prefix
 /// originated by `[bgp] network` (configured) is never overridden or withdrawn by
 /// redistribution.
+/// Fan one origination command out to a single established session without ever
+/// blocking the central BGP task. `try_send` never awaits: if the peer's command
+/// queue is full it is [`CMD_QUEUE`] messages behind — genuinely stuck, not briefly
+/// slow — so the peer is dropped onto `teardown` for the select loop to evict rather
+/// than stalling every other peer's route distribution behind it. A closed channel
+/// (the session already went away) lands here too and is equally harmless. Use this
+/// only for route fan-out; control commands (Cease/Shutdown/Refresh) must still
+/// `await` so they are guaranteed to reach the peer.
+fn fanout(
+    tx: &mpsc::Sender<SessionCmd>,
+    addr: IpAddr,
+    cmd: SessionCmd,
+    teardown: &mpsc::Sender<IpAddr>,
+) {
+    if tx.try_send(cmd).is_err() {
+        let _ = teardown.try_send(addr);
+    }
+}
+
 async fn apply_redistribution(
     r: Redistribution,
     originated: &mut BTreeMap<Prefix, OriginEntry>,
     aggregates: &[Aggregate],
     advertised: &mut BTreeMap<Prefix, OriginRoute>,
     sessions: &HashMap<IpAddr, mpsc::Sender<SessionCmd>>,
+    teardown: &mpsc::Sender<IpAddr>,
 ) {
     // Fold the change into the raw origination set; bail if nothing changed so an
     // idempotent re-announce produces no churn.
@@ -2927,12 +2990,12 @@ async fn apply_redistribution(
         .cloned()
         .collect();
     *advertised = next;
-    for tx in sessions.values() {
+    for (addr, tx) in sessions {
         if !adv.is_empty() {
-            let _ = tx.send(SessionCmd::Advertise(adv.clone())).await;
+            fanout(tx, *addr, SessionCmd::Advertise(adv.clone()), teardown);
         }
         if !withdrawn.is_empty() {
-            let _ = tx.send(SessionCmd::Withdraw(withdrawn.clone())).await;
+            fanout(tx, *addr, SessionCmd::Withdraw(withdrawn.clone()), teardown);
         }
     }
 }
@@ -2944,8 +3007,9 @@ async fn apply_event(
     vrf_table: u32,
     updates: &mpsc::Sender<RouteUpdate>,
     sessions: &HashMap<IpAddr, mpsc::Sender<SessionCmd>>,
+    teardown: &mpsc::Sender<IpAddr>,
 ) {
-    propagate(&ev, sessions).await;
+    propagate(&ev, sessions, teardown).await;
     emit(ev, vrf_table, updates).await;
 }
 
@@ -3018,6 +3082,7 @@ async fn import_and_install(
     vrf_table: u32,
     updates: &mpsc::Sender<RouteUpdate>,
     sessions: &HashMap<IpAddr, mpsc::Sender<SessionCmd>>,
+    teardown: &mpsc::Sender<IpAddr>,
 ) {
     // RPKI origin validation (RFC 6811): when configured to reject Invalid routes, a
     // route whose (prefix, origin AS) validates as Invalid is dropped — withdrawing any
@@ -3028,7 +3093,7 @@ async fn import_and_install(
         if roa.validate(&prefix, origin) == Validity::Invalid {
             debug!(%prefix, origin, "RPKI invalid; rejecting route");
             if let Some(ev) = rib.withdraw_with_id(peer, path_id, prefix) {
-                apply_event(ev, vrf_table, updates, sessions).await;
+                apply_event(ev, vrf_table, updates, sessions, teardown).await;
             }
             return;
         }
@@ -3040,7 +3105,7 @@ async fn import_and_install(
         None => rib.withdraw_with_id(peer, path_id, prefix),
     };
     if let Some(ev) = ev {
-        apply_event(ev, vrf_table, updates, sessions).await;
+        apply_event(ev, vrf_table, updates, sessions, teardown).await;
     }
 }
 
@@ -3048,20 +3113,29 @@ async fn import_and_install(
 /// fan-out), IPv4 or IPv6. This broadcasts unconditionally; each session applies
 /// the eBGP/iBGP propagation rules (and the IPv6 multiprotocol gating) itself, and
 /// the session that taught us the route drops it (split horizon).
-async fn propagate(ev: &RibEvent, sessions: &HashMap<IpAddr, mpsc::Sender<SessionCmd>>) {
+async fn propagate(
+    ev: &RibEvent,
+    sessions: &HashMap<IpAddr, mpsc::Sender<SessionCmd>>,
+    teardown: &mpsc::Sender<IpAddr>,
+) {
     match ev {
         RibEvent::Best { prefix, path, .. } => {
             let pr = PropRoute {
                 prefix: *prefix,
                 path: path.clone(),
             };
-            for tx in sessions.values() {
-                let _ = tx.send(SessionCmd::Propagate(vec![pr.clone()])).await;
+            for (addr, tx) in sessions {
+                fanout(tx, *addr, SessionCmd::Propagate(vec![pr.clone()]), teardown);
             }
         }
         RibEvent::Withdrawn(prefix) => {
-            for tx in sessions.values() {
-                let _ = tx.send(SessionCmd::WithdrawPropagated(vec![*prefix])).await;
+            for (addr, tx) in sessions {
+                fanout(
+                    tx,
+                    *addr,
+                    SessionCmd::WithdrawPropagated(vec![*prefix]),
+                    teardown,
+                );
             }
         }
     }
@@ -3117,6 +3191,7 @@ async fn propagate_addpath(
     state: &mut AddPathState,
     addpath_send: &HashSet<IpAddr>,
     sessions: &HashMap<IpAddr, mpsc::Sender<SessionCmd>>,
+    teardown: &mpsc::Sender<IpAddr>,
 ) {
     if !prefix.is_ipv4() {
         return;
@@ -3164,7 +3239,7 @@ async fn propagate_addpath(
         }
         let empty = advertised.is_empty();
         if !gone.is_empty() {
-            let _ = tx.send(SessionCmd::WithdrawAddPath(prefix, gone)).await;
+            fanout(tx, peer, SessionCmd::WithdrawAddPath(prefix, gone), teardown);
         }
         if !desired.is_empty() {
             let routes: Vec<AddPathRoute> = desired
@@ -3175,7 +3250,7 @@ async fn propagate_addpath(
                     path,
                 })
                 .collect();
-            let _ = tx.send(SessionCmd::AdvertiseAddPath(routes)).await;
+            fanout(tx, peer, SessionCmd::AdvertiseAddPath(routes), teardown);
         }
         if empty {
             if let Some(m) = state.out.get_mut(&peer) {
@@ -3223,10 +3298,11 @@ async fn flush_stale(
     vrf_table: u32,
     updates: &mpsc::Sender<RouteUpdate>,
     sessions: &HashMap<IpAddr, mpsc::Sender<SessionCmd>>,
+    teardown: &mpsc::Sender<IpAddr>,
 ) {
     for prefix in prefixes {
         if let Some(ev) = rib.withdraw(peer, prefix) {
-            apply_event(ev, vrf_table, updates, sessions).await;
+            apply_event(ev, vrf_table, updates, sessions, teardown).await;
         }
     }
 }
@@ -3675,6 +3751,7 @@ async fn handle_evpn_event(
     evpn_subscribers: &mut Vec<mpsc::Sender<EvpnEvent>>,
     local: &Local,
     sessions: &HashMap<IpAddr, mpsc::Sender<SessionCmd>>,
+    teardown: &mpsc::Sender<IpAddr>,
 ) {
     // Fold the change into each per-EVI MAC-VRF view (RFC 7432 §9), and stream the
     // resulting forwarding delta to every `monitor evpn` subscriber (the EVPN↔
@@ -3699,9 +3776,12 @@ async fn handle_evpn_event(
                 if *addr == from_peer || local.peers.get(addr).map(|pp| pp.evpn) != Some(true) {
                     continue;
                 }
-                let _ = tx
-                    .send(SessionCmd::PropagateEvpn(vec![route.clone()]))
-                    .await;
+                fanout(
+                    tx,
+                    *addr,
+                    SessionCmd::PropagateEvpn(vec![route.clone()]),
+                    teardown,
+                );
             }
         }
         EvpnRibEvent::Withdrawn(nlri) => {
@@ -3710,7 +3790,12 @@ async fn handle_evpn_event(
                 if *addr == from_peer || local.peers.get(addr).map(|pp| pp.evpn) != Some(true) {
                     continue;
                 }
-                let _ = tx.send(SessionCmd::WithdrawEvpn(vec![nlri.clone()])).await;
+                fanout(
+                    tx,
+                    *addr,
+                    SessionCmd::WithdrawEvpn(vec![nlri.clone()]),
+                    teardown,
+                );
             }
         }
     }
@@ -6922,6 +7007,7 @@ mod tests {
         let (tx, mut rx) = mpsc::channel::<SessionCmd>(16);
         let mut sessions = HashMap::new();
         sessions.insert(ip([10, 0, 0, 2]), tx);
+        let (teardown, _teardown_rx) = mpsc::channel::<IpAddr>(16);
         let p: Prefix = "10.5.0.0/16".parse().unwrap();
         let mut advertised: BTreeMap<Prefix, OriginRoute> = BTreeMap::new();
 
@@ -6931,6 +7017,7 @@ mod tests {
             &[],
             &mut advertised,
             &sessions,
+            &teardown,
         )
         .await;
         assert!(originated.contains_key(&p));
@@ -6946,6 +7033,7 @@ mod tests {
             &[],
             &mut advertised,
             &sessions,
+            &teardown,
         )
         .await;
         assert!(rx.try_recv().is_err());
@@ -6956,10 +7044,43 @@ mod tests {
             &[],
             &mut advertised,
             &sessions,
+            &teardown,
         )
         .await;
         assert!(!originated.contains_key(&p));
         assert!(matches!(rx.try_recv().unwrap(), SessionCmd::Withdraw(_)));
+    }
+
+    #[tokio::test]
+    async fn a_full_peer_queue_triggers_teardown_instead_of_blocking() {
+        // Backpressure guard: a peer whose command queue is full is genuinely stuck
+        // (`CMD_QUEUE` messages behind). Route fan-out must never await it — that would
+        // stall distribution to every other peer — so `fanout` drops it onto the
+        // teardown channel for the central loop to evict and resync.
+        let mut originated: BTreeMap<Prefix, OriginEntry> = BTreeMap::new();
+        // A capacity-1 channel we then fill, so the fan-out's `try_send` cannot enqueue.
+        // `_rx` is bound (not `_`) so the receiver stays alive and the send fails with
+        // Full, not Closed — the stuck-peer case, not a gone-peer one.
+        let (tx, _rx) = mpsc::channel::<SessionCmd>(1);
+        tx.try_send(SessionCmd::Withdraw(vec![])).unwrap(); // occupy the single slot
+        let stuck = ip([10, 0, 0, 9]);
+        let mut sessions = HashMap::new();
+        sessions.insert(stuck, tx);
+        let (teardown, mut teardown_rx) = mpsc::channel::<IpAddr>(16);
+        let mut advertised: BTreeMap<Prefix, OriginRoute> = BTreeMap::new();
+
+        // The new advertisement fans out to the stuck peer; the send fails and the peer
+        // is scheduled for teardown rather than blocking the central task.
+        apply_redistribution(
+            Redistribution::Announce(static_route("10.9.0.0/16")),
+            &mut originated,
+            &[],
+            &mut advertised,
+            &sessions,
+            &teardown,
+        )
+        .await;
+        assert_eq!(teardown_rx.try_recv().ok(), Some(stuck));
     }
 
     #[tokio::test]
@@ -6978,6 +7099,7 @@ mod tests {
         let (tx, mut rx) = mpsc::channel::<SessionCmd>(16);
         let mut sessions = HashMap::new();
         sessions.insert(ip([10, 0, 0, 2]), tx);
+        let (teardown, _teardown_rx) = mpsc::channel::<IpAddr>(16);
         let mut advertised: BTreeMap<Prefix, OriginRoute> = BTreeMap::new();
 
         apply_redistribution(
@@ -6986,6 +7108,7 @@ mod tests {
             &[],
             &mut advertised,
             &sessions,
+            &teardown,
         )
         .await;
         assert!(originated.contains_key(&p)); // configured: kept
@@ -7000,6 +7123,7 @@ mod tests {
         let (tx, mut rx) = mpsc::channel::<SessionCmd>(16);
         let mut sessions = HashMap::new();
         sessions.insert(ip([10, 0, 0, 2]), tx);
+        let (teardown, _teardown_rx) = mpsc::channel::<IpAddr>(16);
         let p: Prefix = "2001:db8:99::/64".parse().unwrap();
         let mut advertised: BTreeMap<Prefix, OriginRoute> = BTreeMap::new();
 
@@ -7009,6 +7133,7 @@ mod tests {
             &[],
             &mut advertised,
             &sessions,
+            &teardown,
         )
         .await;
         assert!(originated.contains_key(&p));
