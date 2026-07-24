@@ -14,7 +14,8 @@
 # The test asserts:
 #   * before the refresh, A shows B Established with no refresh counter;
 #   * `bgp refresh` on B reports the ROUTE-REFRESH was sent;
-#   * after it, A shows B Established with `refreshes 1` (it honoured the request);
+#   * after it, A shows B Established with `refreshes >= 1` (it honoured the
+#     request — one ROUTE-REFRESH per negotiated family, so the counter may be 2);
 #   * B still has 10.1.0.0/24 installed `proto bgp` (the session never flapped).
 #
 # Usage:  bash scripts/bgp-route-refresh-smoke.sh
@@ -88,7 +89,9 @@ unshare -Urn bash -c '
   # so A counts one per message — assert it honoured at least one.
   after="$("$WREN" --socket "$WORK/a.sock" show bgp neighbors)"
   echo "=== after refresh: show bgp neighbors (on A) ==="; echo "$after"
-  echo "$after" | grep -qE "10.0.0.2 AS 65002 Established refreshes [1-9]" \
+  # The neighbor line renders the negotiated hold time before the refresh counter
+  # (`Established hold 180 refreshes 2`), so allow that field between the two.
+  echo "$after" | grep -qE "10.0.0.2 AS 65002 Established.*refreshes [1-9]" \
     || { echo "FAIL: A did not count the ROUTE-REFRESH"; ok=0; }
 
   echo "=== ip route show proto bgp (on B) ==="
