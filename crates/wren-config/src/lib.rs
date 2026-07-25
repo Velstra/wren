@@ -847,6 +847,36 @@ pub struct BgpEvpn {
     /// The EVPN instances (one per MAC-VRF / VNI).
     #[serde(default)]
     pub instance: Vec<BgpEvpnInstance>,
+    /// The tenant IP-VRFs (one per L3 VNI) for inter-subnet forwarding.
+    #[serde(default, rename = "ip-vrf")]
+    pub ip_vrf: Vec<BgpEvpnIpVrf>,
+}
+
+/// One `[[bgp.evpn.ip-vrf]]`: a tenant IP-VRF, the L3 context symmetric IRB routes
+/// in (RFC 9136). It is a **separate entity from an instance**, not extra fields on
+/// one: an IP-VRF carries its own Route Distinguisher and its own Route Targets,
+/// which in a real deployment differ from the MAC-VRF's — several bridged VNIs
+/// usually share one routed VNI. Type-5 IP Prefix routes are imported here.
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct BgpEvpnIpVrf {
+    /// A name for this IP-VRF, used in `show` output and diagnostics.
+    pub name: String,
+    /// The **L3** VNI this tenant routes in — the value stamped on type-5 routes
+    /// and used to encapsulate inter-subnet traffic. Distinct from an instance's
+    /// L2 VNI, which bridges within one subnet.
+    #[serde(rename = "l3-vni")]
+    pub l3_vni: u32,
+    /// Route Distinguisher override, as `ip:value` or `asn:value`. Defaults to the
+    /// auto-derived `router-id:l3-vni`.
+    pub rd: Option<String>,
+    /// Route Targets to import, in the `[[filter]]` ext-community syntax. Defaults
+    /// to the auto-derived `rt:<local-as>:<l3-vni>`.
+    #[serde(default, rename = "rt-import")]
+    pub rt_import: Vec<String>,
+    /// Route Targets to attach on export. Defaults like `rt-import`.
+    #[serde(default, rename = "rt-export")]
+    pub rt_export: Vec<String>,
 }
 
 /// One `[[bgp.evpn.instance]]`: an EVPN instance (EVI) bridging one VNI.

@@ -365,11 +365,20 @@ fn format_route_event(event: &RouteEvent) -> String {
 /// - evpn vni <vni> mac <mac>                          (remote MAC withdraw)
 /// + evpn vni <vni> flood <vtep>                       (BUM flood VTEP add)
 /// - evpn vni <vni> flood <vtep>                       (BUM flood VTEP remove)
+/// + evpn l3vni <vni> prefix <p> vtep <v> [router-mac <m>] [gw <g>] [srv6 <sid>]
+///                                                     (remote subnet learn/change)
+/// - evpn l3vni <vni> prefix <p>                       (remote subnet withdraw)
 /// % end-of-dump                                       (snapshot done)
 /// ```
 ///
 /// Line-based and stable so the fabric controller can parse it into overlay-map
 /// updates. The MAC is lower-case colon-hex; `vni` names the EVI's L2 VNI.
+///
+/// The prefix lines use the distinct keyword `l3vni`, not `vni`, precisely so a
+/// consumer written against the earlier format keeps working: it matches on the
+/// keyword after the verb, so an unrecognised line is skipped rather than mistaken
+/// for a bridging update on some VNI it serves. Extensions here stay append-only
+/// for that reason.
 fn format_evpn_event(event: &EvpnEvent) -> String {
     let mut out = String::new();
     match event {
@@ -398,6 +407,29 @@ fn format_evpn_event(event: &EvpnEvent) -> String {
         }
         EvpnEvent::FloodWithdraw { vni, vtep } => {
             let _ = writeln!(out, "- evpn vni {vni} flood {vtep}");
+        }
+        EvpnEvent::PrefixUpdate {
+            l3_vni,
+            prefix,
+            vtep,
+            router_mac,
+            gw,
+            srv6_sid,
+        } => {
+            let _ = write!(out, "+ evpn l3vni {l3_vni} prefix {prefix} vtep {vtep}");
+            if let Some(mac) = router_mac {
+                let _ = write!(out, " router-mac {}", fmt_mac(mac));
+            }
+            if let Some(gw) = gw {
+                let _ = write!(out, " gw {gw}");
+            }
+            if let Some(sid) = srv6_sid {
+                let _ = write!(out, " srv6 {}", wren_bgp::srv6::sid_to_string(sid));
+            }
+            out.push('\n');
+        }
+        EvpnEvent::PrefixWithdraw { l3_vni, prefix } => {
+            let _ = writeln!(out, "- evpn l3vni {l3_vni} prefix {prefix}");
         }
         EvpnEvent::EndOfDump => out.push_str("% end-of-dump\n"),
     }
@@ -1242,5 +1274,28 @@ mod tests {
             "- evpn vni 10100 flood 10.0.0.1\n"
         );
         assert_eq!(format_evpn_event(&EvpnEvent::EndOfDump), "% end-of-dump\n");
+
+        // Type-5 (RFC 9136): a routed subnet, keyed by the tenant's L3 VNI. The
+        // keyword is `l3vni`, not `vni` — a consumer written against the earlier
+        // format must skip the line rather than read it as a bridging update for a
+        // VNI it serves, which is why the extension is append-only and re-keyed.
+        assert_eq!(
+            format_evpn_event(&EvpnEvent::PrefixUpdate {
+                l3_vni: 50100,
+                prefix: "10.20.0.0/24".parse().unwrap(),
+                vtep,
+                router_mac: Some([0x02, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE]),
+                gw: None,
+                srv6_sid: None,
+            }),
+            "+ evpn l3vni 50100 prefix 10.20.0.0/24 vtep 10.0.0.1 router-mac 02:aa:bb:cc:dd:ee\n"
+        );
+        assert_eq!(
+            format_evpn_event(&EvpnEvent::PrefixWithdraw {
+                l3_vni: 50100,
+                prefix: "10.20.0.0/24".parse().unwrap(),
+            }),
+            "- evpn l3vni 50100 prefix 10.20.0.0/24\n"
+        );
     }
 }

@@ -44,7 +44,7 @@ use wren_bgp::capability::{BgpRole, Capability, ADD_PATH_BOTH, ADD_PATH_RECEIVE,
 use wren_bgp::community::format_community;
 use wren_bgp::decision::{Path, DEFAULT_LOCAL_PREF};
 use wren_bgp::evpn::{encap_ext_community, Esi, EvpnNlri, Rd, TUNNEL_TYPE_VXLAN};
-use wren_bgp::evpn_rib::{EviChange, EviTable, EvpnRib, EvpnRibEvent};
+use wren_bgp::evpn_rib::{EviChange, EviTable, EvpnRib, EvpnRibEvent, IpVrfChange, IpVrfTable};
 use wren_bgp::ext_community::format_ext_community;
 use wren_bgp::flowspec::{Action as FsAction, FlowSpec};
 use wren_bgp::flowspec_rib::{actions_of, FlowSpecNlri, FlowSpecRib, FlowSpecRibEvent};
@@ -212,6 +212,8 @@ pub struct EvpnConfig {
     pub srv6_locator: Option<(Ipv6Addr, u8)>,
     /// The EVPN instances (one per MAC-VRF / VNI).
     pub instances: Vec<EvpnInstanceCfg>,
+    /// The tenant IP-VRFs (one per L3 VNI) for inter-subnet forwarding (RFC 9136).
+    pub ip_vrfs: Vec<IpVrfCfg>,
 }
 
 /// One resolved EVPN instance (EVI): its identifiers, Route Distinguisher, the
@@ -232,6 +234,23 @@ pub struct EvpnInstanceCfg {
     /// Static MACs to advertise as type-2 MAC/IP routes, each with an optional IP for
     /// remote ARP/ND suppression.
     pub macs: Vec<([u8; 6], Option<IpAddr>)>,
+}
+
+/// A configured tenant IP-VRF (RFC 9136): the L3 context symmetric IRB routes in.
+/// Separate from [`EvpnInstanceCfg`] because an IP-VRF has its own RD and Route
+/// Targets — several bridged L2 VNIs normally share one routed L3 VNI.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IpVrfCfg {
+    /// A name for this IP-VRF, for `show` output.
+    pub name: String,
+    /// The L3 VNI this tenant routes in.
+    pub l3_vni: u32,
+    /// The Route Distinguisher stamped on the type-5 routes it originates.
+    pub rd: Rd,
+    /// Route Targets admitting a type-5 route into this IP-VRF.
+    pub rt_import: Vec<[u8; 8]>,
+    /// Route Targets attached to every type-5 route it exports.
+    pub rt_export: Vec<[u8; 8]>,
 }
 
 /// A configured address aggregate (RFC 4271 §9.2.2.2). The `prefix` is advertised
@@ -1271,6 +1290,29 @@ pub enum EvpnEvent {
         /// The VTEP that is gone.
         vtep: IpAddr,
     },
+    /// Learn/replace a remote IP prefix (from a type-5 route): route traffic for
+    /// `prefix` into `l3_vni` toward `vtep`. The L3 counterpart of [`Self::MacUpdate`].
+    PrefixUpdate {
+        /// The tenant's **L3** VNI to encapsulate with.
+        l3_vni: u32,
+        /// The destination subnet.
+        prefix: Prefix,
+        /// The PE to tunnel to.
+        vtep: IpAddr,
+        /// The egress PE's own MAC (RFC 9135), the inner MAC DA for symmetric IRB.
+        router_mac: Option<[u8; 6]>,
+        /// The overlay next hop inside the tenant VRF, when the route supplied one.
+        gw: Option<IpAddr>,
+        /// The SRv6 service SID (End.DT4/DT6), if the prefix rides SRv6.
+        srv6_sid: Option<Srv6Sid>,
+    },
+    /// Forget a remote IP prefix in `l3_vni`.
+    PrefixWithdraw {
+        /// The tenant's L3 VNI.
+        l3_vni: u32,
+        /// The subnet that is gone.
+        prefix: Prefix,
+    },
     /// Marks the end of the initial snapshot; subsequent events are live.
     EndOfDump,
 }
@@ -1300,6 +1342,24 @@ fn evpn_event_for(vni: u32, change: &EviChange) -> EvpnEvent {
         EviChange::MacForgotten { mac, .. } => EvpnEvent::MacWithdraw { vni, mac: *mac },
         EviChange::VtepAdded { vtep } => EvpnEvent::FloodUpdate { vni, vtep: *vtep },
         EviChange::VtepRemoved { vtep } => EvpnEvent::FloodWithdraw { vni, vtep: *vtep },
+    }
+}
+
+/// The monitor event for one IP-VRF routing change, keyed by the tenant's L3 VNI.
+fn ip_vrf_event_for(l3_vni: u32, change: &IpVrfChange) -> EvpnEvent {
+    match change {
+        IpVrfChange::PrefixLearned { prefix, entry } => EvpnEvent::PrefixUpdate {
+            l3_vni,
+            prefix: *prefix,
+            vtep: entry.vtep,
+            router_mac: entry.router_mac,
+            gw: entry.gw,
+            srv6_sid: entry.srv6_sid,
+        },
+        IpVrfChange::PrefixForgotten { prefix } => EvpnEvent::PrefixWithdraw {
+            l3_vni,
+            prefix: *prefix,
+        },
     }
 }
 
@@ -1758,6 +1818,9 @@ pub async fn run(
     // reflection must preserve the next hop unchanged (§7.7).
     let mut evpn_rib = EvpnRib::new();
     let mut evis: Vec<(EvpnInstanceCfg, EviTable)> = Vec::new();
+    // The L3 counterpart: one import view per tenant IP-VRF, fed the same table
+    // events and folding the type-5 routes the MAC-VRFs ignore (RFC 9136).
+    let mut ip_vrfs: Vec<(IpVrfCfg, IpVrfTable)> = Vec::new();
     let mut evpn_originated: Vec<EvpnOriginRoute> = Vec::new();
     let mut evpn_nh: BTreeMap<EvpnNlri, Vec<u8>> = BTreeMap::new();
     // Open EVPN monitor subscriptions (`wren monitor evpn`); each receives the
@@ -1766,6 +1829,9 @@ pub async fn run(
     let mut evpn_subscribers: Vec<mpsc::Sender<EvpnEvent>> = Vec::new();
     if let Some(evpn) = &cfg.evpn {
         let nh = vtep_next_hop_octets(evpn.vtep_ip);
+        for vrf in &evpn.ip_vrfs {
+            ip_vrfs.push((vrf.clone(), IpVrfTable::new(vrf.rt_import.clone())));
+        }
         for inst in &evpn.instances {
             evis.push((inst.clone(), EviTable::new(inst.rt_import.clone())));
             // Every route this instance originates carries its export RTs plus the
@@ -2076,6 +2142,7 @@ pub async fn run(
                             Vec::new(),
                             addr,
                             &mut evis,
+                            &mut ip_vrfs,
                             &mut evpn_nh,
                             &mut evpn_subscribers,
                             &local,
@@ -2453,6 +2520,7 @@ pub async fn run(
                         Vec::new(),
                         p,
                         &mut evis,
+                        &mut ip_vrfs,
                         &mut evpn_nh,
                         &mut evpn_subscribers,
                         &local,
@@ -2757,6 +2825,7 @@ pub async fn run(
                             Vec::new(),
                             peer,
                             &mut evis,
+                            &mut ip_vrfs,
                             &mut evpn_nh,
                             &mut evpn_subscribers,
                             &local,
@@ -2782,6 +2851,7 @@ pub async fn run(
                                         nh_octets.clone(),
                                         peer,
                                         &mut evis,
+                                        &mut ip_vrfs,
                                         &mut evpn_nh,
                                         &mut evpn_subscribers,
                                         &local,
@@ -3781,6 +3851,7 @@ async fn handle_evpn_event(
     nh: Vec<u8>,
     from_peer: IpAddr,
     evis: &mut [(EvpnInstanceCfg, EviTable)],
+    ip_vrfs: &mut [(IpVrfCfg, IpVrfTable)],
     evpn_nh: &mut BTreeMap<EvpnNlri, Vec<u8>>,
     evpn_subscribers: &mut Vec<mpsc::Sender<EvpnEvent>>,
     local: &Local,
@@ -3795,6 +3866,14 @@ async fn handle_evpn_event(
         if let Some(change) = table.apply(&ev) {
             info!(evi = inst.evi, vni = inst.vni, "EVPN MAC-VRF view updated");
             fanout_evpn(evpn_subscribers, evpn_event_for(inst.vni, &change));
+        }
+    }
+    // The same fold for the tenant IP-VRFs: type-5 routes the MAC-VRFs skipped land
+    // here and stream out as routing (not bridging) deltas.
+    for (vrf, table) in ip_vrfs.iter_mut() {
+        if let Some(change) = table.apply(&ev) {
+            info!(ip_vrf = %vrf.name, l3_vni = vrf.l3_vni, "EVPN IP-VRF view updated");
+            fanout_evpn(evpn_subscribers, ip_vrf_event_for(vrf.l3_vni, &change));
         }
     }
     // Track the next hop and re-propagate to the other EVPN peers.

@@ -2742,6 +2742,52 @@ fn build_evpn_config(
             macs,
         });
     }
+    // The tenant IP-VRFs (RFC 9136). Same RD/RT resolution as an instance, but keyed
+    // on the L3 VNI — an IP-VRF's Route Targets are its own, so the auto-derived
+    // fallback must use `l3-vni`, never an instance's L2 VNI.
+    let mut ip_vrfs = Vec::with_capacity(e.ip_vrf.len());
+    for v in &e.ip_vrf {
+        let rd = match &v.rd {
+            Some(s) => parse_rd(s).with_context(|| {
+                format!(
+                    "bgp evpn ip-vrf {} rd {s:?} must be ip:value or asn:value",
+                    v.name
+                )
+            })?,
+            // An EVI derives its RD from the 16-bit `evi`; an IP-VRF has no such
+            // field, so the L3 VNI supplies the assigned number — truncated to the
+            // 2 octets the type-1 RD allows, which is why an explicit `rd` is the
+            // right answer for a VNI above 65535.
+            None => wren_bgp::evpn::Rd::from_ip(router_id, v.l3_vni as u16),
+        };
+        let mut rt_import = Vec::with_capacity(v.rt_import.len());
+        for s in &v.rt_import {
+            rt_import.push(
+                wren_bgp::ext_community::parse_ext_community(s)
+                    .with_context(|| format!("bgp evpn ip-vrf {} rt-import {s:?}", v.name))?,
+            );
+        }
+        let mut rt_export = Vec::with_capacity(v.rt_export.len());
+        for s in &v.rt_export {
+            rt_export.push(
+                wren_bgp::ext_community::parse_ext_community(s)
+                    .with_context(|| format!("bgp evpn ip-vrf {} rt-export {s:?}", v.name))?,
+            );
+        }
+        if rt_import.is_empty() && rt_export.is_empty() {
+            let auto = wren_bgp::evpn_rib::auto_route_target(local_as as u16, v.l3_vni);
+            rt_import.push(auto);
+            rt_export.push(auto);
+        }
+        ip_vrfs.push(bgp::IpVrfCfg {
+            name: v.name.clone(),
+            l3_vni: v.l3_vni,
+            rd,
+            rt_import,
+            rt_export,
+        });
+    }
+
     // Optional SRv6 locator (RFC 9252): "addr/len", byte-aligned, length 8..=96.
     let srv6_locator = match &e.srv6_locator {
         None => None,
@@ -2767,6 +2813,7 @@ fn build_evpn_config(
         vtep_ip,
         srv6_locator,
         instances,
+        ip_vrfs,
     })
 }
 
