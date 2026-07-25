@@ -19,6 +19,8 @@
 use std::collections::BTreeMap;
 use std::net::IpAddr;
 
+use wren_core::Prefix;
+
 use crate::decision::{is_better, Path};
 use crate::evpn::EvpnNlri;
 
@@ -448,6 +450,159 @@ impl EviTable {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Per-IP-VRF import view (inter-subnet forwarding, RFC 9136)
+// ---------------------------------------------------------------------------
+
+/// A remote IP prefix learned via a type-5 route: how to reach a subnet that lives
+/// behind another PE.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct RemotePrefix {
+    /// The advertising PE (the route's BGP next hop) — the tunnel destination.
+    pub vtep: IpAddr,
+    /// The **L3** VNI to encapsulate with (the route's label). Distinct from an
+    /// [`EviTable`] entry's L2 VNI: symmetric IRB routes into a per-tenant L3 VNI
+    /// rather than bridging into the destination's L2 domain.
+    pub vni: u32,
+    /// The overlay next hop inside the tenant's IP-VRF, when the advertising PE
+    /// supplies one. RFC 9136 §3.2 lets it be unspecified (all-zero) whenever the
+    /// label and next hop already identify the egress, which is the common case —
+    /// so an all-zero gateway is normalised to `None` rather than kept as `0.0.0.0`.
+    pub gw: Option<IpAddr>,
+    /// The egress PE's own MAC (RFC 9135 §4). Symmetric IRB needs it as the inner
+    /// MAC DA; without it a forwarding plane cannot build the inner frame, so an
+    /// entry lacking it is only usable for SRv6 or an already-known egress MAC.
+    pub router_mac: Option<[u8; 6]>,
+    /// The SRv6 service SID (RFC 9252 End.DT4/DT6), when the advertising PE carries
+    /// this prefix over SRv6 instead of VXLAN.
+    pub srv6_sid: Option<crate::srv6::Srv6Sid>,
+}
+
+/// A change to one IP-VRF's imported routing state, returned by
+/// [`IpVrfTable::apply`] — the L3 counterpart of [`EviChange`].
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum IpVrfChange {
+    /// A remote prefix appeared or changed.
+    PrefixLearned {
+        /// The destination subnet.
+        prefix: Prefix,
+        /// Where and how to reach it.
+        entry: RemotePrefix,
+    },
+    /// A remote prefix is gone; stop routing to it.
+    PrefixForgotten {
+        /// The destination subnet that was withdrawn.
+        prefix: Prefix,
+    },
+}
+
+/// One tenant IP-VRF's imported view: the type-5 routes whose Route Targets match
+/// its import set, collapsed across RDs into a prefix table. This is what a
+/// forwarding plane consumes for **inter-subnet** traffic — the fabric `ROUTES`
+/// trie, or a kernel VRF's routing table.
+///
+/// Deliberately simpler than [`EviTable`] in two ways. There is no MAC Mobility
+/// analogue: RFC 9136 defines no mobility sequence for prefixes, and two PEs
+/// advertising the same prefix is normal rather than a conflict (anycast, or a
+/// multihomed subnet), so [`EvpnRib`]'s best-path selection already picks one. And
+/// there is no flood set: a routed prefix has no BUM traffic.
+#[derive(Clone, Debug)]
+pub struct IpVrfTable {
+    /// Route Targets this IP-VRF imports.
+    pub import_rts: Vec<[u8; 8]>,
+    /// Remote prefixes, collapsed across RDs.
+    prefixes: BTreeMap<Prefix, RemotePrefix>,
+    /// Which NLRI backs each prefix, so a withdrawal of a *different* RD's route
+    /// for the same prefix does not tear down a route it does not own — the same
+    /// hazard [`EviTable::owners`] guards against.
+    owners: BTreeMap<Prefix, EvpnNlri>,
+}
+
+impl IpVrfTable {
+    /// An empty IP-VRF view importing `import_rts`.
+    pub fn new(import_rts: Vec<[u8; 8]>) -> Self {
+        Self {
+            import_rts,
+            prefixes: BTreeMap::new(),
+            owners: BTreeMap::new(),
+        }
+    }
+
+    /// Whether a path's Route Targets intersect this IP-VRF's import set.
+    pub fn imports(&self, path: &Path) -> bool {
+        path.ext_communities.iter().any(|c| self.import_rts.contains(c))
+    }
+
+    /// Apply one EVPN table change to this IP-VRF's view, returning `Some(change)`
+    /// when the routing state changed. Route types other than 5 are ignored — they
+    /// belong to the MAC-VRF ([`EviTable`]).
+    pub fn apply(&mut self, ev: &EvpnRibEvent) -> Option<IpVrfChange> {
+        match ev {
+            EvpnRibEvent::Best { nlri, path } => {
+                if !self.imports(path) {
+                    // An RT change can move a route out of our import set; treat a
+                    // non-matching Best as a withdrawal of whatever it backed.
+                    return self.remove_if_owner(nlri);
+                }
+                let EvpnNlri::IpPrefix {
+                    prefix, gw, label, ..
+                } = nlri
+                else {
+                    return None;
+                };
+                let entry = RemotePrefix {
+                    vtep: path.next_hop,
+                    vni: *label,
+                    gw: specified_gw(*gw),
+                    router_mac: router_mac(path),
+                    srv6_sid: path.srv6_sid.map(|s| s.sid),
+                };
+                let changed = self.prefixes.get(prefix) != Some(&entry);
+                self.prefixes.insert(*prefix, entry.clone());
+                self.owners.insert(*prefix, nlri.clone());
+                changed.then_some(IpVrfChange::PrefixLearned {
+                    prefix: *prefix,
+                    entry,
+                })
+            }
+            EvpnRibEvent::Withdrawn(nlri) => self.remove_if_owner(nlri),
+        }
+    }
+
+    fn remove_if_owner(&mut self, nlri: &EvpnNlri) -> Option<IpVrfChange> {
+        let EvpnNlri::IpPrefix { prefix, .. } = nlri else {
+            return None;
+        };
+        if self.owners.get(prefix) != Some(nlri) {
+            return None;
+        }
+        self.owners.remove(prefix);
+        self.prefixes
+            .remove(prefix)
+            .map(|_| IpVrfChange::PrefixForgotten { prefix: *prefix })
+    }
+
+    /// The remote-prefix table, in prefix order.
+    pub fn iter_prefixes(&self) -> impl Iterator<Item = (&Prefix, &RemotePrefix)> {
+        self.prefixes.iter()
+    }
+
+    /// How to reach `prefix`, if it is known.
+    pub fn lookup(&self, prefix: &Prefix) -> Option<&RemotePrefix> {
+        self.prefixes.get(prefix)
+    }
+}
+
+/// A type-5 gateway address, or `None` when it is the RFC 9136 §3.2 "unspecified"
+/// all-zero value meaning "the label and next hop identify the egress".
+fn specified_gw(gw: IpAddr) -> Option<IpAddr> {
+    match gw {
+        IpAddr::V4(a) if a.is_unspecified() => None,
+        IpAddr::V6(a) if a.is_unspecified() => None,
+        other => Some(other),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -495,6 +650,106 @@ mod tests {
             label1: vni,
             label2: None,
         }
+    }
+
+    /// A type-5 IP Prefix route for `prefix` under RD `rd_val`, carrying L3 VNI
+    /// `vni` and the given gateway.
+    fn prefix_route(rd_val: u16, prefix: &str, vni: u32, gw: IpAddr) -> EvpnNlri {
+        EvpnNlri::IpPrefix {
+            rd: Rd::from_ip(Ipv4Addr::new(192, 0, 2, rd_val as u8), rd_val),
+            esi: Esi::ZERO,
+            eth_tag: 0,
+            prefix: prefix.parse().expect("a prefix"),
+            gw,
+            label: vni,
+        }
+    }
+
+    /// A path carrying the import RT and a Router's MAC community.
+    fn irb_path(peer: [u8; 4], pe_mac: [u8; 6]) -> Path {
+        let mut p = path(100, peer, vec![RT]);
+        p.ext_communities.push(build_router_mac(pe_mac));
+        p
+    }
+
+    #[test]
+    fn ip_vrf_imports_type5_prefixes_and_normalises_the_gateway() {
+        let mut vrf = IpVrfTable::new(vec![RT]);
+        let pe_mac = [0x02, 0xAA, 0, 0, 0, 0x01];
+        let unspecified: IpAddr = Ipv4Addr::UNSPECIFIED.into();
+
+        // RFC 9136 §3.2: an all-zero gateway means "the label and next hop identify
+        // the egress". Keeping it as 0.0.0.0 would let a forwarding plane install a
+        // route via a bogus next hop, so it must arrive as None.
+        let nlri = prefix_route(1, "10.20.0.0/24", 50100, unspecified);
+        let change = vrf.apply(&EvpnRibEvent::Best {
+            nlri: nlri.clone(),
+            path: irb_path([10, 0, 0, 1], pe_mac),
+        });
+        let entry = match change {
+            Some(IpVrfChange::PrefixLearned { ref entry, .. }) => entry.clone(),
+            other => panic!("expected the prefix to be learned, got {other:?}"),
+        };
+        assert_eq!(entry.vtep, ip([10, 0, 0, 1]));
+        assert_eq!(entry.vni, 50100, "the L3 VNI, not an L2 one");
+        assert_eq!(entry.gw, None, "an unspecified gateway is not a next hop");
+        assert_eq!(entry.router_mac, Some(pe_mac));
+
+        // A real gateway survives.
+        let with_gw = prefix_route(1, "10.30.0.0/24", 50100, ip([10, 20, 0, 254]));
+        vrf.apply(&EvpnRibEvent::Best {
+            nlri: with_gw,
+            path: irb_path([10, 0, 0, 1], pe_mac),
+        });
+        let e = vrf.lookup(&"10.30.0.0/24".parse().unwrap()).expect("known");
+        assert_eq!(e.gw, Some(ip([10, 20, 0, 254])));
+
+        // A route whose RTs we do not import is not ours to route.
+        let mut other = IpVrfTable::new(vec![[0x00, 0x02, 0, 1, 0, 0, 0, 9]]);
+        assert_eq!(
+            other.apply(&EvpnRibEvent::Best {
+                nlri: nlri.clone(),
+                path: irb_path([10, 0, 0, 1], pe_mac)
+            }),
+            None
+        );
+
+        // Type-2 belongs to the MAC-VRF and must not land here.
+        assert_eq!(
+            vrf.apply(&EvpnRibEvent::Best {
+                nlri: mac_route(1, 0x01, 10100),
+                path: irb_path([10, 0, 0, 1], pe_mac)
+            }),
+            None
+        );
+    }
+
+    #[test]
+    fn a_foreign_rds_withdrawal_does_not_tear_down_the_prefix() {
+        // Two PEs advertise the same subnet under different RDs — normal for an
+        // anycast or multihomed subnet. Whichever route currently backs the entry
+        // owns it; the other one's withdrawal must not remove a route it never
+        // installed, or the surviving PE's path would silently disappear.
+        let mut vrf = IpVrfTable::new(vec![RT]);
+        let pe_mac = [0x02, 0xAA, 0, 0, 0, 0x01];
+        let mine = prefix_route(1, "10.20.0.0/24", 50100, Ipv4Addr::UNSPECIFIED.into());
+        let theirs = prefix_route(2, "10.20.0.0/24", 50100, Ipv4Addr::UNSPECIFIED.into());
+
+        vrf.apply(&EvpnRibEvent::Best {
+            nlri: mine.clone(),
+            path: irb_path([10, 0, 0, 1], pe_mac),
+        });
+        assert_eq!(vrf.apply(&EvpnRibEvent::Withdrawn(theirs)), None);
+        assert!(vrf.lookup(&"10.20.0.0/24".parse().unwrap()).is_some());
+
+        // The owner's own withdrawal does remove it.
+        assert_eq!(
+            vrf.apply(&EvpnRibEvent::Withdrawn(mine)),
+            Some(IpVrfChange::PrefixForgotten {
+                prefix: "10.20.0.0/24".parse().unwrap()
+            })
+        );
+        assert!(vrf.lookup(&"10.20.0.0/24".parse().unwrap()).is_none());
     }
 
     /// A MAC Mobility extended community with `seq` and the sticky flag.
