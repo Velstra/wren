@@ -54,7 +54,10 @@
 use std::net::Ipv6Addr;
 
 pub mod flood;
-pub mod hmac;
+/// SHA-256 / HMAC-SHA-256, shared with the other protocols that need packet
+/// authentication (IS-IS RFC 5310 uses the same primitive). Re-exported at its
+/// original path so callers are unaffected by the move into `wren-core`.
+pub use wren_core::hmac;
 pub mod interface;
 pub mod lsa;
 pub mod lsdb;
