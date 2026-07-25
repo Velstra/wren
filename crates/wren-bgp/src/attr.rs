@@ -340,6 +340,51 @@ pub enum PathAttribute {
     },
 }
 
+/// What a decoded path attribute means for the UPDATE that carries it — the
+/// error-handling categories of RFC 7606 §2, minus the two that never reach here.
+///
+/// [`PathAttribute::decode`] returns `None` for the third category,
+/// "treat-as-withdraw": either the attribute is malformed in a way that could
+/// affect route selection, or the attribute block itself is unparseable (§4). The
+/// remaining two categories, "session reset" and "AFI/SAFI disable", are decided
+/// at the message level and never by an individual attribute.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AttrOutcome {
+    /// The attribute decoded cleanly and takes part in the UPDATE.
+    Keep(PathAttribute),
+    /// The attribute is malformed, but RFC 7606 confines the damage to the
+    /// attribute itself: drop it and process the rest of the UPDATE normally.
+    /// Reserved for attributes that cannot affect route selection or installation
+    /// (§2) — in practice ATOMIC_AGGREGATE (§7.6) and AGGREGATOR (§7.7).
+    Discard {
+        /// The discarded attribute's type code, so the caller can still enforce
+        /// the once-per-UPDATE rule of §3(g) against it.
+        type_code: u8,
+    },
+}
+
+/// Classify a malformed-but-discardable attribute. RFC 7606 §3(c) escalates
+/// contradictory Optional/Transitive bits to treat-as-withdraw *whatever* the
+/// attribute is, and §7.6/§7.7 prescribe discard only for a bad length — so an
+/// attribute qualifies for discard solely when its flags are canonical and it is
+/// the length that is wrong. `canonical` is the attribute's canonical flag byte.
+fn discard_or_withdraw(
+    flags: u8,
+    canonical: u8,
+    type_code: u8,
+    end: usize,
+) -> Option<(AttrOutcome, usize)> {
+    // Mirrors the flag validation applied to well-formed attributes below.
+    let defining = FLAG_OPTIONAL | FLAG_TRANSITIVE;
+    if flags & defining != canonical & defining {
+        return None;
+    }
+    if canonical & defining != FLAG_OPTIONAL | FLAG_TRANSITIVE && flags & FLAG_PARTIAL != 0 {
+        return None;
+    }
+    Some((AttrOutcome::Discard { type_code }, end))
+}
+
 impl PathAttribute {
     const ORIGIN: u8 = 1;
     const AS_PATH: u8 = 2;
@@ -609,7 +654,7 @@ impl PathAttribute {
 
     /// Decode one attribute from the front of `buf`, returning it and the number
     /// of bytes consumed. `four_octet` chooses the AS_PATH / AGGREGATOR width.
-    pub fn decode(buf: &[u8], four_octet: bool) -> Option<(PathAttribute, usize)> {
+    pub fn decode(buf: &[u8], four_octet: bool) -> Option<(AttrOutcome, usize)> {
         if buf.len() < 3 {
             return None;
         }
@@ -650,10 +695,12 @@ impl PathAttribute {
             Self::MED => PathAttribute::MultiExitDisc(read_u32(value)?),
             Self::LOCAL_PREF => PathAttribute::LocalPref(read_u32(value)?),
             Self::ATOMIC_AGGREGATE => {
-                // RFC 7606 §5: ATOMIC_AGGREGATE is a fixed 0-length attribute — a
-                // value-bearing one is malformed, not silently accepted.
+                // RFC 7606 §7.6: ATOMIC_AGGREGATE is a fixed 0-length attribute — a
+                // value-bearing one is malformed, and because the attribute cannot
+                // affect route selection the prescribed handling is attribute
+                // discard rather than withdrawing the UPDATE's routes.
                 if !value.is_empty() {
-                    return None;
+                    return discard_or_withdraw(flags, FLAG_TRANSITIVE, type_code, end);
                 }
                 PathAttribute::AtomicAggregate
             }
@@ -769,10 +816,17 @@ impl PathAttribute {
                     .collect();
                 PathAttribute::ClusterList(ids)
             }
-            Self::AGGREGATOR => {
-                let (asn, id) = decode_aggregator(value, four_octet)?;
-                PathAttribute::Aggregator { asn, id }
-            }
+            Self::AGGREGATOR => match decode_aggregator(value, four_octet) {
+                Some((asn, id)) => PathAttribute::Aggregator { asn, id },
+                // RFC 7606 §7.7: a wrong-length AGGREGATOR is attribute discard —
+                // like ATOMIC_AGGREGATE it is purely informational. (AS4_AGGREGATOR
+                // below is deliberately left at treat-as-withdraw: RFC 7606 §7 hands
+                // it to §8 rather than prescribing discard.)
+                None => {
+                    let canonical = FLAG_OPTIONAL | FLAG_TRANSITIVE;
+                    return discard_or_withdraw(flags, canonical, type_code, end);
+                }
+            },
             Self::AS4_AGGREGATOR => {
                 let (asn, id) = decode_aggregator(value, true)?;
                 PathAttribute::As4Aggregator { asn, id }
@@ -830,7 +884,7 @@ impl PathAttribute {
         if !optional_transitive && flags & FLAG_PARTIAL != 0 {
             return None;
         }
-        Some((attr, end))
+        Some((AttrOutcome::Keep(attr), end))
     }
 }
 
@@ -992,11 +1046,22 @@ mod tests {
         Ipv4Addr::from(o)
     }
 
+    /// Decode one attribute that is expected to survive: `None` for a
+    /// treat-as-withdraw verdict, and a panic if RFC 7606 discarded it instead.
+    fn decode_kept(buf: &[u8], four_octet: bool) -> Option<(PathAttribute, usize)> {
+        match PathAttribute::decode(buf, four_octet)? {
+            (AttrOutcome::Keep(a), used) => Some((a, used)),
+            (AttrOutcome::Discard { type_code }, _) => {
+                panic!("attribute type {type_code} was discarded, expected it to be kept")
+            }
+        }
+    }
+
     /// Round-trip an attribute at the given on-wire AS width.
     fn roundtrip_w(attr: PathAttribute, four_octet: bool) {
         let mut buf = Vec::new();
         attr.encode(&mut buf, four_octet);
-        let (decoded, used) = PathAttribute::decode(&buf, four_octet).expect("decodes");
+        let (decoded, used) = decode_kept(&buf, four_octet).expect("decodes");
         assert_eq!(decoded, attr);
         assert_eq!(used, buf.len());
     }
@@ -1089,7 +1154,7 @@ mod tests {
         let attr = PathAttribute::AsPath(vec![AsPathSegment::Sequence(vec![196_618, 65001])]);
         let mut buf = Vec::new();
         attr.encode(&mut buf, false);
-        let (decoded, _) = PathAttribute::decode(&buf, false).unwrap();
+        let (decoded, _) = decode_kept(&buf, false).unwrap();
         assert_eq!(
             decoded,
             PathAttribute::AsPath(vec![AsPathSegment::Sequence(vec![
@@ -1400,28 +1465,53 @@ mod tests {
     #[test]
     fn variable_length_attributes_reject_wrong_length_rfc7606() {
         // ATOMIC_AGGREGATE (type 6) is exactly 0 octets; the empty canonical form
-        // decodes, a value-bearing one is malformed (RFC 7606 §5).
-        assert!(PathAttribute::decode(&[FLAG_TRANSITIVE, 6, 0], true).is_some());
-        assert!(PathAttribute::decode(&[FLAG_TRANSITIVE, 6, 1, 0], true).is_none());
-        // AGGREGATOR (type 7) is exactly asn_len + 4 (8 octets with a 4-octet AS);
-        // the exact form decodes, a padded one is malformed (RFC 7606 §5/§7.7).
-        assert!(
-            PathAttribute::decode(
-                &[FLAG_OPTIONAL | FLAG_TRANSITIVE, 7, 8, 0, 0, 0, 1, 10, 0, 0, 1],
-                true
-            )
-            .is_some()
+        // decodes, a value-bearing one is malformed and discarded (RFC 7606 §7.6).
+        assert!(decode_kept(&[FLAG_TRANSITIVE, 6, 0], true).is_some());
+        assert_eq!(
+            PathAttribute::decode(&[FLAG_TRANSITIVE, 6, 1, 0], true),
+            Some((AttrOutcome::Discard { type_code: 6 }, 4))
         );
+        // AGGREGATOR (type 7) is exactly asn_len + 4 (8 octets with a 4-octet AS);
+        // the exact form decodes, a padded one is discarded (RFC 7606 §7.7).
         assert!(
+            decode_kept(&[FLAG_OPTIONAL | FLAG_TRANSITIVE, 7, 8, 0, 0, 0, 1, 10, 0, 0, 1], true)
+                .is_some()
+        );
+        assert_eq!(
             PathAttribute::decode(
                 &[FLAG_OPTIONAL | FLAG_TRANSITIVE, 7, 10, 0, 0, 0, 1, 10, 0, 0, 1, 9, 9],
                 true
-            )
-            .is_none()
+            ),
+            Some((AttrOutcome::Discard { type_code: 7 }, 13))
         );
-        // ORIGINATOR_ID (type 9, RFC 4456) is exactly 4 octets.
-        assert!(PathAttribute::decode(&[FLAG_OPTIONAL, 9, 4, 10, 0, 0, 1], true).is_some());
+        // ORIGINATOR_ID (type 9, RFC 4456) is exactly 4 octets. RFC 7606 §7.9 keeps
+        // a wrong-length one at treat-as-withdraw — discard applies there only to an
+        // ORIGINATOR_ID arriving from an external neighbour, which is a policy
+        // decision above the decoder.
+        assert!(decode_kept(&[FLAG_OPTIONAL, 9, 4, 10, 0, 0, 1], true).is_some());
         assert!(PathAttribute::decode(&[FLAG_OPTIONAL, 9, 5, 10, 0, 0, 1, 0], true).is_none());
+    }
+
+    #[test]
+    fn attribute_discard_requires_canonical_flags_rfc7606() {
+        // RFC 7606 §3(c): contradictory Optional/Transitive bits are treat-as-withdraw
+        // whatever the attribute, so the §7.6/§7.7 discard must not swallow them. Each
+        // pair below is the same wrong-length value, once with canonical flags
+        // (discard) and once with broken flags (withdraw).
+        let bad_len = |flags: u8| PathAttribute::decode(&[flags, 6, 1, 0], true);
+        assert!(matches!(bad_len(FLAG_TRANSITIVE), Some((AttrOutcome::Discard { .. }, _))));
+        // ATOMIC_AGGREGATE is well-known transitive: Optional or Partial is a conflict.
+        assert!(bad_len(FLAG_OPTIONAL | FLAG_TRANSITIVE).is_none());
+        assert!(bad_len(FLAG_TRANSITIVE | FLAG_PARTIAL).is_none());
+
+        // AGGREGATOR is optional transitive, so Partial is legal but dropping either
+        // defining bit is not.
+        let agg = |flags: u8| PathAttribute::decode(&[flags, 7, 10, 0, 0, 0, 1, 10, 0, 0, 1, 9, 9], true);
+        let canonical = FLAG_OPTIONAL | FLAG_TRANSITIVE;
+        assert!(matches!(agg(canonical), Some((AttrOutcome::Discard { .. }, _))));
+        assert!(matches!(agg(canonical | FLAG_PARTIAL), Some((AttrOutcome::Discard { .. }, _))));
+        assert!(agg(FLAG_TRANSITIVE).is_none());
+        assert!(agg(FLAG_OPTIONAL).is_none());
     }
 
     #[test]
@@ -1443,7 +1533,7 @@ mod tests {
         let mut buf = Vec::new();
         attr.encode(&mut buf, true);
         assert_ne!(buf[0] & FLAG_EXTENDED_LEN, 0, "extended-length flag set");
-        let (decoded, used) = PathAttribute::decode(&buf, true).unwrap();
+        let (decoded, used) = decode_kept(&buf, true).unwrap();
         assert_eq!(decoded, attr);
         assert_eq!(used, buf.len());
     }

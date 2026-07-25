@@ -12,7 +12,7 @@ use std::net::Ipv4Addr;
 
 use wren_core::Prefix;
 
-use crate::attr::PathAttribute;
+use crate::attr::{AttrOutcome, PathAttribute};
 use crate::capability::{encode_optional_parameters, parse_optional_parameters, Capability};
 use crate::{
     as_trans_fit, decode_prefix, encode_prefix, MessageType, AFI_IPV4, HEADER_LEN, MARKER,
@@ -581,13 +581,23 @@ fn decode_attributes(mut buf: &[u8], four_octet: bool) -> Result<Vec<PathAttribu
     // keeping the first or last copy.
     let mut seen = [false; 256];
     while !buf.is_empty() {
-        let (a, used) = PathAttribute::decode(buf, four_octet).ok_or(DecodeError::Malformed)?;
-        let tc = a.type_code() as usize;
+        let (outcome, used) =
+            PathAttribute::decode(buf, four_octet).ok_or(DecodeError::Malformed)?;
+        // §3(g) counts an attribute that *appeared*, so a discarded one still
+        // occupies its type code.
+        let tc = match &outcome {
+            AttrOutcome::Keep(a) => a.type_code(),
+            AttrOutcome::Discard { type_code } => *type_code,
+        } as usize;
         if seen[tc] {
             return Err(DecodeError::Malformed);
         }
         seen[tc] = true;
-        out.push(a);
+        // RFC 7606 §2 "attribute discard": drop this attribute alone and keep
+        // processing — the UPDATE's routes are unaffected.
+        if let AttrOutcome::Keep(a) = outcome {
+            out.push(a);
+        }
         buf = &buf[used..];
     }
     Ok(out)
@@ -711,12 +721,60 @@ mod tests {
     }
 
     #[test]
-    fn malformed_mp_reach_does_not_reset_the_session_rfc7606() {
-        // RFC 7606 §7.11: a malformed MP_REACH_NLRI / MP_UNREACH_NLRI is handled as
-        // treat-as-withdraw, never as a session reset. Both are truncated below their
-        // fixed preamble (MP_REACH needs AFI/SAFI/NextHop-Length plus the Reserved
-        // octet, MP_UNREACH needs AFI/SAFI), so it is the length that makes them
-        // malformed here and not their flags, which are the canonical 0x80.
+    fn atomic_aggregate_wrong_length_is_discard_not_withdraw_rfc7606() {
+        // RFC 7606 §7.6/§7.7: ATOMIC_AGGREGATE and AGGREGATOR cannot influence route
+        // selection, so a malformed one is discarded on its own — the UPDATE's NLRI
+        // stays *advertised* rather than being withdrawn as a malformed MED would be.
+        // type 6 len 1 (must be 0); type 7 len 10 (must be 8 at a 4-octet AS width).
+        for broken in [vec![0x40, 6, 1, 0], vec![0xC0, 7, 10, 0, 0, 0, 1, 10, 0, 0, 1, 9, 9]] {
+            let type_code = broken[1];
+            let mut attrs = Vec::new();
+            PathAttribute::Origin(Origin::Igp).encode(&mut attrs, true);
+            PathAttribute::AsPath(vec![AsPathSegment::Sequence(vec![65001])])
+                .encode(&mut attrs, true);
+            PathAttribute::NextHop(ip([10, 0, 0, 1])).encode(&mut attrs, true);
+            attrs.extend_from_slice(&broken);
+
+            let msg = frame_update(&update_body(&attrs));
+            let Message::Update(u) = Message::decode(&msg, true, AddPath::NONE).expect("decodes")
+            else {
+                panic!("expected UPDATE")
+            };
+            assert_eq!(u.nlri, vec![p("10.0.0.0/24")], "type {type_code}: NLRI is kept");
+            assert!(u.withdrawn.is_empty(), "type {type_code}: nothing withdrawn");
+            assert_eq!(u.attributes.len(), 3, "type {type_code}: only the good three");
+            assert!(
+                !u.attributes.iter().any(|a| a.type_code() == type_code),
+                "type {type_code}: the malformed attribute itself is gone"
+            );
+        }
+    }
+
+    #[test]
+    fn a_discarded_attribute_still_counts_as_a_duplicate_rfc7606() {
+        // RFC 7606 §3(g) is about an attribute *appearing* twice, so discarding the
+        // second copy must not hide the duplicate. Two malformed ATOMIC_AGGREGATEs
+        // make the UPDATE malformed even though neither would be kept.
+        assert!(decode_attributes(&[0x40, 6, 1, 0], false).is_ok());
+        assert!(decode_attributes(&[0x40, 6, 1, 0, 0x40, 6, 1, 0], false).is_err());
+    }
+
+    #[test]
+    fn malformed_mp_attributes_are_treated_as_withdraw() {
+        // RFC 7606 §7.12 hands MP_UNREACH_NLRI (type 15) to the general rules of
+        // §3/§4, so a malformed one is treat-as-withdraw and must never reset the
+        // session.
+        //
+        // MP_REACH_NLRI (type 14) is a DELIBERATE DEVIATION: because the Next Hop
+        // precedes the NLRI, §7.11 requires "session reset" or "AFI/SAFI disable".
+        // wren is intentionally more lenient and withdraws instead, so a peer emitting
+        // a broken MP_REACH cannot tear the session down; AFI/SAFI disable would be
+        // the conforming replacement. This test pins that choice so it stays explicit.
+        //
+        // Both attributes are truncated below their fixed preamble (MP_REACH needs
+        // AFI/SAFI/NextHop-Length plus the Reserved octet, MP_UNREACH needs AFI/SAFI),
+        // so it is the length that makes them malformed and not their flags, which are
+        // the canonical 0x80.
         let mut base = Vec::new();
         PathAttribute::Origin(Origin::Igp).encode(&mut base, true);
         PathAttribute::AsPath(vec![AsPathSegment::Sequence(vec![65001])]).encode(&mut base, true);
