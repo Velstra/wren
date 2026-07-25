@@ -170,6 +170,12 @@ pub struct RemoteMac {
     /// The SRv6 service SID from the route's Prefix-SID attribute (RFC 9252), if
     /// the advertising PE carries this MAC over SRv6 (End.DT2U) instead of VXLAN.
     pub srv6_sid: Option<crate::srv6::Srv6Sid>,
+    /// The advertising PE's own MAC, from the Router's MAC extended community
+    /// (RFC 9135 §4). Only **symmetric** IRB needs it: the ingress PE routes into
+    /// the L3 VNI and must address the inner Ethernet frame to the egress PE, so
+    /// this is the inner MAC DA. Asymmetric IRB bridges to the destination host's
+    /// own MAC and the community is absent — hence `Option`, not a default.
+    pub router_mac: Option<[u8; 6]>,
 }
 
 /// A change to one EVI's imported forwarding state, returned by
@@ -221,6 +227,35 @@ struct MacMobility {
 const EC_TYPE_EVPN: u8 = 0x06;
 const EC_SUBTYPE_MAC_MOBILITY: u8 = 0x00;
 const MAC_MOBILITY_STICKY: u8 = 0x01;
+/// The Router's MAC extended community (RFC 9135 §4): same EVPN type 0x06, sub-type
+/// 0x03, and the remaining six octets are the advertising PE's MAC address.
+const EC_SUBTYPE_ROUTER_MAC: u8 = 0x03;
+
+/// Build the Router's MAC extended community for `mac`, to attach to the routes a
+/// PE originates for symmetric IRB (RFC 9135 §4 sends it with RT-2; RFC 9136 does
+/// the same for the RT-5 IP Prefix route).
+pub fn build_router_mac(mac: [u8; 6]) -> [u8; 8] {
+    [
+        EC_TYPE_EVPN,
+        EC_SUBTYPE_ROUTER_MAC,
+        mac[0],
+        mac[1],
+        mac[2],
+        mac[3],
+        mac[4],
+        mac[5],
+    ]
+}
+
+/// The advertising PE's MAC from a route's Router's MAC extended community, or
+/// `None` when it carries none — which is the normal case for asymmetric IRB, where
+/// forwarding uses the destination host's own MAC instead.
+fn router_mac(path: &Path) -> Option<[u8; 6]> {
+    path.ext_communities
+        .iter()
+        .find(|ec| ec[0] == EC_TYPE_EVPN && ec[1] == EC_SUBTYPE_ROUTER_MAC)
+        .map(|ec| [ec[2], ec[3], ec[4], ec[5], ec[6], ec[7]])
+}
 
 /// Extract a route's MAC Mobility state from its extended communities, or `None`
 /// when the community is absent (an initial, never-moved advertisement, or a peer
@@ -341,6 +376,7 @@ impl EviTable {
                             vni: *label1,
                             ip: *ip,
                             srv6_sid: path.srv6_sid.map(|s| s.sid),
+                            router_mac: router_mac(path),
                         };
                         let changed = self.macs.get(&key) != Some(&entry);
                         self.macs.insert(key, entry.clone());
@@ -475,6 +511,39 @@ mod tests {
     }
 
     #[test]
+    fn routers_mac_community_round_trips_and_reaches_the_imported_entry() {
+        // RFC 9135 §4: type 0x06, sub-type 0x03, the remaining six octets are the
+        // advertising PE's MAC. Pin the wire bytes — a wrong sub-type would still
+        // round-trip through our own builder and parser while interoperating with
+        // nobody, so the literal encoding is the assertion that matters.
+        let pe_mac = [0x02, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE];
+        let ec = build_router_mac(pe_mac);
+        assert_eq!(ec, [0x06, 0x03, 0x02, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE]);
+
+        let mut p = path(100, [10, 0, 0, 1], vec![RT]);
+        p.ext_communities.push(ec);
+        assert_eq!(router_mac(&p), Some(pe_mac));
+
+        // It travels all the way into the EVI's imported entry, which is where a
+        // forwarding plane doing symmetric IRB reads it as the inner MAC DA.
+        let mut evi = EviTable::new(vec![RT]);
+        evi.apply(&EvpnRibEvent::Best {
+            nlri: mac_route(1, 0x01, 10100),
+            path: p,
+        });
+        let entry = evi.macs.get(&(0, [0x02, 0, 0, 0, 0, 0x01])).expect("imported");
+        assert_eq!(entry.router_mac, Some(pe_mac));
+    }
+
+    #[test]
+    fn a_route_without_the_routers_mac_community_carries_none() {
+        // Asymmetric IRB omits it, and so does a MAC Mobility community that shares
+        // the same 0x06 type — neither may be mistaken for a router MAC.
+        assert_eq!(router_mac(&path(100, [10, 0, 0, 1], vec![RT])), None);
+        assert_eq!(router_mac(&mob_path([10, 0, 0, 1], 7, false)), None);
+    }
+
+    #[test]
     fn mac_mobility_higher_sequence_wins_and_stale_is_ignored() {
         let mut evi = EviTable::new(vec![RT]);
         let mac = [0x02, 0, 0, 0, 0, 0x01];
@@ -579,7 +648,7 @@ mod tests {
         assert!(evi.apply(&ev).is_some());
         assert_eq!(
             evi.lookup_mac(0, [0x02, 0, 0, 0, 0, 0x01]),
-            Some(&RemoteMac { vtep: peer, vni: 10100, ip: None, srv6_sid: None })
+            Some(&RemoteMac { vtep: peer, vni: 10100, ip: None, srv6_sid: None, router_mac: None })
         );
 
         // Foreign RT → not imported.
@@ -665,7 +734,7 @@ mod tests {
             Some(EviChange::MacLearned {
                 eth_tag: 0,
                 mac,
-                entry: RemoteMac { vtep: peer, vni: 10100, ip: None, srv6_sid: None },
+                entry: RemoteMac { vtep: peer, vni: 10100, ip: None, srv6_sid: None, router_mac: None },
             })
         );
         // Re-applying the identical route is a no-op (no spurious churn downstream).
