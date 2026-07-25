@@ -40,7 +40,10 @@ pub mod grace;
 pub mod interface;
 pub mod lsa;
 pub mod lsdb;
-pub mod md5;
+/// MD5, shared with the other protocols that authenticate packets with it (IS-IS
+/// HMAC-MD5, RFC 5304, uses the same primitive). Re-exported at its original path so
+/// callers are unaffected by the move into `wren-core`.
+pub use wren_core::md5;
 pub mod neighbor;
 pub mod packet;
 pub mod spf;

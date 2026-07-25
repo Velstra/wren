@@ -23,6 +23,7 @@
 #![forbid(unsafe_code)]
 
 pub mod hmac;
+pub mod md5;
 pub mod rd;
 pub use rd::RouteDistinguisher;
 

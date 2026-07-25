@@ -1,9 +1,11 @@
 //! A minimal, dependency-free MD5 (RFC 1321).
 //!
-//! MD5 is used here solely for OSPFv2 cryptographic authentication (RFC 2328 §D),
-//! where the digest authenticates each packet against a shared key — it is **not** a
-//! general-purpose or security-grade hash. Hand-rolling it keeps `wren-ospf` free of
-//! third-party dependencies, like the rest of the crate.
+//! MD5 is used solely for packet authentication against a shared key — OSPFv2
+//! cryptographic authentication (RFC 2328 §D) and IS-IS HMAC-MD5 (RFC 5304). It is
+//! **not** a general-purpose or security-grade hash, and nothing here should be read
+//! as an endorsement of MD5: both protocols specify it, and a router that cannot
+//! speak it cannot authenticate with the vendor default. Hand-rolling it keeps the
+//! workspace free of third-party crypto dependencies.
 
 /// Per-round left-rotation amounts (RFC 1321 §3.4).
 const S: [u32; 64] = [
