@@ -38,6 +38,7 @@
 use std::fmt;
 
 pub mod adjacency;
+pub mod auth;
 pub mod dis;
 pub mod lsdb;
 pub mod pdu;
