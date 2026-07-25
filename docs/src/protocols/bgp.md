@@ -131,6 +131,10 @@ withdrawals in **MP_UNREACH_NLRI**, rather than the base NEXT_HOP / NLRI / Withd
 fields (which stay IPv4). The TCP session itself is unchanged — it still runs over
 the IPv4 transport to the neighbour `address`; only the carried NLRI is IPv6.
 
+The same multiprotocol machinery carries **L2VPN/EVPN** — layer-2 reachability,
+routed tenant subnets and the BUM flood set — on a neighbour with `evpn = true`.
+That address family has its own chapter: [EVPN](evpn.md).
+
 To **originate or redistribute** IPv6 routes a speaker must know the next hop to
 advertise for them (next-hop-self), since the base NEXT_HOP attribute is IPv4-only.
 Set it with `next-hop6` — typically this router's own global address on the peering

@@ -16,6 +16,7 @@
 - [OSPFv2](protocols/ospf.md)
 - [OSPFv3](protocols/ospfv3.md)
 - [BGP-4](protocols/bgp.md)
+- [EVPN](protocols/evpn.md)
 - [Babel](protocols/babel.md)
 - [IS-IS](protocols/isis.md)
 - [BFD](protocols/bfd.md)
