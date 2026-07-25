@@ -1246,20 +1246,23 @@ pub struct Isis {
     /// attacker cannot form adjacencies or inject LSPs. Unset ⇒ no authentication.
     /// Equivalent to `auth-type = "text"` with this string as `auth-key`.
     pub password: Option<String>,
-    /// Packet authentication scheme: `"text"` for the cleartext password above, or
-    /// `"hmac-sha256"` for the Generic Cryptographic Authentication of RFC 5310.
-    /// Prefer the latter: a cleartext password is visible to anyone who can observe
-    /// the link and can be replayed, whereas the HMAC signs the encoded PDU.
-    /// Unset (the default) falls back to `password`.
+    /// Packet authentication scheme: `"text"` for the cleartext password above,
+    /// `"hmac-md5"` for RFC 5304, or `"hmac-sha256"` for the Generic Cryptographic
+    /// Authentication of RFC 5310. Prefer a keyed scheme: a cleartext password is
+    /// visible to anyone who can observe the link and can be replayed, whereas the
+    /// HMAC signs the encoded PDU. `"hmac-md5"` is the older and weaker of the two,
+    /// but it is what most other vendors default to. Unset (the default) falls back
+    /// to `password`.
     #[serde(rename = "auth-type")]
     pub auth_type: Option<String>,
-    /// The shared secret — the password (`"text"`) or the HMAC key
-    /// (`"hmac-sha256"`, any length). Required when `auth-type` is set; falls back
-    /// to `password`.
+    /// The shared secret — the password (`"text"`) or the HMAC key (either keyed
+    /// scheme, any length). Required when `auth-type` is set; falls back to
+    /// `password`.
     #[serde(rename = "auth-key")]
     pub auth_key: Option<String>,
     /// The Key ID advertised in the clear alongside the digest (`"hmac-sha256"`
     /// only, RFC 5310 §3.1), so keys can be rolled without an outage. Defaults to 1.
+    /// RFC 5304 has no Key ID, so `"hmac-md5"` ignores this.
     #[serde(rename = "auth-key-id")]
     pub auth_key_id: Option<u16>,
 }

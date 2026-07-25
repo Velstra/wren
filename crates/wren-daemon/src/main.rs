@@ -3332,13 +3332,16 @@ fn build_isis_auth(isis: &wren_config::Isis) -> Result<Option<wren_isis::auth::I
             .map(|p| IsisAuth::Cleartext(p.into_bytes()))),
         Some("none") => Ok(None),
         Some("text") => Ok(Some(IsisAuth::Cleartext(key("text")?))),
+        Some("hmac-md5") => Ok(Some(IsisAuth::HmacMd5 {
+            key: key("hmac-md5")?,
+        })),
         Some("hmac-sha256") => Ok(Some(IsisAuth::HmacSha256 {
             key: key("hmac-sha256")?,
             key_id: isis.auth_key_id.unwrap_or(1),
         })),
-        Some(other) => {
-            anyhow::bail!("unknown isis auth-type {other:?} (want none, text or hmac-sha256)")
-        }
+        Some(other) => anyhow::bail!(
+            "unknown isis auth-type {other:?} (want none, text, hmac-md5 or hmac-sha256)"
+        ),
     }
 }
 

@@ -2,16 +2,20 @@
 # IS-IS cryptographic authentication (RFC 5310) end to end.
 #
 # Two routers form an IS-IS point-to-point adjacency over a veth, like
-# `isis-threeway-smoke.sh`, but with `auth-type = "hmac-sha256"` configured. Every
-# PDU then carries an Authentication TLV (type 10, auth type 3) holding a Key ID
-# and an HMAC-SHA-256 over the encoded PDU, and a PDU whose digest does not verify
-# is dropped before it is even parsed.
+# `isis-threeway-smoke.sh`, but with authentication configured. Every PDU then
+# carries an Authentication TLV (type 10) holding a digest over the encoded PDU, and
+# a PDU whose digest does not verify is dropped before it is even parsed. Both keyed
+# schemes are covered: HMAC-SHA-256 (RFC 5310, auth type 3, with a Key ID) and
+# HMAC-MD5 (RFC 5304, auth type 54, no Key ID).
 #
-# That gives the test its two halves, and both are needed: a run where the keys
-# MATCH proves the digest is computed and verified consistently (a broken seal
-# would leave the Apad placeholder on the wire and no adjacency would ever come
-# up), and a run where they DIFFER proves the check actually rejects — an
-# implementation that authenticated nothing would pass the first half alone.
+# Four cases, and each rules out a different way of being wrong:
+#   - matching keys must come UP — a broken seal would leave the placeholder on the
+#     wire and no adjacency would ever form;
+#   - mismatched keys must stay DOWN — an implementation that authenticated nothing
+#     would sail through the first case alone;
+#   - the same again for HMAC-MD5, whose digest input differs from RFC 5310's (the
+#     Authentication Value is zeroed, not Apad-filled);
+#   - and two routers using DIFFERENT schemes must not form an adjacency either.
 #
 # Like the other smoke scripts it runs rootless inside throwaway `unshare -Urn`
 # namespaces (which grant CAP_NET_RAW) and never touches the host's interfaces.
@@ -33,10 +37,12 @@ fi
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 
-# Run one two-router scenario. $1 names it, $2 is B's key, $3 is "up" or "down":
-# whether the adjacency is expected to come up.
+KEY="correct horse battery staple"
+
+# Run one two-router scenario. $1 names it, $2/$3 are A's and B's auth-type, $4 is
+# B's key, $5 is "up" or "down": whether the adjacency is expected to come up.
 run_case() {
-  local name="$1" b_key="$2" expect="$3"
+  local name="$1" a_auth="$2" b_auth="$3" b_key="$4" expect="$5"
   local dir="$WORK/$name"
   mkdir -p "$dir"
 
@@ -48,8 +54,8 @@ interfaces = ["veth0"]
 system-id = "0000.0000.0001"
 network-type = "point-to-point"
 hello-interval = 3
-auth-type = "hmac-sha256"
-auth-key = "correct horse battery staple"
+auth-type = "$a_auth"
+auth-key = "$KEY"
 auth-key-id = 7
 EOF
 
@@ -61,12 +67,12 @@ interfaces = ["veth1"]
 system-id = "0000.0000.0002"
 network-type = "point-to-point"
 hello-interval = 3
-auth-type = "hmac-sha256"
+auth-type = "$b_auth"
 auth-key = "$b_key"
 auth-key-id = 7
 EOF
 
-  echo "=== case: $name (expecting the adjacency to stay/come $expect) ==="
+  echo "=== case: $name — A=$a_auth B=$b_auth (expecting the adjacency $expect) ==="
   WREN="$WREN" DIR="$dir" EXPECT="$expect" unshare -Urn bash -c '
     set -e
     ip link set lo up
@@ -96,14 +102,14 @@ EOF
     grep -Eq "0000.0000.0001 via .* dev veth1 level 1 state Up" "$DIR/nbr_b.out" && b_up=1
 
     if [[ "$EXPECT" == up ]]; then
-      # Matching keys: authentication must be transparent to adjacency formation.
+      # Matching config: authentication must be transparent to adjacency formation.
       [[ $a_up -eq 1 ]] || { echo "FAIL: A does not see B Up despite matching keys"; ok=0; }
       [[ $b_up -eq 1 ]] || { echo "FAIL: B does not see A Up despite matching keys"; ok=0; }
     else
-      # Mismatched keys: every PDU fails its digest check and is dropped, so neither
+      # Mismatched key or scheme: every PDU fails its check and is dropped, so neither
       # side may ever reach Up. A single Up here means authentication is not enforced.
-      [[ $a_up -eq 0 ]] || { echo "FAIL: A reached Up with a mismatched key"; ok=0; }
-      [[ $b_up -eq 0 ]] || { echo "FAIL: B reached Up with a mismatched key"; ok=0; }
+      [[ $a_up -eq 0 ]] || { echo "FAIL: A reached Up despite the mismatch"; ok=0; }
+      [[ $b_up -eq 0 ]] || { echo "FAIL: B reached Up despite the mismatch"; ok=0; }
     fi
 
     if [[ $ok -ne 1 ]]; then echo "--- A log ---"; cat "$DIR/a.log"; echo "--- B log ---"; cat "$DIR/b.log"; fi
@@ -114,7 +120,11 @@ EOF
   '
 }
 
-run_case matching "correct horse battery staple" up
-run_case mismatched "a different secret entirely" down
+run_case sha256-matching   hmac-sha256 hmac-sha256 "$KEY"                        up
+run_case sha256-mismatched hmac-sha256 hmac-sha256 "a different secret entirely" down
+run_case md5-matching      hmac-md5    hmac-md5    "$KEY"                        up
+# Same secret, different scheme: the digests differ in width, layout and input, so
+# neither side may accept the other's PDUs.
+run_case scheme-mismatch   hmac-sha256 hmac-md5    "$KEY"                        down
 
 echo "isis authentication smoke test: OK"

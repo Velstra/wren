@@ -1,5 +1,5 @@
-//! IS-IS PDU authentication — the cleartext password of ISO 10589 §9.8 and the
-//! Generic Cryptographic Authentication of RFC 5310.
+//! IS-IS PDU authentication — the cleartext password of ISO 10589 §9.8, the
+//! HMAC-MD5 of RFC 5304, and the Generic Cryptographic Authentication of RFC 5310.
 //!
 //! Cleartext authentication is a TLV comparison and needs nothing from this
 //! module beyond [`IsisAuth::placeholder`]. Cryptographic authentication is
@@ -7,21 +7,25 @@
 //! applied once the PDU has been serialized, and it has to be undone in exactly
 //! the same way on receipt. Everything here therefore works on PDU bytes.
 //!
-//! Three details of RFC 5310 are easy to get wrong, and getting them wrong
-//! produces an implementation that authenticates happily against itself and fails
-//! against every other vendor:
+//! Four details are easy to get wrong, and getting any of them wrong produces an
+//! implementation that authenticates happily against itself and fails against every
+//! other vendor:
 //!
-//! 1. Before hashing, the Authentication Data field is filled with **Apad**
-//!    (`0x878FE1F3` repeated), not with zeros (§3.3).
-//! 2. An LSP's Remaining Lifetime and Checksum are zeroed before hashing (§4),
-//!    because both are rewritten by transit routers.
-//! 3. An LSP's Fletcher checksum covers the Authentication TLV, so writing the
+//! 1. **The two schemes fill the digest field differently before hashing.** RFC 5304
+//!    §3 authenticates "the IS-IS PDU … with the Authentication Value field … set to
+//!    zero"; RFC 5310 §3.3 instead fills it with **Apad** (`0x878FE1F3` repeated).
+//!    They are otherwise near-identical, which is exactly why this is easy to miss.
+//! 2. RFC 5310 carries a 2-octet **Key ID** ahead of the digest; RFC 5304 has none,
+//!    so the digest sits directly after the type byte.
+//! 3. An LSP's Remaining Lifetime and Checksum are zeroed before hashing (both
+//!    RFCs), because transit routers rewrite them.
+//! 4. An LSP's Fletcher checksum covers the Authentication TLV, so writing the
 //!    digest invalidates it — the checksum has to be recomputed *afterwards*.
 //!    [`IsisAuth::seal`] does this; a caller that patches the digest by hand will
 //!    emit LSPs every neighbour discards.
 
 use crate::fletcher16;
-use wren_core::hmac::{hmac_sha256, DIGEST_LEN};
+use wren_core::hmac::{hmac_md5, hmac_sha256, DIGEST_LEN, MD5_DIGEST_LEN};
 
 /// Authentication TLV (ISO 10589 §9.8).
 const T_AUTHENTICATION: u8 = 10;
@@ -29,10 +33,24 @@ const T_AUTHENTICATION: u8 = 10;
 pub const AUTH_TYPE_CLEARTEXT: u8 = 1;
 /// Generic Cryptographic Authentication (RFC 5310 §3).
 pub const AUTH_TYPE_CRYPTO: u8 = 3;
+/// HMAC-MD5 authentication (RFC 5304 §2). The older scheme, and the one most
+/// vendors default to.
+pub const AUTH_TYPE_HMAC_MD5: u8 = 54;
 /// Key ID width in a Generic Cryptographic Authentication TLV (RFC 5310 §3.1).
 const KEY_ID_LEN: usize = 2;
-/// Value length of an HMAC-SHA-256 Authentication TLV: type + Key ID + digest.
-const CRYPTO_VALUE_LEN: usize = 1 + KEY_ID_LEN + DIGEST_LEN;
+
+/// How a cryptographic Authentication TLV is laid out and hashed. The two schemes
+/// differ in exactly these ways; everything else about them is shared.
+struct Layout {
+    /// Octets of Key ID between the type byte and the digest (RFC 5310 has 2,
+    /// RFC 5304 none).
+    key_id_len: usize,
+    /// Digest width.
+    digest_len: usize,
+    /// Whether the digest field is filled with Apad before hashing (RFC 5310) as
+    /// opposed to zeros (RFC 5304). See gotcha 1 above.
+    apad: bool,
+}
 
 /// Offset of an LSP's Remaining Lifetime (ISO 10589 §9.6) — rewritten in transit,
 /// so RFC 5310 §4 excludes it from the digest.
@@ -49,6 +67,12 @@ pub enum IsisAuth {
     /// The shared password travels in the clear (ISO 10589 §9.8). Offers no
     /// protection against anyone who can observe the link.
     Cleartext(Vec<u8>),
+    /// HMAC-MD5 over the whole PDU (RFC 5304), keyed by a shared secret. Weaker
+    /// than [`Self::HmacSha256`] but the scheme most deployed routers default to.
+    HmacMd5 {
+        /// The shared secret. Any length — HMAC folds it to the block size.
+        key: Vec<u8>,
+    },
     /// HMAC-SHA-256 over the whole PDU (RFC 5310), keyed by a shared secret.
     HmacSha256 {
         /// The shared secret. Any length — HMAC folds it to the block size.
@@ -63,20 +87,40 @@ impl IsisAuth {
     pub fn auth_type(&self) -> u8 {
         match self {
             Self::Cleartext(_) => AUTH_TYPE_CLEARTEXT,
+            Self::HmacMd5 { .. } => AUTH_TYPE_HMAC_MD5,
             Self::HmacSha256 { .. } => AUTH_TYPE_CRYPTO,
         }
     }
 
+    /// The TLV layout and hashing rules of a cryptographic scheme; `None` for the
+    /// cleartext password, which has neither.
+    fn layout(&self) -> Option<Layout> {
+        match self {
+            Self::Cleartext(_) => None,
+            Self::HmacMd5 { .. } => Some(Layout {
+                key_id_len: 0,
+                digest_len: MD5_DIGEST_LEN,
+                apad: false,
+            }),
+            Self::HmacSha256 { .. } => Some(Layout {
+                key_id_len: KEY_ID_LEN,
+                digest_len: DIGEST_LEN,
+                apad: true,
+            }),
+        }
+    }
+
     /// The Authentication TLV's value *after* the type byte, as it goes on the
-    /// wire before sealing: the password itself, or the Key ID followed by an
-    /// Apad-filled digest field that [`Self::seal`] overwrites.
+    /// wire before sealing: the password itself, or (for a keyed scheme) any Key ID
+    /// followed by a filled digest field that [`Self::seal`] overwrites.
     pub fn placeholder(&self) -> Vec<u8> {
         match self {
             Self::Cleartext(pw) => pw.clone(),
+            Self::HmacMd5 { .. } => digest_placeholder(MD5_DIGEST_LEN, false),
             Self::HmacSha256 { key_id, .. } => {
                 let mut v = Vec::with_capacity(KEY_ID_LEN + DIGEST_LEN);
                 v.extend_from_slice(&key_id.to_be_bytes());
-                v.extend_from_slice(&apad());
+                v.extend_from_slice(&digest_placeholder(DIGEST_LEN, true));
                 v
             }
         }
@@ -85,21 +129,23 @@ impl IsisAuth {
     /// Write the digest into an encoded PDU and repair the checksum it disturbs.
     /// A no-op for cleartext, whose TLV is already final at encode time.
     pub fn seal(&self, pdu: &mut [u8]) {
-        let Self::HmacSha256 { key_id, .. } = self else {
+        let Some(l) = self.layout() else {
             return;
         };
-        let Some(value) = crypto_value_range(pdu) else {
+        let Some(value) = self.crypto_value_range(pdu) else {
             return;
         };
-        // The Key ID rides in the clear ahead of the digest.
-        let key_at = value.start + 1;
-        pdu[key_at..key_at + KEY_ID_LEN].copy_from_slice(&key_id.to_be_bytes());
+        // The Key ID, where the scheme has one, rides in the clear ahead of the digest.
+        if let Self::HmacSha256 { key_id, .. } = self {
+            let at = value.start + 1;
+            pdu[at..at + l.key_id_len].copy_from_slice(&key_id.to_be_bytes());
+        }
         let Some(digest) = self.digest(pdu, value.start) else {
             return;
         };
-        let at = key_at + KEY_ID_LEN;
-        pdu[at..at + DIGEST_LEN].copy_from_slice(&digest);
-        // Gotcha 3: the digest just changed bytes the Fletcher checksum covers.
+        let at = value.start + 1 + l.key_id_len;
+        pdu[at..at + l.digest_len].copy_from_slice(&digest);
+        // Gotcha 4: the digest just changed bytes the Fletcher checksum covers.
         if is_lsp(pdu) {
             fletcher16(&mut pdu[LSP_CSUM_REGION..], LSP_CSUM_REGION);
         }
@@ -114,46 +160,62 @@ impl IsisAuth {
                 }
                 _ => false,
             },
-            Self::HmacSha256 { .. } => {
-                let Some(value) = crypto_value_range(pdu) else {
+            Self::HmacMd5 { .. } | Self::HmacSha256 { .. } => {
+                let (Some(l), Some(value)) = (self.layout(), self.crypto_value_range(pdu)) else {
                     return false;
                 };
                 let Some(expected) = self.digest(pdu, value.start) else {
                     return false;
                 };
-                let at = value.start + 1 + KEY_ID_LEN;
-                ct_eq(&pdu[at..at + DIGEST_LEN], &expected)
+                let at = value.start + 1 + l.key_id_len;
+                ct_eq(&pdu[at..at + l.digest_len], &expected)
             }
         }
     }
 
-    /// The HMAC over `pdu` as RFC 5310 defines the input: the Authentication Data
-    /// field replaced by Apad, and — for an LSP — the two transit-mutable header
-    /// fields zeroed. Computed on a scratch copy, so the caller's bytes are safe
-    /// and the same routine serves both sealing and verification.
-    fn digest(&self, pdu: &[u8], value_start: usize) -> Option<[u8; DIGEST_LEN]> {
-        let Self::HmacSha256 { key, .. } = self else {
-            return None;
-        };
+    /// The HMAC over `pdu` as the RFCs define the input: the Authentication Data
+    /// field refilled with the scheme's placeholder, and — for an LSP — the two
+    /// transit-mutable header fields zeroed. Computed on a scratch copy, so the
+    /// caller's bytes are safe and the same routine serves sealing and verification.
+    fn digest(&self, pdu: &[u8], value_start: usize) -> Option<Vec<u8>> {
+        let l = self.layout()?;
         let mut scratch = pdu.to_vec();
-        let at = value_start + 1 + KEY_ID_LEN;
-        scratch[at..at + DIGEST_LEN].copy_from_slice(&apad());
+        let at = value_start + 1 + l.key_id_len;
+        scratch[at..at + l.digest_len].copy_from_slice(&digest_placeholder(l.digest_len, l.apad));
         if is_lsp(&scratch) {
             scratch[LSP_LIFETIME].fill(0);
             scratch[LSP_CHECKSUM].fill(0);
         }
-        Some(hmac_sha256(key, &scratch))
+        Some(match self {
+            Self::Cleartext(_) => return None,
+            Self::HmacMd5 { key } => hmac_md5(key, &scratch).to_vec(),
+            Self::HmacSha256 { key, .. } => hmac_sha256(key, &scratch).to_vec(),
+        })
+    }
+
+    /// The Authentication TLV's value, but only if it is a well-formed one for
+    /// *this* scheme — so neither sealing nor verification can index past a short
+    /// TLV, and a PDU authenticated under the other scheme is rejected outright.
+    fn crypto_value_range(&self, pdu: &[u8]) -> Option<std::ops::Range<usize>> {
+        let l = self.layout()?;
+        let v = auth_tlv_range(pdu)?;
+        (v.len() == 1 + l.key_id_len + l.digest_len && pdu[v.start] == self.auth_type())
+            .then_some(v)
     }
 }
 
-/// Apad (RFC 5310 §3.3): `0x878FE1F3` repeated to the digest length. Unlike the
-/// OSPFv3 variant of the same idea (RFC 7166 §4.5) it carries no address prefix.
-fn apad() -> [u8; DIGEST_LEN] {
-    let mut a = [0u8; DIGEST_LEN];
-    for chunk in a.chunks_exact_mut(4) {
-        chunk.copy_from_slice(&0x878F_E1F3u32.to_be_bytes());
+/// The digest field as it stands before sealing and, identically, as it is refilled
+/// before hashing: RFC 5304 §3 wants zeros, RFC 5310 §3.3 wants Apad — `0x878FE1F3`
+/// repeated to the digest length. Unlike the OSPFv3 variant of the same idea
+/// (RFC 7166 §4.5), the IS-IS Apad carries no address prefix.
+fn digest_placeholder(len: usize, apad: bool) -> Vec<u8> {
+    let mut v = vec![0u8; len];
+    if apad {
+        for chunk in v.chunks_exact_mut(4) {
+            chunk.copy_from_slice(&0x878F_E1F3u32.to_be_bytes());
+        }
     }
-    a
+    v
 }
 
 /// Whether the encoded PDU is an LSP (types 18 and 20 — ISO 10589 §9.6).
@@ -180,13 +242,6 @@ fn auth_tlv_range(pdu: &[u8]) -> Option<std::ops::Range<usize>> {
     None
 }
 
-/// The Authentication TLV's value, but only if it is a well-formed HMAC-SHA-256
-/// one — so neither sealing nor verification can index past a short TLV.
-fn crypto_value_range(pdu: &[u8]) -> Option<std::ops::Range<usize>> {
-    let v = auth_tlv_range(pdu)?;
-    (v.len() == CRYPTO_VALUE_LEN && pdu[v.start] == AUTH_TYPE_CRYPTO).then_some(v)
-}
-
 /// Constant-time byte-slice equality, so a wrong digest cannot be probed by
 /// timing the compare.
 fn ct_eq(a: &[u8], b: &[u8]) -> bool {
@@ -207,6 +262,14 @@ mod tests {
         IsisAuth::HmacSha256 {
             key: b"s3cret".to_vec(),
             key_id: 7,
+        }
+    }
+
+    /// The same secret under the older scheme, so tests can prove the two do not
+    /// authenticate each other.
+    fn hmac_md5_auth() -> IsisAuth {
+        IsisAuth::HmacMd5 {
+            key: b"s3cret".to_vec(),
         }
     }
 
@@ -279,7 +342,7 @@ mod tests {
         let a = auth();
         let mut pdu = hello_bytes(auth_tlv(&a));
         a.seal(&mut pdu);
-        let v = crypto_value_range(&pdu).expect("a crypto auth TLV");
+        let v = a.crypto_value_range(&pdu).expect("a crypto auth TLV");
         assert_eq!(pdu[v.start], AUTH_TYPE_CRYPTO);
         assert_eq!(&pdu[v.start + 1..v.start + 3], &7u16.to_be_bytes());
     }
@@ -314,16 +377,69 @@ mod tests {
 
     #[test]
     fn sealing_an_lsp_leaves_its_checksum_valid() {
-        // Gotcha 3: encode() checksummed the Apad placeholder, so seal() must
-        // recompute it or every neighbour drops the LSP before ever authenticating.
-        let a = auth();
-        let mut pdu = lsp_bytes(&a, 1200, 5);
-        a.seal(&mut pdu);
-        assert!(
-            crate::fletcher16_valid(&pdu[LSP_CSUM_REGION..]),
-            "the checksum survives the digest write"
+        // Gotcha 4: encode() checksummed the placeholder, so seal() must recompute it
+        // or every neighbour drops the LSP before ever authenticating.
+        for a in [auth(), hmac_md5_auth()] {
+            let mut pdu = lsp_bytes(&a, 1200, 5);
+            a.seal(&mut pdu);
+            assert!(
+                crate::fletcher16_valid(&pdu[LSP_CSUM_REGION..]),
+                "the checksum survives the digest write"
+            );
+            assert!(Pdu::decode(&pdu).is_ok(), "and the PDU still decodes");
+            assert!(a.verify(&pdu));
+        }
+    }
+
+    #[test]
+    fn hmac_md5_zeroes_the_digest_field_where_sha256_apads_it_rfc5304() {
+        // Gotcha 1, the one a copy-paste between the two schemes silently gets wrong.
+        // RFC 5304 §3 hashes the PDU "with the Authentication Value field ... set to
+        // zero"; RFC 5310 §3.3 fills the same field with Apad instead.
+        let md5 = hmac_md5_auth();
+        assert_eq!(md5.placeholder(), vec![0u8; MD5_DIGEST_LEN]);
+
+        let sha = auth();
+        let ph = sha.placeholder();
+        assert_eq!(&ph[..KEY_ID_LEN], &7u16.to_be_bytes(), "the Key ID leads");
+        assert!(ph[KEY_ID_LEN..]
+            .chunks_exact(4)
+            .all(|c| c == 0x878F_E1F3u32.to_be_bytes()));
+
+        // And the digest really is taken over a zero-filled field: rebuild the hash
+        // input here, independently of `digest()`, and compare.
+        let mut pdu = hello_bytes(auth_tlv(&md5));
+        md5.seal(&mut pdu);
+        let v = md5.crypto_value_range(&pdu).expect("an hmac-md5 auth TLV");
+        let mut input = pdu.clone();
+        input[v.start + 1..v.end].fill(0);
+        assert_eq!(
+            &pdu[v.start + 1..v.end],
+            &hmac_md5(b"s3cret", &input)[..],
+            "RFC 5304 hashes a zeroed Authentication Value"
         );
-        assert!(Pdu::decode(&pdu).is_ok(), "and the PDU still decodes");
+    }
+
+    #[test]
+    fn the_two_crypto_schemes_do_not_satisfy_each_other() {
+        // Same secret, different scheme: a router configured for one must reject the
+        // other outright rather than fall back to it.
+        let md5 = hmac_md5_auth();
+        let sha = auth();
+        let mut m = hello_bytes(auth_tlv(&md5));
+        md5.seal(&mut m);
+        let mut s = hello_bytes(auth_tlv(&sha));
+        sha.seal(&mut s);
+
+        assert!(md5.verify(&m) && sha.verify(&s), "each verifies its own");
+        assert!(!sha.verify(&m), "an HMAC-MD5 PDU does not satisfy HMAC-SHA-256");
+        assert!(!md5.verify(&s), "nor the other way round");
+
+        // Truncated input of every length must be rejected, never indexed past.
+        for n in 0..m.len() {
+            assert!(!md5.verify(&m[..n]));
+            md5.seal(&mut m.clone()[..n]);
+        }
     }
 
     #[test]

@@ -1,11 +1,12 @@
-//! A minimal, dependency-free SHA-256 and HMAC-SHA-256 (FIPS 180-4 / RFC 2104).
+//! A minimal, dependency-free SHA-256 and the two HMACs Wren needs (FIPS 180-4 /
+//! RFC 2104).
 //!
-//! These are used solely for OSPFv3 cryptographic authentication (RFC 7166),
-//! where an HMAC over each packet authenticates it against a shared key. Like the
-//! hand-rolled MD5 in `wren-ospf`, hand-rolling these keeps `wren-ospfv3` free of
-//! third-party crypto dependencies, matching the rest of the crate. They are used
-//! only for message authentication against a configured key — not as a
-//! general-purpose hashing service.
+//! These are used solely for packet authentication against a shared key: OSPFv3
+//! (RFC 7166) and IS-IS (RFC 5310) authenticate with HMAC-SHA-256, and IS-IS also
+//! offers HMAC-MD5 (RFC 5304), the older scheme most vendors default to. Hand-rolling
+//! them keeps the workspace free of third-party crypto dependencies. They are for
+//! message authentication against a configured key — not a general-purpose hashing
+//! service.
 
 /// SHA-256 round constants (FIPS 180-4 §4.2.2): the first 32 bits of the
 /// fractional parts of the cube roots of the first 64 primes.
@@ -20,10 +21,13 @@ const K: [u32; 64] = [
     0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
 ];
 
-/// SHA-256 block size in bytes (also the HMAC key-padding block).
+/// SHA-256 block size in bytes (also the HMAC key-padding block). MD5 shares it, so
+/// the same block drives both HMACs here.
 pub const BLOCK_LEN: usize = 64;
 /// SHA-256 output size in bytes.
 pub const DIGEST_LEN: usize = 32;
+/// MD5 output size in bytes.
+pub const MD5_DIGEST_LEN: usize = 16;
 
 /// The 32-byte SHA-256 digest of `input` (FIPS 180-4).
 pub fn sha256(input: &[u8]) -> [u8; DIGEST_LEN] {
@@ -124,6 +128,39 @@ pub fn hmac_sha256(key: &[u8], message: &[u8]) -> [u8; DIGEST_LEN] {
     sha256(&outer)
 }
 
+/// The 16-byte HMAC-MD5 of `message` under `key` (RFC 2104), as IS-IS HMAC-MD5
+/// authentication (RFC 5304) uses it.
+///
+/// The construction is [`hmac_sha256`]'s with MD5 substituted — MD5 shares SHA-256's
+/// 64-byte block, so the key normalisation is identical.
+pub fn hmac_md5(key: &[u8], message: &[u8]) -> [u8; MD5_DIGEST_LEN] {
+    use crate::md5::md5;
+
+    let mut block = [0u8; BLOCK_LEN];
+    if key.len() > BLOCK_LEN {
+        block[..MD5_DIGEST_LEN].copy_from_slice(&md5(key));
+    } else {
+        block[..key.len()].copy_from_slice(key);
+    }
+
+    let mut ipad = [0u8; BLOCK_LEN];
+    let mut opad = [0u8; BLOCK_LEN];
+    for i in 0..BLOCK_LEN {
+        ipad[i] = block[i] ^ 0x36;
+        opad[i] = block[i] ^ 0x5c;
+    }
+
+    let mut inner = Vec::with_capacity(BLOCK_LEN + message.len());
+    inner.extend_from_slice(&ipad);
+    inner.extend_from_slice(message);
+    let inner_digest = md5(&inner);
+
+    let mut outer = Vec::with_capacity(BLOCK_LEN + MD5_DIGEST_LEN);
+    outer.extend_from_slice(&opad);
+    outer.extend_from_slice(&inner_digest);
+    md5(&outer)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -149,6 +186,31 @@ mod tests {
                 b"abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq"
             )),
             "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1"
+        );
+    }
+
+    #[test]
+    fn hmac_md5_matches_rfc2202_vectors() {
+        // Known-answer vectors, because IS-IS HMAC-MD5 (RFC 5304) has to interoperate
+        // with other vendors: a construction that is merely self-consistent would pass
+        // every round-trip test and still authenticate against nobody.
+        // RFC 2202 Test Case 1.
+        assert_eq!(
+            hex(&hmac_md5(&[0x0b; 16], b"Hi There")),
+            "9294727a3638bb1c13f48ef8158bfc9d"
+        );
+        // RFC 2202 Test Case 2 (short ASCII key).
+        assert_eq!(
+            hex(&hmac_md5(b"Jefe", b"what do ya want for nothing?")),
+            "750c783e6ab0b503eaa86e310a5db738"
+        );
+        // RFC 2202 Test Case 6: an 80-byte key (> block size ⇒ key is hashed first).
+        assert_eq!(
+            hex(&hmac_md5(
+                &[0xaa; 80],
+                b"Test Using Larger Than Block-Size Key - Hash Key First"
+            )),
+            "6b1ab7fe4bd7bf8f0b62e6ce61b9d0cd"
         );
     }
 
