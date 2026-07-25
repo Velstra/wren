@@ -272,6 +272,7 @@ mod tests {
             ext_communities: ext,
             srv6_sid: None,
             otc: None,
+            pass_through: vec![],
         }
     }
 

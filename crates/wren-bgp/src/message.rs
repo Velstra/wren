@@ -711,6 +711,45 @@ mod tests {
     }
 
     #[test]
+    fn malformed_mp_reach_does_not_reset_the_session_rfc7606() {
+        // RFC 7606 §7.11: a malformed MP_REACH_NLRI / MP_UNREACH_NLRI is handled as
+        // treat-as-withdraw, never as a session reset. Both are truncated below their
+        // fixed preamble (MP_REACH needs AFI/SAFI/NextHop-Length plus the Reserved
+        // octet, MP_UNREACH needs AFI/SAFI), so it is the length that makes them
+        // malformed here and not their flags, which are the canonical 0x80.
+        let mut base = Vec::new();
+        PathAttribute::Origin(Origin::Igp).encode(&mut base, true);
+        PathAttribute::AsPath(vec![AsPathSegment::Sequence(vec![65001])]).encode(&mut base, true);
+        PathAttribute::NextHop(ip([10, 0, 0, 1])).encode(&mut base, true);
+
+        for type_code in [14u8, 15] {
+            let broken = [0x80, type_code, 2, 0, 2];
+
+            // (a) An MP-only UPDATE carries nothing outside the broken attribute, so
+            // the requirement is simply that decoding succeeds and drops it.
+            let mut body = vec![0, 0]; // Withdrawn Routes Length = 0
+            body.extend_from_slice(&(broken.len() as u16).to_be_bytes());
+            body.extend_from_slice(&broken);
+            let msg = frame_update(&body);
+            let decoded = Message::decode(&msg, true, AddPath::NONE).expect("decodes, not a reset");
+            let Message::Update(u) = decoded else { panic!("expected UPDATE") };
+            assert!(u.attributes.is_empty(), "the malformed MP attribute is dropped");
+            assert!(u.nlri.is_empty());
+            assert!(u.withdrawn.is_empty());
+
+            // (b) The same attribute beside a well-formed IPv4 path: that NLRI is
+            // withdrawn rather than advertised, and the session still survives.
+            let mut attrs = base.clone();
+            attrs.extend_from_slice(&broken);
+            let msg = frame_update(&update_body(&attrs));
+            let decoded = Message::decode(&msg, true, AddPath::NONE).expect("decodes, not a reset");
+            let Message::Update(u) = decoded else { panic!("expected UPDATE") };
+            assert_eq!(u.withdrawn, vec![p("10.0.0.0/24")], "NLRI must be withdrawn");
+            assert!(u.nlri.is_empty());
+        }
+    }
+
+    #[test]
     fn well_formed_update_still_decodes_normally() {
         // The treat-as-withdraw path must not disturb a valid UPDATE: all mandatory
         // attributes present and well-formed → the NLRI is advertised as usual.
