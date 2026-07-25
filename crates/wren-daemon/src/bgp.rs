@@ -44,7 +44,9 @@ use wren_bgp::capability::{BgpRole, Capability, ADD_PATH_BOTH, ADD_PATH_RECEIVE,
 use wren_bgp::community::format_community;
 use wren_bgp::decision::{Path, DEFAULT_LOCAL_PREF};
 use wren_bgp::evpn::{encap_ext_community, Esi, EvpnNlri, Rd, TUNNEL_TYPE_VXLAN};
-use wren_bgp::evpn_rib::{EviChange, EviTable, EvpnRib, EvpnRibEvent, IpVrfChange, IpVrfTable};
+use wren_bgp::evpn_rib::{
+    build_router_mac, EviChange, EviTable, EvpnRib, EvpnRibEvent, IpVrfChange, IpVrfTable,
+};
 use wren_bgp::ext_community::format_ext_community;
 use wren_bgp::flowspec::{Action as FsAction, FlowSpec};
 use wren_bgp::flowspec_rib::{actions_of, FlowSpecNlri, FlowSpecRib, FlowSpecRibEvent};
@@ -251,6 +253,13 @@ pub struct IpVrfCfg {
     pub rt_import: Vec<[u8; 8]>,
     /// Route Targets attached to every type-5 route it exports.
     pub rt_export: Vec<[u8; 8]>,
+    /// The tenant's directly-attached subnets, advertised as type-5 IP Prefix
+    /// routes so remote PEs route toward them through this VTEP.
+    pub prefixes: Vec<Prefix>,
+    /// This router's IRB MAC in this tenant, stamped on those routes as the
+    /// Router's MAC Extended Community (RFC 9135). `None` only for an SRv6
+    /// IP-VRF, where there is no inner Ethernet header to address.
+    pub router_mac: Option<[u8; 6]>,
 }
 
 /// A configured address aggregate (RFC 4271 §9.2.2.2). The `prefix` is advertised
@@ -647,6 +656,126 @@ fn evpn_srv6_tlvs(evpn: &EvpnConfig, vni: u32, is_imet: bool) -> Option<Vec<Srv6
             structure,
         }],
     }])
+}
+
+/// Build the SRv6 **L3** Service TLV for a type-5 IP Prefix route (RFC 9252 §6):
+/// End.DT4 or End.DT6 by the advertised prefix's address family, so the egress
+/// decapsulates into the right table. The L2 counterpart above is a separate TLV
+/// type, which is why this cannot just take another discriminator: a receiver
+/// looking for an L3 service would skip an L2 TLV entirely.
+///
+/// The discriminator is 2 — distinct from the L2 unicast (0) and multicast (1)
+/// values, because one SID value maps to exactly one behaviour on the egress and
+/// an L3 VNI may coincide numerically with an L2 one.
+fn ip_vrf_srv6_tlvs(evpn: &EvpnConfig, l3_vni: u32, prefix: &Prefix) -> Option<Vec<Srv6ServiceTlv>> {
+    let (loc, len) = evpn.srv6_locator?;
+    let behavior = if prefix.addr().is_ipv4() {
+        behavior::END_DT4
+    } else {
+        behavior::END_DT6
+    };
+    let (sid, structure) = build_service_sid(loc, len, 2, l3_vni);
+    Some(vec![Srv6ServiceTlv {
+        is_l2: false,
+        sids: vec![Srv6ServiceSid {
+            sid,
+            behavior,
+            flags: 0,
+            structure,
+        }],
+    }])
+}
+
+/// The unspecified gateway of `prefix`'s address family. RFC 9136 §3.1: "The GW IP
+/// field MUST be all bytes zero if it is not used as an Overlay Index" — and in the
+/// interface-less model we originate, §4.4.1 fixes "GW IP address = 0", the egress
+/// being identified by the label and next hop instead.
+fn unspecified_gw(prefix: &Prefix) -> IpAddr {
+    if prefix.addr().is_ipv4() {
+        IpAddr::V4(Ipv4Addr::UNSPECIFIED)
+    } else {
+        IpAddr::V6(Ipv6Addr::UNSPECIFIED)
+    }
+}
+
+/// Everything this VTEP originates into EVPN, from its resolved configuration: one
+/// type-3 IMET plus a type-2 per static MAC for each EVI (RFC 7432 §7), and a type-5
+/// IP Prefix per advertised subnet for each tenant IP-VRF (RFC 9136). Every route
+/// carries its owner's export Route Targets plus the VXLAN encapsulation community
+/// (RFC 8365 §6), and the next hop is this VTEP throughout.
+///
+/// Extracted from the BGP task so the origination set can be asserted directly —
+/// what goes on the wire here is what a remote PE programs its forwarding from, and
+/// a wrong label or a missing ext-community blackholes traffic without failing
+/// anything locally.
+fn evpn_origination(evpn: &EvpnConfig) -> Vec<EvpnOriginRoute> {
+    let nh = vtep_next_hop_octets(evpn.vtep_ip);
+    let mut out = Vec::new();
+    for inst in &evpn.instances {
+        let mut ext = inst.rt_export.clone();
+        ext.push(encap_ext_community(TUNNEL_TYPE_VXLAN));
+        // Type-3 IMET: "I participate in this EVI"; BUM floods toward our VTEP.
+        out.push(EvpnOriginRoute {
+            nlri: EvpnNlri::Imet {
+                rd: inst.rd,
+                eth_tag: 0,
+                orig_ip: evpn.vtep_ip,
+            },
+            ext_communities: ext.clone(),
+            next_hop: nh.clone(),
+            srv6: evpn_srv6_tlvs(evpn, inst.vni, true),
+        });
+        // Type-2 MAC/IP for each static MAC.
+        for (mac, ip) in &inst.macs {
+            out.push(EvpnOriginRoute {
+                nlri: EvpnNlri::MacIp {
+                    rd: inst.rd,
+                    esi: Esi::ZERO,
+                    eth_tag: 0,
+                    mac: *mac,
+                    ip: *ip,
+                    label1: inst.vni,
+                    label2: None,
+                },
+                ext_communities: ext.clone(),
+                next_hop: nh.clone(),
+                srv6: evpn_srv6_tlvs(evpn, inst.vni, false),
+            });
+        }
+    }
+    for vrf in &evpn.ip_vrfs {
+        if vrf.prefixes.is_empty() {
+            continue;
+        }
+        let mut ext = vrf.rt_export.clone();
+        ext.push(encap_ext_community(TUNNEL_TYPE_VXLAN));
+        // RFC 9136 §4.4.1 requires this "if the route is associated with an Ethernet
+        // NVO tunnel" — config resolution refuses a VXLAN IP-VRF without one, so a
+        // `None` here means SRv6, where the SID's behaviour supplies the context.
+        if let Some(mac) = vrf.router_mac {
+            ext.push(build_router_mac(mac));
+        }
+        // Type-5 IP Prefix: "route to this tenant subnet through me." The
+        // interface-less IP-VRF-to-IP-VRF model — ESI and GW IP both zero and a
+        // non-zero label, so the remote PE forwards on our next hop and L3 VNI
+        // alone and takes the inner destination MAC from the Router's MAC.
+        for prefix in &vrf.prefixes {
+            out.push(EvpnOriginRoute {
+                nlri: EvpnNlri::IpPrefix {
+                    rd: vrf.rd,
+                    esi: Esi::ZERO,
+                    eth_tag: 0,
+                    prefix: *prefix,
+                    gw: unspecified_gw(prefix),
+                    label: vrf.l3_vni,
+                },
+                ext_communities: ext.clone(),
+                next_hop: nh.clone(),
+                srv6: ip_vrf_srv6_tlvs(evpn, vrf.l3_vni, prefix),
+            });
+        }
+    }
+    out
 }
 
 /// One learned EVPN best route the central task asks a session to re-advertise. The
@@ -1203,10 +1332,15 @@ pub fn render_bgp_linkstate(rib: &LinkStateRib) -> String {
     out
 }
 
-/// Render the per-EVI MAC-VRF views (RFC 7432 §9): each instance's remote-MAC table
-/// (type-2) and remote-VTEP flood set (type-3) — `show evpn`.
-pub fn render_evpn_vnis(evis: &[(EvpnInstanceCfg, EviTable)]) -> String {
-    if evis.is_empty() {
+/// Render the per-EVI MAC-VRF views (RFC 7432 §9) followed by the per-tenant
+/// IP-VRF views (RFC 9136): each instance's remote-MAC table (type-2) and
+/// remote-VTEP flood set (type-3), then each IP-VRF's remote prefixes (type-5) —
+/// `show evpn`.
+pub fn render_evpn_vnis(
+    evis: &[(EvpnInstanceCfg, EviTable)],
+    ip_vrfs: &[(IpVrfCfg, IpVrfTable)],
+) -> String {
+    if evis.is_empty() && ip_vrfs.is_empty() {
         return "no evpn instances configured\n".to_string();
     }
     let mut out = String::new();
@@ -1228,6 +1362,36 @@ pub fn render_evpn_vnis(evis: &[(EvpnInstanceCfg, EviTable)]) -> String {
         }
         for vtep in table.iter_vteps() {
             let _ = writeln!(out, "  flood -> {vtep}");
+        }
+    }
+    for (vrf, table) in ip_vrfs {
+        let _ = writeln!(
+            out,
+            "IP-VRF {} l3vni {} rd {}",
+            vrf.name, vrf.l3_vni, vrf.rd
+        );
+        for (prefix, rp) in table.iter_prefixes() {
+            let _ = write!(out, "  prefix {prefix} -> vtep {}", rp.vtep);
+            // The remote's L3 VNI is printed even though it usually equals ours:
+            // RFC 9136 lets the two ends use different values, and a mismatch is
+            // exactly the kind of thing an operator runs `show evpn` to find.
+            if rp.vni != vrf.l3_vni {
+                let _ = write!(out, " remote-l3vni {}", rp.vni);
+            }
+            if let Some(m) = rp.router_mac {
+                let _ = write!(
+                    out,
+                    " router-mac {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+                    m[0], m[1], m[2], m[3], m[4], m[5]
+                );
+            }
+            if let Some(gw) = rp.gw {
+                let _ = write!(out, " gw {gw}");
+            }
+            if let Some(sid) = rp.srv6_sid {
+                let _ = write!(out, " srv6 {}", wren_bgp::srv6::sid_to_string(&sid));
+            }
+            out.push('\n');
         }
     }
     out
@@ -1379,6 +1543,7 @@ fn fanout_evpn(subscribers: &mut Vec<mpsc::Sender<EvpnEvent>>, event: EvpnEvent)
 /// never truncated. A subscriber that has already disconnected is dropped.
 async fn subscribe_evpn(
     evis: &[(EvpnInstanceCfg, EviTable)],
+    ip_vrfs: &[(IpVrfCfg, IpVrfTable)],
     subscribers: &mut Vec<mpsc::Sender<EvpnEvent>>,
     sub: EvpnSubscribe,
 ) {
@@ -1399,6 +1564,24 @@ async fn subscribe_evpn(
             let ev = EvpnEvent::FloodUpdate {
                 vni: inst.vni,
                 vtep: *vtep,
+            };
+            if sub.events.send(ev).await.is_err() {
+                return;
+            }
+        }
+    }
+    // The L3 half of the snapshot. Without it a controller that (re)connects after
+    // the type-5 routes were learned would program bridging but no routing, and see
+    // nothing further until a remote prefix happened to change.
+    for (vrf, table) in ip_vrfs {
+        for (prefix, rp) in table.iter_prefixes() {
+            let ev = EvpnEvent::PrefixUpdate {
+                l3_vni: vrf.l3_vni,
+                prefix: *prefix,
+                vtep: rp.vtep,
+                router_mac: rp.router_mac,
+                gw: rp.gw,
+                srv6_sid: rp.srv6_sid,
             };
             if sub.events.send(ev).await.is_err() {
                 return;
@@ -1828,45 +2011,13 @@ pub async fn run(
     // fan-out. This is the feed the fabric controller consumes (EVPN↔fabric bridge).
     let mut evpn_subscribers: Vec<mpsc::Sender<EvpnEvent>> = Vec::new();
     if let Some(evpn) = &cfg.evpn {
-        let nh = vtep_next_hop_octets(evpn.vtep_ip);
+        for inst in &evpn.instances {
+            evis.push((inst.clone(), EviTable::new(inst.rt_import.clone())));
+        }
         for vrf in &evpn.ip_vrfs {
             ip_vrfs.push((vrf.clone(), IpVrfTable::new(vrf.rt_import.clone())));
         }
-        for inst in &evpn.instances {
-            evis.push((inst.clone(), EviTable::new(inst.rt_import.clone())));
-            // Every route this instance originates carries its export RTs plus the
-            // VXLAN encapsulation community (RFC 8365 §6).
-            let mut ext = inst.rt_export.clone();
-            ext.push(encap_ext_community(TUNNEL_TYPE_VXLAN));
-            // Type-3 IMET: "I participate in this EVI"; BUM floods toward our VTEP.
-            evpn_originated.push(EvpnOriginRoute {
-                nlri: EvpnNlri::Imet {
-                    rd: inst.rd,
-                    eth_tag: 0,
-                    orig_ip: evpn.vtep_ip,
-                },
-                ext_communities: ext.clone(),
-                next_hop: nh.clone(),
-                srv6: evpn_srv6_tlvs(evpn, inst.vni, true),
-            });
-            // Type-2 MAC/IP for each static MAC.
-            for (mac, ip) in &inst.macs {
-                evpn_originated.push(EvpnOriginRoute {
-                    nlri: EvpnNlri::MacIp {
-                        rd: inst.rd,
-                        esi: Esi::ZERO,
-                        eth_tag: 0,
-                        mac: *mac,
-                        ip: *ip,
-                        label1: inst.vni,
-                        label2: None,
-                    },
-                    ext_communities: ext.clone(),
-                    next_hop: nh.clone(),
-                    srv6: evpn_srv6_tlvs(evpn, inst.vni, false),
-                });
-            }
-        }
+        evpn_originated = evpn_origination(evpn);
     }
 
     // FlowSpec (RFC 8955): the local rules to originate to FlowSpec-activated peers,
@@ -1964,7 +2115,7 @@ pub async fn run(
                         None => format!("no established session to {addr}\n"),
                     },
                     BgpQuery::Evpn => render_bgp_evpn(&evpn_rib),
-                    BgpQuery::EvpnVnis => render_evpn_vnis(&evis),
+                    BgpQuery::EvpnVnis => render_evpn_vnis(&evis, &ip_vrfs),
                     BgpQuery::FlowSpec => render_bgp_flowspec(&flowspec_rib),
                     BgpQuery::SrPolicy => render_bgp_srpolicy(&srpolicy_rib),
                     BgpQuery::LinkState => render_bgp_linkstate(&link_state_rib),
@@ -2094,7 +2245,7 @@ pub async fn run(
             // A new `wren monitor evpn` client: replay the MAC-VRF snapshot, then
             // retain it for live changes (the EVPN↔fabric bridge feed).
             Some(sub) = evpn_subscribes.recv() => {
-                subscribe_evpn(&evis, &mut evpn_subscribers, sub).await;
+                subscribe_evpn(&evis, &ip_vrfs, &mut evpn_subscribers, sub).await;
                 continue;
             }
             // A live configuration reload (SIGHUP) added and/or removed neighbours. Bring
@@ -7355,5 +7506,144 @@ mod tests {
         path.next_hop = IpAddr::V6("2001:db8::2".parse().unwrap());
         let route = path.to_route("2001:db8:99::/64".parse().unwrap());
         assert_eq!(route.nexthops[0], wren_core::NextHop::via(path.next_hop));
+    }
+
+    /// A tenant IP-VRF with one advertised subnet, as config resolution produces it.
+    fn test_ip_vrf(prefixes: &[&str], router_mac: Option<[u8; 6]>) -> IpVrfCfg {
+        IpVrfCfg {
+            name: "tenant-a".into(),
+            l3_vni: 50100,
+            rd: Rd::from_ip(id([10, 0, 0, 1]), 50100u32 as u16),
+            rt_import: vec![wren_bgp::evpn_rib::auto_route_target(65001, 50100)],
+            rt_export: vec![wren_bgp::evpn_rib::auto_route_target(65001, 50100)],
+            prefixes: prefixes.iter().map(|p| p.parse().unwrap()).collect(),
+            router_mac,
+        }
+    }
+
+    fn evpn_cfg(ip_vrfs: Vec<IpVrfCfg>, srv6_locator: Option<(Ipv6Addr, u8)>) -> EvpnConfig {
+        EvpnConfig {
+            vtep_ip: ip([10, 0, 0, 1]),
+            srv6_locator,
+            instances: vec![],
+            ip_vrfs,
+        }
+    }
+
+    /// The type-5 route we put on the wire is the interface-less IP-VRF-to-IP-VRF
+    /// model of RFC 9136 §4.4.1: zero ESI, zero gateway, the L3 VNI as the label,
+    /// and the Router's MAC carried so the receiver can address the inner frame.
+    /// Each of those is what a remote PE forwards on, so each is pinned literally.
+    #[test]
+    fn ip_vrf_originates_interface_less_type5() {
+        let mac = [0x02, 0xaa, 0xbb, 0xcc, 0xdd, 0xee];
+        let cfg = evpn_cfg(vec![test_ip_vrf(&["10.20.0.0/24"], Some(mac))], None);
+        let routes = evpn_origination(&cfg);
+        assert_eq!(routes.len(), 1);
+        let r = &routes[0];
+        match &r.nlri {
+            EvpnNlri::IpPrefix {
+                esi,
+                eth_tag,
+                prefix,
+                gw,
+                label,
+                ..
+            } => {
+                assert_eq!(*esi, Esi::ZERO);
+                assert_eq!(*eth_tag, 0);
+                assert_eq!(*prefix, "10.20.0.0/24".parse::<Prefix>().unwrap());
+                // "GW IP address = 0" — a non-zero gateway would send the receiver
+                // looking for an overlay index that does not exist.
+                assert_eq!(*gw, IpAddr::V4(Ipv4Addr::UNSPECIFIED));
+                // The L3 VNI, not any instance's L2 VNI: this is the routed context.
+                assert_eq!(*label, 50100);
+            }
+            other => panic!("expected a type-5 IP Prefix route, got {other:?}"),
+        }
+        // Export RT, the VXLAN encapsulation community, and the Router's MAC.
+        assert!(r.ext_communities.contains(&wren_bgp::evpn_rib::auto_route_target(65001, 50100)));
+        assert!(r
+            .ext_communities
+            .contains(&encap_ext_community(TUNNEL_TYPE_VXLAN)));
+        assert!(r.ext_communities.contains(&build_router_mac(mac)));
+        // Next hop is our VTEP — that is what the remote tunnels toward.
+        assert_eq!(r.next_hop, vtep_next_hop_octets(ip([10, 0, 0, 1])));
+        assert!(r.srv6.is_none(), "a VXLAN IP-VRF carries no Prefix-SID");
+    }
+
+    /// An IP-VRF with no advertised subnet is an import-only tenant: it still holds
+    /// a table for remote prefixes but must put nothing on the wire, or every PE
+    /// would claim a route to networks it does not have.
+    #[test]
+    fn ip_vrf_without_prefixes_originates_nothing() {
+        let cfg = evpn_cfg(vec![test_ip_vrf(&[], None)], None);
+        assert!(evpn_origination(&cfg).is_empty());
+    }
+
+    /// Under SRv6 the type-5 route carries an **L3** Service TLV with End.DT4 or
+    /// End.DT6 by address family (RFC 9252 §6). An L2 TLV, or one behaviour for both
+    /// families, would decapsulate into the wrong table on the egress.
+    #[test]
+    fn ip_vrf_srv6_uses_l3_service_tlv_per_family() {
+        let cfg = evpn_cfg(
+            vec![test_ip_vrf(&["10.20.0.0/24", "2001:db8:20::/64"], None)],
+            Some(("fc00:0:1::".parse().unwrap(), 48)),
+        );
+        let routes = evpn_origination(&cfg);
+        assert_eq!(routes.len(), 2);
+        let behaviors: Vec<u16> = routes
+            .iter()
+            .map(|r| {
+                let tlv = &r.srv6.as_ref().expect("srv6 locator set")[0];
+                assert!(!tlv.is_l2, "a type-5 route needs the L3 Service TLV");
+                tlv.sids[0].behavior
+            })
+            .collect();
+        assert_eq!(
+            behaviors,
+            vec![wren_bgp::srv6::behavior::END_DT4, wren_bgp::srv6::behavior::END_DT6]
+        );
+        // No Router's MAC: an End.DT4/DT6 egress does an IP lookup, so there is no
+        // inner Ethernet header for one to address.
+        assert!(!routes[0]
+            .ext_communities
+            .iter()
+            .any(|ec| ec[0] == 0x06 && ec[1] == 0x03));
+    }
+
+    /// `show evpn` must render the L3 view too — an operator debugging inter-subnet
+    /// reachability needs the remote prefix, its VTEP and the MAC traffic is sent to.
+    #[test]
+    fn render_evpn_vnis_shows_ip_vrf_prefixes() {
+        let vrf = test_ip_vrf(&[], None);
+        let mut table = IpVrfTable::new(vrf.rt_import.clone());
+        let mut path = learned_path(true, [10, 0, 0, 9]);
+        path.ext_communities = vec![
+            wren_bgp::evpn_rib::auto_route_target(65001, 50100),
+            build_router_mac([0x02, 0xaa, 0xbb, 0xcc, 0xdd, 0xee]),
+        ];
+        let nlri = EvpnNlri::IpPrefix {
+            rd: vrf.rd,
+            esi: Esi::ZERO,
+            eth_tag: 0,
+            prefix: "10.30.0.0/24".parse().unwrap(),
+            gw: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+            label: 50100,
+        };
+        let mut rib = EvpnRib::new();
+        let ev = rib
+            .update(ip([10, 0, 0, 9]), nlri, path)
+            .expect("a new best path");
+        table.apply(&ev).expect("the route imports into this IP-VRF");
+        let out = render_evpn_vnis(&[], &[(vrf, table)]);
+        assert!(out.contains("IP-VRF tenant-a l3vni 50100"), "{out}");
+        assert!(
+            out.contains("prefix 10.30.0.0/24 -> vtep 10.0.0.9 router-mac 02:aa:bb:cc:dd:ee"),
+            "{out}"
+        );
+        // The gateway was unspecified on the wire and must not be rendered as a
+        // usable next hop.
+        assert!(!out.contains("gw 0.0.0.0"), "{out}");
     }
 }

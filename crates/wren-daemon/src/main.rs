@@ -2779,12 +2779,41 @@ fn build_evpn_config(
             rt_import.push(auto);
             rt_export.push(auto);
         }
+        let mut prefixes = Vec::with_capacity(v.advertise_prefix.len());
+        for p in &v.advertise_prefix {
+            prefixes.push(p.parse().with_context(|| {
+                format!(
+                    "bgp evpn ip-vrf {} advertise-prefix {p:?} must be addr/len",
+                    v.name
+                )
+            })?);
+        }
+        let router_mac = match &v.router_mac {
+            Some(s) => Some(
+                parse_mac(s)
+                    .with_context(|| format!("bgp evpn ip-vrf {} router-mac", v.name))?,
+            ),
+            // RFC 9136 §4.4.1 requires the Router's MAC "if the route is associated
+            // with an Ethernet NVO tunnel" — a VXLAN receiver has no other source
+            // for the inner destination MAC and would blackhole every routed packet,
+            // so refuse to advertise rather than advertise a hole. Under SRv6 the
+            // End.DT4/DT6 SID decapsulates straight to an IP lookup, and there is no
+            // inner Ethernet header to address.
+            None if !v.advertise_prefix.is_empty() && e.srv6_locator.is_none() => anyhow::bail!(
+                "bgp evpn ip-vrf {}: advertise-prefix needs router-mac \
+                 (a VXLAN peer cannot route toward us without it)",
+                v.name
+            ),
+            None => None,
+        };
         ip_vrfs.push(bgp::IpVrfCfg {
             name: v.name.clone(),
             l3_vni: v.l3_vni,
             rd,
             rt_import,
             rt_export,
+            prefixes,
+            router_mac,
         });
     }
 
@@ -2946,16 +2975,21 @@ fn parse_mac_ip(s: &str) -> Result<([u8; 6], Option<IpAddr>)> {
         ),
         None => (s, None),
     };
-    let parts: Vec<&str> = mac_str.split(':').collect();
+    Ok((parse_mac(mac_str)?, ip))
+}
+
+/// Parse a bare MAC address, `aa:bb:cc:dd:ee:ff`.
+fn parse_mac(s: &str) -> Result<[u8; 6]> {
+    let parts: Vec<&str> = s.split(':').collect();
     if parts.len() != 6 {
-        anyhow::bail!("mac {mac_str:?} must be six colon-separated hex octets");
+        anyhow::bail!("mac {s:?} must be six colon-separated hex octets");
     }
     let mut mac = [0u8; 6];
     for (i, p) in parts.iter().enumerate() {
         mac[i] = u8::from_str_radix(p, 16)
             .with_context(|| format!("mac octet {p:?} must be a hex byte"))?;
     }
-    Ok((mac, ip))
+    Ok(mac)
 }
 
 /// Build a protocol's redistribution target from its `redistribute` list (the RIB
@@ -3565,6 +3599,72 @@ mod tests {
             ip6,
             Some(IpAddr::V6("2001:db8::5".parse::<Ipv6Addr>().unwrap()))
         );
+    }
+
+    /// A tenant IP-VRF resolves to its own RD and Route Targets keyed on the **L3**
+    /// VNI — never an instance's L2 VNI, which would make two different contexts
+    /// import each other's routes.
+    #[test]
+    fn ip_vrf_defaults_rd_and_rt_from_the_l3_vni() {
+        let cfg = wren_config::BgpEvpn {
+            vtep_ip: "10.0.0.1".into(),
+            ip_vrf: vec![wren_config::BgpEvpnIpVrf {
+                name: "tenant-a".into(),
+                l3_vni: 50100,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let out = build_evpn_config(&cfg, 65001, "10.0.0.1".parse().unwrap()).unwrap();
+        let vrf = &out.ip_vrfs[0];
+        assert_eq!(
+            vrf.rt_import,
+            vec![wren_bgp::evpn_rib::auto_route_target(65001, 50100)]
+        );
+        assert_eq!(vrf.rt_export, vrf.rt_import);
+        assert_eq!(vrf.rd, wren_bgp::evpn::Rd::from_ip("10.0.0.1".parse().unwrap(), 50100));
+        assert!(vrf.prefixes.is_empty());
+        assert_eq!(vrf.router_mac, None);
+    }
+
+    /// RFC 9136 §4.4.1 requires the Router's MAC on a type-5 route carried over an
+    /// Ethernet NVO tunnel. Advertising a subnet over VXLAN without one produces a
+    /// route no receiver can forward on, so resolution refuses it rather than
+    /// letting the blackhole reach the wire.
+    #[test]
+    fn vxlan_ip_vrf_refuses_to_advertise_without_a_router_mac() {
+        let mut cfg = wren_config::BgpEvpn {
+            vtep_ip: "10.0.0.1".into(),
+            ip_vrf: vec![wren_config::BgpEvpnIpVrf {
+                name: "tenant-a".into(),
+                l3_vni: 50100,
+                advertise_prefix: vec!["10.20.0.0/24".into()],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let Err(err) = build_evpn_config(&cfg, 65001, "10.0.0.1".parse().unwrap()) else {
+            panic!("advertising over VXLAN without a router-mac must be rejected");
+        };
+        assert!(err.to_string().contains("router-mac"), "{err}");
+
+        // With the MAC it resolves.
+        cfg.ip_vrf[0].router_mac = Some("02:aa:bb:cc:dd:ee".into());
+        let out = build_evpn_config(&cfg, 65001, "10.0.0.1".parse().unwrap()).unwrap();
+        assert_eq!(
+            out.ip_vrfs[0].router_mac,
+            Some([0x02, 0xaa, 0xbb, 0xcc, 0xdd, 0xee])
+        );
+        assert_eq!(
+            out.ip_vrfs[0].prefixes,
+            vec!["10.20.0.0/24".parse::<wren_core::Prefix>().unwrap()]
+        );
+
+        // An SRv6 locator lifts the requirement: End.DT4/DT6 decapsulates to an IP
+        // lookup, with no inner Ethernet header to address.
+        cfg.ip_vrf[0].router_mac = None;
+        cfg.srv6_locator = Some("fc00:0:1::/48".into());
+        assert!(build_evpn_config(&cfg, 65001, "10.0.0.1".parse().unwrap()).is_ok());
     }
 
     #[test]

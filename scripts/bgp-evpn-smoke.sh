@@ -22,13 +22,22 @@
 # share the auto Route Target rt:65010:10100, so each leaf imports the other's
 # routes into its MAC-VRF.
 #
+# Each leaf also holds a tenant IP-VRF (RFC 9136) on L3 VNI 50100 and advertises one
+# subnet into it as a type-5 IP Prefix route, carrying its Router's MAC (RFC 9135).
+# The IP-VRF's auto Route Target rt:65010:50100 differs from the EVI's, so a type-5
+# route landing in the IP-VRF proves the two import sets really are separate.
+#
 # The test asserts, on Leaf2:
 #   * the session to RR is Established; and
 #   * `show bgp evpn` carries Leaf1's routes via 10.0.0.1 (only possible via
 #     reflection); and
-#   * `show evpn` shows Leaf1's MAC and VTEP imported into the EVI 100 MAC-VRF; and
-#   * `monitor evpn` streams Leaf1's MAC and flood VTEP as `+ evpn ...` lines (the
-#     FPM-style EVPN↔fabric bridge feed the fabric controller consumes).
+#   * `show evpn` shows Leaf1's MAC and VTEP imported into the EVI 100 MAC-VRF, and
+#     Leaf1's tenant subnet imported into the tenant-a IP-VRF with the Router's MAC
+#     and the End.DT4 service SID; and
+#   * `monitor evpn` streams Leaf1's MAC, flood VTEP and tenant prefix as
+#     `+ evpn ...` lines (the FPM-style EVPN↔fabric bridge feed the fabric
+#     controller consumes). The monitor attaches after the routes were learned, so
+#     these lines come from the subscriber snapshot, not from live events.
 #
 # Usage:  bash scripts/bgp-evpn-smoke.sh
 set -euo pipefail
@@ -81,6 +90,14 @@ srv6-locator = "fc00:0:1::/48"
 evi = 100
 vni = 10100
 advertise-mac = ["02:00:5e:00:00:01/10.100.0.1"]
+# A tenant IP-VRF (RFC 9136): its own L3 VNI, its own auto Route Target
+# rt:65010:50100 — deliberately not the EVI's, so importing a type-5 route proves
+# the L3 import set is separate from the MAC-VRF's.
+[[bgp.evpn.ip-vrf]]
+name = "tenant-a"
+l3-vni = 50100
+advertise-prefix = ["10.20.0.0/24"]
+router-mac = "02:00:5e:00:00:aa"
 EOF
 
 # Leaf2 (passive) — VTEP 10.0.0.2, same EVI/vni (so it imports Leaf1's routes),
@@ -102,6 +119,11 @@ srv6-locator = "fc00:0:1::/48"
 evi = 100
 vni = 10100
 advertise-mac = ["02:00:5e:00:00:02/10.100.0.2"]
+[[bgp.evpn.ip-vrf]]
+name = "tenant-a"
+l3-vni = 50100
+advertise-prefix = ["10.21.0.0/24"]
+router-mac = "02:00:5e:00:00:bb"
 EOF
 
 export WREN WORK
@@ -175,6 +197,18 @@ unshare -Urn bash -c '
   grep -Eq "\+ evpn vni 10100 mac 02:00:5e:00:00:01 .*vtep 10.0.0.1" "$WORK/out.txt" || { echo "FAIL: monitor evpn did not stream Leaf1 MAC"; ok=0; }
   grep -Eq "\+ evpn vni 10100 mac 02:00:5e:00:00:01 .*vtep 10.0.0.1 srv6 fc00:0:1:0:2774::" "$WORK/out.txt" || { echo "FAIL: monitor evpn did not carry Leaf1 MAC SRv6 service SID"; ok=0; }
   grep -q "+ evpn vni 10100 flood 10.0.0.1"        "$WORK/out.txt" || { echo "FAIL: monitor evpn did not stream Leaf1 flood VTEP"; ok=0; }
+  # Symmetric IRB (RFC 9136): Leaf1 originates its tenant subnet as a type-5 IP
+  # Prefix route in the L3 VNI, and Leaf2 imports it into the IP-VRF — a different
+  # Route Target and a different table from the MAC-VRF above.
+  grep -q "\[5\]:10.0.0.1:50100:10.20.0.0/24"     "$WORK/out.txt" || { echo "FAIL: Leaf2 did not receive Leaf1 type-5 IP Prefix route"; ok=0; }
+  grep -q "IP-VRF tenant-a l3vni 50100"            "$WORK/out.txt" || { echo "FAIL: show evpn did not render the IP-VRF"; ok=0; }
+  # The Router MAC (RFC 9135) is what a receiver writes as the inner destination MAC;
+  # without it the imported prefix is unroutable, so assert it arrived with the route.
+  grep -q "prefix 10.20.0.0/24 -> vtep 10.0.0.1 router-mac 02:00:5e:00:00:aa" "$WORK/out.txt" || { echo "FAIL: Leaf1 tenant prefix not imported into Leaf2 IP-VRF with its router-mac"; ok=0; }
+  # And an End.DT4 service SID (disc 2, l3-vni 50100) — the L3 Service TLV, not the
+  # L2 one the MAC routes carry.
+  grep -Eq "prefix 10.20.0.0/24 .*srv6 fc00:0:1:200:c3b4::" "$WORK/out.txt" || { echo "FAIL: Leaf1 tenant prefix missing its SRv6 L3 service SID"; ok=0; }
+  grep -Eq "\+ evpn l3vni 50100 prefix 10.20.0.0/24 vtep 10.0.0.1 router-mac 02:00:5e:00:00:aa" "$WORK/out.txt" || { echo "FAIL: monitor evpn did not stream Leaf1 tenant prefix"; ok=0; }
 
   if [[ $ok -ne 1 ]]; then
     echo "--- RR log ---";    cat "$WORK/rr.log"

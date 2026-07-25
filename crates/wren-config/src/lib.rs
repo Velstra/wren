@@ -877,6 +877,21 @@ pub struct BgpEvpnIpVrf {
     /// Route Targets to attach on export. Defaults like `rt-import`.
     #[serde(default, rename = "rt-export")]
     pub rt_export: Vec<String>,
+    /// Local subnets to advertise as type-5 IP Prefix routes, each `addr/len`.
+    /// These are the tenant's directly-attached networks; remote PEs route toward
+    /// them through this VTEP's L3 VNI.
+    #[serde(default, rename = "advertise-prefix")]
+    pub advertise_prefix: Vec<String>,
+    /// The MAC of this router's IRB interface in this tenant, as
+    /// `aa:bb:cc:dd:ee:ff`. Advertised as the Router's MAC Extended Community
+    /// (RFC 9135) so a remote PE knows which inner destination MAC to write when
+    /// it encapsulates routed traffic toward us. Required alongside
+    /// `advertise-prefix` under VXLAN — RFC 9136 §4.4.1: "The EVPN Router's MAC
+    /// Extended Community must be sent if the route is associated with an
+    /// Ethernet NVO tunnel". An SRv6 locator makes it optional: End.DT4/DT6
+    /// decapsulates to an IP lookup with no inner Ethernet header to address.
+    #[serde(default, rename = "router-mac")]
+    pub router_mac: Option<String>,
 }
 
 /// One `[[bgp.evpn.instance]]`: an EVPN instance (EVI) bridging one VNI.
