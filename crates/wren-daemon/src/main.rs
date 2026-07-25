@@ -3301,8 +3301,45 @@ fn build_isis_config(
         leak_l2_to_l1: isis.l2_to_l1_leaking,
         bfd: isis.bfd,
         vrf_table,
-        auth_password: isis.password.clone().map(String::into_bytes),
+        auth: build_isis_auth(isis)?,
     })
+}
+
+/// Resolve the `[isis]` authentication config into the runner's [`IsisAuth`]:
+/// `"text"` is the cleartext password of ISO 10589 §9.8, `"hmac-sha256"` the
+/// Generic Cryptographic Authentication of RFC 5310, which signs the encoded PDU
+/// instead of putting the secret on the wire. The older `password` key stays valid
+/// as a shorthand for `auth-type = "text"`.
+#[cfg(feature = "isis")]
+fn build_isis_auth(isis: &wren_config::Isis) -> Result<Option<wren_isis::auth::IsisAuth>> {
+    use wren_isis::auth::IsisAuth;
+    let key = |ty: &str| -> Result<Vec<u8>> {
+        let key = isis
+            .auth_key
+            .as_deref()
+            .or(isis.password.as_deref())
+            .filter(|k| !k.is_empty())
+            .with_context(|| format!("isis auth-type {ty:?} requires a non-empty auth-key"))?;
+        Ok(key.as_bytes().to_vec())
+    };
+    match isis.auth_type.as_deref() {
+        // Unset falls back to the older `password` key, so existing configs keep
+        // working unchanged.
+        None => Ok(isis
+            .password
+            .clone()
+            .filter(|p| !p.is_empty())
+            .map(|p| IsisAuth::Cleartext(p.into_bytes()))),
+        Some("none") => Ok(None),
+        Some("text") => Ok(Some(IsisAuth::Cleartext(key("text")?))),
+        Some("hmac-sha256") => Ok(Some(IsisAuth::HmacSha256 {
+            key: key("hmac-sha256")?,
+            key_id: isis.auth_key_id.unwrap_or(1),
+        })),
+        Some(other) => {
+            anyhow::bail!("unknown isis auth-type {other:?} (want none, text or hmac-sha256)")
+        }
+    }
 }
 
 /// Resolve the `[[vrrp]]` definitions into the VRRP runner's instance configs,

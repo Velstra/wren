@@ -52,6 +52,7 @@ use tracing::{debug, info, warn};
 use wren_core::{NextHop, Prefix, Protocol, Route};
 use wren_isis::adjacency::AdjEvent;
 use wren_isis::adjacency::{AdjState, Adjacency};
+use wren_isis::auth::IsisAuth;
 use wren_isis::dis::{elect_dis, DisCandidate};
 use wren_isis::lsdb::Lsdb;
 use wren_isis::pdu::{Csnp, LanHello, Lsp, P2pHello, Pdu, PduBody, Psnp};
@@ -68,10 +69,10 @@ use crate::router::{Redistribution, RouteUpdate};
 
 /// The lifetime stamped on an originated LSP (seconds). Refreshed before expiry.
 const LSP_LIFETIME: u16 = 1200;
-/// The most neighbours we record per interface. IS-IS has no adjacency
-/// authentication yet, so an on-link attacker spoofing a stream of distinct
-/// system IDs could otherwise grow the neighbour table without bound (OOM). A
-/// real LAN has far fewer than this.
+/// The most neighbours we record per interface. Authentication is optional, so on
+/// an unauthenticated link an attacker spoofing a stream of distinct system IDs
+/// could otherwise grow the neighbour table without bound (OOM). A real LAN has far
+/// fewer than this.
 const MAX_NEIGHBORS_PER_IFACE: usize = 1024;
 /// Re-originate our LSPs once their remaining lifetime drops below this.
 const LSP_REFRESH_BELOW: u16 = 300;
@@ -143,10 +144,10 @@ pub struct IsisConfig {
     /// (`[isis] vrf = "…"`) keeps its routes in the VRF's table instead of the main
     /// table. Defaults to [`wren_core::RT_TABLE_MAIN`] for the default VRF.
     pub vrf_table: u32,
-    /// The cleartext authentication password (ISO 10589 §9.8), as raw bytes. When
-    /// `Some`, every PDU we send carries a matching Authentication TLV and every
-    /// received PDU must too, or it is dropped. `None` disables authentication.
-    pub auth_password: Option<Vec<u8>>,
+    /// How PDUs are authenticated (ISO 10589 §9.8 cleartext, or RFC 5310 HMAC).
+    /// When `Some`, every PDU we send carries a matching Authentication TLV and
+    /// every received PDU must too, or it is dropped. `None` disables it.
+    pub auth: Option<IsisAuth>,
 }
 
 /// Map a single level to its database / per-neighbour-array index.
@@ -743,6 +744,15 @@ impl Isis {
         let Some(pdu_bytes) = strip_llc(&frame.data) else {
             return;
         };
+        // Authentication (ISO 10589 §9.8, RFC 5310): when authentication is
+        // configured, every PDU must carry a matching Authentication TLV or it is
+        // dropped — without this any on-link host could form adjacencies and inject
+        // LSPs. Checked on the raw bytes and *before* decoding: the RFC 5310 digest
+        // covers the encoded PDU, and an unauthenticated frame is then never parsed.
+        if !verify_pdu_auth(self.cfg.auth.as_ref(), pdu_bytes) {
+            debug!("dropping IS-IS PDU with missing/invalid authentication");
+            return;
+        }
         let pdu = match Pdu::decode(pdu_bytes) {
             Ok(p) => p,
             Err(e) => {
@@ -750,13 +760,6 @@ impl Isis {
                 return;
             }
         };
-        // Authentication (ISO 10589 §9.8): when a password is configured, every PDU
-        // must carry a matching cleartext Authentication TLV or it is dropped —
-        // without this any on-link host could form adjacencies and inject LSPs.
-        if !self.pdu_auth_ok(&pdu.body) {
-            debug!("dropping IS-IS PDU with missing/invalid authentication");
-            return;
-        }
         match pdu.body {
             PduBody::LanHello(h) => self.process_lan_hello(frame.idx, h, frame.src, now).await,
             PduBody::P2pHello(h) => self.process_p2p_hello(frame.idx, h, frame.src, now).await,
@@ -766,24 +769,29 @@ impl Isis {
         }
     }
 
-    /// Whether a received PDU body satisfies the configured authentication.
-    fn pdu_auth_ok(&self, body: &PduBody) -> bool {
-        verify_pdu_auth(self.cfg.auth_password.as_deref(), body)
+    /// Prepend the Authentication TLV (ISO 10589 §9.8: it is the first TLV) when
+    /// authentication is configured, so every PDU we send is authenticated. For a
+    /// cleartext password the TLV is final here; for RFC 5310 it carries a
+    /// placeholder that [`Self::encode_pdu`] overwrites with the digest, which can
+    /// only be computed once the PDU has been encoded. A no-op otherwise.
+    fn push_auth(&self, tlvs: &mut Vec<Tlv>) {
+        if let Some(auth) = &self.cfg.auth {
+            tlvs.insert(0, auth_tlv(auth));
+        }
     }
 
-    /// Prepend a cleartext Authentication TLV (ISO 10589 §9.8: it is the first TLV)
-    /// when a password is configured, so every PDU we send is authenticated. A
-    /// no-op for an unauthenticated instance.
-    fn push_auth(&self, tlvs: &mut Vec<Tlv>) {
-        if let Some(pw) = &self.cfg.auth_password {
-            tlvs.insert(
-                0,
-                Tlv::Authentication {
-                    auth_type: 1,
-                    data: pw.clone(),
-                },
-            );
+    /// Encode a PDU we send and authenticate it. Every transmit path goes through
+    /// here, because an RFC 5310 digest covers the encoded bytes and so cannot be
+    /// applied by [`Self::push_auth`] — an `.encode()` that skipped this would emit
+    /// an Apad placeholder where the digest belongs. (Re-flooding a *received* LSP
+    /// is different: those bytes carry the originator's digest and are forwarded
+    /// verbatim.)
+    fn encode_pdu(&self, pdu: Pdu) -> Vec<u8> {
+        let mut bytes = pdu.encode();
+        if let Some(auth) = &self.cfg.auth {
+            auth.seal(&mut bytes);
         }
+        bytes
     }
 
     async fn process_lan_hello(&mut self, idx: usize, h: LanHello, src: [u8; 6], now: u64) {
@@ -948,11 +956,10 @@ impl Isis {
         // Send any LSP the sender lacks or holds an older copy of.
         for id in &sync.send {
             if let Some(lsp) = self.dbs[li].get(id) {
-                let bytes = Pdu {
+                let bytes = self.encode_pdu(Pdu {
                     max_area_addresses: 0,
                     body: PduBody::Lsp(lsp.clone()),
-                }
-                .encode();
+                });
                 self.send_on(idx, level, &bytes).await;
             }
         }
@@ -972,11 +979,10 @@ impl Isis {
         // Treat every listed entry as a request: send the LSP if we hold it.
         for entry in lsp_entries(&psnp.tlvs) {
             if let Some(lsp) = self.dbs[li].get(&entry.lsp_id) {
-                let bytes = Pdu {
+                let bytes = self.encode_pdu(Pdu {
                     max_area_addresses: 0,
                     body: PduBody::Lsp(lsp.clone()),
-                }
-                .encode();
+                });
                 self.send_on(idx, level, &bytes).await;
             }
         }
@@ -1278,11 +1284,10 @@ impl Isis {
     /// Encode an LSP (filling its checksum), store the verified copy and flood it.
     async fn store_and_flood(&mut self, level: IsLevel, lsp: Lsp) {
         let li = lidx(level);
-        let bytes = Pdu {
+        let bytes = self.encode_pdu(Pdu {
             max_area_addresses: 0,
             body: PduBody::Lsp(lsp),
-        }
-        .encode();
+        });
         // Re-decode so the stored copy carries the computed Fletcher checksum (so a
         // reflooded copy of our own LSP never looks "more recent" than ours).
         if let Ok(Pdu {
@@ -1304,11 +1309,10 @@ impl Isis {
         };
         lsp.remaining_lifetime = 0;
         lsp.sequence_number += 1;
-        let bytes = Pdu {
+        let bytes = self.encode_pdu(Pdu {
             max_area_addresses: 0,
             body: PduBody::Lsp(lsp),
-        }
-        .encode();
+        });
         self.flood(level, &bytes, None).await;
     }
 
@@ -1382,7 +1386,7 @@ impl Isis {
                                 tlvs,
                             }),
                         };
-                        to_send.push((idx, level_mac(level), pdu.encode()));
+                        to_send.push((idx, level_mac(level), self.encode_pdu(pdu)));
                     }
                 }
                 IfaceType::PointToPoint => {
@@ -1415,7 +1419,7 @@ impl Isis {
                             tlvs,
                         }),
                     };
-                    to_send.push((idx, ALL_L1_ISS, pdu.encode()));
+                    to_send.push((idx, ALL_L1_ISS, self.encode_pdu(pdu)));
                 }
             }
         }
@@ -1479,7 +1483,7 @@ impl Isis {
                             },
                         }),
                     };
-                    to_send.push((idx, level_mac(level), pdu.encode()));
+                    to_send.push((idx, level_mac(level), self.encode_pdu(pdu)));
                 }
             }
         }
@@ -1503,7 +1507,7 @@ impl Isis {
                 checksum: 0,
             })
             .collect();
-        Pdu {
+        self.encode_pdu(Pdu {
             max_area_addresses: 0,
             body: PduBody::Psnp(Psnp {
                 level,
@@ -1514,8 +1518,7 @@ impl Isis {
                     tlvs
                 },
             }),
-        }
-        .encode()
+        })
     }
 
     // --- timers ------------------------------------------------------------
@@ -2221,23 +2224,26 @@ fn strip_llc(payload: &[u8]) -> Option<&[u8]> {
     Some(&payload[3..])
 }
 
-/// Whether `body` satisfies the authentication `password` (ISO 10589 §9.8): with no
-/// password every PDU passes; with a password the PDU must carry a cleartext
-/// Authentication TLV (type 1) whose data equals it. Pulled out of the runner so
-/// the accept/reject logic is unit-testable without a live IS-IS instance.
-fn verify_pdu_auth(password: Option<&[u8]>, body: &PduBody) -> bool {
-    let Some(expected) = password else {
-        return true;
-    };
-    let tlvs = match body {
-        PduBody::LanHello(h) => &h.tlvs,
-        PduBody::P2pHello(h) => &h.tlvs,
-        PduBody::Lsp(l) => &l.tlvs,
-        PduBody::Csnp(c) => &c.tlvs,
-        PduBody::Psnp(p) => &p.tlvs,
-    };
-    tlvs.iter()
-        .any(|t| matches!(t, Tlv::Authentication { auth_type: 1, data } if data == expected))
+/// The Authentication TLV an outgoing PDU carries under `auth`, as it goes on the
+/// wire before sealing. Shared by the runner and its tests so both build the TLV
+/// the same way.
+fn auth_tlv(auth: &IsisAuth) -> Tlv {
+    Tlv::Authentication {
+        auth_type: auth.auth_type(),
+        data: auth.placeholder(),
+    }
+}
+
+/// Whether an encoded PDU satisfies `auth`: with authentication disabled every PDU
+/// passes; otherwise it must carry an Authentication TLV that matches — the
+/// configured password (ISO 10589 §9.8) or a digest over these very bytes (RFC
+/// 5310). Pulled out of the runner so the accept/reject logic is unit-testable
+/// without a live IS-IS instance.
+fn verify_pdu_auth(auth: Option<&IsisAuth>, bytes: &[u8]) -> bool {
+    match auth {
+        None => true,
+        Some(auth) => auth.verify(bytes),
+    }
 }
 
 #[cfg(test)]
@@ -2300,43 +2306,89 @@ mod tests {
         assert!(!dis_election_input_changed(false, 64, 100));
     }
 
+    /// An encoded LSP carrying the Authentication TLV `auth` would put on the wire,
+    /// sealed the way the runner's `encode_pdu` seals it.
+    fn sealed_lsp(auth: Option<&IsisAuth>) -> Vec<u8> {
+        let mut tlvs = Vec::new();
+        if let Some(a) = auth {
+            tlvs.push(auth_tlv(a));
+        }
+        let mut bytes = Pdu {
+            max_area_addresses: 0,
+            body: PduBody::Lsp(Lsp {
+                level: IsLevel::L2,
+                remaining_lifetime: 1000,
+                lsp_id: LspId::new(SystemId::new([1, 1, 1, 1, 1, 1]), 0, 0),
+                sequence_number: 1,
+                checksum: 0,
+                partition: false,
+                attached: 0,
+                overload: false,
+                is_type: IsLevel::L2,
+                tlvs,
+            }),
+        }
+        .encode();
+        if let Some(a) = auth {
+            a.seal(&mut bytes);
+        }
+        bytes
+    }
+
     #[test]
     fn isis_authentication_accepts_match_rejects_others() {
-        // An LSP whose only TLV is a cleartext Authentication (type 1) for "s3cret".
-        let auth_lsp = |pw: &[u8]| PduBody::Lsp(Lsp {
-            level: IsLevel::L2,
-            remaining_lifetime: 1000,
-            lsp_id: LspId::new(SystemId::new([1, 1, 1, 1, 1, 1]), 0, 0),
-            sequence_number: 1,
-            checksum: 0,
-            partition: false,
-            attached: 0,
-            overload: false,
-            is_type: IsLevel::L2,
-            tlvs: vec![Tlv::Authentication {
-                auth_type: 1,
-                data: pw.to_vec(),
-            }],
-        });
-        let no_auth = PduBody::Lsp(Lsp {
-            level: IsLevel::L2,
-            remaining_lifetime: 1000,
-            lsp_id: LspId::new(SystemId::new([1, 1, 1, 1, 1, 1]), 0, 0),
-            sequence_number: 1,
-            checksum: 0,
-            partition: false,
-            attached: 0,
-            overload: false,
-            is_type: IsLevel::L2,
-            tlvs: vec![],
-        });
-        // No password configured: every PDU passes, authenticated or not.
-        assert!(verify_pdu_auth(None, &auth_lsp(b"s3cret")));
+        let pw = IsisAuth::Cleartext(b"s3cret".to_vec());
+        let wrong_pw = IsisAuth::Cleartext(b"wrong".to_vec());
+        let no_auth = sealed_lsp(None);
+
+        // Authentication disabled: every PDU passes, authenticated or not.
+        assert!(verify_pdu_auth(None, &sealed_lsp(Some(&pw))));
         assert!(verify_pdu_auth(None, &no_auth));
         // Password configured: only a PDU carrying the matching TLV passes.
-        assert!(verify_pdu_auth(Some(b"s3cret"), &auth_lsp(b"s3cret")));
-        assert!(!verify_pdu_auth(Some(b"s3cret"), &auth_lsp(b"wrong")));
-        assert!(!verify_pdu_auth(Some(b"s3cret"), &no_auth));
+        assert!(verify_pdu_auth(Some(&pw), &sealed_lsp(Some(&pw))));
+        assert!(!verify_pdu_auth(Some(&pw), &sealed_lsp(Some(&wrong_pw))));
+        assert!(!verify_pdu_auth(Some(&pw), &no_auth));
+    }
+
+    #[test]
+    fn hmac_authenticated_pdus_round_trip_through_send_and_receive() {
+        // The wiring this pins down: `push_auth` inserts only a placeholder, so a PDU
+        // is authentic only if the transmit path also *sealed* it. Both halves here
+        // are the ones the runner uses — `auth_tlv` and `IsisAuth::seal` on the way
+        // out, `verify_pdu_auth` on the way in.
+        let auth = IsisAuth::HmacSha256 {
+            key: b"s3cret".to_vec(),
+            key_id: 7,
+        };
+        assert!(verify_pdu_auth(Some(&auth), &sealed_lsp(Some(&auth))));
+
+        // An unsealed PDU — what an `.encode()` that bypassed `encode_pdu` would emit
+        // — carries the Apad placeholder and must be rejected, not accepted.
+        let mut unsealed = Pdu {
+            max_area_addresses: 0,
+            body: PduBody::Lsp(Lsp {
+                level: IsLevel::L2,
+                remaining_lifetime: 1000,
+                lsp_id: LspId::new(SystemId::new([1, 1, 1, 1, 1, 1]), 0, 0),
+                sequence_number: 1,
+                checksum: 0,
+                partition: false,
+                attached: 0,
+                overload: false,
+                is_type: IsLevel::L2,
+                tlvs: vec![auth_tlv(&auth)],
+            }),
+        }
+        .encode();
+        assert!(!verify_pdu_auth(Some(&auth), &unsealed));
+        auth.seal(&mut unsealed);
+        assert!(verify_pdu_auth(Some(&auth), &unsealed));
+
+        // The two schemes are not interchangeable, and a cleartext password never
+        // satisfies a router configured for HMAC.
+        let pw = IsisAuth::Cleartext(b"s3cret".to_vec());
+        assert!(!verify_pdu_auth(Some(&auth), &sealed_lsp(Some(&pw))));
+        assert!(!verify_pdu_auth(Some(&pw), &sealed_lsp(Some(&auth))));
     }
 
     #[test]

@@ -184,6 +184,47 @@ installed `proto isis` once `redistribute = ["static"]` is set. This is also the
 **first end-to-end verification of the IS-IS runner itself**, two routers forming
 a point-to-point adjacency over a veth and exchanging LSPs.
 
+## Authentication (ISO 10589 §9.8, RFC 5310)
+
+IS-IS rides directly on the data link, so anything on the wire can send it PDUs —
+there is no IP layer to filter at. Authentication is what stops an on-link host from
+forming an adjacency and injecting LSPs. Every PDU carries an **Authentication TLV**
+(type 10) whose first octet names the scheme; Wren supports two, configured once
+under `[isis]` and applied to every interface (the routers on a link must agree):
+
+```toml
+[isis]
+enabled     = true
+interfaces  = ["eth1"]
+auth-type   = "hmac-sha256"   # "none" (default), "text", or "hmac-sha256"
+auth-key    = "s3cr3t"        # the password, or the HMAC key (any length)
+auth-key-id = 1               # hmac-sha256 only; lets keys be rolled (default 1)
+```
+
+- **`text`** (auth type 1) — a **cleartext password**, carried verbatim in the TLV
+  and compared on receipt. It only stops a *misconfigured* neighbour: anyone who can
+  observe the link can read the password straight off the wire and replay it.
+- **`hmac-sha256`** (auth type 3, RFC 5310) — **cryptographic authentication**: the
+  TLV carries a Key ID and an HMAC-SHA-256 over the *encoded PDU*, so an attacker
+  without the key cannot forge a PDU the digest will accept. This is the one to use.
+  The Key ID travels in the clear so a key can be rolled without an outage.
+
+Three details of the digest are worth knowing, because they are what let it survive
+normal IS-IS behaviour: the Authentication Data field is filled with the constant
+`Apad` (not zeros) before hashing; an LSP's **Remaining Lifetime and Checksum are
+zeroed**, so a transit router may age an LSP without invalidating the digest; and
+because the LSP's Fletcher checksum covers the TLV, Wren recomputes it *after*
+writing the digest.
+
+The older `password = "…"` key remains valid as a shorthand for
+`auth-type = "text"`, so existing configurations keep working unchanged.
+
+A PDU whose Authentication TLV is missing or does not match is dropped **before it is
+parsed**, so it never reaches the adjacency state machine — a mismatched key simply
+means the adjacency never forms. `scripts/isis-auth-smoke.sh` exercises this live
+(rootless): two point-to-point routers reach `Up` with matching HMAC-SHA-256 keys and
+form no adjacency at all when the keys differ.
+
 ## Inspecting it
 
 The daemon answers three IS-IS `show` commands over its

@@ -1244,7 +1244,24 @@ pub struct Isis {
     /// every PDU we send carries an Authentication TLV with this password and every
     /// PDU we receive must carry a matching one, or it is dropped — so an on-link
     /// attacker cannot form adjacencies or inject LSPs. Unset ⇒ no authentication.
+    /// Equivalent to `auth-type = "text"` with this string as `auth-key`.
     pub password: Option<String>,
+    /// Packet authentication scheme: `"text"` for the cleartext password above, or
+    /// `"hmac-sha256"` for the Generic Cryptographic Authentication of RFC 5310.
+    /// Prefer the latter: a cleartext password is visible to anyone who can observe
+    /// the link and can be replayed, whereas the HMAC signs the encoded PDU.
+    /// Unset (the default) falls back to `password`.
+    #[serde(rename = "auth-type")]
+    pub auth_type: Option<String>,
+    /// The shared secret — the password (`"text"`) or the HMAC key
+    /// (`"hmac-sha256"`, any length). Required when `auth-type` is set; falls back
+    /// to `password`.
+    #[serde(rename = "auth-key")]
+    pub auth_key: Option<String>,
+    /// The Key ID advertised in the clear alongside the digest (`"hmac-sha256"`
+    /// only, RFC 5310 §3.1), so keys can be rolled without an outage. Defaults to 1.
+    #[serde(rename = "auth-key-id")]
+    pub auth_key_id: Option<u16>,
 }
 
 /// A named route filter (`[[filter]]`): an ordered list of rules plus a default
