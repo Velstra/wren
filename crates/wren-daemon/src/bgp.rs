@@ -1784,6 +1784,7 @@ pub async fn run(
     bmp_tx: Option<mpsc::Sender<crate::bmp::BmpEvent>>,
     mut bfd_down: mpsc::Receiver<IpAddr>,
     mut evpn_subscribes: mpsc::Receiver<EvpnSubscribe>,
+    mut flowspec_subscribes: mpsc::Receiver<FlowSpecSubscribe>,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
     mut reconfig: mpsc::Receiver<BgpReconfig>,
 ) -> Result<()> {
@@ -2027,6 +2028,9 @@ pub async fn run(
     // forwarding datapath (the fabric eBPF flow classifier) is a separate, privileged
     // step and is not done here.
     let mut flowspec_rib = FlowSpecRib::new();
+    // Live `monitor flowspec` clients — the datapaths that enforce what this
+    // table selects.
+    let mut flowspec_subscribers: Vec<mpsc::Sender<FlowSpecEvent>> = Vec::new();
     let flowspec_originated: Vec<FlowSpecRuleCfg> = cfg
         .flowspec
         .as_ref()
@@ -2248,6 +2252,12 @@ pub async fn run(
                 subscribe_evpn(&evis, &ip_vrfs, &mut evpn_subscribers, sub).await;
                 continue;
             }
+            // A new `wren monitor flowspec` client: replay the installed rules,
+            // then retain it for live changes (the mitigation feed).
+            Some(sub) = flowspec_subscribes.recv() => {
+                subscribe_flowspec(&flowspec_rib, &mut flowspec_subscribers, sub).await;
+                continue;
+            }
             // A live configuration reload (SIGHUP) added and/or removed neighbours. Bring
             // the added peers up and tear the removed ones down cleanly; unchanged peers
             // (named in neither list) keep their session and learned routes untouched.
@@ -2304,6 +2314,7 @@ pub async fn run(
                     }
                     for ev in flowspec_rib.withdraw_peer(addr) {
                         log_flowspec_event(&ev);
+                        fanout_flowspec(&mut flowspec_subscribers, flowspec_event_for(&ev));
                     }
                     for ev in srpolicy_rib.withdraw_peer(addr) {
                         log_srpolicy_event(&ev);
@@ -2683,6 +2694,7 @@ pub async fn run(
                 // FlowSpec (RFC 8955): drop every rule this peer taught us.
                 for ev in flowspec_rib.withdraw_peer(p) {
                     log_flowspec_event(&ev);
+                    fanout_flowspec(&mut flowspec_subscribers, flowspec_event_for(&ev));
                 }
                 // SR Policy (RFC 9256): drop every candidate this peer taught us.
                 for ev in srpolicy_rib.withdraw_peer(p) {
@@ -3022,6 +3034,7 @@ pub async fn run(
                 for nlri in mp_unreach_flowspec(&update) {
                     if let Some(ev) = flowspec_rib.withdraw(peer, nlri) {
                         log_flowspec_event(&ev);
+                        fanout_flowspec(&mut flowspec_subscribers, flowspec_event_for(&ev));
                     }
                 }
                 // FlowSpec reachability (MP_REACH_NLRI, SAFI 133): install each flow
@@ -3034,6 +3047,7 @@ pub async fn run(
                         let nlri = FlowSpecNlri { afi, spec };
                         if let Some(ev) = flowspec_rib.update(peer, nlri, path.clone()) {
                             log_flowspec_event(&ev);
+                            fanout_flowspec(&mut flowspec_subscribers, flowspec_event_for(&ev));
                         }
                     }
                 }
@@ -3952,9 +3966,94 @@ fn log_linkstate_event(ev: &LinkStateRibEvent) {
     }
 }
 
-/// Log a FlowSpec Loc-RIB change (RFC 8955). The wren-side deliverable stops at the
-/// RIB and its `show`; installing the selected rule into a forwarding datapath (the
-/// fabric eBPF flow classifier) is a separate, privileged step done elsewhere.
+/// How many events a `monitor flowspec` subscriber may fall behind before it is
+/// dropped. Mirrors [`EVPN_SUBSCRIBER_CAP`]: bounded so one stalled client cannot
+/// grow the BGP task's memory without limit.
+pub(crate) const FLOWSPEC_SUBSCRIBER_CAP: usize = 1024;
+
+/// One change on the FlowSpec monitor feed (`wren monitor flowspec`) — the
+/// mitigation counterpart of [`EvpnEvent`]. A subscriber receives a snapshot of
+/// the installed rules (one [`RuleUpdate`](FlowSpecEvent::RuleUpdate) each,
+/// terminated by [`EndOfDump`](FlowSpecEvent::EndOfDump)), then live changes.
+///
+/// The consumer is a forwarding datapath: wren selects the rule, the datapath
+/// enforces it. That split is why this is a stream and not a callback — the
+/// enforcing side is a separate, privileged process.
+#[derive(Debug, Clone, PartialEq)]
+pub enum FlowSpecEvent {
+    /// Install or replace a flow rule with its traffic-filtering actions.
+    RuleUpdate {
+        /// The flow specification (its match criteria).
+        nlri: FlowSpecNlri,
+        /// The actions the selected path carries (RFC 8955 §7). **May be empty**:
+        /// a rule advertised without a recognised action community is still
+        /// installed in the RIB, and a consumer must decide for itself what an
+        /// action-less rule means rather than assume "discard".
+        actions: Vec<FsAction>,
+    },
+    /// The rule has no path left and must stop being enforced.
+    RuleWithdraw {
+        /// The flow specification that is gone.
+        nlri: FlowSpecNlri,
+    },
+    /// The initial snapshot is complete; everything after this is live.
+    EndOfDump,
+}
+
+/// A request to subscribe to the FlowSpec monitor feed.
+pub struct FlowSpecSubscribe {
+    /// Where to deliver the snapshot and live events. Bounded: a subscriber whose
+    /// buffer fills is dropped (it can reconnect and re-snapshot).
+    pub events: mpsc::Sender<FlowSpecEvent>,
+}
+
+/// Replay the installed FlowSpec rules to a new subscriber, then a terminating
+/// [`FlowSpecEvent::EndOfDump`], and finally retain the sender for live events.
+/// Delivered with backpressure so a large table is never truncated; a subscriber
+/// that has already disconnected is dropped.
+async fn subscribe_flowspec(
+    rib: &FlowSpecRib,
+    subscribers: &mut Vec<mpsc::Sender<FlowSpecEvent>>,
+    sub: FlowSpecSubscribe,
+) {
+    for (nlri, path) in rib.iter_best() {
+        let ev = FlowSpecEvent::RuleUpdate {
+            nlri: nlri.clone(),
+            actions: actions_of(path),
+        };
+        if sub.events.send(ev).await.is_err() {
+            return;
+        }
+    }
+    if sub.events.send(FlowSpecEvent::EndOfDump).await.is_err() {
+        return;
+    }
+    subscribers.push(sub.events);
+}
+
+/// Translate a Loc-RIB change into its monitor event.
+fn flowspec_event_for(ev: &FlowSpecRibEvent) -> FlowSpecEvent {
+    match ev {
+        FlowSpecRibEvent::Best { nlri, path } => FlowSpecEvent::RuleUpdate {
+            nlri: nlri.clone(),
+            actions: actions_of(path),
+        },
+        FlowSpecRibEvent::Withdrawn(nlri) => FlowSpecEvent::RuleWithdraw {
+            nlri: nlri.clone(),
+        },
+    }
+}
+
+/// Fan a FlowSpec change out to every live monitor subscriber, dropping the ones
+/// that have disconnected or fallen too far behind. `try_send` (never `send`) so
+/// a stalled subscriber can never block the single-threaded BGP task — the same
+/// rule the EVPN fan-out follows.
+fn fanout_flowspec(subscribers: &mut Vec<mpsc::Sender<FlowSpecEvent>>, ev: FlowSpecEvent) {
+    subscribers.retain(|tx| tx.try_send(ev.clone()).is_ok());
+}
+
+/// Log a FlowSpec Loc-RIB change (RFC 8955). Enforcement lives in the forwarding
+/// datapath that consumes `monitor flowspec`; this is the operator-facing trace.
 fn log_flowspec_event(ev: &FlowSpecRibEvent) {
     match ev {
         FlowSpecRibEvent::Best { nlri, path } => {

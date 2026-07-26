@@ -368,6 +368,8 @@ async fn main() -> Result<()> {
     // never sees a closed channel; the `_rx` is moved into `bgp::run`.
     let (evpn_subscribe_tx, evpn_subscribe_rx) = mpsc::channel(QUERY_QUEUE);
     let mut evpn_subscribe_rx = Some(evpn_subscribe_rx);
+    let (flowspec_subscribe_tx, flowspec_subscribe_rx) = mpsc::channel(QUERY_QUEUE);
+    let mut flowspec_subscribe_rx = Some(flowspec_subscribe_rx);
     let (bgp_queries_tx, bgp_queries_rx) = mpsc::channel(QUERY_QUEUE);
     let mut bgp_queries_rx = Some(bgp_queries_rx);
     let bgp_enabled = cfg.bgp.as_ref().is_some_and(|b| b.enabled);
@@ -566,6 +568,7 @@ async fn main() -> Result<()> {
             router: queries_tx.clone(),
             subscribe: subscribe_tx.clone(),
             evpn_subscribe: bgp_enabled.then(|| evpn_subscribe_tx.clone()),
+            flowspec_subscribe: bgp_enabled.then(|| flowspec_subscribe_tx.clone()),
             bgp: bgp_enabled.then(|| bgp_queries_tx.clone()),
             bfd: bfd_enabled.then(|| bfd_queries_tx.clone()),
             #[cfg(feature = "ospf")]
@@ -884,6 +887,9 @@ async fn main() -> Result<()> {
                 let esrx = evpn_subscribe_rx
                     .take()
                     .expect("evpn subscribe rx taken once");
+                let fsrx = flowspec_subscribe_rx
+                    .take()
+                    .expect("flowspec subscribe rx taken once");
                 let sd = shutdown_tx.subscribe();
                 let rcrx = bgp_reload_rx.take().expect("bgp reload rx taken once");
                 proto_handles.push(tokio::spawn(async move {
@@ -896,6 +902,7 @@ async fn main() -> Result<()> {
                         bmp_for_engine,
                         bdrx,
                         esrx,
+                        fsrx,
                         sd,
                         rcrx,
                     )

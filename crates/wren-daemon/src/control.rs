@@ -23,7 +23,9 @@ use tracing::{info, warn};
 #[cfg(feature = "babel")]
 use crate::babel::{BabelQuery, BabelQueryRequest};
 use crate::bfd::{BfdQuery, BfdQueryRequest};
-use crate::bgp::{BgpQuery, BgpQueryRequest, EvpnEvent, EvpnSubscribe};
+use crate::bgp::{
+    BgpQuery, BgpQueryRequest, EvpnEvent, EvpnSubscribe, FlowSpecEvent, FlowSpecSubscribe,
+};
 #[cfg(feature = "isis")]
 use crate::isis::{IsisQuery, IsisQueryRequest};
 #[cfg(feature = "ospf")]
@@ -52,6 +54,9 @@ pub struct Channels {
     /// To the BGP task to open an EVPN monitor stream (`monitor evpn`), if BGP is
     /// running. This is the EVPN↔fabric bridge feed the fabric controller consumes.
     pub evpn_subscribe: Option<mpsc::Sender<EvpnSubscribe>>,
+    /// To the BGP task to open a FlowSpec monitor stream (`monitor flowspec`),
+    /// if BGP is running — the mitigation feed a forwarding datapath consumes.
+    pub flowspec_subscribe: Option<mpsc::Sender<FlowSpecSubscribe>>,
     /// To the BGP task (`show bgp`), if BGP is running.
     pub bgp: Option<mpsc::Sender<BgpQueryRequest>>,
     /// To the BFD task (`show bfd`), if any BFD session is configured.
@@ -156,6 +161,9 @@ async fn handle_conn(stream: UnixStream, channels: Channels) -> Result<()> {
     if is_evpn_subscribe_command(line) {
         return stream_evpn(reader, &channels.evpn_subscribe).await;
     }
+    if is_flowspec_subscribe_command(line) {
+        return stream_flowspec(reader, &channels.flowspec_subscribe).await;
+    }
     if is_subscribe_command(line) {
         return stream_routes(reader, &channels.subscribe).await;
     }
@@ -242,7 +250,7 @@ async fn handle_conn(stream: UnixStream, channels: Channels) -> Result<()> {
              show ospf [neighbors|interfaces|database] | show ospf3 [neighbors|interfaces] | \
              show isis [neighbors|interfaces|database] | show babel [neighbors|routes] | \
              show bfd | show rip | show ripng | show vrrp | show pim [neighbors|mroute] | show vrf | \
-             show metrics | monitor routes | monitor evpn\n"
+             show metrics | monitor routes | monitor evpn | monitor flowspec\n"
         )
     });
 
@@ -300,6 +308,19 @@ pub fn is_subscribe_command(line: &str) -> bool {
     match tokens.next() {
         Some("monitor") | Some("subscribe") => {
             matches!(tokens.next(), Some("routes") | Some("route")) && tokens.next().is_none()
+        }
+        _ => false,
+    }
+}
+
+/// Whether `line` opens a FlowSpec monitor subscription (`monitor flowspec`).
+/// The mitigation counterpart of [`is_evpn_subscribe_command`]: the feed a
+/// forwarding datapath consumes to enforce the rules this speaker selected.
+pub fn is_flowspec_subscribe_command(line: &str) -> bool {
+    let mut tokens = line.split_whitespace();
+    match tokens.next() {
+        Some("monitor") | Some("subscribe") => {
+            tokens.next() == Some("flowspec") && tokens.next().is_none()
         }
         _ => false,
     }
@@ -774,6 +795,90 @@ async fn stream_routes(
     Ok(())
 }
 
+/// Render one FlowSpec monitor event as its wire line.
+///
+/// ```text
+/// + flowspec action <a>[,<a>…] match <flow specification>
+/// - flowspec match <flow specification>
+/// % end-of-dump
+/// ```
+///
+/// The fields before `match` are **keyword/value pairs** and the flow
+/// specification — itself keyword/value pairs, and variable in length — is
+/// always last. A consumer therefore reads pairs until it sees `match`, and
+/// takes everything after it as the specification; a field added later slots in
+/// before `match` without breaking that parse.
+///
+/// Actions are compact single tokens (`discard`, `rate-limit:<bytes-per-second>`,
+/// `mark:<dscp>`) rather than the human-readable rendering, so no action ever
+/// contains a space. `action none` means the rule carried no recognised action
+/// community — deliberately explicit rather than silently implying `discard`,
+/// which would turn a malformed advertisement into a blackhole.
+fn format_flowspec_event(event: &FlowSpecEvent) -> String {
+    match event {
+        FlowSpecEvent::RuleUpdate { nlri, actions } => {
+            let rendered: Vec<String> = actions.iter().map(flowspec_action_token).collect();
+            let action = if rendered.is_empty() {
+                "none".to_string()
+            } else {
+                rendered.join(",")
+            };
+            format!("+ flowspec action {action} match {nlri}\n")
+        }
+        FlowSpecEvent::RuleWithdraw { nlri } => format!("- flowspec match {nlri}\n"),
+        FlowSpecEvent::EndOfDump => "% end-of-dump\n".to_string(),
+    }
+}
+
+/// One traffic-filtering action as a space-free wire token.
+fn flowspec_action_token(action: &wren_bgp::flowspec::Action) -> String {
+    use wren_bgp::flowspec::Action;
+    match action {
+        // RFC 8955 §7.1: a traffic-rate of zero *is* the discard action.
+        Action::RateLimit(r) if *r == 0.0 => "discard".to_string(),
+        Action::RateLimit(r) => format!("rate-limit:{r}"),
+        Action::Marking(d) => format!("mark:{d}"),
+    }
+}
+
+/// Serve a FlowSpec monitor subscription (`wren monitor flowspec`): register with
+/// the BGP task, then stream each event to the client as a line. The mirror of
+/// [`stream_evpn`]; a dropped client is noticed on the next write and the BGP
+/// task prunes the closed sender on its next fan-out.
+async fn stream_flowspec(
+    mut reader: BufReader<UnixStream>,
+    subscribe: &Option<mpsc::Sender<FlowSpecSubscribe>>,
+) -> Result<()> {
+    let Some(subscribe) = subscribe else {
+        reader
+            .get_mut()
+            .write_all(b"bgp is not enabled\n")
+            .await
+            .ok();
+        return Ok(());
+    };
+    let (tx, mut rx) = mpsc::channel(crate::bgp::FLOWSPEC_SUBSCRIBER_CAP);
+    if subscribe.send(FlowSpecSubscribe { events: tx }).await.is_err() {
+        reader
+            .get_mut()
+            .write_all(b"error: bgp unavailable\n")
+            .await
+            .ok();
+        return Ok(());
+    }
+    let stream = reader.get_mut();
+    while let Some(event) = rx.recv().await {
+        if stream
+            .write_all(format_flowspec_event(&event).as_bytes())
+            .await
+            .is_err()
+        {
+            break; // client gone
+        }
+    }
+    Ok(())
+}
+
 /// Serve an EVPN monitor subscription (`wren monitor evpn`): register with the BGP
 /// task, then stream each [`EvpnEvent`] to the client as a line until the channel
 /// ends or the client disconnects. If BGP is not running there is nothing to
@@ -841,6 +946,106 @@ pub async fn run_monitor_client(path: &Path, command: &str) -> Result<()> {
         out.flush().ok();
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod flowspec_monitor_tests {
+    use super::*;
+    use std::net::IpAddr;
+    use wren_bgp::flowspec::{Action, Component, FlowSpec, NumOp};
+    use wren_bgp::flowspec_rib::FlowSpecNlri;
+
+    fn rule() -> FlowSpecNlri {
+        let mut spec = FlowSpec { components: Vec::new() };
+        spec.components.push(Component::DestPrefix(
+            "10.0.0.0/24".parse::<wren_core::Prefix>().unwrap(),
+        ));
+        spec.components
+            .push(Component::IpProto(vec![NumOp::eq(6)]));
+        FlowSpecNlri::v4(spec)
+    }
+
+    /// The flow specification is variable in length, so it has to come last and
+    /// every field before it has to be a keyword/value pair — otherwise a
+    /// consumer cannot tell where the match begins.
+    #[test]
+    fn the_match_is_last_and_the_prefix_is_keyword_value() {
+        let line = format_flowspec_event(&FlowSpecEvent::RuleUpdate {
+            nlri: rule(),
+            actions: vec![Action::DISCARD],
+        });
+        let line = line.trim_end();
+        let (head, tail) = line.split_once(" match ").expect("a match section");
+        assert_eq!(head, "+ flowspec action discard");
+        assert!(tail.contains("dst 10.0.0.0/24"), "{tail}");
+        assert!(tail.contains("proto"), "{tail}");
+
+        let withdraw = format_flowspec_event(&FlowSpecEvent::RuleWithdraw { nlri: rule() });
+        assert!(withdraw.starts_with("- flowspec match "), "{withdraw}");
+        assert_eq!(
+            format_flowspec_event(&FlowSpecEvent::EndOfDump),
+            "% end-of-dump\n"
+        );
+    }
+
+    /// Every action must be a single space-free token: the match section is
+    /// whitespace-delimited, so an action containing a space would make the line
+    /// unparseable. (The human-readable rendering — "rate-limit 5000 bytes/s" —
+    /// is deliberately *not* what goes on the wire.)
+    #[test]
+    fn actions_are_space_free_tokens() {
+        for action in [
+            Action::DISCARD,
+            Action::RateLimit(12500.0),
+            Action::Marking(46),
+        ] {
+            let token = flowspec_action_token(&action);
+            assert!(!token.contains(' '), "action token {token:?} has a space");
+        }
+        assert_eq!(flowspec_action_token(&Action::DISCARD), "discard");
+        assert_eq!(flowspec_action_token(&Action::Marking(46)), "mark:46");
+
+        // Several actions on one rule join with a comma, still space-free.
+        let line = format_flowspec_event(&FlowSpecEvent::RuleUpdate {
+            nlri: rule(),
+            actions: vec![Action::RateLimit(12500.0), Action::Marking(46)],
+        });
+        let head = line.split(" match ").next().unwrap().to_string();
+        assert_eq!(head, "+ flowspec action rate-limit:12500,mark:46");
+    }
+
+    /// A rule advertised without a recognised action community is still in the
+    /// RIB. Saying so explicitly beats implying "discard" — that would turn a
+    /// malformed advertisement into a blackhole.
+    #[test]
+    fn an_action_less_rule_says_none_rather_than_implying_discard() {
+        let line = format_flowspec_event(&FlowSpecEvent::RuleUpdate {
+            nlri: rule(),
+            actions: Vec::new(),
+        });
+        assert!(line.starts_with("+ flowspec action none match "), "{line}");
+        assert!(!line.contains("discard"), "{line}");
+    }
+
+    /// An IPv6 rule must be distinguishable from a v4 one on the wire, or a
+    /// consumer would program a v6 match into a v4 table.
+    #[test]
+    fn ipv6_rules_are_tagged() {
+        let mut spec = FlowSpec { components: Vec::new() };
+        spec.components.push(Component::DestPrefix(
+            "2001:db8::/32".parse::<wren_core::Prefix>().unwrap(),
+        ));
+        let nlri = FlowSpecNlri {
+            afi: wren_bgp::AFI_IPV6,
+            spec,
+        };
+        let line = format_flowspec_event(&FlowSpecEvent::RuleUpdate {
+            nlri,
+            actions: vec![Action::DISCARD],
+        });
+        assert!(line.contains("match [ipv6] "), "{line}");
+        let _ = IpAddr::from([0u8; 4]);
+    }
 }
 
 #[cfg(test)]
@@ -1210,6 +1415,12 @@ mod tests {
 
     #[test]
     fn is_evpn_subscribe_command_matches_monitor_evpn_only() {
+        assert!(is_flowspec_subscribe_command("monitor flowspec"));
+        assert!(is_flowspec_subscribe_command("subscribe flowspec"));
+        assert!(!is_flowspec_subscribe_command("monitor evpn"));
+        assert!(!is_flowspec_subscribe_command("monitor flowspec extra"));
+        assert!(!is_flowspec_subscribe_command("show bgp flowspec"));
+
         assert!(is_evpn_subscribe_command("monitor evpn"));
         assert!(is_evpn_subscribe_command("subscribe evpn"));
         // The `routes` object is the other stream, not this one.

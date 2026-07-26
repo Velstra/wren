@@ -55,6 +55,53 @@ eBPF/XDP data plane, which subscribes, resolves each next-hop's L2 address, and
 programs its own route map. Keeping the contract a generic stream (rather than a
 Velstra-specific `Fib` backend) leaves Wren free of any consumer coupling.
 
+## Streaming filter rules — `wren monitor flowspec`
+
+BGP FlowSpec (RFC 8955) carries **traffic-filtering rules** in BGP: an upstream
+tells you to discard, rate-limit or re-mark a particular flow, typically to
+mitigate a DDoS before it reaches you. Wren selects the best path per rule into a
+FlowSpec RIB (`show bgp flowspec`) — but enforcing one means touching a
+forwarding datapath, which is a separate, privileged job.
+
+`monitor flowspec` is that hand-off, the same shape as `monitor routes`: an
+initial snapshot of every installed rule, then live changes.
+
+```sh
+$ wren monitor flowspec
++ flowspec action discard match dst 10.50.0.0/24 proto =6 dport =22
+% end-of-dump                                        # snapshot complete
++ flowspec action rate-limit:12500 match src 192.0.2.0/24
+- flowspec match dst 10.50.0.0/24 proto =6 dport =22
+```
+
+* `+ flowspec action <a>[,<a>…] match <flow specification>` — install or replace
+  a rule;
+* `- flowspec match <flow specification>` — the rule has no path left and must
+  stop being enforced;
+* `% end-of-dump` — the snapshot is complete; everything after is live.
+
+Two details matter to anyone writing a consumer:
+
+**The match section is last, and everything before it is keyword/value pairs.**
+A flow specification is itself a variable-length list of pairs (`dst …`,
+`proto …`, `dport …`), so it cannot be followed by anything. Read pairs until the
+`match` keyword; take the rest as the specification. A field added in a later
+release slots in before `match` and leaves that parse intact.
+
+**Actions are space-free tokens**, not the human-readable rendering that
+`show bgp flowspec` prints:
+
+| Token | Meaning |
+|---|---|
+| `discard` | drop matching traffic (RFC 8955 §7.1: a traffic-rate of zero) |
+| `rate-limit:<bytes-per-second>` | limit matching traffic to that rate |
+| `mark:<dscp>` | rewrite the DSCP of matching packets |
+| `none` | the rule carried **no recognised action community** |
+
+`none` is deliberately explicit. A rule can reach the RIB without a usable action
+community, and implying `discard` there would turn a malformed advertisement into
+a blackhole — so the feed says what it knows and lets the consumer decide.
+
 ## Configuration hot-reload — `SIGHUP`
 
 Send the running daemon `SIGHUP` and it **re-reads its configuration file and
