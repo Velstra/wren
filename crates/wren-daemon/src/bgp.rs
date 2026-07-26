@@ -1955,9 +1955,10 @@ pub async fn run(
     // otherwise the ordinary async bind is used unchanged.
     // Without authentication we bind a dual-stack IPv6 listener (`[::]:179`,
     // `IPV6_V6ONLY` off) so it accepts both IPv4 (as v4-mapped) and IPv6 (unnumbered,
-    // RFC 5549) inbound connections. With any TCP-MD5/TCP-AO peer we fall back to the
-    // hand-built IPv4 listener that installs each peer's key before `listen` (those
-    // schemes are wired for IPv4 transport only here).
+    // RFC 5549) inbound connections. With any TCP-MD5/TCP-AO peer we use the
+    // hand-built listener instead, which installs each peer's key before `listen` —
+    // still dual-stack whenever any peer is IPv6, since both schemes carry the peer
+    // address in a `sockaddr_storage` and work over either transport.
     let vrf_dev = cfg.vrf_device.as_deref();
     let bound = if cfg.peers.iter().any(|p| p.tcp_auth().is_enabled()) {
         bind_listener_authed(&cfg.peers, vrf_dev)
@@ -4606,6 +4607,20 @@ fn set_tcp_ao(fd: i32, peer: IpAddr, key: &str, key_id: u8) -> std::io::Result<(
     Ok(())
 }
 
+/// Whether the authenticated listener must be dual-stack (`AF_INET6` with
+/// `IPV6_V6ONLY` off) rather than `AF_INET`.
+///
+/// Takes **every** peer's address, and must keep doing so: there is one listener for
+/// the whole speaker, while taking the authenticated path at all is decided by
+/// whether *some* peer has a key. Narrowing this to the authenticated peers — which
+/// it did until this was fixed — means a single `password` on an IPv4 peer silently
+/// drops every unauthenticated IPv6 peer's inbound connection. The session then only
+/// comes up when we happen to dial first, which looks like a flapping peer rather
+/// than a configuration mistake.
+fn listener_needs_dual_stack(mut addrs: impl Iterator<Item = IpAddr>) -> bool {
+    addrs.any(|a| a.is_ipv6())
+}
+
 /// Put `fd` into non-blocking mode, so a connect can be driven by tokio's reactor.
 fn set_nonblocking(fd: i32) -> std::io::Result<()> {
     let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
@@ -4829,11 +4844,7 @@ fn bind_listener_authed(
     vrf_device: Option<&str>,
 ) -> std::io::Result<TcpListener> {
     use std::os::fd::FromRawFd;
-    // Any authenticated IPv6 peer requires a dual-stack (AF_INET6) listener; otherwise
-    // an AF_INET one suffices (and keeps the pure-IPv4 behaviour byte-for-byte).
-    let dual = peers
-        .iter()
-        .any(|p| p.addr.is_ipv6() && p.tcp_auth().is_enabled());
+    let dual = listener_needs_dual_stack(peers.iter().map(|p| p.addr));
     let family = if dual { libc::AF_INET6 } else { libc::AF_INET };
     let fd = unsafe { libc::socket(family, libc::SOCK_STREAM, 0) };
     if fd < 0 {
@@ -6626,6 +6637,22 @@ mod tests {
     // `sockaddr_storage` whose family follows the peer — a sockaddr_in for IPv4, a
     // sockaddr_in6 for IPv6. These pure builders back both the connect and the listen
     // side, so getting the family/address bytes right is what makes IPv6 auth work.
+    /// The authenticated listener is shared by every peer, so its family must follow
+    /// *any* IPv6 peer. Scoping it to the authenticated ones made one `password` on
+    /// an IPv4 peer silently kill inbound IPv6 for the unauthenticated ones.
+    #[test]
+    fn dual_stack_follows_any_ipv6_peer_authenticated_or_not() {
+        let v4: IpAddr = "10.0.0.1".parse().unwrap();
+        let v6: IpAddr = "2001:db8::1".parse().unwrap();
+
+        assert!(!listener_needs_dual_stack([v4].into_iter()));
+        assert!(listener_needs_dual_stack([v6].into_iter()));
+        // The regression: a v4 peer (the authenticated one, in practice) beside an
+        // unauthenticated v6 peer still needs the dual-stack listener.
+        assert!(listener_needs_dual_stack([v4, v6].into_iter()));
+        assert!(!listener_needs_dual_stack(std::iter::empty()));
+    }
+
     #[test]
     fn peer_storage_encodes_v4_and_v6_with_the_right_family() {
         // IPv4 → AF_INET sockaddr_in, address in network byte order.
