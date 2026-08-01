@@ -6,6 +6,93 @@ follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.4.0] — 2026-08-01
+
+A large release: EVPN grows a layer-3 half, IS-IS learns to authenticate, and a
+standing audit of the link-state and BGP paths is closed out. Almost everything
+under **Fixed** is a conformance bug found by reading the RFCs against the code
+rather than by a failing test — the kind that only shows up against another
+vendor's implementation, at three in the morning.
+
+### Added
+
+- **EVPN inter-subnet routing (RFC 9136 / 9135).** A tenant is no longer one
+  broadcast domain: `[[evpn.ip_vrf]]` declares an IP-VRF, its subnets are
+  originated as **type-5 IP Prefix** routes, and received type-5 routes are
+  imported into that VRF's table. The **Router's MAC** extended community
+  (RFC 9135) rides along, which is what lets a symmetric-IRB peer rewrite the
+  inner destination MAC without an ARP for a host it will never see. Tenant
+  prefixes are streamed to a forwarding data plane over the monitor API, so the
+  anycast gateway is programmed from the routes rather than from a second copy
+  of the configuration.
+- **MAC Mobility, honoured rather than parsed (RFC 7432 §7.7).** A MAC that
+  moves is accepted on sequence number, and a **sticky** MAC refuses to move at
+  all — which is the whole point of marking one sticky.
+- **IS-IS authentication, three ways.** Cleartext (ISO 10589 §9.8), **HMAC-MD5**
+  (RFC 5304) and **HMAC-SHA-256** (RFC 5310). The two cryptographic modes differ
+  in a way that is easy to get wrong and impossible to notice against yourself:
+  RFC 5304 zeroes the digest field before computing, RFC 5310 fills it with the
+  Apad constant. Both go through a single `encode_pdu` choke point, so a PDU
+  type cannot be authenticated on one path and not on another. MD5 and
+  HMAC-SHA-256 moved into `wren-core` rather than being carried per-protocol.
+- **OSPFv3 authentication with an RFC 7166 HMAC trailer**, replacing the
+  assumption that IPsec is there.
+- **IS-IS three-way handshake on point-to-point links (RFC 5303).** Without it
+  an adjacency can come up in one direction only, and the SPF then routes into
+  a link that cannot answer.
+- **BGP FlowSpec rules streamed to a forwarding data plane**, so a filter
+  learned from a peer can be enforced by something other than wren.
+- **Unknown transitive attributes are propagated with the Partial bit
+  (RFC 7606 §8)** instead of being dropped, which is what lets a feature wren
+  does not implement survive a hop through it.
+
+### Fixed
+
+- **Self-originated link state is refreshed and re-aged.** OSPF LSAs and IS-IS
+  LSPs were originated once and then left; a neighbour that keeps its own timers
+  correctly would age them out and remove the route, roughly half an hour after
+  everything looked fine. IS-IS pseudonode LSPs had the same gap.
+- **Flooding and database exchange, brought to the letter of RFC 2328** (v2 and
+  v3): MinLSArrival on received LSAs (§13 step 5a), received-LSA checksum
+  verification (§13 step 1), implied acknowledgments and send-back in the flood
+  decision (§13.7-8), link-state **retransmission lists** (§13.5), resync on a
+  Database Description sequence mismatch (§10.6), and the DD MTU check. Each of
+  these is a way for two routers to disagree about the database and never
+  converge.
+- **ECMP is preserved across equal-cost transit networks (§16.1)**, and a
+  prefix length is derived from a mask's **leading run** rather than by counting
+  its bits — `255.255.0.255` is not a /24.
+- **IS-IS: DIS re-election when an up neighbour's priority changes** (§8.4.5),
+  **CSNPs fragmented to the link MTU** (§9.10), a maximum-metric link excluded
+  from the SPF (RFC 5305 §3), zero-lifetime purge LSPs accepted without checksum
+  verification, and a hold-time overflow.
+- **BGP error handling per RFC 7606**, completed: attribute-length, duplicate
+  and flags checks; wrong-length aggregate/originator attributes rejected;
+  a malformed aggregate **discarded** rather than triggering a withdraw; the
+  eBGP LOCAL_PREF filter and deterministic MED; and an unexpected message
+  in-state treated as an FSM error (RFC 4271 §6.5).
+- **The central BGP task can no longer be blocked by one slow peer.** A full
+  send queue used to stall the task that feeds every other session — a
+  self-inflicted denial of service that gets worse the more peers you have.
+  A peer that will not drain is torn down instead.
+- **ORIGINATOR_ID is used in the best-path tie-break**, and the ADD-PATH
+  send-id table is bounded.
+- **The authenticated BGP listener stays dual-stack**, so TCP-MD5/AO does not
+  quietly cost you IPv6 sessions.
+- **Multicast:** PIM Register checksums cover only the first 8 octets, the MFC
+  incoming interface is programmed from the RPF result rather than from where
+  the packet happened to arrive, IGMP/MLD carry the Router Alert option, and
+  SSM sources are withdrawn on leave.
+- **Bounded allocation** on the paths an attacker chooses the length of: OSPF
+  LSU/Link-LSA decode, IGMP reports, and the RTR ROA set. AS 0 is rejected in
+  an AS_PATH, and OSPF MD5 verification is constant-time.
+- **Route deletion wildcards protocol and scope**, so a route wren did not
+  install exactly the way it expects is still removed.
+
+### Documentation
+
+- EVPN is documented in the handbook.
+
 ## [0.3.1] — 2026-07-11
 
 A bug-fix release: graceful shutdown now runs under an init system, not only on
