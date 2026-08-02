@@ -352,6 +352,17 @@ pub struct StaticRoute {
     /// The VRF this route belongs to (a `[[vrf]]` name). Unset means the default VRF
     /// (the main table); a named VRF installs the route into that VRF's table.
     pub vrf: Option<String>,
+    /// Discard what matches instead of forwarding it. A blackhole route takes no
+    /// `via`/`dev` — having nowhere to send is the whole point — and is the
+    /// standard way to null-route a prefix or to make a BGP summary stick
+    /// without also announcing the more specifics inside it.
+    #[serde(default)]
+    pub blackhole: bool,
+    /// Administrative distance, in the usual convention where **lower wins**.
+    /// Unset ⇒ the protocol's own preference. Two routes to the same prefix from
+    /// different sources are ranked by this, which is how a floating static
+    /// route sits behind a learned one and only takes over when it goes away.
+    pub distance: Option<u32>,
 }
 
 /// A Virtual Routing and Forwarding instance (`[[vrf]]`): a named, isolated routing
@@ -1439,7 +1450,18 @@ impl Config {
                 .prefix
                 .parse()
                 .map_err(|e| ConfigError::Invalid(format!("static prefix {:?}: {e}", s.prefix)))?;
-            let nexthop = match (&s.via, &s.dev) {
+            // A discard route carries no next-hop at all: the FIB installs a
+            // route with an empty next-hop list as the kernel's own blackhole
+            // type, so "nowhere to send" needs no second way of saying it.
+            let nexthops = if s.blackhole {
+                if s.via.is_some() || s.dev.is_some() {
+                    return Err(ConfigError::Invalid(format!(
+                        "static route {prefix} is a blackhole and cannot also have a next-hop"
+                    )));
+                }
+                Vec::new()
+            } else {
+                vec![match (&s.via, &s.dev) {
                 (Some(via), dev) => {
                     let gw: IpAddr = via.parse().map_err(|_| {
                         ConfigError::Invalid(format!("static via {via:?} is not an IP address"))
@@ -1452,11 +1474,23 @@ impl Config {
                 (None, Some(dev)) => NextHop::dev(dev.clone()),
                 (None, None) => {
                     return Err(ConfigError::Invalid(format!(
-                        "static route {prefix} needs `via` and/or `dev`"
+                        "static route {prefix} needs `via`, `dev` or `blackhole`"
                     )))
                 }
+                }]
             };
-            let mut route = Route::new(prefix, Protocol::Static, vec![nexthop], s.metric);
+            let mut route = Route::new(prefix, Protocol::Static, nexthops, s.metric);
+            // Distance counts down where preference counts up, so a smaller
+            // distance has to become a larger preference. 255 is the widest
+            // administrative distance anyone writes, which makes it the mirror.
+            if let Some(d) = s.distance {
+                if d > 255 {
+                    return Err(ConfigError::Invalid(format!(
+                        "static route {prefix} distance {d}: 0-255"
+                    )));
+                }
+                route.preference = 255 - d;
+            }
             // Place the route in its VRF's table, if it names one.
             if let Some(vrf) = &s.vrf {
                 let table = self.vrf_table(vrf).ok_or_else(|| {
@@ -2023,6 +2057,37 @@ mod tests {
         .expect("valid config");
         let bgp = cfg.bgp.expect("bgp present");
         assert_eq!(bgp.community, vec!["65001:100", "no-export"]);
+    }
+
+    /// A discard route is a route with nowhere to send, and that is how it
+    /// reaches the FIB: an empty next-hop list, which the netlink layer installs
+    /// as the kernel's own blackhole type. Distance counts down where
+    /// preference counts up, so the two have to be mirrored.
+    #[test]
+    fn a_blackhole_route_has_no_nexthop_and_distance_inverts_preference() {
+        let cfg: Config = toml::from_str(
+            r#"
+[[static]]
+prefix = "203.0.113.0/24"
+blackhole = true
+distance = 254
+"#,
+        )
+        .expect("parses");
+        let routes = cfg.static_routes().expect("resolves");
+        assert_eq!(routes.len(), 1);
+        assert!(
+            routes[0].nexthops.is_empty(),
+            "a blackhole route must carry no next-hop"
+        );
+        assert_eq!(routes[0].preference, 1, "distance 254 is preference 1");
+
+        // …and it cannot also have somewhere to send.
+        let both: Config = toml::from_str(
+            "[[static]]\nprefix = \"203.0.113.0/24\"\nblackhole = true\nvia = \"192.0.2.1\"\n",
+        )
+        .expect("parses");
+        assert!(both.static_routes().is_err(), "blackhole + via was accepted");
     }
 
     #[test]

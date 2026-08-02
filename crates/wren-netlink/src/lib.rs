@@ -52,6 +52,9 @@ const RT_TABLE_MAIN: u8 = 254;
 /// `RTA_TABLE` attribute, for table ids that do not fit the one-octet field (> 255).
 const RT_TABLE_UNSPEC: u8 = 0;
 const RTN_UNICAST: u8 = 1;
+/// A route that discards what it matches. The kernel's own word for a route
+/// with nowhere to send — which is exactly a route carrying no next-hop.
+const RTN_BLACKHOLE: u8 = 6;
 const RT_SCOPE_UNIVERSE: u8 = 0;
 const RT_SCOPE_LINK: u8 = 253;
 /// The "nowhere" scope (255): a wildcard on a delete request — it matches a
@@ -200,7 +203,7 @@ fn parse_route(msg: &[u8]) -> Option<Route> {
     let mut table = msg[20] as u32;
     let protocol = owned_protocol(msg[21])?;
     let rtn_type = msg[23];
-    if rtn_type != RTN_UNICAST {
+    if rtn_type != RTN_UNICAST && rtn_type != RTN_BLACKHOLE {
         return None;
     }
 
@@ -527,7 +530,9 @@ fn build_route_msg(
             // Universe scope if any next-hop has a gateway; link scope for purely
             // on-link routes (a connected/dev route the kernel forwards directly).
             let any_gateway = r.nexthops.iter().any(|n| n.gateway.is_some());
-            buf[22] = if any_gateway {
+            // A discard route has no next-hop at all, so it is neither on-link
+            // nor via anything: universe scope, like the kernel's own.
+            buf[22] = if any_gateway || r.nexthops.is_empty() {
                 RT_SCOPE_UNIVERSE
             } else {
                 RT_SCOPE_LINK
@@ -538,7 +543,13 @@ fn build_route_msg(
             buf[22] = RT_SCOPE_NOWHERE; // rtm_scope — wildcard on delete
         }
     }
-    buf[23] = RTN_UNICAST; // rtm_type
+    // A route with no next-hop is a discard route — the kernel has a type for
+    // exactly that, and installing it as a unicast route with nothing to send
+    // to would be rejected.
+    buf[23] = match route {
+        Some(r) if r.nexthops.is_empty() => RTN_BLACKHOLE,
+        _ => RTN_UNICAST,
+    }; // rtm_type
                            // 24..28 rtm_flags = 0
 
     // --- attributes ---
