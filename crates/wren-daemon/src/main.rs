@@ -3287,8 +3287,19 @@ fn compile_filter(def: &wren_config::FilterDef) -> Result<Filter> {
             Some(list) => Some(parse_ext_communities(list)?),
         };
         let add_ext_communities = parse_ext_communities(&r.add_ext_community)?;
+        // Refused here rather than at the first route that matches: a next hop
+        // that is not an address is a typo, and finding out when traffic
+        // silently keeps its old path is the expensive way to learn it.
+        let set_next_hop = match &r.set_next_hop {
+            None => None,
+            Some(a) => Some(
+                a.parse()
+                    .map_err(|_| anyhow::anyhow!("set-next-hop {a:?} is not an IP address"))?,
+            ),
+        };
         let modify = Modify {
             set_metric: r.set_metric,
+            set_next_hop,
             add_metric: r.add_metric,
             set_preference: r.set_preference,
             set_communities,

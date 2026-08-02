@@ -42,9 +42,10 @@
 #![forbid(unsafe_code)]
 
 use std::fmt;
+use std::net::IpAddr;
 use std::str::FromStr;
 
-use wren_core::{Prefix, Protocol, Route};
+use wren_core::{NextHop, Prefix, Protocol, Route};
 
 /// One prefix pattern: a base network plus an inclusive length window. A prefix
 /// matches when it falls inside the base network *and* its length is in the window.
@@ -219,6 +220,18 @@ pub struct Modify {
     /// Append these extended communities (deduplicated, order-preserving) after
     /// any `set_ext_communities` has been applied.
     pub add_ext_communities: Vec<[u8; 8]>,
+    /// Send the matching route via this address instead of wherever it said.
+    ///
+    /// Replaces the route's next-hop **set**, so a multipath route collapses to
+    /// this one gateway — which is what naming a single next hop means. A route
+    /// that had none (a discard route) stops discarding and starts forwarding;
+    /// that is a large thing to do from a filter, and it is done rather than
+    /// quietly refused because a filter that silently ignores what it was told
+    /// is worse.
+    ///
+    /// The family is not checked against the prefix on purpose: an IPv4 route
+    /// via an IPv6 next hop is RFC 5549, which this daemon speaks.
+    pub set_next_hop: Option<IpAddr>,
 }
 
 impl Modify {
@@ -233,12 +246,18 @@ impl Modify {
             && self.add_large_communities.is_empty()
             && self.set_ext_communities.is_none()
             && self.add_ext_communities.is_empty()
+            && self.set_next_hop.is_none()
     }
 
     /// Apply the changes to `route` in place. `set_metric` is applied before
     /// `add_metric`, so the two compose (set a base, then adjust); likewise
     /// `set_communities` (replace) is applied before `add_communities` (append).
     pub fn apply(&self, route: &mut Route) {
+        if let Some(nh) = self.set_next_hop {
+            // The whole set, not the first entry: a multipath route sent via one
+            // named gateway has one next hop by definition.
+            route.nexthops = vec![NextHop::via(nh)];
+        }
         if let Some(m) = self.set_metric {
             route.metric = m;
         }
@@ -396,6 +415,79 @@ impl fmt::Display for ParseError {
 }
 
 impl std::error::Error for ParseError {}
+
+#[cfg(test)]
+mod set_next_hop_tests {
+    use super::*;
+
+    fn route(nexthops: Vec<NextHop>) -> Route {
+        Route::new(
+            "10.0.0.0/8".parse().unwrap(),
+            Protocol::Bgp,
+            nexthops,
+            0,
+        )
+    }
+
+    /// Naming one gateway means one gateway. A multipath route that keeps its
+    /// other next hops has not been sent via the one that was named — it has
+    /// been sent via that one *and* wherever it was going anyway.
+    #[test]
+    fn a_named_next_hop_replaces_the_whole_set() {
+        let m = Modify {
+            set_next_hop: Some("192.0.2.1".parse().unwrap()),
+            ..Default::default()
+        };
+        let mut r = route(vec![
+            NextHop::via("198.51.100.1".parse().unwrap()),
+            NextHop::via("198.51.100.2".parse().unwrap()),
+        ]);
+        m.apply(&mut r);
+        assert_eq!(r.nexthops.len(), 1, "the other paths survived: {:?}", r.nexthops);
+        assert_eq!(r.nexthops[0].gateway, Some("192.0.2.1".parse().unwrap()));
+        assert_eq!(r.nexthops[0].iface, None, "a named gateway is not pinned to a link");
+    }
+
+    /// A route with no next hop is a discard route. Giving it one from a filter
+    /// stops it discarding — a large thing to do, and done rather than quietly
+    /// ignored, because a filter that silently drops what it was told is worse
+    /// than one that does something surprising and says so in its documentation.
+    #[test]
+    fn a_discard_route_given_a_next_hop_starts_forwarding() {
+        let m = Modify {
+            set_next_hop: Some("192.0.2.1".parse().unwrap()),
+            ..Default::default()
+        };
+        let mut r = route(vec![]);
+        m.apply(&mut r);
+        assert_eq!(r.nexthops.len(), 1);
+    }
+
+    /// An IPv4 route via an IPv6 next hop is RFC 5549, which this daemon speaks
+    /// — so the families are deliberately not checked against each other.
+    #[test]
+    fn the_families_are_not_checked_against_each_other() {
+        let m = Modify {
+            set_next_hop: Some("2001:db8::1".parse().unwrap()),
+            ..Default::default()
+        };
+        let mut r = route(vec![NextHop::via("198.51.100.1".parse().unwrap())]);
+        m.apply(&mut r);
+        assert_eq!(r.nexthops[0].gateway, Some("2001:db8::1".parse().unwrap()));
+    }
+
+    /// Setting nothing must still be a no-op, or every filter with a bare
+    /// `permit` would start rewriting next hops to nothing.
+    #[test]
+    fn a_modify_without_a_next_hop_leaves_the_route_alone() {
+        let m = Modify::default();
+        assert!(m.is_noop());
+        let before = route(vec![NextHop::via("198.51.100.1".parse().unwrap())]);
+        let mut after = before.clone();
+        m.apply(&mut after);
+        assert_eq!(before.nexthops, after.nexthops);
+    }
+}
 
 #[cfg(test)]
 mod tests {

@@ -1375,6 +1375,10 @@ pub struct FilterRule {
     /// Set the matching route's administrative preference to this.
     #[serde(rename = "set-preference")]
     pub set_preference: Option<u32>,
+    /// Send the matching route via this address instead of wherever it said.
+    /// Either family: an IPv4 route via an IPv6 next hop is RFC 5549.
+    #[serde(rename = "set-next-hop")]
+    pub set_next_hop: Option<String>,
     /// Replace the matching route's communities with these (`asn:value` or a
     /// well-known name like `no-export`). Consumed by BGP origination.
     #[serde(rename = "set-community")]
