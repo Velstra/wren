@@ -57,6 +57,10 @@ pub struct InstanceConfig {
     pub preempt: bool,
     /// The virtual IP address(es) — all of one family.
     pub addresses: Vec<IpAddr>,
+    /// The interface the virtual addresses are installed on and announced from.
+    /// Usually the same as `interface`; a firewall with many tagged segments
+    /// runs the election on one link and holds the address on another.
+    pub address_interface: String,
     /// The prefix length to assign each virtual address with.
     pub prefix_len: u8,
     /// Interfaces to track: while any is down, the effective priority drops by
@@ -89,6 +93,13 @@ struct Instance {
     fsm: Vrrp,
     ifname: String,
     ifindex: u32,
+    /// Where the virtual addresses live. Equal to `ifname` unless the
+    /// configuration separates the election link from the served one — in which
+    /// case the address, the gratuitous ARP and the unsolicited neighbour
+    /// advertisement all belong here, where the hosts using the address are.
+    addr_ifname: String,
+    addr_ifindex: u32,
+    addr_mac: [u8; 6],
     primary: IpAddr,
     prefix_len: u8,
     addresses: Vec<IpAddr>,
@@ -145,10 +156,33 @@ pub async fn run(
         let vrid = cfg.vrid;
         tokio::spawn(async move { read_loop(idx, rsock, vrid, ipv6, tx).await });
 
+        // The address link is resolved separately: it has its own index for the
+        // announcement socket and its own MAC to announce, and it may legitimately
+        // not exist yet at start-up — in which case we fall back to the election
+        // link rather than refusing to start a virtual router over it.
+        let addr_ifname = cfg.address_interface.clone();
+        let (addr_ifindex, addr_mac) = if addr_ifname == cfg.interface {
+            (ifindex, mac)
+        } else {
+            match (iface_index(&addr_ifname), read_mac(&addr_ifname)) {
+                (Some(i), Some(m)) => (i, m),
+                _ => {
+                    warn!(
+                        vrid = cfg.vrid,
+                        interface = %addr_ifname,
+                        "address-interface not found; holding the address on the advertisement link"
+                    );
+                    (ifindex, mac)
+                }
+            }
+        };
         let mut inst = Instance {
             fsm,
-            ifname: cfg.interface,
+            ifname: cfg.interface.clone(),
             ifindex,
+            addr_ifname: if addr_ifindex == ifindex { cfg.interface.clone() } else { addr_ifname },
+            addr_ifindex,
+            addr_mac,
             primary,
             prefix_len: cfg.prefix_len,
             addresses: cfg.addresses,
@@ -322,15 +356,23 @@ async fn send_advert(inst: &Instance, priority: u8) {
 /// Assume the virtual IP(s): add each to the interface and announce it (gratuitous
 /// ARP for IPv4, unsolicited neighbor advertisement for IPv6).
 fn assume_vip(inst: &Instance) {
-    info!(vrid = inst.fsm.vrid(), interface = %inst.ifname, "becoming MASTER — assuming virtual IP(s)");
+    info!(
+        vrid = inst.fsm.vrid(),
+        interface = %inst.ifname,
+        address_interface = %inst.addr_ifname,
+        "becoming MASTER — assuming virtual IP(s)",
+    );
     for vip in &inst.addresses {
-        match wren_netlink::add_address(&inst.ifname, *vip, inst.prefix_len) {
+        match wren_netlink::add_address(&inst.addr_ifname, *vip, inst.prefix_len) {
             Ok(()) => debug!(%vip, "virtual IP assigned"),
             Err(e) => warn!(%vip, error = %e, "assigning virtual IP"),
         }
+        // Announced where it is reachable, with that link's own MAC: a host on
+        // the served segment must learn the address against a MAC it can send
+        // to, which is not the election link's.
         let announced = match vip {
-            IpAddr::V4(v4) => send_gratuitous_arp(inst.ifindex, inst.mac, *v4),
-            IpAddr::V6(v6) => send_unsolicited_na(inst.ifindex, inst.mac, *v6),
+            IpAddr::V4(v4) => send_gratuitous_arp(inst.addr_ifindex, inst.addr_mac, *v4),
+            IpAddr::V6(v6) => send_unsolicited_na(inst.addr_ifindex, inst.addr_mac, *v6),
         };
         if let Err(e) = announced {
             debug!(%vip, error = %e, "virtual-IP announcement failed (best-effort)");
@@ -340,10 +382,15 @@ fn assume_vip(inst: &Instance) {
 
 /// Release the virtual IP(s): remove each from the interface.
 fn release_vip(inst: &Instance) {
-    info!(vrid = inst.fsm.vrid(), interface = %inst.ifname, "becoming BACKUP — releasing virtual IP(s)");
+    info!(
+        vrid = inst.fsm.vrid(),
+        interface = %inst.ifname,
+        address_interface = %inst.addr_ifname,
+        "becoming BACKUP — releasing virtual IP(s)",
+    );
     for vip in &inst.addresses {
         // A delete of an address we never held (or already lost) is harmless.
-        if let Err(e) = wren_netlink::del_address(&inst.ifname, *vip, inst.prefix_len) {
+        if let Err(e) = wren_netlink::del_address(&inst.addr_ifname, *vip, inst.prefix_len) {
             debug!(%vip, error = %e, "releasing virtual IP (may already be gone)");
         }
     }
@@ -452,6 +499,14 @@ fn ipv4_payload(buf: &[u8]) -> Option<&[u8]> {
         return None;
     }
     Some(&buf[ihl..])
+}
+
+/// The kernel's index for a link, or `None` if it does not exist right now.
+fn iface_index(ifname: &str) -> Option<u32> {
+    let cname = std::ffi::CString::new(ifname).ok()?;
+    // SAFETY: `cname` is valid for the duration of the call.
+    let idx = unsafe { libc::if_nametoindex(cname.as_ptr()) };
+    (idx != 0).then_some(idx)
 }
 
 /// Open a raw `IPPROTO_VRRP` socket bound to `ifname`, joined to the VRRP multicast

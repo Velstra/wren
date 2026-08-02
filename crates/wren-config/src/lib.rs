@@ -225,6 +225,18 @@ pub struct VrrpDef {
     /// The virtual IP address(es) this router backs (all IPv4 *or* all IPv6).
     #[serde(rename = "virtual-address")]
     pub virtual_addresses: Vec<String>,
+    /// The interface the virtual address(es) live on, when that is *not* the
+    /// interface the advertisements go out of. Unset means the same link.
+    ///
+    /// Two routers can agree on who is master over one link while the address
+    /// they are arguing about sits on another — a design a firewall with many
+    /// tagged segments arrives at quickly, because otherwise every segment needs
+    /// its own virtual router and its own vrid. The election stays on the link
+    /// that is guaranteed to be up between the pair; the address, the gratuitous
+    /// ARP and the unsolicited neighbour advertisement all go where the hosts
+    /// that use it can see them.
+    #[serde(default, rename = "address-interface")]
+    pub address_interface: Option<String>,
     /// The prefix length to assign each virtual address with. Defaults per family
     /// (24 for IPv4, 64 for IPv6) when unset.
     #[serde(default, rename = "prefix-length")]

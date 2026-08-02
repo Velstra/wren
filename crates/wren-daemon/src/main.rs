@@ -3472,8 +3472,14 @@ fn build_vrrp_instances(cfg: &wren_config::Config) -> Result<Vec<vrrp::InstanceC
         let prefix_len = def.prefix_length.unwrap_or(if ipv6 { 64 } else { 24 });
         // Round the interval to centiseconds, clamped to the 12-bit wire field.
         let advert_int_cs = (def.advert_interval_ms / 10).clamp(1, 0x0fff) as u16;
+        // Where the address lives, defaulting to the link the election runs on.
+        let address_interface = def
+            .address_interface
+            .clone()
+            .unwrap_or_else(|| def.interface.clone());
         out.push(vrrp::InstanceConfig {
             interface: def.interface.clone(),
+            address_interface,
             vrid: def.vrid,
             priority: def.priority,
             advert_int_cs,
