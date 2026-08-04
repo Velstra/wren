@@ -19,8 +19,9 @@ protocol: `[rip]`, `[ripng]`, `[ospf]`, `[ospf3]`, `[bgp]`, `[babel]`.
 
 ## Static routes
 
-A `[[static]]` array of operator-configured routes. At least one of `via` / `dev`
-is required.
+A `[[static]]` array of operator-configured routes. Each route needs somewhere to
+go: `via`, `dev`, or `blackhole` — and a blackhole cannot also have a next hop,
+which is refused rather than quietly resolved.
 
 ```toml
 [[static]]
@@ -31,6 +32,16 @@ via    = "192.0.2.1"
 prefix = "10.20.0.0/16"
 dev    = "eth1"
 metric = 10
+
+# Null-route a prefix, and float a backup default behind anything learned.
+[[static]]
+prefix    = "198.51.100.0/24"
+blackhole = true
+
+[[static]]
+prefix   = "0.0.0.0/0"
+via      = "192.0.2.254"
+distance = 200
 ```
 
 | Key | Type | Default | Notes |
@@ -39,6 +50,9 @@ metric = 10
 | `via` | string | — | Gateway address. |
 | `dev` | string | — | Outgoing interface (on-link, or to pin a gateway). |
 | `metric` | integer | `0` | Lower wins among static routes. |
+| `blackhole` | bool | `false` | Discard what matches instead of forwarding it. Takes no `via`/`dev`. |
+| `distance` | integer | — | Administrative distance, `0`–`255`, **lower wins**. Unset ⇒ the protocol's own preference. A distance worse than a learned route's is what makes a static *float*. |
+| `vrf` | string | — | Install into this `[[vrf]]`'s table instead of the main one. |
 
 ## RIP (IPv4) — `[rip]`
 
@@ -259,6 +273,7 @@ rip = "clean-bgp"
 | `add-large-community` | list | Append large communities to the route, after any `set-large-community`. |
 | `set-ext-community` | list | Replace the route's extended communities (`rt:asn:n` / `ro:asn:n` / `rt:ipv4:n`, RFC 4360); consumed by BGP origination. |
 | `add-ext-community` | list | Append extended communities to the route, after any `set-ext-community`. |
+| `set-next-hop` | string | Forward matching routes via this address. Replaces the route's whole next-hop set, so a multipath route collapses to this one gateway. Giving a next hop to a discard route stops it discarding. The family is not checked against the prefix — an IPv4 route via an IPv6 next hop is RFC 5549. |
 | `action` | string | `accept` or `reject` (required). |
 
 **Export filters** reuse the same engine on the way *out* of the RIB. The

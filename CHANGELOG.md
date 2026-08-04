@@ -6,6 +6,36 @@ follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- **VRRP can hold the virtual address on a link other than the one it elects
+  on.** `address-interface` on a `[[vrrp]]` separates the two: advertisements
+  stay on the link that is guaranteed to be up between the pair, while the
+  address is installed on the link that serves it. The gratuitous ARP and the
+  unsolicited neighbour advertisement go out there too, with *that* link's MAC —
+  a host on the served segment has to learn the address against a MAC it can
+  actually send to. Without this, a firewall with a dozen tagged segments needed
+  a virtual router and a VRID per segment to answer one question, "who is
+  master", that has the same answer on all of them. An `address-interface` that
+  does not exist at start-up warns and falls back to the advertisement link
+  rather than refusing to start.
+- **Blackhole static routes and administrative distance.** `blackhole = true` on
+  a `[[static]]` discards what matches instead of forwarding it — the standard
+  way to null-route a prefix, and what makes a BGP summary stick without also
+  announcing the more specifics inside it. It takes no `via`/`dev`, and saying
+  both is refused rather than silently resolved. `distance` ranks two routes to
+  the same prefix in the usual convention where lower wins, which is how a
+  floating static sits behind a learned route and takes over only when that goes
+  away.
+- **A filter can send a route somewhere else.** `set-next-hop <address>` on a
+  `[[filter.rule]]`. Route maps could already change a route's metric,
+  preference and communities — everything about how it is *chosen* — but not
+  where it is forwarded, which is the one an operator reaches for when a path
+  has to move without the routing changing underneath it. It replaces the
+  route's whole next-hop set: a multipath route sent via one named gateway has
+  one next hop by definition. Giving a next hop to a route that had none stops
+  it discarding, which is documented rather than refused.
+
 ## [0.4.0] — 2026-08-01
 
 A large release: EVPN grows a layer-3 half, IS-IS learns to authenticate, and a

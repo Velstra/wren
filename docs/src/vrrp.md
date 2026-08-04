@@ -69,6 +69,36 @@ If `wan0` goes down the priority falls to `200 − 150 = 50`; a backup at priori
 100 then preempts and becomes master. When `wan0` recovers the priority returns to
 200 and (with `preempt = true`) this router takes the gateway back.
 
+### Electing on one link, serving on another
+
+A firewall with many tagged segments has one link it shares with its peer and a
+dozen it serves. If the election and the address had to be the same link, every
+segment would need a virtual router and a VRID of its own — a lot of protocol for
+one question, *who is master*, that has the same answer everywhere.
+
+`address-interface` separates them:
+
+```toml
+[[vrrp]]
+interface         = "sync0"        # advertisements go here
+vrid              = 51
+priority          = 200
+virtual-address   = ["10.0.20.254"]
+address-interface = "lan20"        # the address is installed here
+```
+
+The advertisements stay on the link that is guaranteed to be up between the pair;
+the address is installed on the link that serves it, and the gratuitous ARP and
+the unsolicited neighbour advertisement go out there too — with *that* link's
+MAC. That last part is the one worth saying out loud: a host on the served
+segment has to learn the address against a MAC it can send to, and the election
+link's MAC is not it.
+
+An `address-interface` that does not exist at start-up is a warning and a
+fallback to the advertisement link, not a refusal. A virtual router that will not
+start because one of a dozen segments is missing is worse than one that runs and
+says so.
+
 > VRRP needs `CAP_NET_RAW` (the protocol-112 socket) and `CAP_NET_ADMIN` (to
 > assign the virtual IP).
 
