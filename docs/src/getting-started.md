@@ -66,6 +66,46 @@ sudo ./target/release/wren --config ./examples/wren.toml --backend kernel
 
 The default config path is `/etc/wren/wren.toml`; override it with `--config`.
 
+### Checking a configuration
+
+`wren check` reads a file, resolves everything that can be resolved without a
+network, and exits — parse, compile the filters, resolve the import/export
+attachments and the VRF route-maps, build the static routes and the BGP
+neighbour set. That is the same work a `SIGHUP` reload does before it commits, so
+a file that passes here is one the running daemon would accept.
+
+Nothing is started, no socket is opened and the kernel is not touched, which
+means it is safe on a box that is already routing. The alternative is finding
+out by restarting.
+
+```sh
+$ wren check -c ./examples/wren.toml
+./examples/wren.toml is valid
+  router-id       10.0.0.1
+  static routes   2
+  vrfs            0
+  filters         0
+  import filters  0
+  bgp             disabled
+  vrrp            0
+```
+
+The counts are what was *resolved*, not what was written. They happen to agree
+here, but a static route that a VRF's import route-map rejects is written and not
+counted — and that difference is the one worth seeing before a restart rather
+than after.
+
+A file that does not pass says what is wrong with it and exits non-zero, which is
+what makes this usable from a script or a deployment pipeline:
+
+```sh
+$ wren check -c broken.toml
+Error: reading broken.toml
+
+Caused by:
+    invalid config: static route 198.51.100.0/24 is a blackhole and cannot also have a next-hop
+```
+
 ### Logging
 
 Wren logs through [`tracing`](https://docs.rs/tracing). Set `RUST_LOG` to choose

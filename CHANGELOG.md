@@ -8,6 +8,16 @@ follows [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- **`wren check` — resolve a configuration without starting anything.** Parse,
+  compile the filters, resolve the import/export attachments and the VRF
+  route-maps, build the static routes and the BGP neighbour set, print a summary,
+  exit. It is the same work a `SIGHUP` reload does before it commits, so a file
+  that passes is one the running daemon would accept — and because nothing is
+  started, no socket is opened and the kernel is not touched, it is safe to run
+  on a box that is already routing. A file that fails names what is wrong and
+  exits non-zero. `--config` became a global argument so `wren check -c f.toml`
+  works as well as `wren -c f.toml check`.
+
 - **VRRP can hold the virtual address on a link other than the one it elects
   on.** `address-interface` on a `[[vrrp]]` separates the two: advertisements
   stay on the link that is guaranteed to be up between the pair, while the

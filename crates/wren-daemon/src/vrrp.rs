@@ -105,7 +105,6 @@ struct Instance {
     addresses: Vec<IpAddr>,
     ipv6: bool,
     sock: Arc<UdpSocket>,
-    mac: [u8; 6],
     /// The configured priority before any tracking penalty.
     base_priority: u8,
     /// Interfaces whose state lowers the effective priority while down.
@@ -188,7 +187,6 @@ pub async fn run(
             addresses: cfg.addresses,
             ipv6,
             sock,
-            mac,
             base_priority: cfg.priority,
             track_interfaces: cfg.track_interfaces,
             priority_decrement: cfg.priority_decrement,

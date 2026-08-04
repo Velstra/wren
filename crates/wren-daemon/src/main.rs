@@ -77,7 +77,12 @@ enum Backend {
 #[command(name = "wren", version, about = "Wren — a routing daemon in Rust")]
 struct Args {
     /// Path to the TOML configuration file.
-    #[arg(short, long, default_value = "/etc/wren/wren.toml")]
+    ///
+    /// Global, so it can be given after the subcommand as well as before it —
+    /// `wren check -c ./wren.toml` is what somebody checking a file in front of
+    /// them types, and having that fail on argument order would be a poor
+    /// welcome for the one subcommand meant to be run by hand.
+    #[arg(short, long, global = true, default_value = "/etc/wren/wren.toml")]
     config: PathBuf,
 
     /// Forwarding-plane backend. Defaults to the safe in-memory one; `kernel`
@@ -125,6 +130,17 @@ enum Command {
         #[arg(trailing_var_arg = true)]
         args: Vec<String>,
     },
+    /// Read the configuration, resolve everything that can be resolved without a
+    /// network, and exit — `wren check -c wren.toml`. Exactly the work a SIGHUP
+    /// reload does before it commits: parse, compile the filters, resolve the
+    /// import/export attachments and the VRF route-maps, build the static routes
+    /// and the BGP neighbour set. A file that passes here is one the running
+    /// daemon would accept; a file that does not names what is wrong with it.
+    ///
+    /// Nothing is started, no socket is opened and the kernel is not touched, so
+    /// this is safe to run against a box that is already routing — which is the
+    /// point, since the alternative is finding out by restarting.
+    Check,
     /// Stream the forwarding table from a running wren daemon as it changes
     /// (`wren monitor routes`): an initial snapshot followed by live route
     /// install/withdraw events. The FPM-style feed an external forwarding plane
@@ -192,6 +208,39 @@ async fn main() -> Result<()> {
     if let Some(Command::Monitor { args: words }) = &args.command {
         let command = format!("monitor {}", words.join(" "));
         return control::run_monitor_client(&args.socket, command.trim()).await;
+    }
+    // `check` resolves the configuration and exits. It runs before logging is set
+    // up because its answer belongs on stdout as a report, not in a log stream —
+    // and before anything is started, because the whole point is that it is safe
+    // to run on a box that is currently routing.
+    if let Some(Command::Check) = &args.command {
+        // No extra context: `reload_config` already names the file, and wrapping
+        // it again turns a one-line answer into a chain that says the same thing
+        // twice before it says what is wrong.
+        let cfg = reload_config(&args.config)?;
+        println!("{} is valid", args.config.display());
+        println!(
+            "  router-id       {}",
+            cfg.cfg.router_id.as_deref().unwrap_or("(unset)")
+        );
+        println!("  static routes   {}", cfg.statics.len());
+        println!("  vrfs            {}", cfg.cfg.vrfs.len());
+        println!("  filters         {}", cfg.cfg.filters.len());
+        println!(
+            "  import filters  {}{}",
+            cfg.imports.len(),
+            if cfg.fib_export.is_some() {
+                ", fib export attached"
+            } else {
+                ""
+            }
+        );
+        match &cfg.bgp_peers {
+            Some(peers) => println!("  bgp neighbours  {}", peers.len()),
+            None => println!("  bgp             disabled"),
+        }
+        println!("  vrrp            {}", cfg.cfg.vrrp.len());
+        return Ok(());
     }
     // `mcast-join` is a leaf helper: join the group and park (the kernel emits IGMP
     // reports for it). It never returns, so handle it before standing up the daemon.
@@ -1987,7 +2036,7 @@ struct ReloadedConfig {
 /// is not live-reconfigured.
 fn reload_config(path: &std::path::Path) -> Result<ReloadedConfig> {
     let cfg = wren_config::Config::load(path)
-        .with_context(|| format!("reloading {}", path.display()))?;
+        .with_context(|| format!("reading {}", path.display()))?;
     let by_name = compile_named_filters(&cfg).context("compiling filters")?;
     let imports = resolve_import_filters(&cfg, &by_name).context("resolving import filters")?;
     let fib_export = resolve_fib_export(&cfg, &by_name).context("resolving export filters")?;
