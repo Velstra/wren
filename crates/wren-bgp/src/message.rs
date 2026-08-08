@@ -49,10 +49,26 @@ impl Open {
             hold_time,
             identifier,
             // Always offer the 4-octet AS capability, and the Multiprotocol
-            // capability for IPv6 unicast (RFC 4760) — wren can carry IPv6 NLRI,
-            // and a peer that cannot will simply not advertise it back.
+            // capability for **both** unicast families (RFC 4760).
+            //
+            // IPv4 unicast has to be named explicitly even though RFC 4760 §8
+            // says a speaker advertising no MP capability at all is assumed to
+            // support it. That default only applies when the OPEN carries no MP
+            // capability whatsoever — and this one always carries the IPv6 entry.
+            // A peer then computes the negotiated families as the intersection of
+            // what was advertised, finds no IPv4 in it, and refuses the family:
+            // FRR answers such an OPEN with "Configured AFI/SAFIs do not overlap
+            // with received MP capabilities" and, once IPv6 is activated to get
+            // the session up, reports IPv4 unicast as never negotiated. Omitting
+            // it therefore made every IPv4 prefix unadvertisable to a third-party
+            // speaker while wren-to-wren kept working, because both ends shared
+            // the same assumption.
             capabilities: vec![
                 Capability::FourOctetAs(local_as),
+                Capability::Multiprotocol {
+                    afi: crate::AFI_IPV4,
+                    safi: crate::SAFI_UNICAST,
+                },
                 Capability::Multiprotocol {
                     afi: crate::AFI_IPV6,
                     safi: crate::SAFI_UNICAST,
@@ -896,11 +912,17 @@ mod tests {
 
     #[test]
     fn open_advertises_and_detects_multiprotocol() {
-        use crate::{AFI_IPV6, SAFI_UNICAST};
-        // Open::new advertises IPv6-unicast multiprotocol support out of the box.
+        use crate::{AFI_IPV4, AFI_IPV6, SAFI_UNICAST};
+        // Open::new advertises both unicast families out of the box. IPv4 is
+        // named rather than left to RFC 4760 §8's "no MP capability at all"
+        // default, which this OPEN forfeits the moment it carries the IPv6 entry
+        // — a peer intersecting the advertised families would otherwise find no
+        // IPv4 in the set and refuse the family outright.
         let open = Open::new(VERSION, 65001, DEFAULT_HOLD_TIME, ip([10, 0, 0, 1]));
+        assert!(open.supports_multiprotocol(AFI_IPV4, SAFI_UNICAST));
         assert!(open.supports_multiprotocol(AFI_IPV6, SAFI_UNICAST));
-        assert!(!open.supports_multiprotocol(crate::AFI_IPV4, SAFI_UNICAST));
+        // A family nobody offered is still absent.
+        assert!(!open.supports_multiprotocol(AFI_IPV6, crate::SAFI_FLOWSPEC));
         roundtrip(Message::Open(open));
     }
 
