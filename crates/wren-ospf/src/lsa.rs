@@ -399,6 +399,23 @@ impl Lsa {
         out
     }
 
+    /// Fill the header's `length` and `ls_checksum` from the encoded form.
+    ///
+    /// [`Lsa::encode`] patches both into the bytes it returns but cannot write
+    /// them back into `self.header`, so a freshly built LSA sits in the
+    /// database with `length = 0`. That is invisible while the LSA only ever
+    /// travels inside an LS-Update, whose bytes are encoded — but a Database
+    /// Description carries the *stored* header verbatim, and a peer that
+    /// validates what it receives reads a declared length of zero, rejects the
+    /// whole packet as malformed, and the adjacency never leaves Exchange.
+    /// The checksum matters for a second reason: §13.1 tie-breaks two
+    /// instances on it, and a stored zero loses every tie.
+    pub fn stamp(&mut self) {
+        let bytes = self.encode();
+        self.header.ls_checksum = u16::from_be_bytes([bytes[16], bytes[17]]);
+        self.header.length = u16::from_be_bytes([bytes[18], bytes[19]]);
+    }
+
     /// Parse a full LSA from the front of `buf`, using the header's `length`
     /// field to bound the body. Returns the LSA and the number of bytes it
     /// occupied (so a Link State Update can walk a packed list of them).

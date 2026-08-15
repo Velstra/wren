@@ -721,7 +721,9 @@ impl Ospf {
             for id in ids {
                 let n = &iface.neighbors[id];
                 out.push(OspfNeighborInfo {
-                    router_id: *id,
+                    // From the neighbour, not from the key: on a broadcast link
+                    // the key is its address.
+                    router_id: n.fsm.router_id,
                     addr: n.addr,
                     state: n.fsm.state,
                     iface: iface.name.clone(),
@@ -826,9 +828,30 @@ impl Ospf {
         {
             return;
         }
-        let nbr_id = packet.header.router_id;
+        // RFC 2328 §10: a neighbour is identified by its **source address** on
+        // broadcast, NBMA and point-to-multipoint links, and only by its Router
+        // ID on point-to-point and virtual links.
+        //
+        // Keying everything by Router ID looked equivalent until a peer with two
+        // addresses on one LAN: it then runs an OSPF interface per address and
+        // sends a Hello from each, all carrying the same Router ID, and the one
+        // from the second address lists no neighbours. Collapsed onto a single
+        // entry that reads as 1-Way and knocks the adjacency back to Init on
+        // every hello interval, forever. Two addresses on one LAN is an ordinary
+        // thing for a router to have.
+        //
+        // The Router ID stays what the neighbour is *called* — the DR election,
+        // the Router-LSA and the Grace-LSA all speak in Router IDs — so the two
+        // travel separately from here on rather than one standing in for the
+        // other.
+        let router_id = packet.header.router_id;
+        let nbr_id = if self.ifaces[idx].fsm.iface_type.elects_dr() {
+            pkt.src
+        } else {
+            router_id
+        };
         match packet.body {
-            Body::Hello(h) => self.handle_hello(idx, nbr_id, pkt.src, &h, now).await,
+            Body::Hello(h) => self.handle_hello(idx, nbr_id, router_id, pkt.src, &h, now).await,
             Body::DatabaseDescription(dd) => self.handle_dd(idx, nbr_id, &dd).await,
             Body::LinkStateRequest(req) => self.handle_lsr(idx, nbr_id, &req).await,
             Body::LinkStateUpdate(upd) => self.handle_lsu(idx, nbr_id, upd, now).await,
@@ -853,6 +876,7 @@ impl Ospf {
         &mut self,
         idx: usize,
         nbr_id: Ipv4Addr,
+        router_id: Ipv4Addr,
         src: Ipv4Addr,
         hello: &Hello,
         now: u64,
@@ -884,8 +908,11 @@ impl Ospf {
         let entry = iface
             .neighbors
             .entry(nbr_id)
-            .or_insert_with(|| OspfNeighbor::new(nbr_id, src, now));
+            .or_insert_with(|| OspfNeighbor::new(router_id, src, now));
         let was_bidir = entry.fsm.is_bidirectional();
+        // The neighbour is stored under its key; what it is *called* comes off
+        // the packet, and is kept current in case it renumbers.
+        entry.fsm.router_id = router_id;
         entry.addr = src;
         entry.last_seen = now;
         entry.fsm.priority = hello.router_priority;
@@ -933,7 +960,14 @@ impl Ospf {
         if !iface.fsm.iface_type.elects_dr() {
             return true;
         }
-        iface.fsm.is_dr_or_bdr() || iface.fsm.dr == nbr_id || iface.fsm.bdr == nbr_id
+        // `dr` and `bdr` are Router IDs; `nbr_id` is the map key, which on a
+        // DR-electing link is an address — so the comparison goes through the
+        // neighbour rather than through the key.
+        let rid = iface
+            .neighbors
+            .get(&nbr_id)
+            .map_or(nbr_id, |n| n.fsm.router_id);
+        iface.fsm.is_dr_or_bdr() || iface.fsm.dr == rid || iface.fsm.bdr == rid
     }
 
     /// Drive an interface FSM event and return whether the DR/BDR changed.
@@ -952,11 +986,12 @@ impl Ospf {
     /// After an election, re-evaluate whether each neighbour should now be
     /// adjacent (§10.4 "AdjOK?").
     async fn reeval_adjacencies(&mut self, idx: usize) {
+        // The map keys, because every lookup below is by key.
         let nbr_ids: Vec<Ipv4Addr> = self.ifaces[idx]
             .neighbors
-            .values()
-            .filter(|n| n.fsm.is_bidirectional())
-            .map(|n| n.fsm.router_id)
+            .iter()
+            .filter(|(_, n)| n.fsm.is_bidirectional())
+            .map(|(k, _)| *k)
             .collect();
         for nbr_id in nbr_ids {
             let ok = self.adjacency_ok(idx, nbr_id);
@@ -1288,15 +1323,25 @@ impl Ospf {
 
     /// The `last_seen` timestamp of the neighbour `nbr_id`, if known on any interface.
     fn neighbor_last_seen(&self, nbr_id: Ipv4Addr) -> Option<u64> {
-        self.ifaces.iter().find_map(|i| i.neighbors.get(&nbr_id).map(|n| n.last_seen))
+        // By Router ID, for the same reason: its caller is the graceful-restart
+        // helper, which knows the neighbour from its Grace-LSA.
+        self.ifaces.iter().find_map(|i| {
+            i.neighbors
+                .values()
+                .find(|n| n.fsm.router_id == nbr_id)
+                .map(|n| n.last_seen)
+        })
     }
 
     /// Whether `nbr_id` currently has a Full adjacency on any interface — the
     /// precondition for honouring its Grace-LSA (RFC 3623 §2.2).
     fn neighbor_is_full(&self, nbr_id: Ipv4Addr) -> bool {
-        self.ifaces
-            .iter()
-            .any(|i| i.neighbors.get(&nbr_id).is_some_and(|n| n.fsm.state == NeighborState::Full))
+        // By Router ID: a Grace-LSA names its originator that way.
+        self.ifaces.iter().any(|i| {
+            i.neighbors
+                .values()
+                .any(|n| n.fsm.router_id == nbr_id && n.fsm.state == NeighborState::Full)
+        })
     }
 
     /// Process a Link State Update (§13): install newer LSAs into the area
@@ -1374,6 +1419,16 @@ impl Ospf {
                 FloodDecision::Install { .. } => {
                     ack_headers.push(lsa.header);
                     let key = lsa.key();
+                    // We asked for this and it arrived, so the request is
+                    // answered — whatever we go on to do with the contents.
+                    // Dropping it only on the branch that installs left a
+                    // neighbour holding one of our *own* pre-restart LSAs
+                    // (§13.4 below) asking for it every RxmtInterval forever:
+                    // the adjacency reached Loading and stayed there, and not
+                    // one route crossed it. A fresh pair of routers never sees
+                    // this — both databases start empty — but a peer that has
+                    // been up while we restarted always does.
+                    self.drop_from_request_lists(&key);
                     let third_party = lsa.header.advertising_router != self_id;
                     if !third_party {
                         // RFC 2328 §13.4: this is a more-recent instance of one of
@@ -1402,7 +1457,6 @@ impl Ospf {
                     // Stamp the install time so a subsequent instance arriving within
                     // MinLSArrival is rate-limited (§13 step 5a).
                     self.lsa_installed_at.insert((scope, key), now);
-                    self.drop_from_request_lists(&key);
                     installed = true;
                 }
                 FloodDecision::DirectAck => ack_headers.push(lsa.header),
@@ -1713,9 +1767,8 @@ impl Ospf {
         } else {
             iface
                 .neighbors
-                .get(&dr)
-                .map(|n| n.fsm.state == NeighborState::Full)
-                .unwrap_or(false)
+                .values()
+                .any(|n| n.fsm.router_id == dr && n.fsm.state == NeighborState::Full)
         };
         adjacent.then(|| self.router_id_to_addr(iface, dr))
     }
@@ -2257,8 +2310,12 @@ impl Ospf {
                 .iter()
                 // A neighbour we are helping through a graceful restart is exempt from
                 // the inactivity timeout — its adjacency is held so forwarding survives.
-                .filter(|(id, n)| {
-                    now.saturating_sub(n.last_seen) >= dead_interval && !self.helping.contains_key(id)
+                .filter(|(_, n)| {
+                    // `helping` is keyed by Router ID (a Grace-LSA names its
+                    // originator), and the neighbour map by its key — so the
+                    // exemption is looked up by what the neighbour is called.
+                    now.saturating_sub(n.last_seen) >= dead_interval
+                        && !self.helping.contains_key(&n.fsm.router_id)
                 })
                 .map(|(id, _)| *id)
                 .collect();
@@ -2331,16 +2388,17 @@ impl Ospf {
     async fn force_neighbor_down(&mut self, peer: Ipv4Addr) {
         let mut changed = false;
         for idx in 0..self.ifaces.len() {
-            let id = self.ifaces[idx]
+            let found = self.ifaces[idx]
                 .neighbors
                 .iter()
                 .find(|(_, n)| n.addr == peer)
-                .map(|(id, _)| *id);
-            let Some(id) = id else { continue };
+                .map(|(id, n)| (*id, n.fsm.router_id));
+            let Some((id, rid)) = found else { continue };
             // Hold the adjacency of a neighbour we are helping through a graceful restart
             // (RFC 3623 §3.2): a BFD-reported path failure during its restart must not
             // tear it down, or forwarding would flap — exactly what GR prevents.
-            if self.helping.contains_key(&id) {
+            // `helping` is keyed by Router ID, the neighbour map by its key.
+            if self.helping.contains_key(&rid) {
                 debug!(neighbor = %id, %peer, "OSPF graceful-restart helper: ignoring BFD-down during restart");
                 continue;
             }
@@ -2670,9 +2728,9 @@ impl Ospf {
         } else {
             iface
                 .neighbors
-                .get(&rid)
-                .map(|n| n.addr)
-                .unwrap_or(Ipv4Addr::UNSPECIFIED)
+                .values()
+                .find(|n| n.fsm.router_id == rid)
+                .map_or(Ipv4Addr::UNSPECIFIED, |n| n.addr)
         }
     }
 }

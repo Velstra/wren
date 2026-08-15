@@ -97,7 +97,16 @@ impl Lsdb {
     /// as any instance already held (RFC 2328 §13.1). Returns the [`Install`]
     /// outcome; the caller uses [`Install::changed`] to decide whether to flood
     /// it on and re-run SPF.
-    pub fn install(&mut self, lsa: Lsa) -> Install {
+    pub fn install(&mut self, mut lsa: Lsa) -> Install {
+        // An LSA we built ourselves arrives here with the length and checksum
+        // still unset — they are computed during encoding, which has not
+        // happened yet. Fill them in now, so what the database holds is what
+        // the wire would carry: a Database Description sends these headers
+        // verbatim, and a zero length there is a malformed packet to any peer
+        // that checks. An LSA decoded from a neighbour already carries both.
+        if lsa.header.length == 0 {
+            lsa.stamp();
+        }
         let key = lsa.key();
         match self.entries.get(&key) {
             None => {
@@ -160,6 +169,29 @@ mod tests {
                 links: vec![],
             }),
         }
+    }
+
+    /// A self-originated LSA enters the database with `length = 0` — the value
+    /// is computed while encoding, which has not happened yet. It must not stay
+    /// that way: a Database Description sends stored headers verbatim, and a
+    /// peer that validates the declared length rejects the whole packet as
+    /// malformed, which leaves the adjacency stuck in Exchange forever.
+    #[test]
+    fn an_installed_lsa_carries_its_length_and_checksum() {
+        let mut db = Lsdb::default();
+        let mut lsa = router_lsa([10, 0, 0, 1], INITIAL_SEQUENCE_NUMBER, 0);
+        // As a freshly built LSA is: the length and checksum are computed while
+        // encoding, which has not happened yet.
+        lsa.header.length = 0;
+        lsa.header.ls_checksum = 0;
+        db.install(lsa);
+        let stored = db.iter().next().expect("installed").clone();
+        assert_eq!(
+            stored.header.length as usize,
+            stored.encode().len(),
+            "the stored length must be the length of the encoded LSA"
+        );
+        assert_ne!(stored.header.ls_checksum, 0, "and the checksum is filled in");
     }
 
     fn summary(lsid: [u8; 4], metric: u32) -> Lsa {

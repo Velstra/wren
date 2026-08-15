@@ -747,16 +747,25 @@ async fn program_fib(
         }
         FibChange::Remove { table, prefix } => {
             let was_exported = exported.remove(&(table, prefix)).is_some();
-            // Skip prefixes we never programmed (e.g. export-rejected ones), so we
-            // don't issue spurious kernel deletes or export withdrawals.
-            if fib_export.is_some() && !was_exported {
+            // Only ever unprogram what we programmed. `exported` records every
+            // successful install, so a prefix missing from it is somebody
+            // else's: an export-rejected route, another daemon's, or — the one
+            // that mattered — the kernel's own connected route for the link.
+            //
+            // Install already refuses to touch a connected route; Remove did
+            // not, and only skipped unprogrammed prefixes when an export filter
+            // happened to be configured. So when OSPF withdrew its view of the
+            // segment it is speaking on, the kernel delete went through and took
+            // the interface's connected route with it. The box then had no route
+            // to its own subnet: it stopped hearing its neighbour's hellos,
+            // declared it dead, and the adjacency that had just come up went
+            // down again — every time, a minute after reaching Full.
+            if !was_exported {
                 failed.remove(&(table, prefix));
                 return;
             }
             remove_from_fib(fib, table, prefix, failed).await;
-            if was_exported {
-                fanout(subscribers, RouteEvent::Withdraw { table, prefix });
-            }
+            fanout(subscribers, RouteEvent::Withdraw { table, prefix });
         }
     }
 }
@@ -915,6 +924,42 @@ mod tests {
             ],
             default: Action::Accept,
         }
+    }
+
+    /// A connected route is the kernel's, and withdrawing our view of the same
+    /// prefix must not delete it.
+    ///
+    /// Install already refused to reprogram one; Remove did not, and only
+    /// skipped unprogrammed prefixes when an export filter happened to exist.
+    /// So a protocol that learned the segment it was speaking on, and then
+    /// withdrew it, deleted the interface's own route out of the kernel — after
+    /// which the box could not reach its own subnet.
+    #[tokio::test]
+    async fn withdrawing_a_prefix_we_never_installed_leaves_the_kernel_alone() {
+        let mut h = Harness::new();
+        let connected = Route::new(
+            "10.0.0.0/24".parse().unwrap(),
+            Protocol::Connected,
+            vec![NextHop::dev("eth0")],
+            0,
+        );
+        h.announce(connected.clone()).await;
+        // Tracked in the RIB, never programmed: the kernel made it.
+        assert!(h.is_empty().await, "a connected route must not be programmed");
+
+        h.feed(RouteUpdate::Withdraw {
+            prefix: "10.0.0.0/24".parse().unwrap(),
+            protocol: Protocol::Connected,
+            table: wren_core::RT_TABLE_MAIN,
+            source: 0,
+        })
+        .await;
+        // And the withdrawal must not have issued a delete for it either.
+        assert!(
+            !h.failed.contains(&(wren_core::RT_TABLE_MAIN, "10.0.0.0/24".parse().unwrap())),
+            "removing a route we never installed must not even be attempted"
+        );
+        assert!(h.is_empty().await);
     }
 
     #[tokio::test]

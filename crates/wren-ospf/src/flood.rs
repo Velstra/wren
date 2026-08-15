@@ -184,7 +184,7 @@ mod tests {
     }
 
     fn router_lsa(advr: [u8; 4], seq: i32, age: u16) -> Lsa {
-        Lsa {
+        let mut lsa = Lsa {
             header: LsaHeader {
                 ls_age: age,
                 options: OPT_E,
@@ -196,7 +196,14 @@ mod tests {
                 length: 0,
             },
             body: LsaBody::Router(RouterLsa { flags: 0, links: vec![] }),
-        }
+        };
+        // Stamped, because every LSA these decisions ever see is: one off the
+        // wire carries its length and checksum, and one of ours is stamped on
+        // the way into the database. An unstamped fixture has checksum 0, which
+        // §13.1 then treats as *older* than any real instance — so a duplicate
+        // stopped looking like a duplicate.
+        lsa.stamp();
+        lsa
     }
 
     /// A baseline input: someone else's LSA, no list membership, nobody exchanging.
