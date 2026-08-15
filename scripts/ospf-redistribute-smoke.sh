@@ -85,6 +85,15 @@ unshare -Urn bash -c '
     nsenter -t $BPID -n "$WREN" --socket "$WORK/b.sock" show routes ospf || true
     echo "=== phase $label: ip route proto ospf (on B) ==="
     nsenter -t $BPID -n ip route show proto ospf || true
+    # What B believes about A itself. The externals are only half the story:
+    # RFC 2328 §16.4 says a type-5 LSA is unusable unless its originator is
+    # reachable *as an ASBR*, and that is carried by the E bit in A'"'"'s
+    # Router-LSA. wren-to-wren never noticed it missing, because the receiving
+    # side did not insist on a flag it was never sent — FRR does, and on real
+    # hardware it flooded wren'"'"'s externals faithfully and installed none.
+    echo "=== phase $label: A'"'"'s router-LSA as B sees it ==="
+    nsenter -t $BPID -n "$WREN" --socket "$WORK/b.sock" show ospf database 2>/dev/null \
+      | grep "router id 10.0.0.1" || true
     pkill -f "$WORK/a.sock" 2>/dev/null || true
     nsenter -t $BPID -n pkill -f "$WORK/b.sock" 2>/dev/null || true
     sleep 1
@@ -104,6 +113,14 @@ unshare -Urn bash -c '
   cat "$WORK/p2.out"
   grep -q "10.99.0.0/24" "$WORK/p2.out"            || { echo "FAIL: B missing redistributed external route"; ok=0; }
   grep -q "10.99.0.0/24 via 10.0.0.1 dev" "$WORK/p2.out" || { echo "FAIL: route not installed proto ospf on B"; ok=0; }
+  grep "router id 10.0.0.1" "$WORK/p2.out" | grep -q "asbr" \
+    || { echo "FAIL: A originates externals without saying it is an ASBR (RFC 2328 A.4.2 E bit) — a conforming neighbour will ignore every one of them"; ok=0; }
+
+  # …and it is not simply always on: phase 1 redistributes nothing, so A is not
+  # an ASBR and must not claim to be.
+  if grep "router id 10.0.0.1" "$WORK/p1.out" | grep -q "asbr"; then
+    echo "FAIL: A claims to be an ASBR while redistributing nothing"; ok=0
+  fi
 
   if [[ $ok -ne 1 ]]; then echo "--- A log ---"; cat "$WORK/a.log"; echo "--- B log ---"; cat "$WORK/b.log"; fi
   kill $BPID 2>/dev/null || true

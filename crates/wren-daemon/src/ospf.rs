@@ -41,7 +41,7 @@ use wren_ospf::flood::{decide_flood, FloodDecision, FloodInput};
 use wren_ospf::interface::{Candidate, Interface, InterfaceEvent, InterfaceState, InterfaceType};
 use wren_ospf::lsa::{
     AsExternalLsa, LsType, Lsa, LsaBody, LsaHeader, NetworkLsa, OpaqueLsa, RouterLink,
-    RouterLinkType, RouterLsa, SummaryLsa, RTR_FLAG_B, RTR_FLAG_E,
+    RouterLinkType, RouterLsa, SummaryLsa, RTR_FLAG_B, RTR_FLAG_E, RTR_FLAG_V,
 };
 use wren_ospf::lsdb::{LsaKey, Lsdb};
 use wren_ospf::neighbor::{
@@ -473,6 +473,14 @@ pub struct OspfLsaInfo {
     pub seq: i32,
     /// The LSA's age in seconds.
     pub age: u16,
+    /// For a Router-LSA, the B/E/V flags it carries (RFC 2328 §A.4.2); `None`
+    /// for every other type.
+    ///
+    /// Shown because they are not decoration: the E bit is what tells the rest
+    /// of the area that this router is an ASBR, and §16.4 makes every one of its
+    /// AS-external LSAs unusable without it. An operator whose externals are
+    /// being ignored by a neighbour cannot see why unless this is printed.
+    pub router_flags: Option<u8>,
 }
 
 /// The short name of an LSA type, as shown by `show ospf database`.
@@ -506,11 +514,36 @@ pub fn render_ospf_database(lsas: &[OspfLsaInfo]) -> String {
                 let _ = write!(out, "as-external {}", ls_type_name(l.ls_type));
             }
         }
-        let _ = writeln!(
+        let _ = write!(
             out,
             " id {} adv-router {} seq {:#010x} age {}",
             l.link_state_id, l.advertising_router, l.seq as u32, l.age,
         );
+        // Spelled out rather than printed as a hex byte: "flags 0x02" asks the
+        // reader to remember RFC 2328 §A.4.2, and the whole point of showing
+        // this is that somebody debugging ignored externals should not have to.
+        if let Some(flags) = l.router_flags {
+            let mut names = Vec::new();
+            if flags & RTR_FLAG_B != 0 {
+                names.push("abr");
+            }
+            if flags & RTR_FLAG_E != 0 {
+                names.push("asbr");
+            }
+            if flags & RTR_FLAG_V != 0 {
+                names.push("virtual-link");
+            }
+            let _ = write!(
+                out,
+                " flags {}",
+                if names.is_empty() {
+                    "none".to_string()
+                } else {
+                    names.join(",")
+                }
+            );
+        }
+        let _ = writeln!(out);
     }
     out
 }
@@ -768,6 +801,10 @@ impl Ospf {
                     advertising_router: lsa.header.advertising_router,
                     seq: lsa.header.ls_seq,
                     age: lsa.header.ls_age,
+                    router_flags: match &lsa.body {
+                        LsaBody::Router(r) => Some(r.flags),
+                        _ => None,
+                    },
                 })
                 .collect();
             area_lsas.sort_by_key(sort_key);
@@ -783,6 +820,7 @@ impl Ospf {
                 advertising_router: lsa.header.advertising_router,
                 seq: lsa.header.ls_seq,
                 age: lsa.header.ls_age,
+                router_flags: None,
             })
             .collect();
         ext.sort_by_key(sort_key);
@@ -1623,6 +1661,9 @@ impl Ospf {
     /// no-op and the LSAs propagate via Database Exchange) and on every
     /// redistribution change.
     async fn originate_externals(&mut self) {
+        // Whether we were an AS boundary router before this pass, so the change
+        // can be noticed below. See the re-origination at the end.
+        let was_asbr = self.is_asbr();
         let mut to_flood = Vec::new();
         let mut want = HashSet::new();
         let externals: Vec<(Prefix, u32)> =
@@ -1665,6 +1706,22 @@ impl Ospf {
         // The same destinations are also originated as NSSA type-7 LSAs into any
         // NSSA area we are attached to (RFC 3101 §2).
         self.originate_nssa().await;
+
+        // Becoming (or ceasing to be) an ASBR changes this router's own
+        // Router-LSA: RFC 2328 §12.4.1 puts the E bit there, and §16.4 says a
+        // type-5 LSA is only usable once its advertising router is reachable **as
+        // an ASBR**. Originating externals without re-announcing that bit means
+        // every conforming neighbour floods our LSAs faithfully, keeps them in its
+        // database, and installs none of them.
+        //
+        // Found against FRR on real hardware, and it is exactly the failure a
+        // second implementation exists to find: wren-to-wren worked throughout,
+        // because the receiving side did not insist on the flag it was never sent.
+        // FRR does insist, correctly, and simply showed `Flags: 0x0` next to an
+        // empty border-router table while the externals sat there being ignored.
+        if self.is_asbr() != was_asbr {
+            self.reoriginate_and_flood().await;
+        }
     }
 
     /// Originate this ASBR's external destinations as NSSA type-7 LSAs into each
@@ -2937,21 +2994,48 @@ mod tests {
 
     #[test]
     fn render_ospf_database_groups_areas_then_externals() {
-        let lsa = |area, t, id: [u8; 4], adv: [u8; 4]| OspfLsaInfo {
+        let lsa = |area, t, id: [u8; 4], adv: [u8; 4], flags: Option<u8>| OspfLsaInfo {
             area,
             ls_type: t,
             link_state_id: Ipv4Addr::from(id),
             advertising_router: Ipv4Addr::from(adv),
             seq: -2_147_483_647, // first sequence number (0x80000001)
             age: 42,
+            router_flags: flags,
         };
         assert_eq!(render_ospf_database(&[]), "no ospf lsas\n");
         let out = render_ospf_database(&[
-            lsa(Some(Ipv4Addr::new(0, 0, 0, 0)), LsType::Router, [1, 1, 1, 1], [1, 1, 1, 1]),
-            lsa(None, LsType::AsExternal, [10, 9, 0, 0], [2, 2, 2, 2]),
+            lsa(Some(Ipv4Addr::new(0, 0, 0, 0)), LsType::Router, [1, 1, 1, 1], [1, 1, 1, 1], Some(0)),
+            lsa(None, LsType::AsExternal, [10, 9, 0, 0], [2, 2, 2, 2], None),
         ]);
-        assert!(out.contains("area 0.0.0.0 router id 1.1.1.1 adv-router 1.1.1.1 seq 0x80000001 age 42"));
+        assert!(out.contains("area 0.0.0.0 router id 1.1.1.1 adv-router 1.1.1.1 seq 0x80000001 age 42 flags none"));
         assert!(out.contains("as-external external id 10.9.0.0 adv-router 2.2.2.2 seq 0x80000001"));
+        // Only a Router-LSA has them, so nothing else grows a flags column.
+        assert!(!out.lines().any(|l| l.starts_with("as-external") && l.contains("flags")));
+    }
+
+    /// The flags a Router-LSA carries are named, not printed as a hex byte.
+    ///
+    /// The E bit is the one that matters and the one that went missing: without
+    /// it, RFC 2328 §16.4 makes every AS-external LSA this router originates
+    /// unusable to a conforming neighbour, which faithfully floods them and
+    /// installs none. An operator staring at that needs to be able to see the
+    /// bit, and "0x02" is not seeing it.
+    #[test]
+    fn a_router_lsa_says_in_words_whether_it_is_an_asbr() {
+        let lsa = |flags: u8| OspfLsaInfo {
+            area: Some(Ipv4Addr::new(0, 0, 0, 0)),
+            ls_type: LsType::Router,
+            link_state_id: Ipv4Addr::new(1, 1, 1, 1),
+            advertising_router: Ipv4Addr::new(1, 1, 1, 1),
+            seq: -2_147_483_647,
+            age: 1,
+            router_flags: Some(flags),
+        };
+        assert!(render_ospf_database(&[lsa(RTR_FLAG_E)]).contains("flags asbr"));
+        assert!(render_ospf_database(&[lsa(RTR_FLAG_B)]).contains("flags abr"));
+        assert!(render_ospf_database(&[lsa(RTR_FLAG_B | RTR_FLAG_E)]).contains("flags abr,asbr"));
+        assert!(render_ospf_database(&[lsa(0)]).contains("flags none"));
     }
 
     #[test]

@@ -460,8 +460,22 @@ fn get_u24(b: &[u8]) -> u32 {
 // --- Router-LSA -----------------------------------------------------------
 
 fn encode_router(r: &RouterLsa, out: &mut Vec<u8>) {
-    out.push(0); // reserved
+    // Flags first, then the reserved byte. RFC 2328 §A.4.2 lays the body out as
+    //
+    //     |  0  |V|E|B|      0        |          # links              |
+    //
+    // so the V/E/B bits are in byte 0 and byte 1 is the zero. These two were the
+    // other way round, and nothing in this repository could see it: the decoder
+    // read the same wrong byte, so every round-trip test passed and wren talking
+    // to wren agreed with itself perfectly.
+    //
+    // FRR reads byte 0, as the RFC says, and therefore saw every wren router as
+    // neither an ABR nor an ASBR. §16.4 makes an AS-external LSA unusable unless
+    // its originator is reachable *as an ASBR*, so FRR flooded wren's externals
+    // faithfully, kept them in its database, and installed not one of them.
+    // Found on hardware against FRR, which is the only place it could be found.
     out.push(r.flags);
+    out.push(0); // reserved
     out.extend_from_slice(&(r.links.len() as u16).to_be_bytes());
     for l in &r.links {
         out.extend_from_slice(&l.link_id.octets());
@@ -476,7 +490,9 @@ fn decode_router(b: &[u8]) -> Option<RouterLsa> {
     if b.len() < 4 {
         return None;
     }
-    let flags = b[1];
+    // Byte 0, per §A.4.2 — see the note in `encode_router` for the swap that
+    // used to live here on both sides at once.
+    let flags = b[0];
     let count = u16::from_be_bytes([b[2], b[3]]) as usize;
     let mut links = Vec::with_capacity(count);
     let mut p = 4;
@@ -764,11 +780,44 @@ mod tests {
         assert_lsa_roundtrips(&l);
     }
 
+    /// The V/E/B bits sit in byte 0 of the body, and the zero in byte 1.
+    ///
+    /// Asserted against the wire and not through a round trip, because a round
+    /// trip is exactly what could not see this: the encoder wrote the flags into
+    /// byte 1 and the decoder read them back from byte 1, so wren agreed with
+    /// itself completely while telling every other implementation that it was
+    /// neither an ABR nor an ASBR. FRR reads byte 0, as RFC 2328 §A.4.2 says,
+    /// and consequently ignored every AS-external LSA wren originated (§16.4
+    /// requires the originator to be reachable as an ASBR).
+    ///
+    /// A symmetric bug is invisible to a symmetric test. This one is asymmetric
+    /// on purpose.
+    #[test]
+    fn a_router_lsa_puts_its_flags_in_the_byte_the_rfc_names() {
+        let l = lsa(
+            LsType::Router,
+            [10, 0, 0, 1],
+            LsaBody::Router(RouterLsa {
+                flags: RTR_FLAG_E,
+                links: vec![],
+            }),
+        );
+        let bytes = l.encode();
+        let body = &bytes[LSA_HEADER_LEN..];
+        assert_eq!(
+            body[0], RTR_FLAG_E,
+            "the E bit is not in byte 0, so no other implementation will see this \
+             router as an ASBR"
+        );
+        assert_eq!(body[1], 0, "byte 1 is the reserved zero, not the flags");
+        assert_eq!(u16::from_be_bytes([body[2], body[3]]), 0, "link count");
+    }
+
     #[test]
     fn router_lsa_skips_tos_metrics() {
         // Hand-build a Router-LSA whose single link carries one TOS entry; the
         // decoder must skip it and still land on the right byte boundary.
-        let mut body = vec![0u8, RTR_FLAG_V, 0, 1]; // reserved, flags, #links=1
+        let mut body = vec![RTR_FLAG_V, 0u8, 0, 1]; // flags, reserved, #links=1
         body.extend_from_slice(&Ipv4Addr::new(10, 0, 0, 9).octets()); // link id
         body.extend_from_slice(&Ipv4Addr::new(10, 0, 0, 5).octets()); // link data
         body.push(RouterLinkType::Transit.as_u8());
