@@ -2829,6 +2829,14 @@ pub async fn run(
                         apply_event(ev, vrf_table, &updates, &sessions, &teardown_tx).await;
                     }
                 }
+                // AS_PATH loop avoidance (RFC 4271 §9.1.2): drop reachability whose
+                // AS_PATH already names us. Withdrawals above are still honoured —
+                // a peer taking back a route we should never have had is a message
+                // worth acting on.
+                if is_as_path_loop(&update, local.local_as) {
+                    debug!(peer = %peer, "BGP UPDATE carries our own AS in AS_PATH; reachability ignored");
+                    continue;
+                }
                 // Confederation loop avoidance (RFC 5065 §5.4): drop reachability
                 // whose AS_CONFED_SEQUENCE / AS_CONFED_SET already names our
                 // Member-AS — withdrawals above are still honoured.
@@ -3743,6 +3751,25 @@ fn is_reflection_loop(update: &Update, router_id: Ipv4Addr, cluster_id: Ipv4Addr
 /// Whether a received UPDATE's reachability must be ignored for confederation loop
 /// avoidance (RFC 5065 §5.4): one of its AS_CONFED_SEQUENCE / AS_CONFED_SET segments
 /// already contains our Member-AS, so the route has looped back into our sub-AS.
+/// Whether an UPDATE's AS_PATH already names us (RFC 4271 §9.1.2).
+///
+/// A route that has been through this AS and come back describes a loop, and
+/// installing it is how a router ends up forwarding its own traffic to the
+/// neighbour that will send it straight back. The check belongs on *receipt*
+/// and not only on advertisement: what a peer chooses to send back is the
+/// peer's business, and a speaker that trusts it has no loop protection at all.
+///
+/// Confederation segments are excluded — they carry Member-AS numbers and are
+/// judged by [`is_confed_loop`] against the Member-AS instead.
+fn is_as_path_loop(update: &Update, local_as: u32) -> bool {
+    update.attributes.iter().any(|a| match a {
+        PathAttribute::AsPath(segs) => segs
+            .iter()
+            .any(|s| !s.is_confederation() && s.asns().contains(&local_as)),
+        _ => false,
+    })
+}
+
 fn is_confed_loop(update: &Update, member_as: u32) -> bool {
     update.attributes.iter().any(|a| match a {
         PathAttribute::AsPath(segs) => segs
@@ -7393,6 +7420,41 @@ mod tests {
         assert_eq!(classify(65001, &members, 64500), PeerType::Ebgp);
         // With no members configured, any differing AS is a true external peer.
         assert_eq!(classify(65001, &[], 65002), PeerType::Ebgp);
+    }
+
+    #[test]
+    fn as_path_loop_check_drops_a_route_that_has_been_through_us() {
+        let upd = |attrs: Vec<PathAttribute>| Update {
+            withdrawn: vec![],
+            attributes: attrs,
+            nlri: vec![],
+            ..Default::default()
+        };
+        // A route we originated, handed back by a neighbour with its own AS in
+        // front. Installing it points our traffic at the neighbour that will
+        // send it straight back.
+        let looped = upd(vec![PathAttribute::AsPath(vec![AsPathSegment::Sequence(
+            vec![65005, 65047],
+        )])]);
+        assert!(is_as_path_loop(&looped, 65047));
+        // An AS_SET counts too: it is still a record of where the route has been.
+        let in_set = upd(vec![PathAttribute::AsPath(vec![
+            AsPathSegment::Sequence(vec![65005]),
+            AsPathSegment::Set(vec![64500, 65047]),
+        ])]);
+        assert!(is_as_path_loop(&in_set, 65047));
+        // Somebody else's AS is not our loop.
+        let clean = upd(vec![PathAttribute::AsPath(vec![AsPathSegment::Sequence(
+            vec![65005, 64500],
+        )])]);
+        assert!(!is_as_path_loop(&clean, 65047));
+        // A Member-AS inside a confederation segment is the confederation
+        // check's business, not this one — judging it here would drop every
+        // route inside a confederation.
+        let confed = upd(vec![PathAttribute::AsPath(vec![
+            AsPathSegment::ConfedSequence(vec![65047]),
+        ])]);
+        assert!(!is_as_path_loop(&confed, 65047));
     }
 
     #[test]
