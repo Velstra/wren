@@ -43,8 +43,9 @@ write_a() {  # $1 = ttl line, $2 = tag
   cat >"$WORK/a_$2.toml" <<EOF
 router-id = "10.0.0.1"
 [bgp]
-enabled  = true
-local-as = 65001
+enabled             = true
+local-as            = 65001
+ebgp-require-policy = false
 [[bgp.neighbor]]
 address   = "10.0.2.1"
 remote-as = 65002
@@ -56,8 +57,9 @@ write_b() {  # $1 = ttl line, $2 = tag
   cat >"$WORK/b_$2.toml" <<EOF
 router-id = "10.0.0.2"
 [bgp]
-enabled  = true
-local-as = 65002
+enabled             = true
+local-as            = 65002
+ebgp-require-policy = false
 [[bgp.neighbor]]
 address   = "10.0.1.1"
 remote-as = 65001

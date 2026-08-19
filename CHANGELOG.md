@@ -46,6 +46,40 @@ follows [Semantic Versioning](https://semver.org/).
   one next hop by definition. Giving a next hop to a route that had none stops
   it discarding, which is documented rather than refused.
 
+### Changed
+
+- **BREAKING: an eBGP peer with no policy now exchanges nothing, by default.**
+  RFC 8212's default-deny has been in Wren since 0.4.0, but as `[bgp]
+  ebgp-require-policy = true` — off unless asked for, which is the one setting
+  everybody who needs it has never heard of. It is now the default, as the RFC
+  has required since 2017: an eBGP neighbour with no `import` policy accepts no
+  routes, and one with no `export` policy advertises none. iBGP and
+  confederation sessions are untouched — the RFC is about external peers.
+
+  Two things follow that will surprise an existing configuration. **Upgrading a
+  policy-less eBGP config silences it**: the session still establishes, and no
+  routes cross it. And **a locally-originated route is no longer exempt** — the
+  `network` statements, redistribution, aggregates and `default-originate` of a
+  speaker with no export policy stay home too. The old implementation gated
+  transit routes and let a speaker's own out, which is precisely the leak the
+  RFC exists to stop: "Routes SHALL NOT be added to an Adj-RIB-Out associated
+  with an EBGP peer if no explicit Export Policy has been applied" draws no such
+  line.
+
+  Nothing is silent about it. The session logs, once, at establishment, which
+  directions are denied and how to change it; `show bgp neighbors` grows a
+  `policy-denied <n>` count of what was discarded on receipt, and the same
+  number is exported as `wren_bgp_policy_denied_received_total`. An
+  Established-but-empty peer now says why in three places, rather than looking
+  identical to a broken one.
+
+  To keep permit-all where you mean it: `require-policy = false` on a single
+  `[[bgp.neighbor]]` — the route server or lab peer that really is meant to
+  exchange everything — or `[bgp] ebgp-require-policy = false` for a whole
+  speaker at once. The per-neighbour key wins over the global one, so one
+  session can opt out while the rest of the router keeps the protection, and one
+  can be re-armed on a speaker that has opted out globally.
+
 ## [0.4.0] — 2026-08-01
 
 A large release: EVPN grows a layer-3 half, IS-IS learns to authenticate, and a

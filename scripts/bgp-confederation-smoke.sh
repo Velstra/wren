@@ -64,6 +64,7 @@ enabled               = true
 local-as              = 65002
 confederation-id      = 65000
 confederation-members = [65001]
+ebgp-require-policy   = false
 [[bgp.neighbor]]
 address   = "10.12.0.1"
 remote-as = 65001
@@ -78,9 +79,10 @@ EOF
 cat >"$WORK/c.toml" <<EOF
 router-id = "10.23.0.3"
 [bgp]
-enabled  = true
-local-as = 64500
-network  = ["10.3.0.0/24"]
+enabled             = true
+local-as            = 64500
+network             = ["10.3.0.0/24"]
+ebgp-require-policy = false
 [[bgp.neighbor]]
 address   = "10.23.0.2"
 remote-as = 65000

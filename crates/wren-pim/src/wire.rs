@@ -841,4 +841,190 @@ mod tests {
         EncodedSource::source(ip("10.0.0.1")).encode_into(&mut out);
         assert_eq!(out[2], 0x04);
     }
+
+    // =======================================================================
+    // Byte-offset assertions (RFC 7761 §4.9)
+    //
+    // Every round-trip test above asserts byte 0 (version and type) and then
+    // trusts the encoder and decoder to agree with each other about everything
+    // after it — which they always will, even when both are wrong.
+    // =======================================================================
+
+    /// RFC 7761 §4.9.1 fixes the Encoded-Group-Address: Addr Family 0, Encoding
+    /// Type 1, a flags octet 2 with B = 0x80 and Z = 0x01, Mask Len 3, then the
+    /// group address. The Encoded-Unicast-Address (§4.9.1) has no flags or mask
+    /// at all — family, encoding, address — and the Encoded-Source-Address
+    /// carries S = 0x04, W = 0x02, R = 0x01 in its flags octet.
+    ///
+    /// Flags and Mask Len transposed is the one a round trip cannot see: a
+    /// `/32` mask read as a flags octet sets B and Z and several reserved bits,
+    /// so a conformant router treats every join as bidirectional and
+    /// admin-scoped — and reads the flags byte as a mask length of 0 or 4,
+    /// which matches an enormous group range instead of the one group asked for.
+    #[test]
+    fn the_encoded_address_formats_match_the_rfc_field_order() {
+        // A Register-Stop carries an Encoded-Group then an Encoded-Unicast, so
+        // one message exercises both formats at known offsets.
+        let b = Message::RegisterStop {
+            group: EncodedGroup {
+                group: ip("239.1.2.3"),
+                mask_len: 32,
+                bidir: false,
+                admin_scope: false,
+            },
+            source: EncodedUnicast(ip("10.0.0.1")),
+        }
+        .encode();
+        assert_eq!(b[0], 0x22, "version 2 in the top nibble, type 2 in the low");
+        assert_eq!(b[1], 0, "byte 1 is Reserved");
+        let g = &b[4..12];
+        assert_eq!(g[0], 1, "Addr Family is byte 0 of the group; IPv4 is 1");
+        assert_eq!(g[1], 0, "Encoding Type is byte 1; native is 0");
+        assert_eq!(g[2], 0, "byte 2 is the B/Z flags octet");
+        assert_eq!(g[3], 32, "Mask Len is byte 3");
+        assert_eq!(&g[4..8], &[239, 1, 2, 3], "the group address is bytes 4..8");
+        let u = &b[12..18];
+        assert_eq!(u[0], 1, "an Encoded-Unicast is family, encoding, address —");
+        assert_eq!(u[1], 0, "— with no flags and no mask octet");
+        assert_eq!(&u[2..6], &[10, 0, 0, 1]);
+        assert_eq!(b.len(), 18);
+
+        // The B and Z flag bits, asserted individually.
+        let flags = |bidir, admin_scope| {
+            Message::RegisterStop {
+                group: EncodedGroup { group: ip("239.0.0.1"), mask_len: 32, bidir, admin_scope },
+                source: EncodedUnicast(ip("10.0.0.1")),
+            }
+            .encode()[6]
+        };
+        assert_eq!(flags(true, false), 0x80, "B is the top bit of the flags octet");
+        assert_eq!(flags(false, true), 0x01, "Z is the low bit");
+        assert_eq!(flags(true, true), 0x81);
+    }
+
+    /// RFC 7761 §4.9.5 fixes the Join/Prune body: the Upstream Neighbor Address
+    /// (an Encoded-Unicast) at 4..10, a Reserved octet 10, Number of Groups 11,
+    /// Holdtime 12..14, then the group blocks — each an Encoded-Group followed
+    /// by Number of Joined Sources and Number of Pruned Sources, both 16-bit.
+    ///
+    /// The two source counts transposed makes a peer read a join list as a
+    /// prune list: the message that was meant to build the tree tears it down
+    /// instead, and the traffic stops. Both counts round-trip through wren
+    /// perfectly either way round.
+    #[test]
+    fn a_join_prune_body_is_encoded_in_the_rfc_field_order() {
+        let b = Message::JoinPrune {
+            upstream: EncodedUnicast(ip("10.0.0.254")),
+            holdtime: 0x00d2, // 210
+            groups: vec![JpGroup {
+                group: EncodedGroup {
+                    group: ip("239.1.2.3"),
+                    mask_len: 32,
+                    bidir: false,
+                    admin_scope: false,
+                },
+                joins: vec![EncodedSource {
+                    source: ip("192.0.2.1"),
+                    mask_len: 32,
+                    sparse: true,
+                    wildcard: false,
+                    rpt: false,
+                }],
+                prunes: vec![],
+            }],
+        }
+        .encode();
+        assert_eq!(b[0], 0x23, "a Join/Prune is version 2, type 3");
+        assert_eq!(&b[4..10], &[1, 0, 10, 0, 0, 254], "the Upstream Neighbor is 4..10");
+        assert_eq!(b[10], 0, "byte 10 is Reserved");
+        assert_eq!(b[11], 1, "Number of Groups is byte 11");
+        assert_eq!(&b[12..14], &[0x00, 0xd2], "Holdtime is bytes 12..14");
+        let grp = &b[14..];
+        assert_eq!(&grp[0..8], &[1, 0, 0, 32, 239, 1, 2, 3], "the Encoded-Group");
+        assert_eq!(&grp[8..10], &[0, 1], "Number of Joined Sources is 8..10");
+        assert_eq!(&grp[10..12], &[0, 0], "Number of Pruned Sources is 10..12");
+        assert_eq!(
+            &grp[12..20],
+            &[1, 0, 0x04, 32, 192, 0, 2, 1],
+            "the joined source, S set in its flags octet"
+        );
+        assert_eq!(b.len(), 14 + 20);
+    }
+
+    /// RFC 7761 §4.9.1 fixes the Register flags as a 32-bit word right after the
+    /// header: B (Border) is the **top** bit, N (Null-Register) the next.
+    /// §4.4.1 also makes the Register checksum cover only the first 8 octets —
+    /// the header and this flags word — never the encapsulated datagram, so a
+    /// PMTU-truncated Register still verifies.
+    ///
+    /// N in the wrong bit makes the RP treat a probe Null-Register as a real
+    /// data Register and decapsulate whatever follows it — or, the other way
+    /// round, drop the data of every genuine Register.
+    #[test]
+    fn a_register_puts_its_flags_in_the_top_bits_of_the_word_after_the_header() {
+        let mk = |border, null, data: Vec<u8>| Message::Register { border, null, data }.encode();
+        assert_eq!(
+            &mk(true, false, vec![])[4..8],
+            &[0x80, 0, 0, 0],
+            "B is the top bit of the 32-bit flags word"
+        );
+        assert_eq!(&mk(false, true, vec![])[4..8], &[0x40, 0, 0, 0], "N is the next bit");
+        assert_eq!(&mk(false, false, vec![])[4..8], &[0, 0, 0, 0]);
+
+        // The checksum covers the first 8 octets only, so appending payload
+        // leaves it unchanged — and the header still verifies at 0..8.
+        let with_data = mk(false, false, vec![0x45, 0x00, 0xde, 0xad]);
+        let bare = mk(false, false, vec![]);
+        assert_eq!(&with_data[2..4], &bare[2..4], "the payload is outside the checksum");
+        assert_eq!(checksum(&with_data[..8]), 0, "the 8-octet header checksums to zero");
+        assert_eq!(&with_data[8..], &[0x45, 0x00, 0xde, 0xad], "the datagram follows at 8");
+    }
+
+    /// RFC 7761 §4.9.2 makes each Hello option a `Type(2) · Length(2) · Value`
+    /// TLV, and §4.9.2 assigns the codes: Holdtime 1, LAN Prune Delay 2, DR
+    /// Priority 19, Generation ID 20.
+    ///
+    /// DR Priority decides the §4.3.2 Designated-Router election. A wrong
+    /// option code makes the neighbour read no priority at all and fall back to
+    /// the highest-address rule, so both routers can believe they are the DR
+    /// on the LAN and duplicate every register.
+    #[test]
+    fn the_hello_option_codes_and_tlv_shape_are_the_ones_the_rfc_assigns() {
+        let one = |o: HelloOption| {
+            let b = Message::Hello { options: vec![o] }.encode();
+            b[4..].to_vec()
+        };
+        let h = one(HelloOption::Holdtime(105));
+        assert_eq!(&h[0..2], &[0, 1], "Holdtime is option type 1");
+        assert_eq!(&h[2..4], &[0, 2], "then a 2-octet Length");
+        assert_eq!(&h[4..6], &[0, 105], "then the value");
+        assert_eq!(h.len(), 6);
+
+        assert_eq!(&one(HelloOption::DrPriority(7))[0..4], &[0, 19, 0, 4], "DR Priority is 19");
+        assert_eq!(
+            &one(HelloOption::GenerationId(9))[0..4],
+            &[0, 20, 0, 4],
+            "Generation ID is 20"
+        );
+        let l = one(HelloOption::LanPruneDelay { value: 500, override_interval: 2500 });
+        assert_eq!(&l[0..4], &[0, 2, 0, 4], "LAN Prune Delay is option 2, 4 octets");
+        assert_eq!(&l[4..6], &[0x01, 0xf4], "Propagation_Delay first");
+        assert_eq!(&l[6..8], &[0x09, 0xc4], "then Override_Interval");
+    }
+
+    /// RFC 1071 known-answer vector for the 16-bit ones-complement checksum PIM
+    /// uses (RFC 7761 §4.9). The existing tests only fold wren's own output back
+    /// to zero, which a wrong implementation does just as happily — while every
+    /// real router on the segment discards the message.
+    #[test]
+    fn the_checksum_matches_a_known_answer() {
+        let header = [
+            0x45, 0x00, 0x00, 0x3c, 0x1c, 0x46, 0x40, 0x00, 0x40, 0x06, 0x00, 0x00, 0xac, 0x10,
+            0x0a, 0x63, 0xac, 0x10, 0x0a, 0x0c,
+        ];
+        assert_eq!(checksum(&header), 0xb1e6);
+        // RFC 1071 §1: a trailing odd octet is the *high* byte of the last word.
+        assert_eq!(checksum(&[0x12]), !0x1200u16);
+        assert_eq!(checksum(&[0x12]), checksum(&[0x12, 0x00]));
+    }
 }

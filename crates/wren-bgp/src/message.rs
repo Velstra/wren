@@ -16,6 +16,7 @@ use crate::attr::{AttrOutcome, PathAttribute};
 use crate::capability::{encode_optional_parameters, parse_optional_parameters, Capability};
 use crate::{
     as_trans_fit, decode_prefix, encode_prefix, MessageType, AFI_IPV4, HEADER_LEN, MARKER,
+    MAX_MESSAGE_LEN,
     SAFI_UNICAST, VERSION,
 };
 
@@ -387,7 +388,21 @@ impl Message {
             return Err(DecodeError::BadMarker);
         }
         let stated = u16::from_be_bytes([buf[16], buf[17]]);
-        if stated as usize != buf.len() || (stated as usize) < HEADER_LEN {
+        // RFC 4271 §4.1 fixes the message length between 19 and 4096 octets.
+        // The lower bound was here; the upper was not, so this primitive would
+        // decode a 60000-octet "BGP message" that no conformant speaker may
+        // send. `wren-daemon` bounds it while framing, which is why nothing has
+        // gone wrong in the daemon — but this is a public library entry point,
+        // it is what the fuzz target drives, and a second caller would not
+        // inherit the daemon's check.
+        //
+        // No RFC 8654 extended-message support exists in this crate (no
+        // capability, no negotiation), so 4096 is the whole of the contract and
+        // not merely the un-negotiated default.
+        if stated as usize != buf.len()
+            || (stated as usize) < HEADER_LEN
+            || stated as usize > MAX_MESSAGE_LEN
+        {
             return Err(DecodeError::BadLength {
                 stated,
                 actual: buf.len(),
@@ -443,11 +458,36 @@ fn decode_open(body: &[u8]) -> Result<Open, DecodeError> {
     if body.len() < 10 + opt_len {
         return Err(DecodeError::TooShort);
     }
+    let my_as = u16::from_be_bytes([body[1], body[2]]);
+    // RFC 7607 §2: AS 0 is reserved, and an OPEN carrying it in My Autonomous
+    // System must be refused. A peer that got in with AS 0 would then be
+    // compared against, and matched by, every AS-0 test in the decision
+    // process — and `decode_as_segments` already refuses AS 0 inside an
+    // AS_PATH, so accepting it in the OPEN was the one door left open.
+    //
+    // AS_TRANS (23456) is *not* this case: a four-octet speaker puts it here on
+    // purpose and carries its real ASN in a capability (RFC 6793 §4.1).
+    if my_as == 0 {
+        return Err(DecodeError::Malformed);
+    }
+    let identifier = Ipv4Addr::new(body[5], body[6], body[7], body[8]);
+    // RFC 6286 §2.2: "a BGP Identifier is valid if and only if it is a non-zero
+    // four-octet unsigned integer" — it relaxed RFC 4271's "must be an IP
+    // address of this speaker" to exactly this, so zero is the whole test and
+    // nothing here may reject an address merely for looking unusual.
+    //
+    // It matters beyond tidiness: the identifier is a tie-breaker in the
+    // decision process and one half of the collision-detection comparison, so a
+    // peer offering zero wins or loses those by a value the RFC says cannot
+    // occur.
+    if identifier.is_unspecified() {
+        return Err(DecodeError::Malformed);
+    }
     Ok(Open {
         version,
-        my_as: u16::from_be_bytes([body[1], body[2]]),
+        my_as,
         hold_time: u16::from_be_bytes([body[3], body[4]]),
-        identifier: Ipv4Addr::new(body[5], body[6], body[7], body[8]),
+        identifier,
         capabilities: parse_optional_parameters(&body[10..10 + opt_len]),
     })
 }
@@ -527,7 +567,7 @@ fn decode_update(body: &[u8], four_octet: bool, add_path: AddPath) -> Result<Upd
     // the session down) or when a mandatory well-known attribute is missing from an
     // UPDATE that carries NLRI (RFC 4271 §5 mandates ORIGIN, AS_PATH and NEXT_HOP).
     let attributes = match decode_attributes(attr_bytes, four_octet) {
-        Ok(attrs) if nlri.is_empty() || has_mandatory_attributes(&attrs) => attrs,
+        Ok(attrs) if mandatory_attributes_present(&attrs, !nlri.is_empty()) => attrs,
         _ => {
             // Fold the NLRI into the withdrawn set and drop the attributes.
             withdrawn.extend(nlri);
@@ -551,10 +591,48 @@ fn decode_update(body: &[u8], four_octet: bool, add_path: AddPath) -> Result<Upd
     })
 }
 
-/// Whether the well-known mandatory attributes required for a NLRI-bearing IPv4
-/// UPDATE are all present (RFC 4271 §5: ORIGIN, AS_PATH, NEXT_HOP). Their absence
-/// triggers RFC 7606 treat-as-withdraw rather than a session reset.
-fn has_mandatory_attributes(attrs: &[PathAttribute]) -> bool {
+/// Whether an UPDATE carries any MP_REACH_NLRI — that is, whether it advertises
+/// anything through the multiprotocol attribute rather than the IPv4 NLRI field.
+fn advertises_multiprotocol(attrs: &[PathAttribute]) -> bool {
+    attrs.iter().any(|a| {
+        matches!(
+            a,
+            PathAttribute::MpReachNlri { .. }
+                | PathAttribute::MpReachEvpn { .. }
+                | PathAttribute::MpReachFlowSpec { .. }
+                | PathAttribute::MpReachSrPolicy { .. }
+                | PathAttribute::MpReachLinkState { .. }
+        )
+    })
+}
+
+/// Whether the well-known mandatory attributes this UPDATE needs are present.
+/// Their absence triggers RFC 7606 treat-as-withdraw rather than a session reset.
+///
+/// Two advertising shapes, and they require different sets:
+///
+/// * **IPv4 NLRI** (RFC 4271 §5) — ORIGIN, AS_PATH *and* NEXT_HOP.
+/// * **MP_REACH_NLRI** (RFC 4760 §3) — ORIGIN and AS_PATH. Not NEXT_HOP: the
+///   next hop for those routes is carried *inside* MP_REACH, and §3 says such an
+///   UPDATE "should not" carry the NEXT_HOP attribute at all, so requiring it
+///   would reject every conformant IPv6 advertisement in existence.
+///
+/// The MP case was not checked. The test was `nlri.is_empty()`, and an MP-only
+/// UPDATE has an empty IPv4 NLRI field — so the whole check was skipped and a
+/// peer could advertise IPv6, EVPN, FlowSpec, SR-Policy or Link-State routes
+/// with no ORIGIN and no AS_PATH at all. An AS_PATH nobody sent is an AS_PATH
+/// with no loop to detect and no length to compare.
+///
+/// LOCAL_PREF is deliberately not checked here even though §3 requires it on an
+/// IBGP MP UPDATE: whether a session is internal is not something the wire
+/// format knows, and this function has only the bytes.
+fn mandatory_attributes_present(attrs: &[PathAttribute], has_ipv4_nlri: bool) -> bool {
+    let mp = advertises_multiprotocol(attrs);
+    if !has_ipv4_nlri && !mp {
+        // Advertises nothing: a pure withdraw, or an End-of-RIB marker. There is
+        // no route for an attribute to describe.
+        return true;
+    }
     let mut origin = false;
     let mut as_path = false;
     let mut next_hop = false;
@@ -566,7 +644,7 @@ fn has_mandatory_attributes(attrs: &[PathAttribute]) -> bool {
             _ => {}
         }
     }
-    origin && as_path && next_hop
+    origin && as_path && (!has_ipv4_nlri || next_hop)
 }
 
 /// Decode a run of NLRI prefixes (IPv4 base NLRI). With `add_path`, each prefix is
@@ -734,6 +812,149 @@ mod tests {
         assert_eq!(u.withdrawn, vec![p("10.0.0.0/24")], "NLRI must be withdrawn");
         assert!(u.nlri.is_empty());
         assert!(u.attributes.is_empty());
+    }
+
+    /// An UPDATE body carrying only an attribute block — no IPv4 NLRI at all,
+    /// which is the shape every IPv6/EVPN/FlowSpec advertisement has.
+    fn mp_only_body(attrs: &[u8]) -> Vec<u8> {
+        let mut body = vec![0, 0]; // Withdrawn Routes Length = 0
+        body.extend_from_slice(&(attrs.len() as u16).to_be_bytes());
+        body.extend_from_slice(attrs);
+        body
+    }
+
+    /// A well-formed MP_REACH for one IPv6 unicast prefix, as raw attribute
+    /// bytes: flags · type 14 · len · AFI(2) · SAFI · NHLen · NextHop · Reserved
+    /// · NLRI.
+    fn mp_reach_ipv6(nh: &[u8]) -> Vec<u8> {
+        let mut value = vec![0, 2, 1, nh.len() as u8];
+        value.extend_from_slice(nh);
+        value.push(0); // Reserved
+        value.extend_from_slice(&[64, 0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0]); // 2001:db8::/64
+        let mut out = vec![0x80, 14, value.len() as u8];
+        out.extend_from_slice(&value);
+        out
+    }
+
+    #[test]
+    fn an_mp_only_update_still_needs_origin_and_as_path_rfc4760() {
+        // The hole: the mandatory-attribute check was gated on the *IPv4* NLRI
+        // field being non-empty, and an MP-only UPDATE leaves that field empty —
+        // so the check never ran and a peer could advertise IPv6 (or EVPN, or
+        // FlowSpec) with no ORIGIN and no AS_PATH whatsoever. An AS_PATH nobody
+        // sent is an AS_PATH with no loop to detect and no length to compare.
+        //
+        // RFC 4760 §3 requires both on any UPDATE carrying MP_REACH_NLRI.
+        let bare = mp_reach_ipv6(&[0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
+        let decoded = Message::decode(&frame_update(&mp_only_body(&bare)), true, AddPath::NONE)
+            .expect("treat-as-withdraw, not a session reset");
+        let Message::Update(u) = decoded else { panic!("expected UPDATE") };
+        assert!(
+            u.attributes.is_empty(),
+            "an MP_REACH with no ORIGIN or AS_PATH was accepted: {:?}",
+            u.attributes
+        );
+
+        // And with them present it is accepted, so the check is about the
+        // attributes and not about MP_REACH itself.
+        let mut ok = Vec::new();
+        PathAttribute::Origin(Origin::Igp).encode(&mut ok, true);
+        PathAttribute::AsPath(vec![AsPathSegment::Sequence(vec![65001])]).encode(&mut ok, true);
+        ok.extend_from_slice(&bare);
+        let decoded = Message::decode(&frame_update(&mp_only_body(&ok)), true, AddPath::NONE)
+            .expect("decodes");
+        let Message::Update(u) = decoded else { panic!("expected UPDATE") };
+        assert!(
+            u.attributes.iter().any(|a| matches!(a, PathAttribute::MpReachNlri { .. })),
+            "a complete MP UPDATE was rejected: {:?}",
+            u.attributes
+        );
+    }
+
+    #[test]
+    fn an_mp_only_update_does_not_need_a_next_hop_attribute_rfc4760() {
+        // The other half of RFC 4760 §3, and the reason the mandatory set had to
+        // be split rather than simply applied: the next hop for MP routes is
+        // carried *inside* MP_REACH, and §3 says such an UPDATE "should not"
+        // carry the NEXT_HOP attribute at all. Requiring it would reject every
+        // conformant IPv6 advertisement in existence.
+        let mut attrs = Vec::new();
+        PathAttribute::Origin(Origin::Igp).encode(&mut attrs, true);
+        PathAttribute::AsPath(vec![AsPathSegment::Sequence(vec![65001])]).encode(&mut attrs, true);
+        attrs.extend_from_slice(&mp_reach_ipv6(&[
+            0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
+        ]));
+        let decoded = Message::decode(&frame_update(&mp_only_body(&attrs)), true, AddPath::NONE)
+            .expect("decodes");
+        let Message::Update(u) = decoded else { panic!("expected UPDATE") };
+        assert!(
+            u.attributes.iter().any(|a| matches!(a, PathAttribute::MpReachNlri { .. })),
+            "an MP UPDATE was rejected for lacking a NEXT_HOP it must not carry"
+        );
+    }
+
+    #[test]
+    fn a_message_longer_than_the_contract_allows_is_refused_rfc4271() {
+        // RFC 4271 §4.1 bounds a BGP message at 4096 octets, and this crate
+        // negotiates no RFC 8654 extended-message capability, so 4096 is the
+        // whole of it. The lower bound was checked here and the upper was not;
+        // `wren-daemon` bounds it while framing, so the daemon was never
+        // exposed — but this is the public entry point and what the fuzz target
+        // drives.
+        let body = vec![0u8; MAX_MESSAGE_LEN + 1 - HEADER_LEN];
+        let mut m = Vec::new();
+        m.extend_from_slice(&MARKER);
+        m.extend_from_slice(&((HEADER_LEN + body.len()) as u16).to_be_bytes());
+        m.push(4); // KEEPALIVE, so only the length can be what is wrong
+        m.extend_from_slice(&body);
+        assert_eq!(m.len(), MAX_MESSAGE_LEN + 1);
+        assert!(
+            matches!(Message::decode(&m, true, AddPath::NONE), Err(DecodeError::BadLength { .. })),
+            "a {}-octet message was accepted",
+            m.len()
+        );
+
+        // Exactly 4096 is still legal — the bound is inclusive.
+        let body = vec![0u8; MAX_MESSAGE_LEN - HEADER_LEN];
+        let mut m = Vec::new();
+        m.extend_from_slice(&MARKER);
+        m.extend_from_slice(&(MAX_MESSAGE_LEN as u16).to_be_bytes());
+        m.push(2); // UPDATE — a KEEPALIVE must have an empty body
+        m.extend_from_slice(&body);
+        assert!(
+            !matches!(
+                Message::decode(&m, true, AddPath::NONE),
+                Err(DecodeError::BadLength { .. })
+            ),
+            "the largest legal message was refused for its length"
+        );
+    }
+
+    #[test]
+    fn an_open_with_a_reserved_as_or_a_zero_identifier_is_refused() {
+        // RFC 7607 §2: AS 0 is reserved and an OPEN carrying it must be refused.
+        // RFC 6286 §2.2: a BGP Identifier is valid iff it is a non-zero 4-octet
+        // integer. Neither was checked, and both feed comparisons that assume
+        // the value cannot occur — AS 0 every AS-0 test in the decision process,
+        // the identifier the tie-break and collision detection.
+        let open = |my_as: u16, id: [u8; 4]| {
+            let mut body = vec![VERSION];
+            body.extend_from_slice(&my_as.to_be_bytes());
+            body.extend_from_slice(&180u16.to_be_bytes());
+            body.extend_from_slice(&id);
+            body.push(0); // no optional parameters
+            let mut m = Vec::new();
+            m.extend_from_slice(&MARKER);
+            m.extend_from_slice(&((HEADER_LEN + body.len()) as u16).to_be_bytes());
+            m.push(1); // OPEN
+            m.extend_from_slice(&body);
+            Message::decode(&m, true, AddPath::NONE)
+        };
+        assert!(open(0, [10, 0, 0, 1]).is_err(), "AS 0 was accepted in an OPEN");
+        assert!(open(65001, [0, 0, 0, 0]).is_err(), "a zero BGP Identifier was accepted");
+        // AS_TRANS is not this case: a four-octet speaker puts it here on purpose.
+        assert!(open(23456, [10, 0, 0, 1]).is_ok(), "AS_TRANS was refused");
+        assert!(open(65001, [10, 0, 0, 1]).is_ok(), "a valid OPEN was refused");
     }
 
     #[test]
@@ -1051,5 +1272,175 @@ mod tests {
         let mut bytes = Message::Open(Open::new(VERSION, 1, 90, ip([1, 1, 1, 1]))).encode(true, AddPath::NONE);
         bytes[HEADER_LEN] = 3; // version 3
         assert_eq!(Message::decode(&bytes, true, AddPath::NONE), Err(DecodeError::BadVersion(3)));
+    }
+
+    // =======================================================================
+    // Byte-offset assertions (RFC 4271 §4)
+    //
+    // The `roundtrip` helper above encodes with wren and decodes with wren; it
+    // checks the marker and the length field and nothing else. A field written
+    // at the wrong offset is invisible to it, because the decoder reads it back
+    // from the same wrong offset. The tests below name the offset the RFC names.
+    // =======================================================================
+
+    /// RFC 4271 §4.1: every message opens with a 16-octet all-ones Marker, a
+    /// 2-octet Length at 16..18 covering the whole message, and a 1-octet Type
+    /// at 18. §4.1 assigns OPEN 1, UPDATE 2, NOTIFICATION 3, KEEPALIVE 4, and
+    /// RFC 2918 adds ROUTE-REFRESH 5.
+    #[test]
+    fn the_message_header_and_type_codes_are_the_ones_the_rfc_assigns() {
+        for (t, code) in [
+            (MessageType::Open, 1u8),
+            (MessageType::Update, 2),
+            (MessageType::Notification, 3),
+            (MessageType::Keepalive, 4),
+            (MessageType::RouteRefresh, 5),
+        ] {
+            assert_eq!(t.as_u8(), code, "{t:?} is message type {code}");
+            assert_eq!(MessageType::from_u8(code), Some(t));
+        }
+        assert_eq!(MessageType::from_u8(0), None);
+        assert_eq!(MessageType::from_u8(6), None);
+
+        let b = Message::Keepalive.encode(true, AddPath::NONE);
+        assert_eq!(&b[0..16], &[0xffu8; 16], "the Marker is 16 octets of 0xff");
+        assert_eq!(&b[16..18], &[0, 19], "Length is bytes 16..18; a KEEPALIVE is 19");
+        assert_eq!(b[18], 4, "Type is byte 18");
+        assert_eq!(b.len(), 19, "a KEEPALIVE is header-only");
+    }
+
+    /// RFC 4271 §4.2: the OPEN body is Version 19, My Autonomous System 20..22,
+    /// Hold Time 22..24, BGP Identifier 24..28, Optional Parameters Length 28,
+    /// then the parameters.
+    ///
+    /// My AS and Hold Time transposed round-trips perfectly and is fatal: the
+    /// peer reads the AS number as a hold time (and vice versa), so §6.2's
+    /// "Bad Peer AS" check fires and the session never opens. Note also that
+    /// `my_as` is the *2-octet* field even for a 4-octet speaker — the real AS
+    /// travels in the capability — so `AS_TRANS` (23456) is what a 4-octet AS
+    /// must put here.
+    #[test]
+    fn an_open_body_is_encoded_in_the_rfc_field_order() {
+        let msg = Message::Open(Open {
+            version: 4,
+            my_as: 0xfde8,     // 65000
+            hold_time: 0x005a, // 90
+            identifier: ip([10, 0, 0, 1]),
+            capabilities: vec![],
+        });
+        let b = msg.encode(true, AddPath::NONE);
+        assert_eq!(b[18], 1, "an OPEN is Type 1");
+        assert_eq!(b[19], 4, "Version is byte 19");
+        assert_eq!(&b[20..22], &[0xfd, 0xe8], "My Autonomous System is bytes 20..22");
+        assert_eq!(&b[22..24], &[0x00, 0x5a], "Hold Time is bytes 22..24");
+        assert_eq!(&b[24..28], &[10, 0, 0, 1], "BGP Identifier is bytes 24..28");
+        assert_eq!(b[28], 0, "Optional Parameters Length is byte 28");
+        assert_eq!(b.len(), 29, "an OPEN with no parameters is 29 octets");
+    }
+
+    /// RFC 4271 §4.3: the UPDATE body is Withdrawn Routes Length 19..21, the
+    /// withdrawn routes, Total Path Attribute Length, the attributes, then the
+    /// NLRI to the end of the message — the NLRI carries no length of its own
+    /// and is derived from the header Length.
+    ///
+    /// Swap the two length fields and a peer reads the attribute block as
+    /// withdrawn routes: it withdraws prefixes nobody advertised and installs
+    /// nothing. Wren's own decoder, reading them back in the same order, sees a
+    /// perfectly good UPDATE.
+    #[test]
+    fn an_update_body_is_encoded_in_the_rfc_field_order() {
+        let msg = Message::Update(Update {
+            withdrawn: vec![p("192.0.2.0/24")],
+            attributes: vec![PathAttribute::Origin(Origin::Igp)],
+            nlri: vec![p("10.0.0.0/24")],
+            nlri_path_ids: vec![],
+            withdrawn_path_ids: vec![],
+        });
+        let b = msg.encode(true, AddPath::NONE);
+        assert_eq!(b[18], 2, "an UPDATE is Type 2");
+        // One withdrawn /24 is 4 octets: a length byte plus three prefix octets.
+        assert_eq!(&b[19..21], &[0, 4], "Withdrawn Routes Length is bytes 19..21");
+        assert_eq!(&b[21..25], &[24, 192, 0, 2], "the withdrawn prefix follows it");
+        // ORIGIN is 4 octets on the wire: flags, type, length, value.
+        assert_eq!(&b[25..27], &[0, 4], "Total Path Attribute Length follows the withdrawals");
+        assert_eq!(&b[27..31], &[0x40, 1, 1, 0], "the ORIGIN attribute");
+        assert_eq!(&b[31..], &[24, 10, 0, 0], "the NLRI runs to the end of the message");
+        assert_eq!(
+            u16::from_be_bytes([b[16], b[17]]) as usize,
+            b.len(),
+            "only the header Length bounds the NLRI"
+        );
+
+        // An UPDATE with nothing in it is the 19-octet header plus two zero
+        // length fields — the shape of an End-of-RIB marker (RFC 4724 §2).
+        let eor = Message::Update(Update {
+            withdrawn: vec![],
+            attributes: vec![],
+            nlri: vec![],
+            nlri_path_ids: vec![],
+            withdrawn_path_ids: vec![],
+        })
+        .encode(true, AddPath::NONE);
+        assert_eq!(eor.len(), 23);
+        assert_eq!(&eor[19..23], &[0, 0, 0, 0]);
+    }
+
+    /// RFC 4271 §4.5: a NOTIFICATION is Error code 19, Error subcode 20, then
+    /// the data. This is the last thing a peer hears before the session is torn
+    /// down, and the pair is what an operator reads to find out why; transposed,
+    /// every diagnosis on the far side is wrong.
+    #[test]
+    fn a_notification_body_is_the_code_then_the_subcode_then_data() {
+        let msg = Message::Notification(Notification {
+            code: 6,    // Cease
+            subcode: 2, // Administrative Shutdown
+            data: b"bye".to_vec(),
+        });
+        let b = msg.encode(true, AddPath::NONE);
+        assert_eq!(b[18], 3, "a NOTIFICATION is Type 3");
+        assert_eq!(b[19], 6, "Error code is byte 19");
+        assert_eq!(b[20], 2, "Error subcode is byte 20");
+        assert_eq!(&b[21..], b"bye", "the data follows from byte 21");
+        assert_eq!(b.len(), 24);
+    }
+
+    /// RFC 2918 §3: a ROUTE-REFRESH body is AFI 19..21, a Reserved octet 21,
+    /// and SAFI 22 — a fixed 23-octet message. The reserved octet between the
+    /// two is easy to omit, which shifts the SAFI into it and makes the peer
+    /// refresh the wrong address family (or none).
+    #[test]
+    fn a_route_refresh_body_has_a_reserved_octet_between_afi_and_safi() {
+        let b = Message::RouteRefresh { afi: crate::AFI_IPV6, safi: crate::SAFI_UNICAST }
+            .encode(true, AddPath::NONE);
+        assert_eq!(b[18], 5, "a ROUTE-REFRESH is Type 5");
+        assert_eq!(&b[19..21], &[0, 2], "AFI is bytes 19..21; IPv6 is 2");
+        assert_eq!(b[21], 0, "byte 21 is Reserved and must be zero");
+        assert_eq!(b[22], 1, "SAFI is byte 22; unicast is 1");
+        assert_eq!(b.len(), 23);
+    }
+
+    /// The decode side, from bytes laid out by hand rather than by wren's own
+    /// encoder — the half a round trip cannot check.
+    #[test]
+    fn a_hand_built_open_decodes_each_field_from_its_rfc_offset() {
+        let mut w = vec![0xffu8; 16];
+        w.extend_from_slice(&[0, 29]); // length
+        w.push(1); // OPEN
+        w.push(4); // version
+        w.extend_from_slice(&[0x5b, 0xa0]); // my AS = 23456 (AS_TRANS)
+        w.extend_from_slice(&[0x00, 0xb4]); // hold time = 180
+        w.extend_from_slice(&[192, 0, 2, 1]); // identifier
+        w.push(0); // no optional parameters
+        assert_eq!(w.len(), 29);
+        match Message::decode(&w, true, AddPath::NONE).expect("a well-formed OPEN decodes") {
+            Message::Open(o) => {
+                assert_eq!(o.version, 4);
+                assert_eq!(o.my_as, 23456);
+                assert_eq!(o.hold_time, 180);
+                assert_eq!(o.identifier, ip([192, 0, 2, 1]));
+                assert!(o.capabilities.is_empty());
+            }
+            other => panic!("expected an OPEN, got {other:?}"),
+        }
     }
 }

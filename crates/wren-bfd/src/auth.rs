@@ -180,18 +180,17 @@ impl AuthState {
                 if !constant_eq(&calc, &recv) {
                     return false;
                 }
-                // Replay window (§6.7.3): the sequence number must advance within
-                // 3 × Detect Mult of the last accepted one (strictly, for meticulous).
+                // Replay window (§6.7.3/§6.7.4): the sequence number must lie
+                // within 3 × Detect Mult of the last accepted one — from it
+                // inclusive for keyed, from one past it for meticulous.
                 let ok = match self.rx_seq {
                     None => true, // first authenticated packet seeds the window
-                    Some(last) => {
-                        let advanced = if self.cfg.auth_type.meticulous() {
-                            seq > last
-                        } else {
-                            seq >= last
-                        };
-                        advanced && seq <= last.saturating_add(3 * self.detect_mult as u32)
-                    }
+                    Some(last) => within_replay_window(
+                        last,
+                        seq,
+                        self.detect_mult,
+                        self.cfg.auth_type.meticulous(),
+                    ),
                 };
                 if ok {
                     self.rx_seq = Some(seq);
@@ -200,6 +199,33 @@ impl AuthState {
             }
         }
     }
+}
+
+/// Whether `seq` is inside the replay window that opens at `last`.
+///
+/// **Serial-number arithmetic, because the sequence space is circular.** RFC 5880
+/// §6.7.3 has the sender increment the sequence number "occasionally", and
+/// §6.7.4 on every packet — so a long-lived meticulous session at 3 packets a
+/// second wraps 2³² in about forty-five years, and one at the 10 ms floor in
+/// under a year and a half. What was here compared the numbers directly and
+/// bounded the window with `last.saturating_add(..)`, so both halves broke at
+/// the wrap: `seq > last` is false for every sequence number after the wrap, and
+/// the saturating bound pins the window's top at `u32::MAX` for ever. The
+/// session then rejects every authenticated packet its peer sends, permanently,
+/// and BFD tears the link down — from one legitimate increment.
+///
+/// Taking the difference modulo 2³² instead is the standard reading of a
+/// circular sequence space (the same arithmetic RFC 1982 describes): a packet
+/// one past a wrapped `last` has a delta of 1 whatever the absolute values are,
+/// and a replay from far behind has a delta close to 2³², which is outside any
+/// window this can produce.
+fn within_replay_window(last: u32, seq: u32, detect_mult: u8, meticulous: bool) -> bool {
+    // At most 3 × 255 = 765, so the multiply cannot overflow a u32.
+    let window = 3 * detect_mult as u32;
+    let delta = seq.wrapping_sub(last);
+    // Meticulous requires a strict advance; keyed permits the same number again.
+    let floor = if meticulous { 1 } else { 0 };
+    delta >= floor && delta <= window
 }
 
 /// Compute the digest of a keyed-auth packet under the given type.
@@ -458,11 +484,164 @@ mod tests {
         assert!(!rx.verify(&p1));
     }
 
+    /// A keyed-auth packet at a chosen sequence number, with a digest that
+    /// verifies. Mirrors `append`, but takes the sequence rather than
+    /// incrementing a counter — which is the only way to reach the far end of a
+    /// 2³² space in a test.
+    fn forge(cfg: &AuthConfig, seq: u32) -> Vec<u8> {
+        let ty = cfg.auth_type;
+        let dlen = ty.digest_len();
+        let mut out = mand().to_vec();
+        out[1] |= 1 << 2; // the A bit
+        let auth_len = 8 + dlen;
+        out[3] = (24 + auth_len) as u8;
+        out.push(ty.code());
+        out.push(auth_len as u8);
+        out.push(cfg.key_id);
+        out.push(0); // Reserved
+        out.extend_from_slice(&seq.to_be_bytes());
+        let digest_off = out.len();
+        let mut key = cfg.secret.clone();
+        key.resize(dlen, 0);
+        out.extend_from_slice(&key);
+        let digest = digest_for(ty, &out);
+        out[digest_off..digest_off + dlen].copy_from_slice(&digest);
+        out
+    }
+
+    #[test]
+    fn the_replay_window_survives_the_sequence_wrapping_to_zero() {
+        // The sequence space is circular, and the window did not know it. The
+        // comparison was `seq > last` with a `saturating_add` ceiling, so at the
+        // wrap both halves failed at once: every sequence number after the wrap
+        // is numerically *below* `last`, and the ceiling had already pinned
+        // itself at u32::MAX. The session then rejected every authenticated
+        // packet its peer sent, for ever, and BFD tore the link down — from one
+        // legitimate increment.
+        for ty in [AuthType::MeticulousKeyedSha1, AuthType::KeyedMd5] {
+            let c = cfg(ty, b"k");
+            let mut rx = c.new_state(3);
+            assert!(rx.verify(&forge(&c, u32::MAX)), "{ty:?} seeds at u32::MAX");
+            assert!(
+                rx.verify(&forge(&c, 0)),
+                "{ty:?} refused the packet after the sequence wrapped to 0"
+            );
+            assert!(rx.verify(&forge(&c, 1)), "{ty:?} refused the one after that");
+        }
+    }
+
+    /// The window itself, at the edges and across the wrap.
+    #[test]
+    fn the_replay_window_is_a_circular_range() {
+        // 3 × Detect Mult = 9 either side of the wrap.
+        for meticulous in [false, true] {
+            let floor = u32::from(meticulous);
+            assert!(within_replay_window(u32::MAX, u32::MAX.wrapping_add(1), 3, meticulous));
+            assert!(within_replay_window(u32::MAX, 8, 3, meticulous), "the far edge, wrapped");
+            assert!(!within_replay_window(u32::MAX, 9, 3, meticulous), "one past the far edge");
+            // A replay from behind is a huge forward delta, so it is outside.
+            assert!(!within_replay_window(0, u32::MAX, 3, meticulous), "a replay was admitted");
+            assert!(!within_replay_window(100, 99, 3, meticulous), "an older number was admitted");
+            // The same number again: keyed permits it, meticulous does not.
+            assert_eq!(within_replay_window(100, 100, 3, meticulous), floor == 0);
+        }
+    }
+
     #[test]
     fn wrong_auth_type_is_rejected() {
         let mut tx = cfg(AuthType::KeyedMd5, b"k").new_state(3);
         let bytes = tx.append(&mand());
         let mut rx = cfg(AuthType::KeyedSha1, b"k").new_state(3);
         assert!(!rx.verify(&bytes));
+    }
+
+    /// RFC 5880 §4.4 fixes the Simple Password Authentication Section, which
+    /// begins immediately after the 24-octet mandatory section: Auth Type 24,
+    /// Auth Len 25, Auth Key ID 26, Password 27 onward. Auth Len counts the
+    /// whole section including its own three header octets.
+    ///
+    /// Asserted on the bytes rather than through `verify`, because `append` and
+    /// `verify` share this layout: move a field and wren still authenticates
+    /// against itself while every other implementation reads the key ID as part
+    /// of the password and drops the session.
+    #[test]
+    fn the_simple_password_section_matches_the_rfc_field_order() {
+        let mut tx = cfg(AuthType::SimplePassword, b"hunter2").new_state(3);
+        let b = tx.append(&mand());
+        assert_eq!(b[1] & 0x04, 0x04, "the A bit is set in byte 1 of the header");
+        assert_eq!(b[3] as usize, b.len(), "the header Length now covers the section");
+        assert_eq!(b[24], 1, "Auth Type is byte 24; Simple Password is 1");
+        assert_eq!(b[25], 3 + 7, "Auth Len is byte 26 and counts its own 3 octets");
+        assert_eq!(b[26], 7, "Auth Key ID is byte 26");
+        assert_eq!(&b[27..], b"hunter2", "the password starts at byte 27");
+        assert_eq!(b.len(), 24 + 3 + 7);
+    }
+
+    /// RFC 5880 §4.3/§4.4 fix the Keyed MD5 and SHA1 sections: Auth Type 24,
+    /// Auth Len 25, Auth Key ID 26, Reserved 27 (must be zero), Sequence Number
+    /// 28..32 big-endian, then the digest from byte 32. Auth Len is
+    /// 8 + digest length — 24 for MD5, 28 for SHA1.
+    ///
+    /// The sequence number is the replay defence (§6.7.3). Land it at the wrong
+    /// offset and a peer reads four bytes of the digest as the sequence: every
+    /// packet looks like a wild jump, the receiver's window rejects the lot, and
+    /// the authenticated session never comes up at all.
+    #[test]
+    fn a_keyed_digest_section_matches_the_rfc_field_order() {
+        for (ty, code, dlen) in [
+            (AuthType::KeyedMd5, 2u8, 16usize),
+            (AuthType::MeticulousKeyedMd5, 3, 16),
+            (AuthType::KeyedSha1, 4, 20),
+            (AuthType::MeticulousKeyedSha1, 5, 20),
+        ] {
+            let mut tx = cfg(ty, b"sharedsecret").new_state(3);
+            tx.xmit_seq = 0x0102_0303; // append bumps it to ...04
+            let b = tx.append(&mand());
+            assert_eq!(ty.code(), code, "{ty:?} is auth type code {code}");
+            assert_eq!(b[1] & 0x04, 0x04, "the A bit is set");
+            assert_eq!(b[3] as usize, b.len(), "the header Length covers the section");
+            assert_eq!(b[24], code, "Auth Type is byte 24");
+            assert_eq!(b[25] as usize, 8 + dlen, "Auth Len is byte 25 = 8 + digest len");
+            assert_eq!(b[26], 7, "Auth Key ID is byte 26");
+            assert_eq!(b[27], 0, "byte 27 is Reserved and must be zero");
+            assert_eq!(
+                &b[28..32],
+                &[0x01, 0x02, 0x03, 0x04],
+                "the Sequence Number is bytes 28..32, big-endian, incremented on send"
+            );
+            assert_eq!(b.len(), 24 + 8 + dlen, "the digest occupies the last {dlen} octets");
+            // The digest field is not the raw key: the key is only the seed
+            // written into that field before hashing (§4.3).
+            let mut key = b"sharedsecret".to_vec();
+            key.resize(dlen, 0);
+            assert_ne!(&b[32..], &key[..], "byte 32 onward is the digest, not the key");
+        }
+    }
+
+    /// RFC 5880 §4.3: the digest is computed over the whole datagram *with the
+    /// shared key sitting in the digest field*, zero-padded or truncated to the
+    /// digest length. That is unusual enough that a self-consistent
+    /// implementation is easy to get wrong and impossible to notice — both ends
+    /// of a wren-to-wren session would agree on any other construction.
+    ///
+    /// Rebuilt here independently of `append`, so a change to the construction
+    /// shows up as a mismatch rather than as silent non-interoperability.
+    #[test]
+    fn the_keyed_md5_digest_is_taken_over_the_packet_with_the_key_in_its_own_field() {
+        let mut tx = cfg(AuthType::KeyedMd5, b"sharedsecret").new_state(3);
+        let b = tx.append(&mand());
+        // Rebuild the pre-digest image: everything as sent, but with the key
+        // (padded to 16) in place of the digest.
+        let mut image = b[..32].to_vec();
+        let mut key = b"sharedsecret".to_vec();
+        key.resize(16, 0);
+        image.extend_from_slice(&key);
+        assert_eq!(image.len(), b.len());
+        assert_eq!(&b[32..], &md5(&image)[..], "the digest must match §4.3's construction");
+        // And it really covers the mandatory section: flipping My Discriminator
+        // changes the digest.
+        let mut other = image.clone();
+        other[7] ^= 0xff;
+        assert_ne!(md5(&other), md5(&image));
     }
 }

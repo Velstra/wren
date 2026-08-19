@@ -480,4 +480,148 @@ mod tests {
             other => panic!("expected Update, got {other:?}"),
         }
     }
+
+    // =======================================================================
+    // Byte-offset assertions (RFC 8966 §4.6)
+    //
+    // Every test above round-trips a TLV through this crate's own encoder and
+    // decoder. That cannot see a field at the wrong offset — the decoder reads
+    // it back from the same wrong place — which is exactly how the OSPFv2
+    // Router-LSA flag bug survived until another implementation was put on the
+    // wire. The tests below name the offset the RFC names.
+    // =======================================================================
+
+    /// RFC 8966 §4.2 fixes the packet header: Magic 42, Version 2, then a
+    /// 2-octet Body Length that counts the TLVs *only* — not the four header
+    /// octets. §4.3 makes every TLV `[Type][Length][Body]`, where Length also
+    /// excludes its own two octets.
+    ///
+    /// Count the header into the body length and a peer reads four octets past
+    /// the end of the TLV stream, so the last TLV in every packet is discarded
+    /// as malformed — including the Update that carries the route.
+    #[test]
+    fn the_packet_body_length_counts_the_tlvs_only() {
+        let pkt = Packet::new(vec![Tlv::Ack { nonce: 0x1234 }]);
+        let b = pkt.encode();
+        assert_eq!(b[0], MAGIC, "byte 0 is the magic, 42");
+        assert_eq!(b[1], VERSION, "byte 1 is the version, 2");
+        assert_eq!(
+            u16::from_be_bytes([b[2], b[3]]) as usize,
+            b.len() - 4,
+            "Body Length is bytes 2..4 and excludes the 4-octet header"
+        );
+        assert_eq!(b[4], 3, "the Ack TLV type is 3");
+        assert_eq!(b[5], 2, "the TLV Length excludes its own 2 octets");
+        assert_eq!(&b[6..8], &[0x12, 0x34], "then the 2-octet nonce");
+        assert_eq!(b.len(), 8);
+    }
+
+    /// RFC 8966 §4.6 assigns the TLV type codes, and §4.6.1 makes Pad1 the one
+    /// TLV with **no length octet at all** — a bare zero byte. Give Pad1 a
+    /// length octet and every TLV after it in the packet is misframed.
+    #[test]
+    fn the_tlv_type_codes_are_the_ones_the_rfc_assigns_and_pad1_has_no_length() {
+        let first_two = |t: Tlv| {
+            let b = Packet::new(vec![t]).encode();
+            (b[4], b.len())
+        };
+        assert_eq!(first_two(Tlv::Pad1), (0, 5), "Pad1 is type 0 and one octet total");
+        assert_eq!(first_two(Tlv::PadN(3)).0, 1, "PadN is type 1");
+        assert_eq!(first_two(Tlv::AckReq { nonce: 0, interval: 0 }).0, 2, "AckReq is 2");
+        assert_eq!(first_two(Tlv::Ack { nonce: 0 }).0, 3, "Ack is 3");
+        assert_eq!(
+            first_two(Tlv::Hello { flags: 0, seqno: 0, interval: 0 }).0,
+            4,
+            "Hello is 4"
+        );
+        assert_eq!(
+            first_two(Tlv::Ihu { rxcost: 0, interval: 0, address: None }).0,
+            5,
+            "IHU is 5"
+        );
+        assert_eq!(first_two(Tlv::RouterId([0; 8])).0, 6, "Router-Id is 6");
+        assert_eq!(first_two(Tlv::RouteRequest { prefix: None }).0, 9, "Route Req is 9");
+        // Pad1 really is a single octet: two of them plus an Ack frame correctly.
+        let b = Packet::new(vec![Tlv::Pad1, Tlv::Pad1, Tlv::Ack { nonce: 7 }]).encode();
+        assert_eq!(&b[4..6], &[0, 0], "two bare Pad1 octets");
+        assert_eq!(b[6], 3, "then the Ack TLV type");
+        assert_eq!(b.len(), 4 + 1 + 1 + 4);
+    }
+
+    /// RFC 8966 §4.6.9 fixes the Update TLV body: AE 0, Flags 1, Plen 2,
+    /// Omitted 3, Interval 4..6, Seqno 6..8, Metric 8..10, then the
+    /// `ceil((plen - omitted)/8)` prefix octets.
+    ///
+    /// Seqno and Metric transposed is the dangerous one, and it round-trips
+    /// perfectly. Babel's loop-freedom rests on the feasibility condition
+    /// (§3.5.1), which compares `(seqno, metric)` pairs: read them the wrong way
+    /// round and a peer either accepts routes it must not (a routing loop that
+    /// the protocol is specifically designed to make impossible) or rejects
+    /// every update as unfeasible and never installs a route at all.
+    #[test]
+    fn an_update_tlv_is_encoded_in_the_rfc_field_order() {
+        let pkt = Packet::new(vec![Tlv::Update {
+            flags: 0,
+            interval: 0x0064,
+            seqno: 0x1122,
+            metric: 0x3344,
+            prefix: p("10.9.8.0/24"),
+        }]);
+        let b = pkt.encode();
+        assert_eq!(b[4], 8, "the Update TLV type is 8");
+        let v = &b[6..]; // past the TLV type and length octets
+        assert_eq!(v[0], 1, "AE is byte 0 of the body; IPv4 is 1");
+        assert_eq!(v[1], 0, "Flags is byte 1");
+        assert_eq!(v[2], 24, "Plen is byte 2");
+        assert_eq!(v[3], 0, "Omitted is byte 3 — wren never compresses on send");
+        assert_eq!(&v[4..6], &[0x00, 0x64], "Interval is bytes 4..6");
+        assert_eq!(&v[6..8], &[0x11, 0x22], "Seqno is bytes 6..8");
+        assert_eq!(&v[8..10], &[0x33, 0x44], "Metric is bytes 8..10");
+        assert_eq!(&v[10..13], &[10, 9, 8], "the prefix is ceil(24/8) = 3 octets");
+        assert_eq!(b[5] as usize, 13, "the TLV Length covers exactly the body");
+        assert_eq!(b.len(), 4 + 2 + 13);
+
+        // An IPv6 update uses AE 2 and carries ceil(plen/8) octets, not 16.
+        let b = Packet::new(vec![Tlv::Update {
+            flags: 0,
+            interval: 100,
+            seqno: 1,
+            metric: METRIC_INFINITY,
+            prefix: p("2001:db8::/32"),
+        }])
+        .encode();
+        let v = &b[6..];
+        assert_eq!(v[0], 2, "AE 2 is IPv6");
+        assert_eq!(v[2], 32, "Plen 32");
+        assert_eq!(&v[8..10], &[0xff, 0xff], "an infinity metric retracts the route");
+        assert_eq!(&v[10..14], &[0x20, 0x01, 0x0d, 0xb8], "four prefix octets for a /32");
+        assert_eq!(b[5] as usize, 14);
+    }
+
+    /// RFC 8966 §4.6.6 fixes the IHU body: AE 0, Reserved 1, Rxcost 2..4,
+    /// Interval 4..6, then the optional address. Rxcost and Interval transposed
+    /// feeds the neighbour's cost computation (§3.4.3) an interval in place of a
+    /// cost, so link costs bear no relation to link quality and the metric that
+    /// Babel's whole route selection rests on is noise.
+    #[test]
+    fn an_ihu_tlv_is_encoded_in_the_rfc_field_order() {
+        let b = Packet::new(vec![Tlv::Ihu {
+            rxcost: 0x0100,
+            interval: 0x012c,
+            address: Some("10.0.0.2".parse().unwrap()),
+        }])
+        .encode();
+        assert_eq!(b[4], 5, "the IHU TLV type is 5");
+        let v = &b[6..];
+        assert_eq!(v[0], 1, "AE is byte 0; IPv4 is 1");
+        assert_eq!(v[1], 0, "byte 1 is Reserved and must be zero");
+        assert_eq!(&v[2..4], &[0x01, 0x00], "Rxcost is bytes 2..4");
+        assert_eq!(&v[4..6], &[0x01, 0x2c], "Interval is bytes 4..6");
+        assert_eq!(&v[6..10], &[10, 0, 0, 2], "the address follows at byte 6");
+
+        // With no address the AE is 0 (wildcard) and the body stops at 6 octets.
+        let b = Packet::new(vec![Tlv::Ihu { rxcost: 1, interval: 2, address: None }]).encode();
+        assert_eq!(b[6], 0, "AE 0 means no address is present");
+        assert_eq!(b[5], 6, "the body is just the six fixed octets");
+    }
 }

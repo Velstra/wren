@@ -1122,4 +1122,171 @@ mod tests {
         let body = [0xff, 0xff, 0xff, 0xff]; // count = 4_294_967_295, no LSA data
         assert_eq!(decode_lsu(&body), Err(DecodeError::BadLsa));
     }
+
+    // =======================================================================
+    // Byte-offset assertions (RFC 5340 Appendix A.3)
+    // =======================================================================
+
+    /// RFC 5340 §A.3.1 fixes the 16-byte common header: Version 0, Type 1,
+    /// Packet Length 2..4, Router ID 4..8, Area ID 8..12, Checksum 12..14,
+    /// **Instance ID 14**, and a reserved zero at 15. OSPFv3 has no
+    /// authentication field, which is why the header is 16 octets and not
+    /// OSPFv2's 24.
+    ///
+    /// Instance ID is what lets several OSPFv3 instances share one link
+    /// (§4.2.1): a packet whose Instance ID does not match the receiving
+    /// interface's is dropped. Put it at byte 15 and it always reads as the
+    /// reserved zero, so every non-zero-instance deployment silently forms no
+    /// adjacencies — while `instance_id_survives` above passes, because wren
+    /// reads back the same byte it wrote.
+    #[test]
+    fn the_common_header_writes_each_field_at_the_offset_the_rfc_names() {
+        let mut pkt = sample_hello();
+        pkt.header.router_id = Ipv4Addr::new(1, 2, 3, 4);
+        pkt.header.area_id = Ipv4Addr::new(0, 0, 0, 42);
+        pkt.header.instance_id = 42;
+        let b = pkt.encode(SRC, ALL_SPF_ROUTERS);
+        assert_eq!(b[0], 3, "Version is byte 0 and OSPFv3 is 3");
+        assert_eq!(b[1], 1, "Type is byte 1 and a Hello is 1");
+        assert_eq!(
+            u16::from_be_bytes([b[2], b[3]]) as usize,
+            b.len(),
+            "Packet Length is bytes 2..4"
+        );
+        assert_eq!(&b[4..8], &[1, 2, 3, 4], "Router ID is bytes 4..8");
+        assert_eq!(&b[8..12], &[0, 0, 0, 42], "Area ID is bytes 8..12");
+        assert_ne!(&b[12..14], &[0, 0], "Checksum is bytes 12..14 and is filled in");
+        assert_eq!(b[14], 42, "Instance ID is byte 14");
+        assert_eq!(b[15], 0, "byte 15 is reserved and must be zero");
+    }
+
+    /// RFC 5340 §A.3.1 assigns the packet type codes, and they are the numbers
+    /// every other OSPFv3 speaker switches on. `packet_type_roundtrips` above
+    /// only checks the enum against itself.
+    #[test]
+    fn the_packet_type_codes_are_the_ones_the_rfc_assigns() {
+        for (t, code) in [
+            (PacketType::Hello, 1u8),
+            (PacketType::DatabaseDescription, 2),
+            (PacketType::LinkStateRequest, 3),
+            (PacketType::LinkStateUpdate, 4),
+            (PacketType::LinkStateAck, 5),
+        ] {
+            assert_eq!(t.as_u8(), code, "{t:?} is packet type {code}");
+            assert_eq!(PacketType::from_u8(code), Some(t));
+        }
+        assert_eq!(PacketType::from_u8(0), None);
+        assert_eq!(PacketType::from_u8(6), None);
+    }
+
+    /// RFC 5340 §A.3.2: a Hello body is Interface ID 16..20, Rtr Pri 20, a
+    /// 24-bit Options field 21..24, HelloInterval 24..26, RouterDeadInterval
+    /// 26..28, Designated Router ID 28..32, Backup DR ID 32..36, then the
+    /// neighbour list.
+    ///
+    /// Note the two differences from OSPFv2 that a round trip cannot police:
+    /// Options is three octets, not one, and the dead interval is 16 bits, not
+    /// 32. Encode either at OSPFv2's width and every field after it shifts,
+    /// so the peer reads a hello/dead pair that never matches its own and
+    /// §4.2.1 rejects the Hello outright.
+    #[test]
+    fn a_hello_body_is_encoded_in_the_rfc_field_order() {
+        let pkt = Packet::hello(
+            sample_header(),
+            Hello {
+                interface_id: 0x1112_1314,
+                router_priority: 7,
+                options: OPT_V6 | OPT_R | OPT_E,
+                hello_interval: 0x000a,
+                dead_interval: 0x0028,
+                designated_router: Ipv4Addr::new(10, 0, 0, 1),
+                backup_designated_router: Ipv4Addr::new(10, 0, 0, 2),
+                neighbors: vec![Ipv4Addr::new(10, 0, 0, 3)],
+            },
+        );
+        let b = pkt.encode(SRC, ALL_SPF_ROUTERS);
+        assert_eq!(&b[16..20], &[0x11, 0x12, 0x13, 0x14], "Interface ID is bytes 16..20");
+        assert_eq!(b[20], 7, "Rtr Pri is byte 20");
+        assert_eq!(
+            u32::from_be_bytes([0, b[21], b[22], b[23]]),
+            OPT_V6 | OPT_R | OPT_E,
+            "Options is a 24-bit field at bytes 21..24"
+        );
+        assert_eq!(&b[24..26], &[0x00, 0x0a], "HelloInterval is bytes 24..26");
+        assert_eq!(&b[26..28], &[0x00, 0x28], "RouterDeadInterval is bytes 26..28");
+        assert_eq!(&b[28..32], &[10, 0, 0, 1], "Designated Router ID is bytes 28..32");
+        assert_eq!(&b[32..36], &[10, 0, 0, 2], "Backup DR ID is bytes 32..36");
+        assert_eq!(&b[36..40], &[10, 0, 0, 3], "the neighbour list starts at byte 36");
+        assert_eq!(b.len(), 40);
+    }
+
+    /// RFC 5340 §A.3.3: a Database Description body is a reserved octet 16, a
+    /// 24-bit Options field 17..20, Interface MTU 20..22, a second reserved
+    /// octet 22, the I/M/MS flag byte 23, and the DD sequence number 24..28.
+    /// §A.3.3 also fixes the flag bits: MS = 0x01, M = 0x02, I = 0x04.
+    ///
+    /// Note the reserved octet *before* the flags: OSPFv2 has no such gap, so
+    /// copying its layout puts the flags one byte early. Both ends then believe
+    /// they are master (or both slave) and §10.8's exchange deadlocks in
+    /// ExStart forever — with no error anywhere, because wren reads back
+    /// exactly what it wrote.
+    #[test]
+    fn a_database_description_body_and_its_flag_bits_match_the_rfc() {
+        assert_eq!(DD_FLAG_MASTER, 0x01, "MS is the low bit of the flag byte");
+        assert_eq!(DD_FLAG_MORE, 0x02, "M is 0x02");
+        assert_eq!(DD_FLAG_INIT, 0x04, "I is 0x04");
+
+        let pkt = Packet::database_description(
+            sample_header(),
+            DatabaseDescription {
+                options: OPT_V6 | OPT_E,
+                interface_mtu: 1500,
+                flags: DD_FLAG_INIT | DD_FLAG_MORE | DD_FLAG_MASTER,
+                dd_sequence: 0x1234_5678,
+                lsa_headers: vec![],
+            },
+        );
+        let b = pkt.encode(SRC, ALL_SPF_ROUTERS);
+        assert_eq!(b[1], 2, "a DD packet is Type 2");
+        assert_eq!(b[16], 0, "byte 16 is reserved and must be zero");
+        assert_eq!(
+            u32::from_be_bytes([0, b[17], b[18], b[19]]),
+            OPT_V6 | OPT_E,
+            "Options is a 24-bit field at bytes 17..20"
+        );
+        assert_eq!(&b[20..22], &[0x05, 0xdc], "Interface MTU 1500 is bytes 20..22");
+        assert_eq!(b[22], 0, "byte 22 is reserved and must be zero");
+        assert_eq!(b[23], 0x07, "the I|M|MS flag byte is byte 23");
+        assert_eq!(&b[24..28], &[0x12, 0x34, 0x56, 0x78], "DD sequence is bytes 24..28");
+        assert_eq!(b.len(), 28);
+    }
+
+    /// RFC 5340 §A.3.4: each Link State Request entry is 12 octets — two
+    /// reserved zero octets, then the *16-bit* LS Type at 2..4, Link State ID
+    /// 4..8, Advertising Router 8..12.
+    ///
+    /// The reserved pair is easy to omit (OSPFv2 has a 32-bit type field with
+    /// three leading zeros instead), which shifts both identifiers and makes
+    /// every request name an LSA nobody has — the adjacency then never leaves
+    /// Loading.
+    #[test]
+    fn a_link_state_request_entry_has_two_reserved_octets_before_a_16_bit_type() {
+        let pkt = Packet::link_state_request(
+            sample_header(),
+            LinkStateRequest {
+                entries: vec![LsRequest {
+                    ls_type: LsType::AsExternal, // 0x4005
+                    link_state_id: Ipv4Addr::new(10, 1, 0, 0),
+                    advertising_router: Ipv4Addr::new(10, 0, 0, 9),
+                }],
+            },
+        );
+        let b = pkt.encode(SRC, ALL_SPF_ROUTERS);
+        let e = &b[16..28];
+        assert_eq!(&e[0..2], &[0, 0], "bytes 0..2 of the entry are reserved zeros");
+        assert_eq!(&e[2..4], &[0x40, 0x05], "the 16-bit LS Type is bytes 2..4");
+        assert_eq!(&e[4..8], &[10, 1, 0, 0], "Link State ID is bytes 4..8");
+        assert_eq!(&e[8..12], &[10, 0, 0, 9], "Advertising Router is bytes 8..12");
+        assert_eq!(b.len(), 16 + 12);
+    }
 }

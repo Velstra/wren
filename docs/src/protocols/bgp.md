@@ -45,7 +45,12 @@ Established`, with the ConnectRetry, Hold and Keepalive timers and clean teardow
   Hold Time becomes the smaller of the two proposals (Keepalive = Hold / 3);
 - the Hold and Keepalive timers driving the FSM;
 - originated `network`s advertised on reaching Established, optionally summarised by
-  `[[bgp.aggregate]]` covering prefixes (RFC 4271 §9.2.2.2);
+  `[[bgp.aggregate]]` covering prefixes (RFC 4271 §9.2.2.2) — subject to the
+  default-deny below, which withholds them from a policy-less eBGP peer like
+  anything else;
+- **RFC 8212 default-deny** on every eBGP edge: no `import` policy, no routes
+  accepted; no `export` policy, nothing advertised — see
+  [Default-deny without policy](#default-deny-without-policy-rfc-8212);
 - received UPDATEs folded into the shared BGP RIB, whose best-path changes are
   announced into the kernel RIB as `proto bgp`;
 - learned best paths **propagated** onward to the other peers (transit), prepending
@@ -67,9 +72,10 @@ waits passively:
 router-id = "10.0.0.1"
 
 [bgp]
-enabled  = true
-local-as = 65001
-network  = ["10.10.0.0/24"]
+enabled             = true
+local-as            = 65001
+network             = ["10.10.0.0/24"]
+ebgp-require-policy = false   # lab setting — see "Default-deny without policy"
 
 [[bgp.neighbor]]
 address   = "10.0.0.2"
@@ -81,15 +87,24 @@ remote-as = 65002
 router-id = "10.0.0.2"
 
 [bgp]
-enabled  = true
-local-as = 65002
-network  = ["10.20.0.0/24"]
+enabled             = true
+local-as            = 65002
+network             = ["10.20.0.0/24"]
+ebgp-require-policy = false   # lab setting — see "Default-deny without policy"
 
 [[bgp.neighbor]]
 address   = "10.0.0.1"
 remote-as = 65001
 passive   = true
 ```
+
+That `ebgp-require-policy = false` is doing real work, and it is the one line here
+you should not copy into production. Without it these two speakers would establish
+a session and exchange nothing at all: an eBGP peer with no `import`/`export`
+policy is denied in both directions by default (RFC 8212). It is switched off here
+so the example demonstrates BGP rather than policy — every example below inherits
+the same assumption. [Default-deny without policy](#default-deny-without-policy-rfc-8212)
+explains what a real deployment writes instead.
 
 For **iBGP**, set the neighbour's `remote-as` equal to `local-as`; Wren then
 leaves the AS_PATH empty and carries LOCAL_PREF, as iBGP requires.
@@ -815,6 +830,82 @@ LOCAL_PREF-as-preference, communities). Two live (rootless) checks:
 `scripts/bgp-export-filter-smoke.sh` rejects/re-tags routes a transit router passes to
 its iBGP peer (one `/24` suppressed, the other arriving with `localpref 200` and a
 community).
+
+## Default-deny without policy (RFC 8212)
+
+The section above is what a policy *does*. This is what happens when there isn't
+one: an eBGP neighbour with no `import` accepts no routes, and one with no `export`
+advertises none. That is the default — configure nothing and nothing crosses the
+session. iBGP and confederation peers are unaffected; RFC 8212 is about external
+edges, where a missing policy is how a leak gets out.
+
+It applies to **everything** leaving toward such a peer, not just transit. A
+speaker's own `network` statements, its redistributed routes, its aggregates and
+its `default-originate` all stay home while it has no export policy — "Routes SHALL
+NOT be added to an Adj-RIB-Out associated with an EBGP peer if no explicit Export
+Policy has been applied" makes no exception for the routes you originated yourself,
+and a speaker that withholds what it learned while still leaking what it originates
+has not stopped anything.
+
+A session in this state is **Established and empty**, which looks exactly like a
+broken one, so Wren says so in three places. Once, in the log, when the session
+comes up:
+
+```
+WARN peer=10.0.0.1 directions="import and export" RFC 8212 default-deny: this eBGP
+peer has no policy in the named directions, so no routes are exchanged there —
+configure an import/export filter, or set `require-policy = false` on the neighbour
+to allow permit-all
+```
+
+`directions` names only what is actually silenced, so a peer that has an `import`
+policy and no `export` one reads `directions="export"` rather than a blanket "no
+policy".
+
+In `show bgp neighbors`, as a running count of what was discarded on receipt
+(absent until something actually is):
+
+```
+10.0.0.1 AS 65001 Established hold 90 policy-denied 412
+```
+
+And on the metrics endpoint, as `wren_bgp_policy_denied_received_total{neighbor=…}`
+— the series to alert on, since a peer that starts denying at 03:00 because someone
+removed a filter is otherwise invisible until somebody runs a `show`.
+
+### Turning it off where you mean it
+
+Two knobs, because the two legitimate permit-all cases have different shapes. One
+neighbour — the route server, the lab peer:
+
+```toml
+[[bgp.neighbor]]
+address        = "10.0.0.1"
+remote-as      = 65001
+require-policy = false        # this session only
+```
+
+Or the whole speaker, which is what a test rig wants:
+
+```toml
+[bgp]
+ebgp-require-policy = false   # every eBGP neighbour on this speaker
+```
+
+The per-neighbour key wins over the global one, in both directions: one session can
+opt out while the rest of the router keeps the protection, and one session can be
+re-armed with `require-policy = true` on a speaker that has opted out globally.
+
+One live (rootless) check covers it. `scripts/bgp-default-deny-smoke.sh` gives each
+gate a phase of its own, so no phase can pass for the wrong reason: one where nothing
+is configured at all (the default itself denies, and both routers log it); one where
+only the receiver has a policy, so the sender withholding its own `network` proves
+the export gate reaches locally-originated routes; one where only the sender has one,
+so the receiver's discard is what stops the route and its `policy-denied` counter has
+to move — this is the phase that stops the test merely watching a silent talker; one
+where both do and the route crosses and installs; and one for each opt-out spelling,
+per-neighbour and speaker-wide. It also asserts the session is Established in every
+phase, so "no route" can never pass because BGP never connected.
 
 ## Maximum-prefix limit (RFC 4486)
 

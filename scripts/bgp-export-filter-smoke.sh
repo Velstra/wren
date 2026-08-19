@@ -39,9 +39,10 @@ trap 'rm -rf "$WORK"' EXIT
 cat >"$WORK/a.toml" <<EOF
 router-id = "10.0.0.1"
 [bgp]
-enabled  = true
-local-as = 65001
-network  = ["10.50.1.0/24", "10.50.2.0/24"]
+enabled             = true
+local-as            = 65001
+network             = ["10.50.1.0/24", "10.50.2.0/24"]
+ebgp-require-policy = false
 [[bgp.neighbor]]
 address   = "10.0.1.2"
 remote-as = 65002
@@ -64,8 +65,9 @@ write_b() {  # $1 = export line for the C neighbour, $2 = tag, $3 = extra filter
 router-id = "10.0.0.2"
 $3
 [bgp]
-enabled  = true
-local-as = 65002
+enabled             = true
+local-as            = 65002
+ebgp-require-policy = false
 [[bgp.neighbor]]
 address   = "10.0.1.1"
 remote-as = 65001

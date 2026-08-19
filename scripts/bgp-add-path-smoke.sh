@@ -47,9 +47,10 @@ trap 'rm -rf "$WORK"' EXIT
 cat >"$WORK/b.toml" <<EOF
 router-id = "10.0.0.2"
 [bgp]
-enabled  = true
-local-as = 65002
-network  = ["10.50.0.0/24"]
+enabled             = true
+local-as            = 65002
+network             = ["10.50.0.0/24"]
+ebgp-require-policy = false
 [[bgp.neighbor]]
 address   = "10.1.0.1"
 remote-as = 65001
@@ -59,9 +60,10 @@ EOF
 cat >"$WORK/c.toml" <<EOF
 router-id = "10.0.0.3"
 [bgp]
-enabled  = true
-local-as = 65003
-network  = ["10.50.0.0/24"]
+enabled             = true
+local-as            = 65003
+network             = ["10.50.0.0/24"]
+ebgp-require-policy = false
 [[bgp.neighbor]]
 address   = "10.2.0.1"
 remote-as = 65001
@@ -74,8 +76,9 @@ gen_a() { # $1 = add-path line for the D neighbour ("" or "add-path = true")
 cat >"$WORK/a.toml" <<EOF
 router-id = "10.0.0.1"
 [bgp]
-enabled  = true
-local-as = 65001
+enabled             = true
+local-as            = 65001
+ebgp-require-policy = false
 [[bgp.neighbor]]
 address   = "10.1.0.2"
 remote-as = 65002

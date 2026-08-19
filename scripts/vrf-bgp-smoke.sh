@@ -38,10 +38,11 @@ prefix = "10.99.0.0/24"
 via    = "10.9.0.100"
 vrf    = "blue"
 [bgp]
-enabled      = true
-local-as     = 65001
-vrf          = "blue"
-redistribute = ["static"]
+enabled             = true
+local-as            = 65001
+vrf                 = "blue"
+redistribute        = ["static"]
+ebgp-require-policy = false
 [[bgp.neighbor]]
 address   = "10.9.0.2"
 remote-as = 65002
@@ -53,9 +54,10 @@ router-id = "10.0.0.2"
 name  = "blue"
 table = 100
 [bgp]
-enabled  = true
-local-as = 65002
-vrf      = "blue"
+enabled             = true
+local-as            = 65002
+vrf                 = "blue"
+ebgp-require-policy = false
 [[bgp.neighbor]]
 address   = "10.9.0.1"
 remote-as = 65001

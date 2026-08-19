@@ -2391,6 +2391,88 @@ mod tests {
         assert!(!verify_pdu_auth(Some(&pw), &sealed_lsp(Some(&auth))));
     }
 
+    /// A purge is authenticated exactly like any other LSP — the checksum skip
+    /// on a zero-lifetime LSP is not an unauthenticated injection path.
+    ///
+    /// A purge (Remaining Lifetime 0) withdraws an LSP from the whole domain, so
+    /// an attacker who could inject one unauthenticated could blackhole any
+    /// prefix. The decoder deliberately does NOT verify the Fletcher checksum of
+    /// a purge — real routers zero it, and verifying it would reject every
+    /// standard neighbour's purge and leave the dead LSP in the database — and
+    /// that skip could look like a hole. It is not one: the checksum is not the
+    /// control. `verify_pdu_auth` runs on the raw bytes BEFORE `Pdu::decode`, so
+    /// a purge with missing or wrong authentication never reaches the decoder
+    /// where the checksum would have been checked anyway. This pins that the two
+    /// are independent: auth enforced, checksum skipped, no gap between them.
+    ///
+    /// (Verifying the checksum on purges would close nothing even if it were
+    /// added: it is unkeyed, so anyone able to inject a purge can compute a
+    /// valid one. Authentication is the only control that bounds purge
+    /// injection, which is why the property under test is auth, not checksum.)
+    #[test]
+    fn a_purge_is_authenticated_like_any_lsp_despite_the_checksum_skip() {
+        let auth = IsisAuth::HmacSha256 {
+            key: b"s3cret".to_vec(),
+            key_id: 7,
+        };
+
+        // A purge: zero remaining lifetime, zeroed checksum, empty body — the
+        // shape ISO 10589 §7.3.16.4 floods to withdraw an LSP.
+        let build_purge = |a: Option<&IsisAuth>| {
+            let mut tlvs = Vec::new();
+            if let Some(a) = a {
+                tlvs.push(auth_tlv(a));
+            }
+            let mut bytes = Pdu {
+                max_area_addresses: 0,
+                body: PduBody::Lsp(Lsp {
+                    level: IsLevel::L2,
+                    remaining_lifetime: 0,
+                    lsp_id: LspId::new(SystemId::new([2, 2, 2, 2, 2, 2]), 0, 0),
+                    sequence_number: 9,
+                    checksum: 0,
+                    partition: false,
+                    attached: 0,
+                    overload: false,
+                    is_type: IsLevel::L2,
+                    tlvs,
+                }),
+            }
+            .encode();
+            if let Some(a) = a {
+                a.seal(&mut bytes);
+            }
+            bytes
+        };
+
+        // The checksum skip works: a purge with a zero checksum decodes rather
+        // than being rejected as BadChecksum (the interop half).
+        let sealed = build_purge(Some(&auth));
+        assert!(
+            Pdu::decode(&sealed).is_ok(),
+            "a zero-checksum purge must decode, not be rejected"
+        );
+
+        // And auth is still the gate: a sealed purge passes, an unauthenticated
+        // one is dropped before it ever reaches the decoder.
+        assert!(
+            verify_pdu_auth(Some(&auth), &sealed),
+            "an authenticated purge must be accepted"
+        );
+        assert!(
+            !verify_pdu_auth(Some(&auth), &build_purge(None)),
+            "a purge with no authentication must be dropped when auth is configured"
+        );
+        let wrong = IsisAuth::HmacSha256 {
+            key: b"other".to_vec(),
+            key_id: 7,
+        };
+        assert!(
+            !verify_pdu_auth(Some(&auth), &build_purge(Some(&wrong))),
+            "a purge sealed with the wrong key must be dropped"
+        );
+    }
+
     #[test]
     fn parses_system_id() {
         let id = parse_system_id("1921.6800.1001").unwrap();

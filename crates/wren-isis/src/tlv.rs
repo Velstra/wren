@@ -222,7 +222,31 @@ impl Tlv {
             Tlv::ExtendedIpReachability(reaches) => {
                 for r in reaches {
                     v.extend_from_slice(&r.metric.to_be_bytes());
-                    let mut control = r.prefix_len & 0x3f;
+                    // Clamped, and the *same* clamped value feeds both the
+                    // control byte and the byte count.
+                    //
+                    // The mask was `& 0x3f` alone, which keeps 33..=63 intact —
+                    // so a caller-set 40 wrote a control byte saying /40 and
+                    // then sliced five bytes out of a four-byte address, which
+                    // panics. Masking is not validating: 0x3f is only there to
+                    // keep the length out of the up/down and sub-TLV bits.
+                    //
+                    // Saturating rather than refusing, because `encode` has no
+                    // way to say no — it returns `()`, and every caller in the
+                    // tree treats it as infallible. The file already answers
+                    // "this value cannot fit its wire field" this way three
+                    // times over (`sub.len().min(u8::MAX as usize)`), and the
+                    // clamp keeps the output *decodable*: `decode_all` refuses
+                    // a length above 32, so an encoder that emitted one would
+                    // be producing a PDU wren itself would drop.
+                    // No `debug_assert` beside it, deliberately. These lengths
+                    // can arrive from outside — a redistributed route, a TLV
+                    // this daemon is passing through — so an assertion here
+                    // would turn hostile input into a debug-build crash, which
+                    // is the opposite of hardening. The two clamps this file
+                    // already has carry no assertion either.
+                    let prefix_len = r.prefix_len.min(MAX_IPV4_PREFIX_LEN);
+                    let mut control = prefix_len;
                     if r.up_down {
                         control |= 0x80;
                     }
@@ -230,7 +254,7 @@ impl Tlv {
                         control |= 0x40;
                     }
                     v.push(control);
-                    let n = pfx_bytes(r.prefix_len);
+                    let n = pfx_bytes(prefix_len);
                     v.extend_from_slice(&r.prefix.octets()[..n]);
                     if let Some(sub) = &r.sub_tlvs {
                         v.push(sub.len().min(u8::MAX as usize) as u8);
@@ -257,8 +281,13 @@ impl Tlv {
                         flags |= 0x20;
                     }
                     v.push(flags);
-                    v.push(r.prefix_len);
-                    let n = pfx_bytes(r.prefix_len);
+                    // The same clamp, for the same reason: `prefix_len` is a
+                    // public field, 129..=255 asks for 17..32 bytes out of a
+                    // sixteen-byte address, and `decode_all` refuses anything
+                    // above 128 anyway.
+                    let prefix_len = r.prefix_len.min(MAX_IPV6_PREFIX_LEN);
+                    v.push(prefix_len);
+                    let n = pfx_bytes(prefix_len);
                     v.extend_from_slice(&r.prefix.octets()[..n]);
                     if let Some(sub) = &r.sub_tlvs {
                         v.push(sub.len().min(u8::MAX as usize) as u8);
@@ -548,6 +577,14 @@ pub fn decode_all(buf: &[u8]) -> Option<Vec<Tlv>> {
 
 // --- helpers ---------------------------------------------------------------
 
+/// The longest IPv4 prefix, and the most `pfx_bytes` may be asked for on a
+/// four-byte address. `decode_all` refuses anything above it, so the encoder
+/// clamps to it rather than emitting a PDU this implementation would drop.
+const MAX_IPV4_PREFIX_LEN: u8 = 32;
+
+/// The same, for the sixteen-byte IPv6 address.
+const MAX_IPV6_PREFIX_LEN: u8 = 128;
+
 /// The number of significant prefix bytes for a prefix of `len` bits.
 fn pfx_bytes(len: u8) -> usize {
     (len as usize).div_ceil(8)
@@ -693,6 +730,66 @@ mod tests {
             sub_tlvs: None,
         }]);
         assert_eq!(roundtrip(&def), def);
+    }
+
+    /// A prefix length no address can hold must not take the encoder down.
+    ///
+    /// `prefix_len` is a public field on a public struct, so nothing stops a
+    /// caller — or a redistribution path carrying a length in from another
+    /// protocol — from setting one. It used to slice five to eight bytes out of
+    /// a four-byte address and panic; the control byte's `& 0x3f` mask made
+    /// 33..=63 look handled while doing nothing about the byte count.
+    ///
+    /// What is asserted is not merely "no panic": it is that whatever comes out
+    /// goes back in. An encoder that emitted a /40 would be writing a PDU
+    /// `decode_all` refuses, which is a silent black hole rather than a crash.
+    #[test]
+    fn an_impossible_ipv4_prefix_length_is_clamped_not_a_panic() {
+        for len in [33u8, 40, 63, 64, 200, 255] {
+            let t = Tlv::ExtendedIpReachability(vec![ExtIpReach {
+                metric: 7,
+                up_down: true,
+                prefix_len: len,
+                prefix: Ipv4Addr::new(10, 0, 0, 0),
+                sub_tlvs: None,
+            }]);
+            let mut buf = Vec::new();
+            t.encode(&mut buf);
+            let back = decode_all(&buf).unwrap_or_else(|| {
+                panic!("a prefix_len of {len} encoded to something wren refuses to read")
+            });
+            let Tlv::ExtendedIpReachability(got) = &back[0] else {
+                panic!("wrong TLV back");
+            };
+            assert_eq!(got[0].prefix_len, 32, "prefix_len {len} was not clamped");
+            assert!(got[0].up_down, "the clamp ate the up/down bit");
+        }
+    }
+
+    /// The same for IPv6: 129..=255 asked for seventeen to thirty-two bytes out
+    /// of sixteen.
+    #[test]
+    fn an_impossible_ipv6_prefix_length_is_clamped_not_a_panic() {
+        for len in [129u8, 130, 200, 255] {
+            let t = Tlv::Ipv6Reachability(vec![Ipv6Reach {
+                metric: 9,
+                up_down: false,
+                external: true,
+                prefix_len: len,
+                prefix: Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0),
+                sub_tlvs: None,
+            }]);
+            let mut buf = Vec::new();
+            t.encode(&mut buf);
+            let back = decode_all(&buf).unwrap_or_else(|| {
+                panic!("a prefix_len of {len} encoded to something wren refuses to read")
+            });
+            let Tlv::Ipv6Reachability(got) = &back[0] else {
+                panic!("wrong TLV back");
+            };
+            assert_eq!(got[0].prefix_len, 128, "prefix_len {len} was not clamped");
+            assert!(got[0].external, "the clamp ate the external bit");
+        }
     }
 
     #[test]

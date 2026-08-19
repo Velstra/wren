@@ -149,10 +149,6 @@ pub struct BgpConfig {
     /// Drop received routes that RPKI origin validation classifies as Invalid
     /// (RFC 6811); `Valid` and `NotFound` are always accepted.
     pub rpki_reject_invalid: bool,
-    /// RFC 8212 strict default-deny for eBGP: an eBGP peer with no explicit `import`
-    /// filter accepts no routes, and with no explicit `export` filter re-advertises no
-    /// transit routes. iBGP and locally-originated routes are unaffected.
-    pub ebgp_require_policy: bool,
     /// The VRF (kernel routing table) this BGP instance installs its routes into.
     /// Defaults to [`wren_core::RT_TABLE_MAIN`] for the default VRF.
     pub vrf_table: u32,
@@ -368,6 +364,12 @@ pub struct BgpPeerCfg {
     /// set-community (and, for a propagated route, set-metric→MED / set-preference→
     /// LOCAL_PREF) modifications applied. `None` advertises everything unchanged.
     pub export: Option<Filter>,
+    /// Whether RFC 8212 default-deny is enforced on this peer — the global
+    /// `[bgp] ebgp-require-policy` already resolved against the neighbour's own
+    /// `require-policy` override (see [`effective_require_policy`]), so the engine
+    /// reads one settled answer per peer rather than combining two knobs at every
+    /// gate. Only ever acted on for a true-eBGP session.
+    pub require_policy: bool,
     /// This local speaker's BGP Role toward this peer (RFC 9234 §4), advertised in the
     /// Role capability and driving the Only-To-Customer route-leak procedures. `None`
     /// disables roles/OTC for this peer.
@@ -483,10 +485,6 @@ struct Local {
     /// The VRF (L3 master) device name to bind session sockets to (`SO_BINDTODEVICE`),
     /// or `None` for the default VRF. Connectors and the accept loop read it.
     vrf_device: Option<String>,
-    /// RFC 8212 strict default-deny for eBGP (from [`BgpConfig::ebgp_require_policy`]):
-    /// an eBGP peer with no import filter accepts nothing, and with no export filter
-    /// re-advertises no transit routes.
-    ebgp_require_policy: bool,
 }
 
 impl Local {
@@ -507,6 +505,10 @@ struct PeerProps {
     ttl_security: Option<u8>,
     /// The peer's `max-prefix` limit (RFC 4486 §4), if any.
     max_prefix: Option<u32>,
+    /// Whether RFC 8212 default-deny is enforced on this peer (already resolved from
+    /// the global setting and the neighbour's override). The import gate reads it here,
+    /// since a received UPDATE is matched to its peer by address.
+    require_policy: bool,
     /// Whether ADD-PATH (RFC 7911) is configured for this peer (IPv4 unicast).
     add_path: bool,
     /// Whether Extended Next Hop Encoding (RFC 5549) is configured for this peer.
@@ -827,6 +829,9 @@ struct PeerInfo {
     peer_type: PeerType,
     /// GTSM (RFC 5082) max hop count for this peer, if enabled.
     ttl_security: Option<u8>,
+    /// Whether RFC 8212 default-deny is enforced on this peer, already resolved from
+    /// the global setting and the neighbour's own override.
+    require_policy: bool,
     /// Whether ADD-PATH (RFC 7911) is configured for this peer (IPv4 unicast).
     add_path: bool,
     /// Whether Extended Next Hop Encoding (RFC 5549) is configured for this peer.
@@ -976,6 +981,12 @@ struct NeighborState {
     /// How many ROUTE-REFRESH requests this peer has sent us (RFC 2918) — a visible
     /// signal in `show bgp neighbors` that a refresh was honoured.
     refreshes_received: u64,
+    /// How much reachability from this peer RFC 8212 default-deny discarded for want of
+    /// an import policy, counted in NLRI — a prefix the peer sends twice counts twice,
+    /// since this measures what was thrown away rather than the size of a RIB that was
+    /// never built. A rising count is the answer to "the session is up, so why is the
+    /// RIB empty?".
+    policy_denied_in: u64,
     /// The operator's free-form label for this neighbour (`description`), if any.
     description: Option<String>,
     /// Whether this neighbour is administratively shut down (`shutdown`).
@@ -997,6 +1008,9 @@ pub struct NeighborSummary {
     pub established: bool,
     /// How many ROUTE-REFRESH requests this peer has sent us (RFC 2918).
     pub refreshes_received: u64,
+    /// How much received reachability (in NLRI) RFC 8212 default-deny discarded for
+    /// want of an import policy on this peer.
+    pub policy_denied_in: u64,
     /// The operator's free-form label for this neighbour (`description`), if any.
     pub description: Option<String>,
     /// Whether this neighbour is administratively shut down (`shutdown`).
@@ -1087,6 +1101,7 @@ fn neighbor_summaries(neighbors: &BTreeMap<IpAddr, NeighborState>) -> Vec<Neighb
             remote_as: n.remote_as,
             established: n.established,
             refreshes_received: n.refreshes_received,
+            policy_denied_in: n.policy_denied_in,
             description: n.description.clone(),
             shutdown: n.shutdown,
             negotiated_hold: n.negotiated_hold,
@@ -1648,6 +1663,12 @@ pub fn render_bgp_neighbors(neighbors: &[NeighborSummary]) -> String {
         if n.refreshes_received > 0 {
             let _ = write!(out, " refreshes {}", n.refreshes_received);
         }
+        // RFC 8212 default-deny discards: shown only once something has actually been
+        // dropped, so the line stays quiet on a peer that has a policy — but names the
+        // cause the moment an operator wonders where the routes went.
+        if n.policy_denied_in > 0 {
+            let _ = write!(out, " policy-denied {}", n.policy_denied_in);
+        }
         if let Some(desc) = &n.description {
             let _ = write!(out, " \"{desc}\"");
         }
@@ -1718,6 +1739,25 @@ pub fn render_bgp_metrics(neighbors: &[NeighborSummary], rib_routes: usize) -> S
             "wren_bgp_route_refresh_received_total",
             &[("neighbor", &addr)],
             n.refreshes_received,
+        );
+    }
+
+    // Prefixes dropped by RFC 8212 default-deny, per neighbour — a counter, so a
+    // policy that has been quietly eating a peer's routes since it came up is visible
+    // on a dashboard and not only to whoever runs `show bgp neighbors`.
+    crate::metrics::family(
+        &mut out,
+        "wren_bgp_policy_denied_received_total",
+        "Prefixes discarded on receipt because the eBGP peer has no import policy (RFC 8212).",
+        "counter",
+    );
+    for n in neighbors {
+        let addr = n.addr.to_string();
+        crate::metrics::sample(
+            &mut out,
+            "wren_bgp_policy_denied_received_total",
+            &[("neighbor", &addr)],
+            n.policy_denied_in,
         );
     }
 
@@ -1800,6 +1840,7 @@ pub async fn run(
                     remote_as: p.remote_as,
                     established: false,
                     refreshes_received: 0,
+                    policy_denied_in: 0,
                     description: p.description.clone(),
                     shutdown: p.shutdown,
                     negotiated_hold: None,
@@ -1841,9 +1882,6 @@ pub async fn run(
     let static_roas = cfg.roas.clone();
     let mut roa = RoaTable::new(static_roas.clone());
     let rpki_reject = cfg.rpki_reject_invalid;
-    // RFC 8212 strict default-deny for eBGP: when set, an eBGP peer with no import
-    // filter accepts no reachability (the import-deny is applied per received UPDATE).
-    let require_policy = cfg.ebgp_require_policy;
     // Established sessions we can push origination changes to, keyed by peer.
     let mut sessions: HashMap<IpAddr, mpsc::Sender<SessionCmd>> = HashMap::new();
     // Route fan-out to a peer must never block the central task. If a peer's command
@@ -1922,6 +1960,7 @@ pub async fn run(
                         ),
                         ttl_security: p.ttl_security,
                         max_prefix: p.max_prefix,
+                        require_policy: p.require_policy,
                         add_path: p.add_path,
                         ext_nexthop: p.ext_nexthop,
                         evpn: p.evpn,
@@ -1943,7 +1982,6 @@ pub async fn run(
             .filter_map(|p| p.export.clone().map(|f| (p.addr, f)))
             .collect(),
         vrf_device: cfg.vrf_device.clone(),
-        ebgp_require_policy: cfg.ebgp_require_policy,
     });
 
     let (tx, mut rx) = mpsc::channel::<PeerMsg>(PEER_QUEUE);
@@ -2347,6 +2385,7 @@ pub async fn run(
                             remote_as: peer.remote_as,
                             established: false,
                             refreshes_received: 0,
+                            policy_denied_in: 0,
                             description: peer.description.clone(),
                             shutdown: peer.shutdown,
                             negotiated_hold: None,
@@ -2374,6 +2413,7 @@ pub async fn run(
                             ),
                             ttl_security: peer.ttl_security,
                             max_prefix: peer.max_prefix,
+                            require_policy: peer.require_policy,
                             add_path: peer.add_path,
                             ext_nexthop: peer.ext_nexthop,
                             evpn: peer.evpn,
@@ -2457,6 +2497,31 @@ pub async fn run(
                     }
                 }
                 info!(peer = %p, "BGP session established");
+                // RFC 8212 default-deny, said out loud exactly once per session: a peer
+                // that is up but exchanging nothing looks identical to a broken one, so
+                // the reason is stated at the moment the session comes up rather than
+                // left for the operator to infer from an empty RIB. Which directions are
+                // silenced is spelled out, because a peer can easily have one policy and
+                // not the other.
+                if let Some(pp) = local.peers.get(&p) {
+                    let deny_in = rfc8212_deny(
+                        pp.require_policy,
+                        pp.peer_type == PeerType::Ebgp,
+                        imports.contains_key(&p),
+                    );
+                    let deny_out = rfc8212_deny(
+                        pp.require_policy,
+                        pp.peer_type == PeerType::Ebgp,
+                        local.exports.contains_key(&p),
+                    );
+                    if let Some(directions) = deny_directions(deny_in, deny_out) {
+                        warn!(
+                            peer = %p,
+                            directions,
+                            "RFC 8212 default-deny: this eBGP peer has no policy in the named directions, so no routes are exchanged there — configure an import/export filter, or set `require-policy = false` on the neighbour to allow permit-all"
+                        );
+                    }
+                }
                 if let Some(n) = neighbors.get_mut(&p) {
                     n.established = true;
                     n.negotiated_hold = Some(neg_hold);
@@ -2883,9 +2948,32 @@ pub async fn run(
                     }
                 }
                 let import = imports.get(&peer);
-                // RFC 8212 strict default-deny: an eBGP peer with no import policy
-                // accepts no reachability. Withdrawals above are still honoured.
-                let import_deny = rfc8212_deny(require_policy, facts.from_ebgp, import.is_some());
+                // RFC 8212 §3: reachability from an eBGP peer with no import policy is
+                // never eligible for the Decision Process, so it is discarded here — the
+                // RFC asks for the routes to be dropped, not for the session to be reset,
+                // so the peer keeps talking and its withdrawals above are still honoured.
+                // What was dropped is counted per peer (`show bgp neighbors`), because a
+                // policy that silently eats every route is as hard to diagnose as none.
+                let peer_require_policy = local
+                    .peers
+                    .get(&peer)
+                    .is_some_and(|pp| pp.require_policy);
+                let import_deny =
+                    rfc8212_deny(peer_require_policy, facts.from_ebgp, import.is_some());
+                if import_deny {
+                    let dropped = update.nlri.len()
+                        + mp_reach_v6(&update).map_or(0, |(_, nlri, _)| nlri.len());
+                    if dropped > 0 {
+                        if let Some(n) = neighbors.get_mut(&peer) {
+                            n.policy_denied_in += dropped as u64;
+                        }
+                        debug!(
+                            peer = %peer,
+                            dropped,
+                            "RFC 8212: no import policy on this eBGP peer; reachability discarded"
+                        );
+                    }
+                }
                 // RFC 9234 Only-To-Customer ingress: reject a leaked route, and compute
                 // the OTC value to stamp on an accepted one. The peer's (remote) role is
                 // the complement of our configured role toward it.
@@ -3451,6 +3539,17 @@ async fn propagate_addpath(
             continue;
         };
         let export = local.exports.get(&peer);
+        // RFC 8212 default-deny: ADD-PATH builds its own Adj-RIB-Out here rather than
+        // going through `Session::propagate_routes`, so the export gate has to be
+        // repeated — otherwise a policy-less eBGP peer that negotiated ADD-PATH would
+        // still be handed every path.
+        if rfc8212_deny(
+            pp.require_policy,
+            pp.peer_type == PeerType::Ebgp,
+            export.is_some(),
+        ) {
+            continue;
+        }
         // The paths to offer this peer, each under its stable Path Identifier.
         let mut desired: std::collections::BTreeMap<u32, Path> = std::collections::BTreeMap::new();
         for (src, path) in rib.paths(&prefix) {
@@ -3685,13 +3784,38 @@ fn otc_from_update(update: &Update) -> Option<u32> {
     })
 }
 
-/// RFC 8212 strict default-deny: whether routes must be dropped in one direction
-/// because the session is a true-eBGP one with **no** configured policy on that
-/// direction and strict mode is enabled. iBGP and confederation-eBGP (`from_ebgp`
-/// false) are exempt, as is any direction that has a policy (`has_policy`). Shared
-/// by the import (received) and export (advertised) enforcement points.
+/// RFC 8212 default-deny: whether routes must be dropped in one direction because the
+/// session is a true-eBGP one with **no** configured policy on that direction and the
+/// enforcement is armed for the peer. iBGP and confederation-eBGP (`from_ebgp` false)
+/// are exempt — the RFC is explicitly about external sessions — as is any direction
+/// that has a policy (`has_policy`). Shared by every enforcement point so the import
+/// side, the transit export, the ADD-PATH export and the origination gate cannot drift
+/// apart.
 fn rfc8212_deny(require_policy: bool, from_ebgp: bool, has_policy: bool) -> bool {
     require_policy && from_ebgp && !has_policy
+}
+
+/// How to name the directions RFC 8212 has silenced on a session, for the log line at
+/// establishment: `"import and export"`, or just the one that is missing a policy.
+/// `None` when nothing is denied and there is nothing to say.
+fn deny_directions(deny_in: bool, deny_out: bool) -> Option<&'static str> {
+    match (deny_in, deny_out) {
+        (true, true) => Some("import and export"),
+        (true, false) => Some("import"),
+        (false, true) => Some("export"),
+        (false, false) => None,
+    }
+}
+
+/// Whether RFC 8212 default-deny is armed for one neighbour, resolved from the two
+/// places an operator can speak: the neighbour's own `require-policy` wins if set,
+/// otherwise the global `[bgp] ebgp-require-policy`, and with neither set the RFC's
+/// own default applies — enforced. Both knobs exist because the two legitimate
+/// permit-all cases have different shapes: a whole lab is a global `false`, while one
+/// route-server session among ordinary peers is a per-neighbour `false` that leaves
+/// the rest of the router protected.
+pub fn effective_require_policy(global: Option<bool>, per_neighbor: Option<bool>) -> bool {
+    per_neighbor.or(global).unwrap_or(true)
 }
 
 /// RFC 9234 §5 ingress Only-To-Customer decision for reachability received from a peer
@@ -4349,6 +4473,7 @@ fn spawn_bgp_connector(
         // Classify against the effective local AS (the `local-as` override if set).
         peer_type: classify(peer.local_as.unwrap_or(local_as), members, peer.remote_as),
         ttl_security: peer.ttl_security,
+        require_policy: peer.require_policy,
         add_path: peer.add_path,
         ext_nexthop: peer.ext_nexthop,
         evpn: peer.evpn,
@@ -4386,7 +4511,6 @@ fn local_with_peers(
         peers,
         exports,
         vrf_device: base.vrf_device.clone(),
-        ebgp_require_policy: base.ebgp_require_policy,
     }
 }
 
@@ -4430,6 +4554,7 @@ async fn accept_loop(listener: TcpListener, local: Arc<Local>, tx: mpsc::Sender<
                     rr_client: props.rr_client,
                     peer_type: props.peer_type,
                     ttl_security: props.ttl_security,
+                    require_policy: props.require_policy,
                     add_path: props.add_path,
                     ext_nexthop: props.ext_nexthop,
                     evpn: props.evpn,
@@ -5906,12 +6031,17 @@ impl Session<'_> {
         )
     }
 
-    /// RFC 8212 strict default-deny on the export side: a true-eBGP peer with no export
-    /// filter re-advertises no **transit** routes when strict mode is enabled.
-    /// Locally-originated routes are exempt (they do not flow through this gate).
+    /// RFC 8212 default-deny on the export side: nothing at all is added to a true-eBGP
+    /// peer's Adj-RIB-Out while it has no export filter. The RFC draws no line between
+    /// transit and locally-originated routes — "Routes SHALL NOT be added to an
+    /// Adj-RIB-Out associated with an EBGP peer if no explicit Export Policy has been
+    /// applied" — so this gates the `network`/redistribute/aggregate origination and
+    /// `default-originate` as well, not only re-advertised transit. Gating one and not
+    /// the other is the failure mode the RFC exists to stop: a speaker that stays quiet
+    /// about what it learned but still leaks what it originates.
     fn export_deny_all(&self) -> bool {
         rfc8212_deny(
-            self.local.ebgp_require_policy,
+            self.peer.require_policy,
             self.from_ebgp,
             self.export.is_some(),
         )
@@ -5923,6 +6053,15 @@ impl Session<'_> {
     /// LARGE_COMMUNITY attribute, and a route whose well-known communities forbid
     /// this peer (RFC 1997) is skipped.
     async fn advertise(&mut self, routes: &[OriginRoute]) -> Result<()> {
+        // RFC 8212 default-deny: a true-eBGP peer with no export policy is told nothing,
+        // and that includes the routes this speaker originates itself. `default-originate`
+        // reaches the session through here too, so an operator who asked for a default
+        // route toward a policy-less eBGP peer does not get one — deliberately: the
+        // establishment log below names the peer so the silence is explained, not
+        // mysterious.
+        if self.export_deny_all() {
+            return Ok(());
+        }
         // Per-neighbour outbound export policy: drop or re-tag originated routes before
         // they are grouped into UPDATEs.
         let routes: Vec<OriginRoute> = routes
@@ -6076,32 +6215,50 @@ impl Session<'_> {
         if !v4.is_empty() {
             match (self.ext_nexthop_send, self.local.next_hop6) {
                 (true, Some(nh6)) => {
-                    let mut attributes = base.clone();
-                    attributes.push(PathAttribute::MpReachNlri {
-                        afi: AFI_IPV4,
-                        safi: SAFI_UNICAST,
-                        // We originate, so this is always next-hop-self.
-                        next_hop: self.v6_next_hop_field(nh6, true),
-                        nlri: v4,
-                    });
-                    self.send(&Message::Update(Update {
+                    // MP_REACH (AFI IPv4): the prefixes live inside the attribute,
+                    // like IPv6 below, so they are chunked the same way and carry
+                    // no ADD-PATH ids.
+                    let next_hop = self.v6_next_hop_field(nh6, true);
+                    let base = &base;
+                    for msg in Self::split_updates(&v4, false, self.four_octet, |nlri| Update {
                         withdrawn: vec![],
-                        attributes,
+                        attributes: {
+                            let mut a = base.clone();
+                            a.push(PathAttribute::MpReachNlri {
+                                afi: AFI_IPV4,
+                                safi: SAFI_UNICAST,
+                                next_hop: next_hop.clone(),
+                                nlri,
+                            });
+                            a
+                        },
                         nlri: vec![],
                         ..Default::default()
-                    }))
-                    .await?;
+                    }) {
+                        self.send(&msg).await?;
+                    }
                 }
                 _ => {
-                    let mut attributes = base.clone();
-                    attributes.push(PathAttribute::NextHop(self.local_ip));
-                    self.send(&Message::Update(Update {
-                        withdrawn: vec![],
-                        attributes,
-                        nlri: v4,
-                        ..Default::default()
-                    }))
-                    .await?;
+                    // Base IPv4 NLRI, which does carry ADD-PATH ids when the
+                    // session negotiated sending them.
+                    let local_ip = self.local_ip;
+                    let base = &base;
+                    for msg in
+                        Self::split_updates(&v4, self.add_path_send, self.four_octet, |nlri| {
+                            Update {
+                                withdrawn: vec![],
+                                attributes: {
+                                    let mut a = base.clone();
+                                    a.push(PathAttribute::NextHop(local_ip));
+                                    a
+                                },
+                                nlri,
+                                ..Default::default()
+                            }
+                        })
+                    {
+                        self.send(&msg).await?;
+                    }
                 }
             }
         }
@@ -6111,21 +6268,25 @@ impl Session<'_> {
         if !v6.is_empty() {
             match (self.mp_ipv6, self.local.next_hop6) {
                 (true, Some(nh6)) => {
-                    let mut attributes = base;
-                    attributes.push(PathAttribute::MpReachNlri {
-                        afi: AFI_IPV6,
-                        safi: SAFI_UNICAST,
-                        // We originate, so this is always next-hop-self.
-                        next_hop: self.v6_next_hop_field(nh6, true),
-                        nlri: v6,
-                    });
-                    self.send(&Message::Update(Update {
+                    let next_hop = self.v6_next_hop_field(nh6, true);
+                    let base = &base;
+                    for msg in Self::split_updates(&v6, false, self.four_octet, |nlri| Update {
                         withdrawn: vec![],
-                        attributes,
+                        attributes: {
+                            let mut a = base.clone();
+                            a.push(PathAttribute::MpReachNlri {
+                                afi: AFI_IPV6,
+                                safi: SAFI_UNICAST,
+                                next_hop: next_hop.clone(),
+                                nlri,
+                            });
+                            a
+                        },
                         nlri: vec![],
                         ..Default::default()
-                    }))
-                    .await?;
+                    }) {
+                        self.send(&msg).await?;
+                    }
                 }
                 (false, _) => {
                     debug!(peer = %self.peer.addr, "peer has no IPv6 capability; not advertising IPv6 NLRI")
@@ -6136,6 +6297,69 @@ impl Session<'_> {
             }
         }
         Ok(())
+    }
+
+    /// Split `prefixes` into as few UPDATEs as RFC 4271's 4096-octet ceiling
+    /// allows, all carrying the attributes `build` puts on them.
+    ///
+    /// wren put every configured `network` prefix into ONE update. Enough of
+    /// them — roughly 815 IPv4 /32s, and far fewer /128s — overflow 4096 octets,
+    /// and a conformant peer answers a message that long with a NOTIFICATION and
+    /// resets the session: the routes never propagate and the session flaps. The
+    /// fix is not to cap the config but to send what BGP has always sent for a
+    /// large route set — the same attributes across several UPDATEs, each within
+    /// the limit. RFC 4271 §5 makes that identical in meaning: the path
+    /// attributes describe every NLRI in the message equally, so which message a
+    /// prefix rides in is not observable to the peer.
+    ///
+    /// `add_path` must match what the caller passes to `encode` for this family
+    /// (only IPv4 base NLRI carries ADD-PATH ids here); it feeds both the
+    /// overhead measurement and the per-prefix cost so the two cannot disagree.
+    fn split_updates(
+        prefixes: &[Prefix],
+        add_path: bool,
+        four_octet: bool,
+        build: impl Fn(Vec<Prefix>) -> Update,
+    ) -> Vec<Message> {
+        if prefixes.is_empty() {
+            return Vec::new();
+        }
+        // The fixed cost of a message with all its attributes and no NLRI,
+        // measured rather than computed so a change to the attribute set can
+        // never leave this stale. For base IPv4 NLRI this is exact for the whole
+        // message; for an MP_REACH family it is the empty-NLRI attribute, whose
+        // length field gains one octet once its content passes 255 — the margin
+        // below covers that, keeping the estimate a strict upper bound.
+        let overhead = Message::Update(build(Vec::new()))
+            .encode(four_octet, AddPath::ipv4(add_path))
+            .len();
+        const MARGIN: usize = 8;
+        let budget = MAX_MESSAGE_LEN.saturating_sub(overhead + MARGIN);
+
+        // A prefix on the wire is one length octet plus the minimal whole octets
+        // of the address, `ceil(len/8)` (RFC 4271 §4.3), and four more for an
+        // ADD-PATH Path Identifier where the family carries one. Pinned to the
+        // encoder by `split_matches_the_encoders_prefix_cost`.
+        let cost = |p: &Prefix| {
+            (if add_path { 4 } else { 0 }) + 1 + p.len().div_ceil(8) as usize
+        };
+
+        let mut out = Vec::new();
+        let mut chunk: Vec<Prefix> = Vec::new();
+        let mut used = 0usize;
+        for p in prefixes {
+            let c = cost(p);
+            if !chunk.is_empty() && used + c > budget {
+                out.push(Message::Update(build(std::mem::take(&mut chunk))));
+                used = 0;
+            }
+            chunk.push(*p);
+            used += c;
+        }
+        if !chunk.is_empty() {
+            out.push(Message::Update(build(chunk)));
+        }
+        out
     }
 
     /// Withdraw originated prefixes from this peer: IPv4 in the base Withdrawn Routes
@@ -6786,6 +7010,7 @@ mod tests {
                 remote_as: 65002,
                 established: true,
                 refreshes_received: 2,
+                policy_denied_in: 7,
                 description: Some("transit uplink".to_string()),
                 shutdown: false,
                 negotiated_hold: Some(90),
@@ -6795,6 +7020,7 @@ mod tests {
                 remote_as: 4_200_000_000,
                 established: false,
                 refreshes_received: 0,
+                policy_denied_in: 0,
                 description: None,
                 shutdown: false,
                 negotiated_hold: None,
@@ -6806,23 +7032,24 @@ mod tests {
                 remote_as: 65004,
                 established: false,
                 refreshes_received: 0,
+                policy_denied_in: 0,
                 description: None,
                 shutdown: true,
                 negotiated_hold: None,
             },
         ];
         let out = render_bgp_neighbors(&n);
-        assert!(
-            out.contains("10.0.0.2 AS 65002 Established hold 90 refreshes 2 \"transit uplink\"")
-        );
+        // The RFC 8212 discard count rides on the neighbour line, so an operator
+        // looking at an Established-but-empty peer sees why in the same place.
+        assert!(out.contains(
+            "10.0.0.2 AS 65002 Established hold 90 refreshes 2 policy-denied 7 \"transit uplink\""
+        ));
         assert!(out.contains("10.0.0.3 AS 4200000000 Idle"));
         assert!(out.contains("10.0.0.4 AS 65004 admin-shutdown"));
-        // A peer with no refreshes does not show the counter.
-        assert!(!out
-            .lines()
-            .find(|l| l.contains("10.0.0.3"))
-            .unwrap()
-            .contains("refreshes"));
+        // A peer with no refreshes and nothing denied shows neither counter.
+        let idle = out.lines().find(|l| l.contains("10.0.0.3")).unwrap();
+        assert!(!idle.contains("refreshes"));
+        assert!(!idle.contains("policy-denied"));
         assert_eq!(render_bgp_neighbors(&[]), "no bgp neighbors configured\n");
     }
 
@@ -6834,6 +7061,7 @@ mod tests {
                 remote_as: 65002,
                 established: true,
                 refreshes_received: 3,
+                policy_denied_in: 12,
                 description: None,
                 shutdown: false,
                 negotiated_hold: Some(90),
@@ -6843,6 +7071,7 @@ mod tests {
                 remote_as: 65003,
                 established: false,
                 refreshes_received: 0,
+                policy_denied_in: 0,
                 description: None,
                 shutdown: false,
                 negotiated_hold: None,
@@ -6859,6 +7088,11 @@ mod tests {
         // ROUTE-REFRESH counter (RFC 2918).
         assert!(out.contains("# TYPE wren_bgp_route_refresh_received_total counter"));
         assert!(out.contains("wren_bgp_route_refresh_received_total{neighbor=\"10.0.0.2\"} 3"));
+        // RFC 8212 discard counter, per neighbour — including the zero series, so a
+        // dashboard can alert on the rate rising from nothing.
+        assert!(out.contains("# TYPE wren_bgp_policy_denied_received_total counter"));
+        assert!(out.contains("wren_bgp_policy_denied_received_total{neighbor=\"10.0.0.2\"} 12"));
+        assert!(out.contains("wren_bgp_policy_denied_received_total{neighbor=\"10.0.0.3\"} 0"));
         // Loc-RIB best-path count.
         assert!(out.contains("wren_bgp_rib_routes 4"));
     }
@@ -7001,12 +7235,12 @@ mod tests {
     }
 
     #[test]
-    fn rfc8212_deny_only_a_policyless_true_ebgp_peer_in_strict_mode() {
-        // The one case that denies: strict mode on, true eBGP, no policy.
+    fn rfc8212_deny_only_a_policyless_true_ebgp_peer() {
+        // The one case that denies: enforcement armed, true eBGP, no policy.
         assert!(rfc8212_deny(true, true, false));
 
         // Every exemption the smoke does not exercise:
-        //   strict mode off  -> permissive default (legacy behaviour).
+        //   enforcement turned off for this peer -> deliberate permit-all.
         assert!(!rfc8212_deny(false, true, false));
         //   iBGP / confed-eBGP (from_ebgp == false) -> exempt.
         assert!(!rfc8212_deny(true, false, false));
@@ -7014,6 +7248,38 @@ mod tests {
         assert!(!rfc8212_deny(true, true, true));
         //   none of the conditions -> allow.
         assert!(!rfc8212_deny(false, false, true));
+    }
+
+    #[test]
+    fn require_policy_defaults_to_enforced_and_the_neighbour_has_the_last_word() {
+        // RFC 8212 is the behaviour of an unconfigured router: with neither knob set
+        // the enforcement is on. This is the assertion that would catch the default
+        // silently regressing to the old permit-all.
+        assert!(effective_require_policy(None, None));
+
+        // The global turns it off for every eBGP neighbour at once (a lab), and on
+        // again explicitly.
+        assert!(!effective_require_policy(Some(false), None));
+        assert!(effective_require_policy(Some(true), None));
+
+        // A neighbour overrides the global in both directions: one route-server
+        // session opts out while the rest of the router stays protected ...
+        assert!(!effective_require_policy(None, Some(false)));
+        assert!(!effective_require_policy(Some(true), Some(false)));
+        // ... and one neighbour can stay protected inside an otherwise permissive
+        // router.
+        assert!(effective_require_policy(Some(false), Some(true)));
+    }
+
+    #[test]
+    fn deny_directions_names_only_the_silenced_directions() {
+        // What the establishment log says. A peer with one policy and not the other is
+        // the case worth naming precisely — "no policy" would be wrong there.
+        assert_eq!(deny_directions(true, true), Some("import and export"));
+        assert_eq!(deny_directions(true, false), Some("import"));
+        assert_eq!(deny_directions(false, true), Some("export"));
+        // Nothing denied: the session says nothing at all.
+        assert_eq!(deny_directions(false, false), None);
     }
 
     #[test]
@@ -7833,5 +8099,157 @@ mod tests {
         // The gateway was unspecified on the wire and must not be rendered as a
         // usable next hop.
         assert!(!out.contains("gw 0.0.0.0"), "{out}");
+    }
+}
+
+#[cfg(test)]
+mod split_updates_tests {
+    use super::*;
+    use std::net::Ipv6Addr;
+    use wren_core::Prefix;
+
+    /// The base path attributes an originated UPDATE carries, sized like a real
+    /// one so the overhead the splitter measures is representative.
+    fn base_attrs() -> Vec<PathAttribute> {
+        vec![
+            PathAttribute::Origin(Origin::Igp),
+            PathAttribute::AsPath(vec![AsPathSegment::Sequence(vec![65001, 65002, 65003])]),
+        ]
+    }
+
+    /// Build an IPv4 base-NLRI UPDATE for a chunk, exactly as `send_originated_update`
+    /// does in its plain-IPv4 arm.
+    fn v4_update(nlri: Vec<Prefix>) -> Update {
+        let mut a = base_attrs();
+        a.push(PathAttribute::NextHop(Ipv4Addr::new(10, 0, 0, 1)));
+        Update {
+            withdrawn: vec![],
+            attributes: a,
+            nlri,
+            ..Default::default()
+        }
+    }
+
+    /// Build an IPv6 MP_REACH UPDATE for a chunk, as the IPv6 arm does.
+    fn v6_update(nlri: Vec<Prefix>) -> Update {
+        let mut a = base_attrs();
+        a.push(PathAttribute::MpReachNlri {
+            afi: AFI_IPV6,
+            safi: SAFI_UNICAST,
+            next_hop: Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1)
+                .octets()
+                .to_vec(),
+            nlri,
+        });
+        Update {
+            withdrawn: vec![],
+            attributes: a,
+            nlri: vec![],
+            ..Default::default()
+        }
+    }
+
+    fn v4(n: u32, len: u8) -> Prefix {
+        Prefix::new(IpAddr::V4(Ipv4Addr::from(n)), len).unwrap()
+    }
+    fn v6(n: u128, len: u8) -> Prefix {
+        Prefix::new(IpAddr::V6(Ipv6Addr::from(n)), len).unwrap()
+    }
+
+    /// The defect this exists for: no matter how many prefixes are configured,
+    /// every UPDATE wren emits is within RFC 4271's 4096-octet limit, and the
+    /// prefixes are neither lost nor duplicated across the split.
+    #[test]
+    fn every_split_update_is_within_the_limit_and_carries_each_prefix_once() {
+        // Far more than the ~815 that overflow a single message, at a worst-case
+        // /32 (five octets each on the wire), and distinct so duplicates show.
+        let prefixes: Vec<Prefix> = (0..4000u32).map(|i| v4(0x0a00_0000 + i, 32)).collect();
+
+        let msgs = Session::split_updates(&prefixes, false, true, v4_update);
+        assert!(msgs.len() > 1, "4000 /32s must not fit one message");
+
+        let mut seen = Vec::new();
+        for msg in &msgs {
+            let bytes = msg.encode(true, AddPath::ipv4(false));
+            assert!(
+                bytes.len() <= MAX_MESSAGE_LEN,
+                "an emitted UPDATE is {} octets, over the {MAX_MESSAGE_LEN} limit",
+                bytes.len()
+            );
+            // Decode it back and collect the NLRI, so "carries each prefix once"
+            // is asserted against what actually went on the wire.
+            let Message::Update(u) = Message::decode(&bytes, true, AddPath::ipv4(false)).unwrap()
+            else {
+                panic!("split produced a non-UPDATE");
+            };
+            seen.extend(u.nlri);
+        }
+        seen.sort_by_key(|p| (p.addr().to_string(), p.len()));
+        let mut expected = prefixes.clone();
+        expected.sort_by_key(|p| (p.addr().to_string(), p.len()));
+        assert_eq!(seen, expected, "the split lost or duplicated a prefix");
+    }
+
+    /// The same for IPv6, where each prefix is far larger (up to 17 octets) so a
+    /// message holds fewer and the split kicks in sooner — and where the NLRI
+    /// lives inside the MP_REACH attribute, the case the length-field margin is
+    /// for.
+    #[test]
+    fn ipv6_mp_reach_splits_within_the_limit() {
+        let base = 0x2001_0db8_0000_0000_0000_0000_0000_0000u128;
+        let prefixes: Vec<Prefix> =
+            (0..2000u128).map(|i| v6(base + (i << 64), 128)).collect();
+        let msgs = Session::split_updates(&prefixes, false, true, v6_update);
+        assert!(msgs.len() > 1, "2000 /128s must not fit one message");
+
+        let mut count = 0;
+        for msg in &msgs {
+            let bytes = msg.encode(true, AddPath::NONE);
+            assert!(
+                bytes.len() <= MAX_MESSAGE_LEN,
+                "an emitted IPv6 UPDATE is {} octets, over the limit",
+                bytes.len()
+            );
+            let Message::Update(u) = Message::decode(&bytes, true, AddPath::NONE).unwrap() else {
+                panic!("non-UPDATE");
+            };
+            // IPv6 NLRI comes back inside the MP_REACH attribute.
+            for a in &u.attributes {
+                if let PathAttribute::MpReachNlri { nlri, .. } = a {
+                    count += nlri.len();
+                }
+            }
+        }
+        assert_eq!(count, prefixes.len(), "the IPv6 split lost or duplicated a prefix");
+    }
+
+    /// A set that fits in one message is still one message — the split must not
+    /// fragment gratuitously.
+    #[test]
+    fn a_small_set_is_a_single_update() {
+        let prefixes = vec![v4(0x0a00_0001, 32), v4(0x0a00_0002, 32)];
+        let msgs = Session::split_updates(&prefixes, false, true, v4_update);
+        assert_eq!(msgs.len(), 1);
+    }
+
+    /// The per-prefix cost the splitter budgets with is exactly what the encoder
+    /// writes. If the encoder's NLRI format ever changes, this breaks here rather
+    /// than silently letting a chunk cross 4096 in production.
+    #[test]
+    fn split_matches_the_encoders_prefix_cost() {
+        let overhead = Message::Update(v4_update(vec![]))
+            .encode(true, AddPath::ipv4(false))
+            .len();
+        // A /32 (5 octets: 1 length + 4 address) and a /8 (2 octets: 1 + 1).
+        for (p, want) in [(v4(0x0a00_0001, 32), 5usize), (v4(0x0a00_0000, 8), 2usize)] {
+            let with_one = Message::Update(v4_update(vec![p]))
+                .encode(true, AddPath::ipv4(false))
+                .len();
+            assert_eq!(
+                with_one - overhead,
+                want,
+                "the encoder's per-prefix cost drifted from the splitter's estimate"
+            );
+        }
     }
 }

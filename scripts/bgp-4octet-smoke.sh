@@ -32,9 +32,10 @@ cat >"$WORK/a.toml" <<EOF
 # Router A — AS 196618 (4-octet), active connector
 router-id = "10.0.0.1"
 [bgp]
-enabled  = true
-local-as = 196618
-network  = ["10.10.0.0/24"]
+enabled             = true
+local-as            = 196618
+network             = ["10.10.0.0/24"]
+ebgp-require-policy = false
 [[bgp.neighbor]]
 address   = "10.0.0.2"
 remote-as = 4200000000
@@ -44,9 +45,10 @@ cat >"$WORK/b.toml" <<EOF
 # Router B — AS 4200000000 (4-octet), passive listener
 router-id = "10.0.0.2"
 [bgp]
-enabled  = true
-local-as = 4200000000
-network  = ["10.20.0.0/24"]
+enabled             = true
+local-as            = 4200000000
+network             = ["10.20.0.0/24"]
+ebgp-require-policy = false
 [[bgp.neighbor]]
 address   = "10.0.0.1"
 remote-as = 196618

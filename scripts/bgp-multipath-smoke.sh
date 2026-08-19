@@ -44,9 +44,10 @@ trap 'rm -rf "$WORK"' EXIT
 cat >"$WORK/a.toml" <<EOF
 router-id = "10.0.0.1"
 [bgp]
-enabled   = true
-local-as  = 65001
-network   = ["10.99.0.0/24"]
+enabled             = true
+local-as            = 65001
+network             = ["10.99.0.0/24"]
+ebgp-require-policy = false
 [[bgp.neighbor]]
 address   = "10.0.0.2"
 remote-as = 65000
@@ -57,9 +58,10 @@ EOF
 cat >"$WORK/b.toml" <<EOF
 router-id = "10.1.0.1"
 [bgp]
-enabled   = true
-local-as  = 65001
-network   = ["10.99.0.0/24"]
+enabled             = true
+local-as            = 65001
+network             = ["10.99.0.0/24"]
+ebgp-require-policy = false
 [[bgp.neighbor]]
 address   = "10.1.0.2"
 remote-as = 65000
@@ -70,8 +72,9 @@ EOF
 cat >"$WORK/r1.toml" <<EOF
 router-id = "10.0.0.2"
 [bgp]
-enabled   = true
-local-as  = 65000
+enabled             = true
+local-as            = 65000
+ebgp-require-policy = false
 [[bgp.neighbor]]
 address   = "10.0.0.1"
 remote-as = 65001
@@ -84,9 +87,10 @@ EOF
 cat >"$WORK/r2.toml" <<EOF
 router-id = "10.0.0.2"
 [bgp]
-enabled   = true
-local-as  = 65000
-multipath = 2
+enabled             = true
+local-as            = 65000
+multipath           = 2
+ebgp-require-policy = false
 [[bgp.neighbor]]
 address   = "10.0.0.1"
 remote-as = 65001

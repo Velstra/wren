@@ -236,6 +236,10 @@ pub struct Prefix {
     pub address: Vec<u8>,
 }
 
+/// The longest IPv6 prefix. Above it `prefix_addr_bytes` asks for more bytes
+/// than an address has.
+pub const MAX_PREFIX_LEN: u8 = 128;
+
 /// The number of address bytes an OSPFv3 prefix of the given length occupies:
 /// the significant bits rounded up to whole 32-bit words (§A.4.1).
 pub fn prefix_addr_bytes(length: u8) -> usize {
@@ -246,6 +250,18 @@ impl Prefix {
     /// Build a prefix from a full IPv6 address and a length, keeping only the
     /// significant 32-bit words.
     pub fn from_ipv6(addr: Ipv6Addr, length: u8, options: u8) -> Prefix {
+        // Clamped to /128. `prefix_addr_bytes` rounds up to whole 32-bit words,
+        // so a length above 128 asks for more than the sixteen bytes an IPv6
+        // address has and the slice panics — and this is `pub`, reached from
+        // six places in `spf.rs` with a length that came off the wire by way of
+        // another LSA. `Prefix::ipv6` two functions down already answers the
+        // mirror-image question with `.min(16)`; this is the same answer on the
+        // way in.
+        // No `debug_assert`: `spf.rs` reaches this with lengths derived from
+        // decoded LSAs, so an assertion would make a malformed neighbour a
+        // debug-build crash. `Prefix::ipv6` clamps without one for the same
+        // reason.
+        let length = length.min(MAX_PREFIX_LEN);
         let n = prefix_addr_bytes(length);
         Prefix {
             length,
@@ -839,6 +855,39 @@ fn decode_intra_area_prefix(b: &[u8]) -> Option<IntraAreaPrefixLsa> {
 
 #[cfg(test)]
 mod tests {
+    /// A length no IPv6 address can hold must not take the builder down.
+    ///
+    /// `prefix_addr_bytes` rounds up to whole 32-bit words, so /129 asks for
+    /// twenty bytes and /255 for thirty-two, out of the sixteen an address has.
+    /// This is `pub` and `spf.rs` reaches it from six places with lengths
+    /// derived from decoded LSAs.
+    ///
+    /// The assertion is that it round-trips: a prefix that encoded to a length
+    /// `decode` refuses would be a silent black hole instead of a crash.
+    #[test]
+    fn an_impossible_prefix_length_is_clamped_not_a_panic() {
+        use super::*;
+        for len in [129u8, 130, 160, 200, 255] {
+            let p = Prefix::from_ipv6(
+                Ipv6Addr::new(0x2001, 0xdb8, 1, 0, 0, 0, 0, 0),
+                len,
+                PREFIX_NU,
+            );
+            assert_eq!(p.length, 128, "length {len} was not clamped");
+            assert_eq!(
+                p.address.len(),
+                16,
+                "length {len} produced the wrong number of address bytes"
+            );
+            let mut buf = Vec::new();
+            p.encode(0, &mut buf);
+            let (back, _mid, used) = Prefix::decode(&buf)
+                .unwrap_or_else(|| panic!("length {len} encoded to something wren refuses"));
+            assert_eq!(used, buf.len());
+            assert_eq!(back, p, "length {len} did not survive the round trip");
+        }
+    }
+
     use super::*;
     use crate::{INITIAL_SEQUENCE_NUMBER, OPT_E, OPT_R, OPT_V6};
 
@@ -1123,5 +1172,256 @@ mod tests {
         let short = (bytes.len() - 1) as u16;
         bytes[18..20].copy_from_slice(&short.to_be_bytes());
         assert_eq!(Lsa::decode(&bytes[..bytes.len() - 1]), None);
+    }
+
+    // =======================================================================
+    // Byte-offset assertions (RFC 5340 Appendix A.4)
+    //
+    // Everything above encodes and decodes with this crate alone, so a field at
+    // the wrong offset or a flag in the wrong bit is invisible: the decoder
+    // reads it back from the same wrong place. That is precisely how OSPFv2's
+    // Router-LSA V/E/B bug survived every round-trip test in this repository
+    // until FRR was put on the other end of the wire.
+    // =======================================================================
+
+    /// RFC 5340 §A.4.3 puts the Router-LSA's W/V/E/B bits in the **first octet
+    /// of the body** (byte 20 of the LSA), with the 24-bit Options field in
+    /// bytes 21..24: B = 0x01, E = 0x02, V = 0x04, and RFC 3101's Nt = 0x10.
+    ///
+    /// This is the OSPFv2 bug's exact twin. §3.8.1 makes an AS-external LSA
+    /// unusable unless its originator is reachable *as an ASBR*, so an E bit in
+    /// the wrong octet means FRR keeps every external wren originates in its
+    /// database and installs none of them — while wren, reading the same wrong
+    /// octet back, sees nothing at all wrong.
+    #[test]
+    fn a_router_lsa_puts_its_flags_in_the_first_body_octet() {
+        let mk = |flags| {
+            lsa(
+                LsType::Router,
+                [0, 0, 0, 0],
+                LsaBody::Router(RouterLsa { flags, options: OPT_V6 | OPT_R | OPT_E, links: vec![] }),
+            )
+            .encode()
+        };
+        assert_eq!(RTR_FLAG_B, 0x01, "B is bit 0");
+        assert_eq!(RTR_FLAG_E, 0x02, "E is bit 1");
+        assert_eq!(RTR_FLAG_V, 0x04, "V is bit 2");
+        assert_eq!(RTR_FLAG_NT, 0x10, "Nt is bit 4");
+        for flags in [RTR_FLAG_B, RTR_FLAG_E, RTR_FLAG_V, RTR_FLAG_NT, RTR_FLAG_B | RTR_FLAG_E] {
+            let b = mk(flags);
+            assert_eq!(
+                b[LSA_HEADER_LEN],
+                flags,
+                "the flags belong in byte 20 — the first octet of the body"
+            );
+            assert_eq!(
+                get_u24(&b[LSA_HEADER_LEN + 1..LSA_HEADER_LEN + 4]),
+                OPT_V6 | OPT_R | OPT_E,
+                "the 24-bit Options field is bytes 21..24, after the flags"
+            );
+        }
+    }
+
+    /// RFC 5340 §A.4.3: each Router-LSA link description is 16 octets — Type 0,
+    /// a reserved octet 1, Metric 2..4, Interface ID 4..8, Neighbor Interface ID
+    /// 8..12, Neighbor Router ID 12..16 — with link types 1 (point-to-point),
+    /// 2 (transit) and 4 (virtual link).
+    ///
+    /// The two Interface IDs transposed round-trips perfectly and breaks §3.8.1's
+    /// two-way check on every peer: the link is pruned from their SPF and the
+    /// route through wren disappears.
+    #[test]
+    fn a_router_lsa_link_is_encoded_in_the_rfc_field_order() {
+        let l = lsa(
+            LsType::Router,
+            [0, 0, 0, 0],
+            LsaBody::Router(RouterLsa {
+                flags: 0,
+                options: 0,
+                links: vec![RouterLink {
+                    link_type: RouterLinkType::Transit,
+                    metric: 0x0064,
+                    interface_id: 0x1112_1314,
+                    neighbor_interface_id: 0x2122_2324,
+                    neighbor_router_id: Ipv4Addr::new(10, 0, 0, 2),
+                }],
+            }),
+        );
+        let b = l.encode();
+        let link = &b[LSA_HEADER_LEN + 4..LSA_HEADER_LEN + 20];
+        assert_eq!(link[0], 2, "link Type is byte 0 of the entry; Transit is 2");
+        assert_eq!(link[1], 0, "byte 1 is reserved and must be zero");
+        assert_eq!(&link[2..4], &[0x00, 0x64], "Metric is bytes 2..4");
+        assert_eq!(&link[4..8], &[0x11, 0x12, 0x13, 0x14], "Interface ID is bytes 4..8");
+        assert_eq!(
+            &link[8..12],
+            &[0x21, 0x22, 0x23, 0x24],
+            "Neighbor Interface ID is bytes 8..12"
+        );
+        assert_eq!(&link[12..16], &[10, 0, 0, 2], "Neighbor Router ID is bytes 12..16");
+        assert_eq!(b.len(), LSA_HEADER_LEN + 4 + 16, "one link is 16 octets");
+    }
+
+    /// RFC 5340 §A.4.2 fixes the 20-byte LSA header: LS Age 0..2, LS Type 2..4
+    /// (a *16-bit* field, unlike OSPFv2's one octet with a separate Options
+    /// byte), Link State ID 4..8, Advertising Router 8..12, LS Sequence Number
+    /// 12..16, LS Checksum 16..18, Length 18..20.
+    #[test]
+    fn an_lsa_header_writes_each_field_at_the_offset_the_rfc_names() {
+        let h = LsaHeader {
+            ls_age: 0x0102,
+            ls_type: LsType::IntraAreaPrefix, // 0x2009
+            link_state_id: Ipv4Addr::new(11, 12, 13, 14),
+            advertising_router: Ipv4Addr::new(21, 22, 23, 24),
+            ls_seq: 0x3132_3334,
+            ls_checksum: 0x4142,
+            length: 0x0034,
+        };
+        let mut b = Vec::new();
+        h.encode(&mut b);
+        assert_eq!(b.len(), LSA_HEADER_LEN);
+        assert_eq!(&b[0..2], &[0x01, 0x02], "LS Age is bytes 0..2");
+        assert_eq!(&b[2..4], &[0x20, 0x09], "LS Type is a 16-bit field at bytes 2..4");
+        assert_eq!(&b[4..8], &[11, 12, 13, 14], "Link State ID is bytes 4..8");
+        assert_eq!(&b[8..12], &[21, 22, 23, 24], "Advertising Router is bytes 8..12");
+        assert_eq!(&b[12..16], &[0x31, 0x32, 0x33, 0x34], "LS Sequence is bytes 12..16");
+        assert_eq!(&b[16..18], &[0x41, 0x42], "LS Checksum is bytes 16..18");
+        assert_eq!(&b[18..20], &[0x00, 0x34], "Length is bytes 18..20");
+    }
+
+    /// RFC 5340 §A.4.2.1 splits the 16-bit LS Type into a U bit (0x8000), two
+    /// flooding-scope bits S2/S1 (0x6000) and a 13-bit function code — which is
+    /// why the codes are 0x2001, 0x2002, … and not 1, 2, ….
+    ///
+    /// The scope bits decide how far an LSA travels. Give an AS-external the
+    /// area scope by mistake and it stops at the first ABR; give a Link-LSA a
+    /// wider scope and link-local information leaks across the whole area.
+    /// `ls_type_roundtrips_and_scopes` above only proves wren agrees with
+    /// itself about which constant means which scope.
+    #[test]
+    fn the_ls_type_codes_and_their_scope_bits_are_the_ones_the_rfc_assigns() {
+        for (t, code) in [
+            (LsType::Router, 0x2001u16),
+            (LsType::Network, 0x2002),
+            (LsType::InterAreaPrefix, 0x2003),
+            (LsType::InterAreaRouter, 0x2004),
+            (LsType::AsExternal, 0x4005),
+            (LsType::Link, 0x0008),
+            (LsType::IntraAreaPrefix, 0x2009),
+        ] {
+            assert_eq!(t.as_u16(), code, "{t:?} is LS Type {code:#06x}");
+            assert_eq!(LsType::from_u16(code), t);
+        }
+        // The scope is bits 14..13 of the type word: 0 link-local, 1 area, 2 AS.
+        assert_eq!(LsType::Link.as_u16() & 0x6000, 0x0000, "link-local scope is 0b00");
+        assert_eq!(LsType::Router.as_u16() & 0x6000, 0x2000, "area scope is 0b01");
+        assert_eq!(LsType::AsExternal.as_u16() & 0x6000, 0x4000, "AS scope is 0b10");
+        // The U bit is clear on every type wren originates: an unrecognised LSA
+        // with U=0 must not be flooded on by a receiver that does not know it.
+        for t in [
+            LsType::Router,
+            LsType::Network,
+            LsType::InterAreaPrefix,
+            LsType::InterAreaRouter,
+            LsType::AsExternal,
+            LsType::Link,
+            LsType::IntraAreaPrefix,
+        ] {
+            assert_eq!(t.as_u16() & 0x8000, 0, "{t:?} must not set the U bit");
+        }
+    }
+
+    /// RFC 5340 §A.4.1: a prefix is encoded as PrefixLength 0, PrefixOptions 1,
+    /// a two-octet field whose meaning depends on the containing LSA, then the
+    /// prefix itself in **whole 32-bit words** — `ceil(len/32)*4` octets, with
+    /// the trailing bits of the last word zero.
+    ///
+    /// The word padding is the trap: encode `ceil(len/8)` octets instead and a
+    /// /48 occupies 6 rather than 8, so every subsequent prefix in the LSA is
+    /// misaligned and the whole Intra-Area-Prefix-LSA is discarded by any
+    /// conformant peer. wren's own decoder, computing the same wrong length,
+    /// would parse it back perfectly.
+    #[test]
+    fn a_prefix_is_padded_out_to_whole_32_bit_words() {
+        let p = Prefix::from_ipv6(
+            Ipv6Addr::new(0x2001, 0x0db8, 0xabcd, 0, 0, 0, 0, 0),
+            48,
+            PREFIX_LA,
+        );
+        let mut b = Vec::new();
+        p.encode(0x0007, &mut b);
+        assert_eq!(b[0], 48, "PrefixLength is byte 0");
+        assert_eq!(b[1], PREFIX_LA, "PrefixOptions is byte 1");
+        assert_eq!(&b[2..4], &[0x00, 0x07], "the two-octet mid field is bytes 2..4");
+        assert_eq!(
+            &b[4..12],
+            &[0x20, 0x01, 0x0d, 0xb8, 0xab, 0xcd, 0x00, 0x00],
+            "a /48 occupies two whole words, the second zero-padded"
+        );
+        assert_eq!(b.len(), 12, "4 + ceil(48/32)*4 = 12 octets");
+        // A /0 carries no address words at all.
+        let dflt = Prefix::from_ipv6(Ipv6Addr::UNSPECIFIED, 0, 0);
+        let mut d = Vec::new();
+        dflt.encode(0, &mut d);
+        assert_eq!(d.len(), 4, "a default prefix is just the 4-octet fixed part");
+    }
+
+    /// RFC 5340 §A.4.7 puts the AS-external-LSA's E, F and T bits in the first
+    /// body octet: E = 0x04 (type-2 metric), F = 0x02 (a forwarding address is
+    /// present), T = 0x01 (an external route tag is present) — note these are
+    /// *not* OSPFv2's 0x80 E bit.
+    ///
+    /// The F and T bits do not merely describe the LSA, they tell the reader
+    /// whether the optional 16-octet forwarding address and 4-octet tag are
+    /// present at all. Get one wrong and the peer parses the wrong number of
+    /// trailing octets, so the LSA is rejected outright rather than
+    /// misinterpreted — the external route simply never appears.
+    #[test]
+    fn an_as_external_lsa_puts_its_e_f_and_t_bits_in_the_first_body_octet() {
+        assert_eq!(EXT_FLAG_E, 0x04, "E is bit 2");
+        assert_eq!(EXT_FLAG_F, 0x02, "F is bit 1");
+        assert_eq!(EXT_FLAG_T, 0x01, "T is bit 0");
+        let full = lsa(
+            LsType::AsExternal,
+            [0, 0, 0, 1],
+            LsaBody::AsExternal(AsExternalLsa {
+                external_type2: true,
+                metric: 0x0000_1420,
+                prefix: Prefix::from_ipv6(
+                    Ipv6Addr::new(0x2001, 0xdb8, 0xc, 0, 0, 0, 0, 0),
+                    48,
+                    0,
+                ),
+                referenced_ls_type: 0,
+                forwarding_address: Some(Ipv6Addr::new(0x2001, 0xdb8, 0xa, 0, 0, 0, 0, 1)),
+                route_tag: Some(0xdead_beef),
+                referenced_link_state_id: None,
+            }),
+        );
+        let b = full.encode();
+        let body = &b[LSA_HEADER_LEN..];
+        assert_eq!(
+            body[0],
+            EXT_FLAG_E | EXT_FLAG_F | EXT_FLAG_T,
+            "a type-2 external with a forwarding address and a tag sets E|F|T"
+        );
+        assert_eq!(&body[1..4], &[0x00, 0x14, 0x20], "the 24-bit metric is bytes 1..4");
+
+        // A minimal external — type-1 metric, no forwarding address, no tag —
+        // leaves the flag octet entirely zero.
+        let bare = lsa(
+            LsType::AsExternal,
+            [0, 0, 0, 2],
+            LsaBody::AsExternal(AsExternalLsa {
+                external_type2: false,
+                metric: 10,
+                prefix: Prefix::from_ipv6(Ipv6Addr::UNSPECIFIED, 0, 0),
+                referenced_ls_type: 0,
+                forwarding_address: None,
+                route_tag: None,
+                referenced_link_state_id: None,
+            }),
+        );
+        assert_eq!(bare.encode()[LSA_HEADER_LEN], 0, "no flags set for a bare type-1");
     }
 }

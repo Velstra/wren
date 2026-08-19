@@ -183,6 +183,7 @@ passive   = true              # wait for the peer to connect
 | `router-id` | string | top-level `router-id` | The BGP identifier. |
 | `hold-time` | integer | `180` | Proposed Hold Time in seconds. |
 | `network` | list | `[]` | Prefixes to originate into BGP. |
+| `ebgp-require-policy` | bool | `true` | RFC 8212 default-deny on every eBGP neighbour of this speaker: with no `import` policy it accepts no routes, with no `export` policy it advertises none — including its own `network`s. `false` is permit-all. |
 | `[[bgp.neighbor]]` | array | `[]` | Peers — see below. |
 
 Each `[[bgp.neighbor]]`:
@@ -192,6 +193,12 @@ Each `[[bgp.neighbor]]`:
 | `address` | string | — | The peer's IP address. |
 | `remote-as` | integer | — | The peer's AS (eBGP if it differs from `local-as`). |
 | `passive` | bool | `false` | Wait for the peer to connect rather than dialling it. |
+| `require-policy` | bool | `ebgp-require-policy` | RFC 8212 default-deny for **this** neighbour, overriding the speaker-wide setting either way. Ignored on an iBGP or confederation session. |
+
+The example above establishes two sessions and, being policy-less, exchanges no
+routes over the eBGP one — see
+[Default-deny without policy](protocols/bgp.md#default-deny-without-policy-rfc-8212)
+for what to write instead, or set `ebgp-require-policy = false` for a lab.
 
 See [BGP-4](protocols/bgp.md).
 

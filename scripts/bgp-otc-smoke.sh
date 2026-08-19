@@ -39,9 +39,10 @@ trap 'rm -rf "$WORK"' EXIT
 cat >"$WORK/prov.toml" <<EOF
 router-id = "10.0.0.1"
 [bgp]
-enabled  = true
-local-as = 65001
-network  = ["203.0.113.0/24"]
+enabled             = true
+local-as            = 65001
+network             = ["203.0.113.0/24"]
+ebgp-require-policy = false
 [[bgp.neighbor]]
 address   = "10.0.0.2"
 remote-as = 65002
@@ -52,9 +53,10 @@ EOF
 cat >"$WORK/mid.toml" <<EOF
 router-id = "10.0.0.2"
 [bgp]
-enabled  = true
-local-as = 65002
-network  = ["198.51.100.0/24"]
+enabled             = true
+local-as            = 65002
+network             = ["198.51.100.0/24"]
+ebgp-require-policy = false
 [[bgp.neighbor]]
 address   = "10.0.0.1"
 remote-as = 65001
@@ -69,8 +71,9 @@ EOF
 cat >"$WORK/peer_match.toml" <<EOF
 router-id = "10.0.0.3"
 [bgp]
-enabled  = true
-local-as = 65003
+enabled             = true
+local-as            = 65003
+ebgp-require-policy = false
 [[bgp.neighbor]]
 address   = "10.0.0.2"
 remote-as = 65002
@@ -82,8 +85,9 @@ EOF
 cat >"$WORK/peer_mismatch.toml" <<EOF
 router-id = "10.0.0.3"
 [bgp]
-enabled  = true
-local-as = 65003
+enabled             = true
+local-as            = 65003
+ebgp-require-policy = false
 [[bgp.neighbor]]
 address   = "10.0.0.2"
 remote-as = 65002

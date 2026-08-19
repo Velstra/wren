@@ -2355,6 +2355,13 @@ fn build_bgp_config(
             link_state: n.link_state,
             import,
             export,
+            // RFC 8212 default-deny, settled here into one answer per peer: the
+            // neighbour's `require-policy` if it has an opinion, else the global
+            // `[bgp] ebgp-require-policy`, else the RFC's own default of enforced.
+            require_policy: bgp::effective_require_policy(
+                bgp.ebgp_require_policy,
+                n.require_policy,
+            ),
             role,
             local_as: n.local_as,
             update_source,
@@ -2511,7 +2518,6 @@ fn build_bgp_config(
         aggregates,
         roas,
         rpki_reject_invalid: bgp.rpki_reject_invalid,
-        ebgp_require_policy: bgp.ebgp_require_policy,
         vrf_table,
         vrf_device,
         evpn,

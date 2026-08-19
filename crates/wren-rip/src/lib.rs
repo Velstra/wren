@@ -405,7 +405,15 @@ impl RipTable {
         now: u64,
     ) -> Option<RipEvent> {
         // metric = min(received + 1, infinity) — the cost to reach it through us.
-        let metric = (recv_metric + 1).min(METRIC_INFINITY);
+        //
+        // The add saturates: `recv_metric` comes straight off the wire as a
+        // 32-bit field (RFC 2453 §4, the RIPv2 RTE metric), so a neighbour can
+        // advertise `0xffff_ffff`. A plain `+ 1` overflows — a panic in a debug
+        // build, and in release (no `overflow-checks`) it wraps to 0, which
+        // `.min()` then leaves as a metric-0 route: better than a connected
+        // route, installed from one unauthenticated datagram. RFC 2453 §3.9.2
+        // requires any metric above infinity to be treated as infinity.
+        let metric = recv_metric.saturating_add(1).min(METRIC_INFINITY);
         let nh = next_hop.unwrap_or(from);
 
         match self.routes.get_mut(&prefix) {
@@ -964,5 +972,107 @@ mod tests {
         t.clear_changed();
         assert!(!t.has_changes());
         assert!(t.triggered(3).is_empty());
+    }
+
+    // =======================================================================
+    // Byte-offset assertions and wire-input validation (RFC 2453)
+    // =======================================================================
+
+    /// RFC 2453 §4 fixes the 20-byte RTE: Address Family Identifier 0..2, Route
+    /// Tag 2..4, IP Address 4..8, Subnet Mask 8..12, Next Hop 12..16, Metric
+    /// 16..20.
+    ///
+    /// Mask and Next Hop transposed is the one that round-trips perfectly and
+    /// is fatal in the field: a peer reads `255.255.255.0` as the gateway and
+    /// black-holes every prefix wren advertises, while wren's own decoder
+    /// reconstructs exactly what it encoded. Only an assertion on the offsets
+    /// the RFC names can see it.
+    #[test]
+    fn a_route_table_entry_matches_the_rfc_field_order() {
+        let msg = Message {
+            command: Command::Response,
+            version: 2,
+            entries: vec![Entry {
+                family: AF_INET,
+                tag: 0x1234,
+                addr: Ipv4Addr::new(10, 9, 8, 0),
+                mask: Ipv4Addr::new(255, 255, 255, 0),
+                next_hop: Ipv4Addr::new(192, 168, 1, 254),
+                metric: 5,
+            }],
+        };
+        let b = msg.encode();
+        assert_eq!(b[0], 2, "Command is byte 0; a Response is 2");
+        assert_eq!(b[1], 2, "Version is byte 1");
+        assert_eq!(&b[2..4], &[0, 0], "bytes 2..4 must be zero");
+        let rte = &b[HEADER_LEN..HEADER_LEN + ENTRY_LEN];
+        assert_eq!(&rte[0..2], &[0, 2], "AFI is bytes 0..2 of the RTE; AF_INET is 2");
+        assert_eq!(&rte[2..4], &[0x12, 0x34], "Route Tag is bytes 2..4");
+        assert_eq!(&rte[4..8], &[10, 9, 8, 0], "IP Address is bytes 4..8");
+        assert_eq!(&rte[8..12], &[255, 255, 255, 0], "Subnet Mask is bytes 8..12");
+        assert_eq!(&rte[12..16], &[192, 168, 1, 254], "Next Hop is bytes 12..16");
+        assert_eq!(&rte[16..20], &[0, 0, 0, 5], "Metric is bytes 16..20, big-endian");
+        assert_eq!(b.len(), HEADER_LEN + ENTRY_LEN);
+    }
+
+    /// The decode side, from bytes laid out by hand rather than by this crate's
+    /// own encoder — the half a round trip cannot check.
+    #[test]
+    fn a_hand_built_response_decodes_each_rte_field_from_its_rfc_offset() {
+        let mut w = vec![2u8, 2, 0, 0];
+        w.extend_from_slice(&[0, 2]); // AFI = AF_INET
+        w.extend_from_slice(&[0x00, 0x2a]); // route tag = 42
+        w.extend_from_slice(&[172, 16, 0, 0]); // address
+        w.extend_from_slice(&[255, 255, 0, 0]); // mask
+        w.extend_from_slice(&[10, 0, 0, 1]); // next hop
+        w.extend_from_slice(&[0, 0, 0, 3]); // metric = 3
+        let m = Message::decode(&w).expect("a well-formed response decodes");
+        assert_eq!(m.command, Command::Response);
+        assert_eq!(m.version, 2);
+        let e = &m.entries[0];
+        assert_eq!(e.family, AF_INET);
+        assert_eq!(e.tag, 42);
+        assert_eq!(e.addr, Ipv4Addr::new(172, 16, 0, 0));
+        assert_eq!(e.mask, Ipv4Addr::new(255, 255, 0, 0));
+        assert_eq!(e.next_hop, Ipv4Addr::new(10, 0, 0, 1));
+        assert_eq!(e.metric, 3);
+        assert_eq!(e.prefix().unwrap().len(), 16, "the mask gives a /16");
+    }
+
+    /// RFC 2453 §3.9.2: a received metric above infinity is treated as
+    /// infinity, and an unreachable route is never added.
+    ///
+    /// The metric is a full 32-bit field on the wire, so a neighbour can send
+    /// `0xffff_ffff`. Adding one to it without saturating overflows: a panic in
+    /// a debug build (the daemon dies on one unauthenticated datagram) and, in
+    /// release, a wrap to metric 0 — which is better than a directly-connected
+    /// route, so the attacker's next hop wins for that prefix outright.
+    /// Regression test for exactly that.
+    #[test]
+    fn an_absurd_metric_from_the_wire_is_infinity_and_never_installs_a_route() {
+        let entry = |metric| Entry {
+            family: AF_INET,
+            tag: 0,
+            addr: Ipv4Addr::new(10, 9, 9, 0),
+            mask: Ipv4Addr::new(255, 255, 255, 0),
+            next_hop: Ipv4Addr::UNSPECIFIED,
+            metric,
+        };
+        let from = Ipv4Addr::new(10, 0, 0, 2);
+        for metric in [u32::MAX, u32::MAX - 1, 0xffff_0000, 17, METRIC_INFINITY] {
+            let mut t = RipTable::new();
+            assert!(
+                t.process(&entry(metric), from, 1, 0).is_none(),
+                "metric {metric} is at or beyond infinity and must install nothing"
+            );
+            assert!(
+                t.routes().is_empty(),
+                "metric {metric} left a route in the table"
+            );
+        }
+        // The boundary below infinity still works normally.
+        let mut t = RipTable::new();
+        assert!(t.process(&entry(METRIC_INFINITY - 2), from, 1, 0).is_some());
+        assert_eq!(t.routes()[0].metric, METRIC_INFINITY - 1);
     }
 }

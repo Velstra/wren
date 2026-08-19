@@ -36,8 +36,9 @@ trap 'rm -rf "$WORK"' EXIT
 cat >"$WORK/b.toml" <<EOF
 router-id = "10.0.0.2"
 [bgp]
-enabled   = true
-local-as  = 65002
+enabled             = true
+local-as            = 65002
+ebgp-require-policy = false
 [[bgp.neighbor]]
 address   = "10.0.0.1"
 remote-as = 65001
@@ -50,11 +51,12 @@ router-id = "10.0.0.1"
 prefix = "10.99.0.0/24"
 via    = "10.0.0.2"
 [bgp]
-enabled      = true
-local-as     = 65001
-network      = ["10.10.0.0/24"]
-ext-community = ["rt:65001:100"]
-redistribute = ["static"]
+enabled             = true
+local-as            = 65001
+network             = ["10.10.0.0/24"]
+ext-community       = ["rt:65001:100"]
+redistribute        = ["static"]
+ebgp-require-policy = false
 [[bgp.neighbor]]
 address   = "10.0.0.2"
 remote-as = 65002

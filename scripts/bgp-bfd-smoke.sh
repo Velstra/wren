@@ -38,9 +38,10 @@ min-tx      = 200
 min-rx      = 200
 detect-mult = 3
 [bgp]
-enabled   = true
-local-as  = 65001
-hold-time = 180
+enabled             = true
+local-as            = 65001
+hold-time           = 180
+ebgp-require-policy = false
 [[bgp.neighbor]]
 address   = "10.0.0.2"
 remote-as = 65002
@@ -54,10 +55,11 @@ min-tx      = 200
 min-rx      = 200
 detect-mult = 3
 [bgp]
-enabled   = true
-local-as  = 65002
-hold-time = 180
-network   = ["10.20.0.0/24"]
+enabled             = true
+local-as            = 65002
+hold-time           = 180
+network             = ["10.20.0.0/24"]
+ebgp-require-policy = false
 [[bgp.neighbor]]
 address   = "10.0.0.1"
 remote-as = 65001

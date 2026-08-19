@@ -425,7 +425,7 @@ impl Pdu {
                     partition: flags & 0x80 != 0,
                     attached: (flags >> 3) & 0x0f,
                     overload: flags & 0x04 != 0,
-                    is_type: IsLevel::from_bits(flags),
+                    is_type: IsLevel::is_type_from_bits(flags),
                     tlvs,
                 })
             }
@@ -483,7 +483,7 @@ fn lsp_flags(l: &Lsp) -> u8 {
     if l.overload {
         b |= 0x04;
     }
-    b |= l.is_type.bits();
+    b |= l.is_type.is_type_bits();
     b
 }
 
@@ -578,7 +578,9 @@ mod tests {
                 partition: false,
                 attached: 0,
                 overload: false,
-                is_type: IsLevel::L1L2,
+                // A Level-2 LSP's IS Type is L2 (§9.8 value 3). L1L2 is not a
+                // value this field has, so it cannot round-trip through it.
+                is_type: IsLevel::L2,
                 tlvs: vec![Tlv::ExtendedIpReachability(vec![ExtIpReach {
                     metric: 10,
                     up_down: false,
@@ -665,7 +667,9 @@ mod tests {
                 partition: true,
                 attached: 0b1010,
                 overload: true,
-                is_type: IsLevel::L1L2,
+                // L2, not L1L2: an LSP IS Type is L1 or L2 (§9.8), and L2 is the
+                // half the old shared codec encoded as the unused value 0b10.
+                is_type: IsLevel::L2,
                 tlvs: vec![],
             }),
         };
@@ -673,7 +677,7 @@ mod tests {
         if let PduBody::Lsp(l) = &decoded.body {
             assert!(l.partition && l.overload);
             assert_eq!(l.attached, 0b1010);
-            assert_eq!(l.is_type, IsLevel::L1L2);
+            assert_eq!(l.is_type, IsLevel::L2);
         }
     }
 
@@ -729,5 +733,309 @@ mod tests {
         let mut bad_type = good.clone();
         bad_type[4] = 19; // not a known PDU type
         assert_eq!(Pdu::decode(&bad_type), Err(DecodeError::UnknownType(19)));
+    }
+
+    // =======================================================================
+    // Byte-offset assertions (ISO/IEC 10589 §9, RFC 1195)
+    //
+    // Everything above encodes with wren and decodes with wren, which cannot
+    // see a field written at the wrong offset or a flag in the wrong bit: the
+    // decoder reads it back from the same wrong place. That is how the OSPFv2
+    // Router-LSA V/E/B bug survived every round-trip test in this repository
+    // and was only found on hardware, against FRR. The tests below name the
+    // offset and the bit the standard names.
+    // =======================================================================
+
+    /// ISO 10589 §9.8 fixes the LSP flags octet (the last byte of the LSP
+    /// fixed header):
+    ///
+    /// ```text
+    ///   bit  8   7  6  5  4   3    2 1
+    ///       [P] [   ATT   ] [OL] [IStype]
+    /// ```
+    ///
+    /// i.e. `P` = 0x80, the four ATT bits = 0x78 (default-metric ATT is the
+    /// *lowest* of the four, 0x08), `OL` = 0x04, IS-type = 0x03.
+    ///
+    /// The ATT bits are the dangerous ones: a Level-1 router installs its
+    /// default route towards the nearest LSP with ATT set (§7.2.9.2). Shift the
+    /// field by one and every L1-only router in the area either loses its
+    /// default route entirely or points it at a router that is not attached to
+    /// the backbone. A round trip cannot see it — `lsp_flags_roundtrip` above
+    /// passes with any permutation of these bits.
+    #[test]
+    fn the_lsp_flags_octet_puts_each_bit_where_iso_10589_names_it() {
+        let lsp = |partition, attached, overload, is_type| Pdu {
+            max_area_addresses: 0,
+            body: PduBody::Lsp(Lsp {
+                level: IsLevel::L1,
+                remaining_lifetime: 500,
+                lsp_id: LspId::new(sid([4, 4, 4, 4, 4, 4]), 0, 0),
+                sequence_number: 1,
+                checksum: 0,
+                partition,
+                attached,
+                overload,
+                is_type,
+                tlvs: vec![],
+            }),
+        };
+        // The flags octet is the last byte of the 27-byte LSP fixed header.
+        let flags_off = PduType::L1Lsp.fixed_header_len() - 1;
+        assert_eq!(flags_off, 26, "the LSP fixed header is 27 octets (§9.8)");
+
+        let f = |p, a, o, t| lsp(p, a, o, t).encode()[flags_off];
+        assert_eq!(f(true, 0, false, IsLevel::L1) & 0x80, 0x80, "P is bit 8 (0x80)");
+        assert_eq!(f(false, 0, true, IsLevel::L1) & 0x04, 0x04, "OL is bit 3 (0x04)");
+        assert_eq!(
+            f(false, 0b0001, false, IsLevel::L1) & 0x78,
+            0x08,
+            "the default-metric ATT bit is bit 4 (0x08), the lowest of the four"
+        );
+        assert_eq!(
+            f(false, 0b1111, false, IsLevel::L1) & 0x78,
+            0x78,
+            "all four ATT bits occupy 0x78"
+        );
+        assert_eq!(
+            f(false, 0b1000, false, IsLevel::L1) & 0x78,
+            0x40,
+            "the error-metric ATT bit is bit 7 (0x40), the highest of the four"
+        );
+        assert_eq!(f(false, 0, false, IsLevel::L1) & 0x03, 0b01, "IS-type is bits 2..1");
+        assert_eq!(f(false, 0, false, IsLevel::L1L2) & 0x03, 0b11);
+        // Nothing bleeds outside its own field.
+        assert_eq!(f(true, 0b1111, true, IsLevel::L1L2), 0xff, "all bits set = 0xff");
+        assert_eq!(f(false, 0, false, IsLevel::L1), 0b01, "only IS-type set");
+        // The half the old test never checked, and the bug it hid: a Level-2 LSP
+        // must carry IS Type 3 (§9.8), not the unused value 2 that the Circuit
+        // Type's `L2 = 0b10` produced here.
+        assert_eq!(
+            f(false, 0, false, IsLevel::L2) & 0x03,
+            0b11,
+            "a Level-2 LSP's IS Type is 3, not the unused 2"
+        );
+    }
+
+    /// The IS Type codec is the LSP field (§9.8), which is not the Circuit Type
+    /// (§9.5) even though both are two bits of the same enum.
+    ///
+    /// `L2` differs between them — `0b10` as a Circuit Type, `0b11` as an IS
+    /// Type — and one codec serving both wrote the Circuit Type value into every
+    /// Level-2 LSP (an *unused* IS Type) and read a standard neighbour's `3` back
+    /// as `L1L2`. That misread was invisible because nothing in the tree branches
+    /// on `is_type`; it is fixed here so it stays fixed.
+    #[test]
+    fn the_lsp_is_type_is_encoded_and_decoded_per_iso_10589_9_8() {
+        // Encode: L1 -> 1, L2 -> 3, and L1L2 (an L2-capable IS) -> 3.
+        assert_eq!(IsLevel::L1.is_type_bits(), 0b01);
+        assert_eq!(IsLevel::L2.is_type_bits(), 0b11);
+        assert_eq!(IsLevel::L1L2.is_type_bits(), 0b11);
+
+        // Decode: 1 -> L1, 3 -> L2. The `3 -> L2` is the FRR-interop half — FRR
+        // emits 3 for a Level-2 LSP, and the Circuit Type decoder read that as
+        // L1L2.
+        assert_eq!(IsLevel::is_type_from_bits(0b01), IsLevel::L1);
+        assert_eq!(IsLevel::is_type_from_bits(0b11), IsLevel::L2);
+
+        // The Circuit Type is untouched and still numbers L2 as 0b10, which is
+        // the whole reason the two need separate codecs.
+        assert_eq!(IsLevel::L2.bits(), 0b10);
+        assert_ne!(IsLevel::L2.bits(), IsLevel::L2.is_type_bits());
+    }
+
+    /// ISO 10589 §9.1 fixes the 8-octet common header shared by every PDU:
+    /// byte 0 the Intradomain Routeing Protocol Discriminator 0x83, byte 1 the
+    /// Length Indicator (the fixed header length), byte 2 the Version/Protocol
+    /// ID Extension 1, byte 3 the ID Length (0 = the default 6), byte 4 the PDU
+    /// Type in its low five bits, byte 5 the Version 1, byte 6 reserved, byte 7
+    /// Maximum Area Addresses.
+    ///
+    /// A wrong Length Indicator makes a conformant peer start reading TLVs in
+    /// the middle of the fixed header and discard the PDU; a wrong discriminator
+    /// means the frame is not recognised as IS-IS at all.
+    #[test]
+    fn the_common_header_writes_each_field_at_the_offset_iso_10589_names() {
+        let pdu = Pdu {
+            max_area_addresses: 3,
+            body: PduBody::Lsp(Lsp {
+                level: IsLevel::L2,
+                remaining_lifetime: 1199,
+                lsp_id: LspId::new(sid([9, 9, 9, 9, 9, 9]), 0, 0),
+                sequence_number: 1,
+                checksum: 0,
+                partition: false,
+                attached: 0,
+                overload: false,
+                is_type: IsLevel::L1L2,
+                tlvs: vec![],
+            }),
+        };
+        let b = pdu.encode();
+        assert_eq!(b[0], 0x83, "byte 0 is the intradomain routeing discriminator");
+        assert_eq!(b[1], 27, "byte 1 is the fixed header length — 27 for an LSP");
+        assert_eq!(b[2], 1, "byte 2 is the Version/Protocol ID Extension");
+        assert_eq!(b[3], 0, "byte 3 is the ID Length, 0 meaning the default 6");
+        assert_eq!(b[4], 20, "byte 4 is the PDU type — an L2 LSP is 20");
+        assert_eq!(b[5], 1, "byte 5 is the Version");
+        assert_eq!(b[6], 0, "byte 6 is reserved and must be zero");
+        assert_eq!(b[7], 3, "byte 7 is Maximum Area Addresses");
+    }
+
+    /// ISO 10589 §9.5–§9.13 assign the PDU type codes. These are the numbers
+    /// every other IS-IS speaker switches on; renumbering one makes wren's
+    /// Hellos or LSPs unrecognisable, and `PduType` round-tripping through
+    /// itself proves nothing about them.
+    #[test]
+    fn the_pdu_type_codes_are_the_ones_iso_10589_assigns() {
+        for (t, code, hdr) in [
+            (PduType::L1LanHello, 15u8, 27usize),
+            (PduType::L2LanHello, 16, 27),
+            (PduType::P2pHello, 17, 20),
+            (PduType::L1Lsp, 18, 27),
+            (PduType::L2Lsp, 20, 27),
+            (PduType::L1Csnp, 24, 33),
+            (PduType::L2Csnp, 25, 33),
+            (PduType::L1Psnp, 26, 17),
+            (PduType::L2Psnp, 27, 17),
+        ] {
+            assert_eq!(t.as_u8(), code, "{t:?} is PDU type {code}");
+            assert_eq!(PduType::from_u8(code), Some(t));
+            assert_eq!(t.fixed_header_len(), hdr, "{t:?} has a {hdr}-octet fixed header");
+        }
+        // 19, 21, 22 and 23 are unassigned between the LSP and CSNP blocks.
+        for bad in [0u8, 14, 19, 21, 22, 23, 28] {
+            assert_eq!(PduType::from_u8(bad), None, "{bad} is not an IS-IS PDU type");
+        }
+    }
+
+    /// ISO 10589 §9.8: an LSP's fixed header is PDU Length 8..10, Remaining
+    /// Lifetime 10..12, LSP ID 12..20 (System ID 12..18, pseudonode 18,
+    /// fragment 19), Sequence Number 20..24, Checksum 24..26, flags 26.
+    ///
+    /// The checksum is computed from the LSP ID onward (§7.3.11), i.e. it
+    /// deliberately excludes the Remaining Lifetime so the lifetime can be
+    /// decremented hop by hop without recomputing it. Move the region start and
+    /// wren still verifies its own LSPs while every peer rejects them.
+    #[test]
+    fn an_lsp_fixed_header_matches_the_iso_10589_field_order() {
+        let pdu = Pdu {
+            max_area_addresses: 0,
+            body: PduBody::Lsp(Lsp {
+                level: IsLevel::L1,
+                remaining_lifetime: 0x04b0, // 1200
+                lsp_id: LspId::new(sid([0x19, 0x21, 0x68, 0x00, 0x10, 0x01]), 0x02, 0x03),
+                sequence_number: 0x1122_3344,
+                checksum: 0,
+                partition: false,
+                attached: 0,
+                overload: false,
+                is_type: IsLevel::L1,
+                tlvs: vec![],
+            }),
+        };
+        let b = pdu.encode();
+        assert_eq!(
+            u16::from_be_bytes([b[8], b[9]]) as usize,
+            b.len(),
+            "PDU Length is bytes 8..10 and covers the whole PDU"
+        );
+        assert_eq!(&b[10..12], &[0x04, 0xb0], "Remaining Lifetime is bytes 10..12");
+        assert_eq!(
+            &b[12..18],
+            &[0x19, 0x21, 0x68, 0x00, 0x10, 0x01],
+            "the LSP ID's System ID is bytes 12..18"
+        );
+        assert_eq!(b[18], 0x02, "the pseudonode octet is byte 18");
+        assert_eq!(b[19], 0x03, "the LSP number (fragment) is byte 19");
+        assert_eq!(&b[20..24], &[0x11, 0x22, 0x33, 0x44], "Sequence Number is 20..24");
+        assert_ne!(&b[24..26], &[0, 0], "the Checksum at 24..26 is filled in");
+
+        // The checksum covers bytes 12.. (LSP ID onward) and not the lifetime:
+        // rewriting the lifetime must leave it valid, rewriting the LSP ID must not.
+        let mut aged = b.clone();
+        aged[10..12].copy_from_slice(&1u16.to_be_bytes());
+        assert!(
+            crate::fletcher16_valid(&aged[12..]),
+            "decrementing Remaining Lifetime must not invalidate the checksum"
+        );
+        let mut tampered = b.clone();
+        tampered[12] ^= 0xff;
+        assert!(!crate::fletcher16_valid(&tampered[12..]));
+    }
+
+    /// ISO 10589 §9.5: a LAN Hello is Circuit Type 8, Source ID 9..15, Holding
+    /// Time 15..17, PDU Length 17..19, Priority 19 (low 7 bits, bit 8
+    /// reserved), LAN ID 20..27 (System ID 20..26, pseudonode 26).
+    ///
+    /// Priority drives the §8.4.5 DIS election. Slip it a byte and two routers
+    /// each read the other's LAN-ID octet as a priority, both claim the DIS
+    /// role, and the pseudonode LSP flaps.
+    #[test]
+    fn a_lan_hello_matches_the_iso_10589_field_order() {
+        let pdu = Pdu {
+            max_area_addresses: 0,
+            body: PduBody::LanHello(LanHello {
+                level: IsLevel::L1,
+                circuit_type: IsLevel::L1L2,
+                source_id: sid([1, 2, 3, 4, 5, 6]),
+                holding_time: 0x001e, // 30
+                priority: 64,
+                lan_id: (sid([7, 8, 9, 10, 11, 12]), 1),
+                tlvs: vec![],
+            }),
+        };
+        let b = pdu.encode();
+        assert_eq!(b[8], 0b11, "Circuit Type is byte 8; L1L2 is 0b11");
+        assert_eq!(&b[9..15], &[1, 2, 3, 4, 5, 6], "Source ID is bytes 9..15");
+        assert_eq!(&b[15..17], &[0x00, 0x1e], "Holding Time is bytes 15..17");
+        assert_eq!(
+            u16::from_be_bytes([b[17], b[18]]) as usize,
+            b.len(),
+            "PDU Length is bytes 17..19"
+        );
+        assert_eq!(b[19], 64, "Priority is byte 19");
+        assert_eq!(&b[20..26], &[7, 8, 9, 10, 11, 12], "the LAN ID System ID is 20..26");
+        assert_eq!(b[26], 1, "the LAN ID pseudonode octet is byte 26");
+        assert_eq!(b.len(), 27, "an empty LAN Hello is exactly its 27-octet header");
+
+        // Bit 8 of the priority octet is reserved and must never be set.
+        let mut hi = pdu.clone();
+        if let PduBody::LanHello(h) = &mut hi.body {
+            h.priority = 0xff;
+        }
+        assert_eq!(hi.encode()[19] & 0x80, 0, "the priority octet's top bit is reserved");
+    }
+
+    /// ISO 10589 §9.10: a CSNP is PDU Length 8..10, Source ID 10..16, source
+    /// circuit octet 16, Start LSP ID 17..25, End LSP ID 25..33.
+    ///
+    /// The start/end pair bounds the range the CSNP describes; overlap them by
+    /// a byte and a peer concludes its own LSPs fall outside the advertised
+    /// range, never requests the ones it is missing, and the two databases stay
+    /// permanently out of sync without any visible error.
+    #[test]
+    fn a_csnp_matches_the_iso_10589_field_order() {
+        let pdu = Pdu {
+            max_area_addresses: 0,
+            body: PduBody::Csnp(Csnp {
+                level: IsLevel::L1,
+                source_id: (sid([1, 1, 1, 1, 1, 1]), 0),
+                start_lsp_id: LspId::new(sid([0, 0, 0, 0, 0, 0]), 0, 0),
+                end_lsp_id: LspId::new(sid([0xff; 6]), 0xff, 0xff),
+                tlvs: vec![],
+            }),
+        };
+        let b = pdu.encode();
+        assert_eq!(
+            u16::from_be_bytes([b[8], b[9]]) as usize,
+            b.len(),
+            "PDU Length is bytes 8..10"
+        );
+        assert_eq!(&b[10..16], &[1, 1, 1, 1, 1, 1], "Source ID is bytes 10..16");
+        assert_eq!(b[16], 0, "the source circuit octet is byte 16");
+        assert_eq!(&b[17..25], &[0u8; 8], "Start LSP ID is bytes 17..25");
+        assert_eq!(&b[25..33], &[0xffu8; 8], "End LSP ID is bytes 25..33");
+        assert_eq!(b.len(), 33, "an empty CSNP is exactly its 33-octet header");
     }
 }

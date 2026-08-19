@@ -898,4 +898,232 @@ mod tests {
         assert_eq!(decoded.header.ls_type.as_u8(), 7);
         assert!(matches!(decoded.body, LsaBody::AsExternal(_)));
     }
+
+    // =======================================================================
+    // Byte-offset assertions (RFC 2328 Appendix A.4)
+    //
+    // Everything above this line round-trips through wren's own encoder and
+    // decoder. That is exactly the shape of test the Router-LSA flag bug walked
+    // straight through: the encoder wrote a field at the wrong offset and the
+    // decoder read it back from the same wrong offset, so wren agreed with
+    // itself perfectly and every other implementation on the wire disagreed.
+    // The tests below assert the offset and value the RFC names, so a symmetric
+    // move of any field is caught here instead of on hardware.
+    // =======================================================================
+
+    /// RFC 2328 §A.4.1 fixes the 20-byte LSA header field-by-field:
+    /// LS age 0..2, Options 2, LS type 3, Link State ID 4..8, Advertising
+    /// Router 8..12, LS sequence number 12..16, LS checksum 16..18, length
+    /// 18..20.
+    ///
+    /// If Options and LS type were transposed, a peer would read LS type 0x02
+    /// (Network) for a Router-LSA carrying `OPT_E` and either drop the LSA or
+    /// install a bogus transit network; a transposed Link State ID and
+    /// Advertising Router would make every LSA identify the wrong originator,
+    /// so §16.1's "is the originator reachable" check fails and no route from
+    /// that router is installed. Neither is visible to a round trip.
+    #[test]
+    fn an_lsa_header_writes_each_field_at_the_offset_the_rfc_names() {
+        let h = LsaHeader {
+            ls_age: 0x0102,
+            options: 0x22,
+            ls_type: LsType::SummaryAsbr, // 4
+            link_state_id: Ipv4Addr::new(11, 12, 13, 14),
+            advertising_router: Ipv4Addr::new(21, 22, 23, 24),
+            ls_seq: 0x3132_3334,
+            ls_checksum: 0x4142,
+            length: 0x0024,
+        };
+        let mut b = Vec::new();
+        h.encode(&mut b);
+        assert_eq!(b.len(), LSA_HEADER_LEN);
+        assert_eq!(&b[0..2], &[0x01, 0x02], "LS age is bytes 0..2, big-endian");
+        assert_eq!(b[2], 0x22, "Options is byte 2");
+        assert_eq!(b[3], 4, "LS type is byte 3 (SummaryAsbr = 4)");
+        assert_eq!(&b[4..8], &[11, 12, 13, 14], "Link State ID is bytes 4..8");
+        assert_eq!(&b[8..12], &[21, 22, 23, 24], "Advertising Router is bytes 8..12");
+        assert_eq!(&b[12..16], &[0x31, 0x32, 0x33, 0x34], "LS sequence is bytes 12..16");
+        assert_eq!(&b[16..18], &[0x41, 0x42], "LS checksum is bytes 16..18");
+        assert_eq!(&b[18..20], &[0x00, 0x24], "length is bytes 18..20");
+    }
+
+    /// The decode side, asserted against bytes laid out by hand rather than by
+    /// wren's own encoder — the half a round trip can never check.
+    #[test]
+    fn an_lsa_header_reads_each_field_from_the_offset_the_rfc_names() {
+        let wire: [u8; 20] = [
+            0x00, 0x0a, // LS age = 10
+            0x02, // Options = E-bit
+            0x01, // LS type = 1 (Router)
+            192, 168, 0, 1, // Link State ID
+            10, 0, 0, 7, // Advertising Router
+            0x80, 0x00, 0x00, 0x05, // LS sequence number
+            0xab, 0xcd, // LS checksum
+            0x00, 0x30, // length = 48
+        ];
+        let h = LsaHeader::decode(&wire).expect("a well-formed header decodes");
+        assert_eq!(h.ls_age, 10);
+        assert_eq!(h.options, crate::OPT_E);
+        assert_eq!(h.ls_type, LsType::Router);
+        assert_eq!(h.link_state_id, Ipv4Addr::new(192, 168, 0, 1));
+        assert_eq!(h.advertising_router, Ipv4Addr::new(10, 0, 0, 7));
+        assert_eq!(h.ls_seq, INITIAL_SEQUENCE_NUMBER + 4);
+        assert_eq!(h.ls_checksum, 0xabcd);
+        assert_eq!(h.length, 48);
+    }
+
+    /// RFC 2328 §A.4.2 lays a Router-LSA link out as Link ID 0..4, Link Data
+    /// 4..8, Type 8, #TOS 9, TOS 0 metric 10..12 — 12 bytes per link.
+    ///
+    /// `router_lsa_skips_tos_metrics` above feeds hand-built bytes to the
+    /// *decoder*; this checks the *encoder* writes the same layout. A Link ID
+    /// and Link Data the wrong way round makes a point-to-point link name the
+    /// interface address as the neighbour Router ID, so §16.1's two-way check
+    /// never matches and the link is pruned from every other router's SPF.
+    #[test]
+    fn a_router_link_entry_is_encoded_in_the_rfc_field_order() {
+        let l = lsa(
+            LsType::Router,
+            [10, 0, 0, 1],
+            LsaBody::Router(RouterLsa {
+                flags: RTR_FLAG_B,
+                links: vec![RouterLink {
+                    link_id: Ipv4Addr::new(10, 0, 0, 2),
+                    link_data: Ipv4Addr::new(192, 168, 1, 1),
+                    link_type: RouterLinkType::Transit, // 2
+                    metric: 0x0064,
+                }],
+            }),
+        );
+        let bytes = l.encode();
+        let body = &bytes[LSA_HEADER_LEN..];
+        assert_eq!(body[0], RTR_FLAG_B, "V/E/B flags in byte 0");
+        assert_eq!(body[1], 0, "byte 1 is reserved zero");
+        assert_eq!(u16::from_be_bytes([body[2], body[3]]), 1, "# links in bytes 2..4");
+        let link = &body[4..16];
+        assert_eq!(&link[0..4], &[10, 0, 0, 2], "Link ID is bytes 0..4 of the entry");
+        assert_eq!(&link[4..8], &[192, 168, 1, 1], "Link Data is bytes 4..8");
+        assert_eq!(link[8], 2, "link Type is byte 8 (Transit = 2)");
+        assert_eq!(link[9], 0, "#TOS is byte 9 and wren always originates TOS 0 only");
+        assert_eq!(&link[10..12], &[0x00, 0x64], "TOS 0 metric is bytes 10..12");
+        assert_eq!(body.len(), 16, "no trailing TOS entries");
+    }
+
+    /// RFC 2328 §A.4.4: a Summary-LSA body is Network Mask 0..4, a *reserved
+    /// zero* byte 4, then a 24-bit TOS 0 metric in bytes 5..8.
+    ///
+    /// Writing the metric as a plain 32-bit word at 4..8 round-trips
+    /// perfectly against wren's own decoder but puts the metric's top octet in
+    /// the reserved byte — and every metric over 65535 then also corrupts it.
+    /// A peer reads a metric shifted by 8 bits and prefers or shuns the
+    /// inter-area route by a factor of 256.
+    #[test]
+    fn a_summary_lsa_keeps_byte_4_reserved_and_the_metric_in_bytes_5_to_8() {
+        let l = lsa(
+            LsType::SummaryNetwork,
+            [10, 2, 0, 0],
+            LsaBody::Summary(SummaryLsa {
+                network_mask: Ipv4Addr::new(255, 255, 0, 0),
+                metric: 0x00ab_cdef,
+            }),
+        );
+        let body = &l.encode()[LSA_HEADER_LEN..];
+        assert_eq!(&body[0..4], &[255, 255, 0, 0], "Network Mask is bytes 0..4");
+        assert_eq!(body[4], 0, "byte 4 is reserved and must be zero, not metric bits");
+        assert_eq!(&body[5..8], &[0xab, 0xcd, 0xef], "the 24-bit metric is bytes 5..8");
+        assert_eq!(body.len(), 8, "a TOS-0-only summary body is exactly 8 bytes");
+    }
+
+    /// RFC 2328 §A.4.5: an AS-external-LSA body is Network Mask 0..4, then a
+    /// byte whose **high-order bit** is the E-bit with the remaining 7 bits
+    /// zero, then the 24-bit metric 5..8, Forwarding address 8..12, External
+    /// Route Tag 12..16.
+    ///
+    /// The E-bit chooses between a type-1 external metric (comparable with
+    /// internal cost) and a type-2 (always worse than any internal path,
+    /// §16.4). Put it in the low bit instead and wren's own decoder still
+    /// agrees — while every other router treats the route's preference class as
+    /// the opposite of what was meant, and the 0x01 bit it did set is a
+    /// reserved bit peers may reject the LSA over.
+    #[test]
+    fn an_as_external_lsa_puts_the_e_bit_in_the_high_bit_of_byte_4() {
+        let mk = |type2: bool| {
+            lsa(
+                LsType::AsExternal,
+                [0, 0, 0, 0],
+                LsaBody::AsExternal(AsExternalLsa {
+                    network_mask: Ipv4Addr::new(255, 255, 255, 0),
+                    external_type2: type2,
+                    metric: 0x0000_1420,
+                    forwarding_address: Ipv4Addr::new(192, 168, 1, 254),
+                    route_tag: 0xdead_beef,
+                }),
+            )
+            .encode()
+        };
+        let t2 = mk(true);
+        let body = &t2[LSA_HEADER_LEN..];
+        assert_eq!(&body[0..4], &[255, 255, 255, 0], "Network Mask is bytes 0..4");
+        assert_eq!(body[4], 0x80, "a type-2 external sets only the high bit of byte 4");
+        assert_eq!(&body[5..8], &[0x00, 0x14, 0x20], "the 24-bit metric is bytes 5..8");
+        assert_eq!(&body[8..12], &[192, 168, 1, 254], "Forwarding address is 8..12");
+        assert_eq!(&body[12..16], &[0xde, 0xad, 0xbe, 0xef], "Route Tag is 12..16");
+        assert_eq!(body.len(), 16, "a TOS-0-only external body is exactly 16 bytes");
+
+        let t1 = mk(false);
+        assert_eq!(
+            t1[LSA_HEADER_LEN + 4],
+            0x00,
+            "a type-1 external leaves byte 4 entirely zero"
+        );
+    }
+
+    /// RFC 2328 §A.4.3: a Network-LSA is Network Mask 0..4 followed by the
+    /// Attached Router IDs, four bytes each, in order.
+    #[test]
+    fn a_network_lsa_is_the_mask_then_the_attached_routers_in_order() {
+        let l = lsa(
+            LsType::Network,
+            [192, 168, 1, 1],
+            LsaBody::Network(NetworkLsa {
+                network_mask: Ipv4Addr::new(255, 255, 255, 0),
+                attached_routers: vec![Ipv4Addr::new(10, 0, 0, 1), Ipv4Addr::new(10, 0, 0, 2)],
+            }),
+        );
+        let body = &l.encode()[LSA_HEADER_LEN..];
+        assert_eq!(&body[0..4], &[255, 255, 255, 0], "Network Mask is bytes 0..4");
+        assert_eq!(&body[4..8], &[10, 0, 0, 1], "first Attached Router at 4..8");
+        assert_eq!(&body[8..12], &[10, 0, 0, 2], "second Attached Router at 8..12");
+        assert_eq!(body.len(), 12);
+    }
+
+    /// RFC 2328 §12.1.7: the LS checksum is a Fletcher checksum over the LSA
+    /// *from the Options field onward*, and it is stored in bytes 16..18 of the
+    /// LSA — i.e. at offset 14 of the checksummed region.
+    ///
+    /// Asserted on the bytes rather than through `checksum_valid`, because
+    /// `stamp_checksum` and `checksum_valid` share `LSA_CSUM_OFFSET`: move the
+    /// constant and both agree on the wrong place while every peer computing
+    /// the checksum per the RFC rejects the LSA outright (§13 step 1) and the
+    /// LSA is never flooded on.
+    #[test]
+    fn the_ls_checksum_is_stamped_into_bytes_16_and_17_of_the_lsa() {
+        let l = lsa(
+            LsType::Router,
+            [10, 0, 0, 1],
+            LsaBody::Router(RouterLsa { flags: RTR_FLAG_E, links: vec![] }),
+        );
+        let bytes = l.encode();
+        let stamped = u16::from_be_bytes([bytes[16], bytes[17]]);
+        assert_ne!(stamped, 0, "a real LSA gets a non-zero checksum");
+        assert_eq!(LSA_CSUM_OFFSET, 14, "offset 14 within the age-stripped region");
+        // Independent recomputation: zero the field, fold the region by hand per
+        // RFC 1008 and confirm the stored value makes the sums vanish.
+        let (mut c0, mut c1) = (0i32, 0i32);
+        for b in &bytes[2..] {
+            c0 = (c0 + *b as i32) % 255;
+            c1 = (c1 + c0) % 255;
+        }
+        assert_eq!((c0, c1), (0, 0), "the stored checksum must fold the region to zero");
+    }
 }

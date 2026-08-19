@@ -218,6 +218,37 @@ mod checksum_tests {
         assert_ne!(ip_checksum(&buf), 0);
     }
 
+    /// A known-answer vector, not a self-consistency check: the OSPF checksum is
+    /// the standard 16-bit ones-complement internet checksum (RFC 1071), and
+    /// `ip_checksum_detects_corruption` above only proves wren agrees with
+    /// itself. This is a real IPv4 header whose checksum is 0xb1e6 — the value
+    /// every other implementation computes for these bytes.
+    ///
+    /// If the fold or the odd-byte handling were wrong, wren would still verify
+    /// its own packets and every peer would drop them as corrupt.
+    #[test]
+    fn ip_checksum_matches_a_known_answer_for_a_real_ipv4_header() {
+        let header = [
+            0x45, 0x00, 0x00, 0x3c, 0x1c, 0x46, 0x40, 0x00, 0x40, 0x06, // proto TCP
+            0x00, 0x00, // checksum field, zeroed for the computation
+            0xac, 0x10, 0x0a, 0x63, // 172.16.10.99
+            0xac, 0x10, 0x0a, 0x0c, // 172.16.10.12
+        ];
+        assert_eq!(ip_checksum(&header), 0xb1e6);
+    }
+
+    /// RFC 1071 §1: a trailing odd byte is padded on the *right* with zero, i.e.
+    /// it is the high byte of the final 16-bit word. Padding on the left instead
+    /// shifts the whole tail contribution by 8 bits — invisible to a
+    /// sum-then-verify round trip, fatal against any real peer.
+    #[test]
+    fn ip_checksum_pads_a_trailing_odd_byte_as_the_high_byte() {
+        // [0x12] must sum as the word 0x1200, so the checksum is !0x1200.
+        assert_eq!(ip_checksum(&[0x12]), !0x1200u16);
+        // And the same bytes with an explicit zero low byte give the same answer.
+        assert_eq!(ip_checksum(&[0x12]), ip_checksum(&[0x12, 0x00]));
+    }
+
     #[test]
     fn fletcher_roundtrips_and_validates() {
         // A 20-byte stand-in LSA region (options-onward) with checksum at off 14.

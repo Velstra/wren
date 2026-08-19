@@ -738,14 +738,17 @@ pub struct Bgp {
     /// are always accepted. Defaults to false (validate and show, but accept all).
     #[serde(default, rename = "rpki-reject-invalid")]
     pub rpki_reject_invalid: bool,
-    /// RFC 8212 strict default-deny for eBGP: when enabled, an eBGP neighbour with **no**
-    /// explicit `import` policy accepts no routes, and one with no explicit `export`
-    /// policy re-advertises no transit routes (locally-originated `network`/redistribute
-    /// and `default-originate` routes are exempt, as are iBGP sessions). The RFC
-    /// recommends this be on; wren defaults it **off** so existing configurations keep
-    /// their current behaviour — set `true` to require a policy on every eBGP peer.
-    #[serde(default, rename = "ebgp-require-policy")]
-    pub ebgp_require_policy: bool,
+    /// RFC 8212 default-deny for eBGP: an eBGP neighbour with **no** explicit `import`
+    /// policy accepts no routes, and one with no explicit `export` policy advertises
+    /// none — including its own `network`/redistributed and `default-originate` routes.
+    /// iBGP and confederation peers are unaffected. This is the RFC's *default*
+    /// behaviour and wren's: unset means enforced. Setting it `false` turns the
+    /// enforcement off for every eBGP neighbour at once — the deliberate permit-all a
+    /// lab or a route server wants (RFC 8212 §3 allows exactly this deviation).
+    /// A single neighbour can opt out on its own with `[[bgp.neighbor]]
+    /// require-policy`, which overrides whatever is set here.
+    #[serde(rename = "ebgp-require-policy")]
+    pub ebgp_require_policy: Option<bool>,
     /// An RTR (RFC 8210) validating cache to fetch ROAs from live, instead of (or in
     /// addition to) the static `[[bgp.roa]]` entries. Unset disables RTR.
     pub rtr: Option<BgpRtr>,
@@ -1180,6 +1183,16 @@ pub struct BgpNeighbor {
     /// with any set-community (and, for transit routes, set-metric/set-preference)
     /// modifications applied. Unset advertises everything.
     pub export: Option<String>,
+    /// Whether RFC 8212 default-deny applies to **this** neighbour, overriding the
+    /// global `[bgp] ebgp-require-policy`. Setting it `false` is how an operator says
+    /// "yes, I really do mean permit-all here" for one session — the route server or
+    /// lab peer that is meant to exchange everything without a policy — while every
+    /// other eBGP neighbour keeps the RFC's protection. Setting it `true` re-arms the
+    /// enforcement for one neighbour when the global has been turned off. Unset
+    /// follows the global, which itself defaults to enforced. Ignored on an iBGP or
+    /// confederation session, where the RFC does not apply.
+    #[serde(rename = "require-policy")]
+    pub require_policy: Option<bool>,
     /// This local speaker's BGP Role toward this neighbour (RFC 9234 §4), one of
     /// `provider`, `customer`, `peer`, `rs-server` or `rs-client`. It is advertised in
     /// the Role capability and must be the complement of the peer's role (Provider ↔
@@ -2336,6 +2349,54 @@ distance = 254
         )
         .expect("valid config");
         assert!(!cfg.ospf.expect("ospf present").bfd);
+    }
+
+    #[test]
+    fn parses_rfc8212_require_policy_at_both_levels() {
+        // Neither knob set: both stay `None`, which the daemon resolves to the RFC's
+        // enforced default. The point of the assertion is that an absent setting is
+        // distinguishable from an explicit `false` — a plain `bool` could not carry
+        // "the neighbour has no opinion, follow the global".
+        let cfg = Config::from_toml(
+            r#"
+            router-id = "10.0.0.1"
+            [bgp]
+            enabled  = true
+            local-as = 65001
+            [[bgp.neighbor]]
+            address   = "10.0.0.2"
+            remote-as = 65002
+            "#,
+        )
+        .expect("valid config");
+        let bgp = cfg.bgp.expect("bgp present");
+        assert_eq!(bgp.ebgp_require_policy, None);
+        assert_eq!(bgp.neighbor[0].require_policy, None);
+
+        // The global turned off, with one neighbour re-arming itself and another
+        // opting out in its own right.
+        let cfg = Config::from_toml(
+            r#"
+            router-id = "10.0.0.1"
+            [bgp]
+            enabled             = true
+            local-as            = 65001
+            ebgp-require-policy = false
+            [[bgp.neighbor]]
+            address        = "10.0.0.2"
+            remote-as      = 65002
+            require-policy = true
+            [[bgp.neighbor]]
+            address        = "10.0.0.3"
+            remote-as      = 65003
+            require-policy = false
+            "#,
+        )
+        .expect("valid config");
+        let bgp = cfg.bgp.expect("bgp present");
+        assert_eq!(bgp.ebgp_require_policy, Some(false));
+        assert_eq!(bgp.neighbor[0].require_policy, Some(true));
+        assert_eq!(bgp.neighbor[1].require_policy, Some(false));
     }
 
     #[test]

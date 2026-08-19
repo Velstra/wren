@@ -1,15 +1,35 @@
 name: CI
 
+# Two speeds:
+#
+#   every push and pull request — clippy, the workspace tests, shell hygiene,
+#   and a curated handful of the rootless convergence smokes. Minutes, not tens
+#   of minutes, so it can gate a merge.
+#
+#   nightly — `scripts/run-all-tests.sh`, which is the workspace tests plus
+#   every one of the ~90 smokes. That run takes 25-40 minutes because half the
+#   protocols in it converge on their own timers (OSPF, IS-IS, Babel, BFD), and
+#   waiting that long for every push is how a suite stops being run at all.
+#   Nightly is the compromise: a regression in a protocol the curated subset
+#   does not touch is caught within a day, by name, without anybody remembering
+#   to run anything.
+
 on:
   push:
     branches: [main]
   pull_request:
+  schedule:
+    - cron: "0 2 * * *"
   workflow_dispatch:
 
 # Cancel superseded runs on the same ref.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
+
+# Least privilege by default; no job here writes anything back to the repo.
+permissions:
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
@@ -18,6 +38,7 @@ env:
 jobs:
   test:
     name: clippy + test (stable)
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -30,23 +51,74 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Clippy (all targets, warnings are errors)
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
       # The unit/integration tests are pure and need no privileges. The
       # convergence smoke scripts under scripts/ need CAP_NET_RAW + network
-      # namespaces and are intentionally NOT run here — they are run manually
-      # via `unshare -Urn` (see the protocol pages in docs/).
+      # namespaces and run in the `smokes` job below.
       - name: Test (workspace)
-        run: cargo test --workspace
+        run: cargo test --workspace --locked
+
+  # What stands in for a formatting gate here.
+  #
+  # `cargo fmt --check` is not run, and this is not an oversight: the committed
+  # source is hand-formatted, and today's rustfmt (1.9.0) rewrites 492 places in
+  # 71 of the 103 source files — mostly splitting expressions that fit well
+  # within 100 columns onto four lines. That is not drift that can be fixed once
+  # and then held: `use_small_heuristics = "Max"` and a widened `fn_call_width`
+  # were both tried against the tree and made it *worse* (946 and 834 rewrites),
+  # so there is no rustfmt configuration that agrees with this codebase. A gate
+  # that would demand reformatting every file to turn green is a gate that gets
+  # switched off, so instead this job checks the things a formatter would have
+  # guaranteed and a human reviewer will not notice: no tab indentation, no
+  # trailing whitespace, and a newline at the end of every file. All three hold
+  # across the tree today, so this job starts green and stays honest.
+  hygiene:
+    name: source hygiene + shellcheck
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Whitespace
+        run: |
+          set -uo pipefail
+          fail=0
+          mapfile -t files < <(git ls-files '*.rs')
+          if bad=$(grep -lP '\t' -- "${files[@]}"); then
+            echo "::error::tab indentation (this project indents with spaces):"
+            awk '{print "  " $0}' <<< "$bad"
+            fail=1
+          fi
+          if bad=$(grep -nP '[ \t]+$' -- "${files[@]}"); then
+            echo "::error::trailing whitespace:"
+            awk '{print "  " $0}' <<< "$bad"
+            fail=1
+          fi
+          for f in "${files[@]}"; do
+            if [ -s "$f" ] && [ -n "$(tail -c1 "$f")" ]; then
+              echo "::error file=$f::no newline at end of file"
+              fail=1
+            fi
+          done
+          echo "checked ${#files[@]} files"
+          exit $fail
+
+      # The smokes are the live proof this project leans on, and they are shell.
+      # `--severity=error` only: the scripts are clean at that level today, and
+      # the 100-odd style suggestions below it are opinions, not defects.
+      - name: Shellcheck the smoke scripts
+        run: git ls-files -z '*.sh' | xargs -0 shellcheck --severity=error
 
   # The rootless `unshare -Urn` convergence smokes — the "live-verified" proof
   # that the protocol runners actually form adjacencies and install routes. They
   # need only unprivileged user + network namespaces (CAP_NET_RAW/ADMIN are held
   # by the netns-root inside `unshare -Urn`), which GitHub-hosted runners allow.
-  # We run a curated, representative subset — not all of scripts/*smoke*.sh — to
-  # keep CI time sane; extend the `smokes` array below to cover more.
+  # A curated, representative subset — one per major protocol path — so the job
+  # stays a few minutes; the nightly job below runs all of them.
   smokes:
     name: rootless netns smokes
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -59,33 +131,27 @@ jobs:
       # The smoke scripts invoke ./target/debug/wren (and build it themselves if
       # missing); build it once up front so each script just runs.
       - name: Build the daemon (debug)
-        run: cargo build -p wren-daemon
+        run: cargo build -p wren-daemon --locked
 
       # GitHub's ubuntu-24.04 runners ship AppArmor's
       # `kernel.apparmor_restrict_unprivileged_userns=1`, which blocks the rootless
-      # `unshare -Urn` the smokes rely on. Relax it (best-effort — passwordless
-      # sudo is available on the runner; the guard below skips cleanly if it stays
-      # blocked on some future image).
+      # `unshare -Urn` the smokes rely on. Relax it (passwordless sudo is available
+      # on the runner) and then insist it worked — a "green" run that skipped every
+      # smoke is worse than a red one.
       - name: Allow unprivileged user namespaces
-        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
-
-      - name: Check user-namespace support
-        id: userns
         run: |
-          if unshare -Urn true 2>/dev/null; then
-            echo "supported=yes" >> "$GITHUB_OUTPUT"
-            echo "unprivileged user + network namespaces work; running the smokes."
-          else
-            echo "supported=no" >> "$GITHUB_OUTPUT"
-            echo "::warning::unprivileged user namespaces are unavailable on this runner; skipping the rootless netns smokes (not a failure)."
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+          if ! unshare -Urn true; then
+            echo "::error::unprivileged user namespaces are unavailable on this runner — the smokes cannot run."
+            exit 1
           fi
+          echo "unprivileged user + network namespaces work."
 
       - name: Run rootless convergence smokes
-        if: steps.userns.outputs.supported == 'yes'
         run: |
           set -uo pipefail
           # A representative subset — one per major protocol path — kept small so
-          # CI stays fast. Add more scripts/*smoke*.sh here as needed.
+          # CI stays fast. The rest run nightly.
           smokes=(
             bgp-redistribute-smoke.sh      # BGP
             ospf-redistribute-smoke.sh     # OSPFv2
@@ -112,6 +178,32 @@ jobs:
           fi
           echo "All ${#smokes[@]} smokes passed."
 
-  # `rustfmt --check` is deliberately omitted: parts of the codebase use
-  # intentional hand-formatting that newer rustfmt would rewrite. Run
-  # `cargo fmt` locally if you want, but it is not a CI gate.
+  # Everything: the workspace tests and all ~90 smokes, through the same runner
+  # a maintainer uses by hand. It prints a pass/fail table and exits non-zero if
+  # anything failed, so the job needs no logic of its own.
+  full-suite:
+    name: whole suite (nightly)
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    # Its own estimate is 25-40 minutes; the ceiling is generous because a
+    # protocol that fails to converge fails by timing out, and a job killed at
+    # the default six hours reports nothing at all.
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Allow unprivileged user namespaces
+        run: |
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+          if ! unshare -Urn true; then
+            echo "::error::unprivileged user namespaces are unavailable on this runner — the smokes cannot run."
+            exit 1
+          fi
+
+      - name: scripts/run-all-tests.sh
+        run: bash scripts/run-all-tests.sh

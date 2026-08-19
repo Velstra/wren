@@ -698,4 +698,130 @@ mod tests {
             }
         }
     }
+
+    // =======================================================================
+    // Byte-offset assertions (RFC 3376 §4)
+    //
+    // The round-trip tests above assert message *lengths* and nothing about
+    // where each field lands. A field at the wrong offset is invisible to them,
+    // because the decoder reads it back from the same wrong place.
+    // =======================================================================
+
+    /// RFC 3376 §4.1 fixes the Membership Query: Type 0x11 at 0, Max Resp Code
+    /// 1, Checksum 2..4, Group Address 4..8, then — for the v3 long form — a
+    /// byte at 8 holding Resv (top 4 bits, zero), S (0x08) and QRV (0x07), QQIC
+    /// at 9, Number of Sources at 10..12, and the sources from 12.
+    ///
+    /// S and QRV share one octet, and S is the bit *above* the three QRV bits.
+    /// Encode QRV four bits wide and a robustness of 8 sets S — the
+    /// Suppress-Router-Side-Processing flag — so every other querier and every
+    /// host stops running its timers on this query (§4.1.5). Nothing in a
+    /// round trip can see it.
+    #[test]
+    fn a_v3_query_packs_s_and_qrv_into_the_byte_the_rfc_names() {
+        let q = |suppress, qrv| {
+            Message::Query(Query {
+                max_resp_code: 100,
+                group: ip("239.1.2.3"),
+                suppress,
+                qrv,
+                qqic: 125,
+                sources: vec![ip("10.0.0.1")],
+                v3: true,
+            })
+            .encode()
+        };
+        let b = q(false, 2);
+        assert_eq!(b[0], 0x11, "Type is byte 0; a Membership Query is 0x11");
+        assert_eq!(b[1], 100, "Max Resp Code is byte 1");
+        assert_ne!(&b[2..4], &[0, 0], "the Checksum at 2..4 is filled in");
+        assert_eq!(&b[4..8], &[239, 1, 2, 3], "Group Address is bytes 4..8");
+        assert_eq!(b[8], 0x02, "byte 8 is Resv|S|QRV; QRV 2 alone is 0x02");
+        assert_eq!(b[9], 125, "QQIC is byte 9");
+        assert_eq!(&b[10..12], &[0, 1], "Number of Sources is bytes 10..12");
+        assert_eq!(&b[12..16], &[10, 0, 0, 1], "the sources start at byte 12");
+        assert_eq!(b.len(), 16);
+
+        assert_eq!(q(true, 0)[8], 0x08, "S alone is 0x08");
+        assert_eq!(q(true, 7)[8], 0x0f, "S plus the maximum QRV is 0x0f");
+        assert_eq!(q(false, 7)[8] & 0xf0, 0, "the top four bits are Resv and stay zero");
+    }
+
+    /// RFC 3376 §4.2.4 fixes the Group Record: Record Type 0, **Aux Data Len in
+    /// 32-bit words** 1, Number of Sources 2..4, Multicast Address 4..8, then
+    /// the sources, then the auxiliary data.
+    ///
+    /// Aux Data Len counting *octets* instead of words is the classic version
+    /// of this bug: it round-trips perfectly against a decoder that makes the
+    /// same mistake, and every conformant receiver reads four times too many
+    /// bytes for the auxiliary data — running off the end of the record and
+    /// discarding the whole report, so the group is never joined.
+    #[test]
+    fn a_group_record_counts_its_aux_data_in_32_bit_words() {
+        let rec = GroupRecord {
+            record_type: RecordType::ToExclude as u8,
+            multicast: ip("239.9.9.9"),
+            sources: vec![ip("10.0.0.1"), ip("10.0.0.2")],
+            aux: vec![0xde, 0xad, 0xbe, 0xef, 0x01, 0x02, 0x03, 0x04], // 8 octets = 2 words
+        };
+        let b = Message::V3Report { records: vec![rec.clone()] }.encode();
+        assert_eq!(b[0], 0x22, "a Version 3 Membership Report is Type 0x22");
+        assert_eq!(b[1], 0, "byte 1 is Reserved");
+        assert_eq!(&b[4..6], &[0, 0], "bytes 4..6 are Reserved");
+        assert_eq!(&b[6..8], &[0, 1], "Number of Group Records is bytes 6..8");
+        let r = &b[8..];
+        assert_eq!(r[0], 4, "Record Type is byte 0; CHANGE_TO_EXCLUDE_MODE is 4");
+        assert_eq!(r[1], 2, "Aux Data Len is byte 1, in 32-bit words — 8 octets is 2");
+        assert_eq!(&r[2..4], &[0, 2], "Number of Sources is bytes 2..4");
+        assert_eq!(&r[4..8], &[239, 9, 9, 9], "Multicast Address is bytes 4..8");
+        assert_eq!(&r[8..12], &[10, 0, 0, 1], "the sources follow the group");
+        assert_eq!(&r[12..16], &[10, 0, 0, 2]);
+        assert_eq!(&r[16..24], &rec.aux[..], "the auxiliary data comes last");
+        assert_eq!(b.len(), 8 + 24);
+    }
+
+    /// RFC 3376 §4.2.12 numbers the Record Types 1..=6, and §4 the message
+    /// types. These are the numbers every host and every other querier switches
+    /// on: swap MODE_IS_INCLUDE and MODE_IS_EXCLUDE and a report meaning "I want
+    /// only these sources" is read as "I want everything except these", so the
+    /// router forwards precisely the traffic the host asked not to receive.
+    #[test]
+    fn the_message_and_record_type_codes_are_the_ones_the_rfc_assigns() {
+        assert_eq!(TYPE_QUERY, 0x11, "Membership Query");
+        assert_eq!(TYPE_V1_REPORT, 0x12, "Version 1 Membership Report");
+        assert_eq!(TYPE_V2_REPORT, 0x16, "Version 2 Membership Report");
+        assert_eq!(TYPE_V2_LEAVE, 0x17, "Version 2 Leave Group");
+        assert_eq!(TYPE_V3_REPORT, 0x22, "Version 3 Membership Report");
+        for (t, code) in [
+            (RecordType::IsInclude, 1u8),
+            (RecordType::IsExclude, 2),
+            (RecordType::ToInclude, 3),
+            (RecordType::ToExclude, 4),
+            (RecordType::AllowNew, 5),
+            (RecordType::BlockOld, 6),
+        ] {
+            assert_eq!(t as u8, code, "{t:?} is record type {code}");
+            assert_eq!(RecordType::from_u8(code), Some(t));
+        }
+        assert_eq!(RecordType::from_u8(0), None);
+        assert_eq!(RecordType::from_u8(7), None);
+    }
+
+    /// RFC 1071 known-answer vector for the 16-bit ones-complement checksum
+    /// IGMP uses (RFC 3376 §4). `checksum_is_zero_over_a_correct_message` above
+    /// only proves wren agrees with itself; a wrong fold or a mishandled odd
+    /// trailing byte would still pass it, while every host on the segment
+    /// discarded the query.
+    #[test]
+    fn the_checksum_matches_a_known_answer() {
+        // The classic RFC 1071 IPv4 header, checksum field zeroed → 0xb1e6.
+        let header = [
+            0x45, 0x00, 0x00, 0x3c, 0x1c, 0x46, 0x40, 0x00, 0x40, 0x06, 0x00, 0x00, 0xac, 0x10,
+            0x0a, 0x63, 0xac, 0x10, 0x0a, 0x0c,
+        ];
+        assert_eq!(checksum(&header), 0xb1e6);
+        // RFC 1071 §1: a trailing odd octet is the *high* byte of the last word.
+        assert_eq!(checksum(&[0x12]), !0x1200u16);
+        assert_eq!(checksum(&[0x12]), checksum(&[0x12, 0x00]));
+    }
 }

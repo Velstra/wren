@@ -215,12 +215,55 @@ impl IsLevel {
         }
     }
 
-    /// The two-bit encoding.
+    /// The two-bit **Circuit Type** encoding, for a Hello PDU (ISO 10589 §9.5):
+    /// `01` L1, `10` L2, `11` both.
+    ///
+    /// This is NOT the LSP IS Type — that field numbers its values differently
+    /// (§9.8), and conflating the two is exactly the bug [`Self::is_type_bits`]
+    /// exists to keep apart: here `L2` is `0b10`, there `L2` is `0b11` and
+    /// `0b10` is unused. One function serving both fields emitted an unused
+    /// value into every Level-2 LSP.
     pub fn bits(self) -> u8 {
         match self {
             IsLevel::L1 => 0b01,
             IsLevel::L2 => 0b10,
             IsLevel::L1L2 => 0b11,
+        }
+    }
+
+    /// The two-bit **IS Type** encoding for an LSP's flags octet (ISO 10589
+    /// §9.8): `1` = Level 1 IS, `3` = Level 2 IS; `0` and `2` are unused.
+    ///
+    /// The field describes the originating IS, not the LSP, and it has no
+    /// distinct "both" value: a Level-2-capable IS — whether L2-only or L1L2 —
+    /// advertises `3` in its LSPs, which is what FRR emits and what a conformant
+    /// peer expects. `bits()` (the Circuit Type) encodes `L2` as `0b10`, which in
+    /// this field is *unused*; using it here put a value into every Level-2 LSP
+    /// that ISO 10589 §9.8 does not define, and made wren decode FRR's `3` as
+    /// `L1L2` rather than `L2` — see [`Self::is_type_from_bits`].
+    pub fn is_type_bits(self) -> u8 {
+        match self {
+            IsLevel::L1 => 0b01,
+            // A Level-2-capable IS advertises 3, the only value this field has
+            // for L2. L1L2 has no separate encoding here and is L2-capable, so
+            // it too is 3.
+            IsLevel::L2 | IsLevel::L1L2 => 0b11,
+        }
+    }
+
+    /// Decode an LSP flags octet's IS Type (ISO 10589 §9.8): `1` → L1, `3` → L2.
+    ///
+    /// `0` and `2` are unused; a robust decoder does not reject an LSP over an
+    /// IS Type it does not recognise (the field is consulted for nothing that
+    /// would change a forwarding decision), so they fall through to `L1L2`. The
+    /// important half is that `3` decodes to `L2`, not `L1L2` — `from_bits`, the
+    /// Circuit Type decoder, gets that wrong for this field and so misread every
+    /// Level-2 LSP a standard neighbour sent.
+    pub fn is_type_from_bits(v: u8) -> IsLevel {
+        match v & 0b11 {
+            0b01 => IsLevel::L1,
+            0b11 => IsLevel::L2,
+            _ => IsLevel::L1L2,
         }
     }
 

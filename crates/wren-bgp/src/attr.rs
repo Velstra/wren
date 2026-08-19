@@ -29,7 +29,10 @@ use crate::sr_policy::{
     TunnelTlv, SAFI_SR_POLICY,
 };
 use crate::srv6::{decode_prefix_sid, encode_srv6_service_tlv, Srv6ServiceTlv};
-use crate::{as_trans_fit, decode_prefix, decode_prefix_v6, encode_prefix_any, AFI_IPV6};
+use crate::{
+    as_trans_fit, decode_prefix, decode_prefix_v6, encode_prefix_any, AFI_IPV4, AFI_IPV6,
+    SAFI_UNICAST,
+};
 
 /// Attribute flag: the attribute is optional (vs. well-known).
 pub const FLAG_OPTIONAL: u8 = 0x80;
@@ -771,6 +774,36 @@ impl PathAttribute {
                     let nlri = decode_ls_nlris(&value[nh_end + 1..])?;
                     PathAttribute::MpReachLinkState { next_hop, nlri }
                 } else {
+                    // Only the families this speaker actually understands reach
+                    // the prefix decoder. `decode_mp_prefixes` treats every AFI
+                    // that is not IPv6 as IPv4, so an unrecognised pair used to
+                    // fall through and be *misparsed*: AFI 1234 / SAFI 77 came
+                    // back as a list of IPv4 prefixes, tagged with the AFI it
+                    // was not. Bytes that mean nothing to us must not become
+                    // routes that mean something.
+                    if !known_family(afi, safi) {
+                        return None;
+                    }
+                    // The Next Hop is not free-form here. RFC 4760 §3 fixes its
+                    // length by family, RFC 2545 §3 gives IPv6 either 16 octets
+                    // or 32 (a global address followed by a link-local one), and
+                    // RFC 8950 §3 lets an IPv6 next hop carry IPv4 routes at
+                    // those same two lengths. Nothing checked it, so `nh_len` of
+                    // 0 decoded happily and every route in the attribute arrived
+                    // pointing at an empty vector.
+                    //
+                    // Checked *here* rather than beside the AFI/SAFI, and that
+                    // placement is the whole subtlety: FlowSpec has no
+                    // meaningful next hop at all (RFC 8955 §4) and this crate's
+                    // own encoder emits length 0 for it, so a blanket rule in
+                    // the preamble refuses wren's own valid FlowSpec attribute —
+                    // the existing round-trip test says so. The families with
+                    // their own next-hop conventions keep them; this arm is
+                    // plain unicast, where the two RFCs above are the whole
+                    // contract.
+                    if !unicast_next_hop_len(afi, nh_len) {
+                        return None;
+                    }
                     let nlri = decode_mp_prefixes(&value[nh_end + 1..], afi)?;
                     PathAttribute::MpReachNlri { afi, safi, next_hop, nlri }
                 }
@@ -794,6 +827,13 @@ impl PathAttribute {
                     let withdrawn = decode_ls_nlris(&value[3..])?;
                     PathAttribute::MpUnreachLinkState { withdrawn }
                 } else {
+                    // The same gate on the withdraw side. A withdraw for a
+                    // family we never advertised support for cannot name a route
+                    // we hold, and misparsing it would manufacture IPv4
+                    // withdrawals out of somebody else's address format.
+                    if !known_family(afi, safi) {
+                        return None;
+                    }
                     let withdrawn = decode_mp_prefixes(&value[3..], afi)?;
                     PathAttribute::MpUnreachNlri { afi, safi, withdrawn }
                 }
@@ -900,6 +940,33 @@ fn read_u32(b: &[u8]) -> Option<u32> {
 
 /// Decode a run of MP-BGP NLRI prefixes for the given address family (RFC 4760):
 /// IPv6 for [`AFI_IPV6`], IPv4 otherwise.
+/// Whether a Next Hop of `nh_len` octets is a length **unicast** defines.
+///
+/// * **IPv4** — 4 (RFC 4760 §3), or 16/32 when the peer negotiated RFC 8950 and
+///   carries IPv4 routes over an IPv6 next hop.
+/// * **IPv6** — 16, or 32 for a global address followed by a link-local one
+///   (RFC 2545 §3).
+///
+/// Zero is valid for neither: a unicast route needs a next hop to resolve, and
+/// "no next hop" is what MP_UNREACH is for. Families that genuinely have no next
+/// hop do not come through here — see the call site.
+fn unicast_next_hop_len(afi: u16, nh_len: usize) -> bool {
+    match afi {
+        AFI_IPV4 => matches!(nh_len, 4 | 16 | 32),
+        AFI_IPV6 => matches!(nh_len, 16 | 32),
+        // Unreachable: `known_family` has already gated this to the two above.
+        _ => false,
+    }
+}
+
+/// Whether this speaker understands an (AFI, SAFI) pair well enough to parse its
+/// NLRI. The families with their own decoders are matched before this is
+/// reached; what is left is the plain prefix encoding, which only IPv4 and IPv6
+/// unicast use here.
+fn known_family(afi: u16, safi: u8) -> bool {
+    matches!((afi, safi), (AFI_IPV4, SAFI_UNICAST) | (AFI_IPV6, SAFI_UNICAST))
+}
+
 fn decode_mp_prefixes(buf: &[u8], afi: u16) -> Option<Vec<Prefix>> {
     let mut out = Vec::new();
     let mut off = 0;
@@ -1352,6 +1419,118 @@ mod tests {
         roundtrip(PathAttribute::MpUnreachEvpn { withdrawn: vec![] });
     }
 
+        /// Build a raw MP_REACH value: AFI(2) · SAFI · NHLen · NextHop · Reserved ·
+    /// NLRI, with one 2001:db8::/64 in it.
+    fn mp_reach_value(afi: u16, safi: u8, nh: &[u8]) -> Vec<u8> {
+        let mut v = afi.to_be_bytes().to_vec();
+        v.push(safi);
+        v.push(nh.len() as u8);
+        v.extend_from_slice(nh);
+        v.push(0); // Reserved
+        // The NLRI has to match the family, or an IPv4 decode of an IPv6 /64
+        // fails on the prefix length rather than on the next hop this is about.
+        if afi == AFI_IPV6 {
+            v.extend_from_slice(&[64, 0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0]);
+        } else {
+            v.extend_from_slice(&[24, 10, 0, 0]);
+        }
+        v
+    }
+
+    fn decode_mp_reach(value: &[u8]) -> Option<PathAttribute> {
+        let mut raw = vec![FLAG_OPTIONAL, 14, value.len() as u8];
+        raw.extend_from_slice(value);
+        PathAttribute::decode(&raw, true).map(|(o, _)| match o {
+            AttrOutcome::Keep(a) => a,
+            AttrOutcome::Discard { .. } => panic!("unexpected discard"),
+        })
+    }
+
+    #[test]
+    fn a_next_hop_of_a_length_no_family_defines_is_refused() {
+        // RFC 4760 §3 fixes the Next Hop length by family; RFC 2545 §3 gives
+        // IPv6 16 or 32 octets; RFC 8950 §3 reuses those two for IPv4 routes
+        // over an IPv6 next hop. Nothing checked it, so length 0 decoded happily
+        // and every route in the attribute arrived pointing at an empty vector —
+        // a route this speaker cannot resolve and will never install, silently.
+        for bad in [0usize, 1, 3, 5, 15, 17, 31, 33] {
+            let nh = vec![0x22; bad];
+            assert!(
+                decode_mp_reach(&mp_reach_value(AFI_IPV6, SAFI_UNICAST, &nh)).is_none(),
+                "an IPv6 next hop of {bad} octets was accepted"
+            );
+        }
+        // The lengths the RFCs do define.
+        for good in [16usize, 32] {
+            let nh = vec![0x22; good];
+            assert!(
+                decode_mp_reach(&mp_reach_value(AFI_IPV6, SAFI_UNICAST, &nh)).is_some(),
+                "an IPv6 next hop of {good} octets was refused"
+            );
+        }
+        // RFC 8950: IPv4 unicast may take an IPv6-shaped next hop, and its own.
+        for good in [4usize, 16, 32] {
+            let nh = vec![0x22; good];
+            let v = mp_reach_value(AFI_IPV4, SAFI_UNICAST, &nh);
+            assert!(
+                decode_mp_reach(&v).is_some(),
+                "an IPv4 next hop of {good} octets was refused"
+            );
+        }
+    }
+
+    #[test]
+    fn a_family_this_speaker_does_not_know_is_refused_not_misparsed() {
+        // `decode_mp_prefixes` reads every AFI that is not IPv6 as IPv4, so an
+        // unrecognised pair used to fall through and be *misparsed*: the NLRI
+        // came back as a list of IPv4 prefixes, tagged with an AFI it was not.
+        // Bytes that mean nothing to us must not become routes that mean
+        // something.
+        for (afi, safi) in [(1234u16, 77u8), (AFI_IPV4, 99), (AFI_IPV6, 4), (0, 0)] {
+            let v = mp_reach_value(afi, safi, &[10, 0, 0, 1]);
+            assert!(
+                decode_mp_reach(&v).is_none(),
+                "MP_REACH for the unknown family ({afi}, {safi}) was decoded"
+            );
+        }
+        // MP_UNREACH takes the same gate: a withdraw for a family we never
+        // advertised cannot name a route we hold.
+        for (afi, safi) in [(1234u16, 77u8), (AFI_IPV4, 99)] {
+            let mut v = afi.to_be_bytes().to_vec();
+            v.push(safi);
+            v.extend_from_slice(&[24, 10, 0, 0]);
+            let mut raw = vec![FLAG_OPTIONAL, 15, v.len() as u8];
+            raw.extend_from_slice(&v);
+            assert!(
+                PathAttribute::decode(&raw, true).is_none(),
+                "MP_UNREACH for the unknown family ({afi}, {safi}) was decoded"
+            );
+        }
+    }
+
+    #[test]
+    fn flowspec_keeps_its_absent_next_hop() {
+        // The placement of the next-hop rule is load-bearing, not incidental.
+        // FlowSpec has no meaningful next hop (RFC 8955 §4) and this crate's own
+        // encoder emits length 0 for it — so a blanket length check in the
+        // MP_REACH preamble refuses wren's own valid attribute. It did, and the
+        // existing round-trip test caught it.
+        use crate::flowspec::{Component, FlowSpec};
+        let attr = PathAttribute::MpReachFlowSpec {
+            afi: AFI_IPV4,
+            next_hop: vec![],
+            nlri: vec![FlowSpec {
+                components: vec![Component::DestPrefix("10.50.0.0/24".parse().unwrap())],
+            }],
+        };
+        let mut buf = Vec::new();
+        attr.encode(&mut buf, true);
+        assert!(
+            PathAttribute::decode(&buf, true).is_some(),
+            "a zero-length FlowSpec next hop was refused"
+        );
+    }
+
     #[test]
     fn mp_reach_flowspec_roundtrips() {
         use crate::flowspec::{Component, FlowSpec, NumOp};
@@ -1580,5 +1759,374 @@ mod tests {
                 AsPathSegment::Sequence(vec![100, 70_000]),
             ]
         );
+    }
+
+    // =======================================================================
+    // Byte-offset assertions (RFC 4271 §4.3, RFC 4760 §3)
+    //
+    // The `roundtrip` helper above encodes and decodes with wren alone, so a
+    // field at the wrong offset is invisible to it. The tests below assert the
+    // offsets and code points the RFCs name — the only kind of test that can
+    // see the class of bug that made every wren router invisible to FRR.
+    // =======================================================================
+
+    /// RFC 4271 §4.3 lays every path attribute out as Attribute Flags 0,
+    /// Attribute Type Code 1, then a 1-octet length at 2 — or, when the
+    /// Extended Length bit (0x10) is set, a 2-octet big-endian length at 2..4.
+    ///
+    /// The Extended Length rule is the interesting half: get the threshold or
+    /// the width wrong and the peer reads the first octet of the value as part
+    /// of the length. It then treats the whole UPDATE as malformed (§6.3) and
+    /// resets the session — a repeating flap for as long as the route is
+    /// advertised.
+    #[test]
+    fn an_attribute_header_uses_a_two_octet_length_exactly_above_255_octets() {
+        // An unrecognised attribute lets the value be any length, so the
+        // boundary can be straddled exactly: 255 is the largest that still fits
+        // one octet, 256 the smallest that does not.
+        let unknown = |n: usize| PathAttribute::Unknown {
+            flags: FLAG_OPTIONAL | FLAG_TRANSITIVE,
+            type_code: 200,
+            value: vec![0xab; n],
+        };
+        let mut b = Vec::new();
+        unknown(255).encode(&mut b, true);
+        assert_eq!(b[0] & 0x10, 0, "255 octets is the largest one-octet length");
+        assert_eq!(b[1], 200, "the type code is byte 1");
+        assert_eq!(b[2], 255, "the length is a single octet at byte 2");
+        assert_eq!(b.len(), 3 + 255, "3 octets of header");
+
+        let mut b = Vec::new();
+        unknown(256).encode(&mut b, true);
+        assert_eq!(b[0] & 0x10, 0x10, "256 octets sets the Extended Length bit");
+        assert_eq!(&b[2..4], &[0x01, 0x00], "the length is 2 octets at 2..4, big-endian");
+        assert_eq!(b.len(), 4 + 256, "4 octets of header");
+
+        // And both come back intact through the decoder. (An `Unknown` keeps the
+        // flags exactly as received, Extended Length bit included, so compare
+        // the type and value rather than the whole attribute.)
+        for n in [255usize, 256] {
+            let mut b = Vec::new();
+            unknown(n).encode(&mut b, true);
+            let (got, used) = decode_kept(&b, true).expect("decodes");
+            assert_eq!(used, b.len(), "the header width is read back correctly");
+            match got {
+                PathAttribute::Unknown { type_code, value, .. } => {
+                    assert_eq!(type_code, 200);
+                    assert_eq!(value.len(), n, "a {n}-octet value survives");
+                    assert!(value.iter().all(|&x| x == 0xab));
+                }
+                other => panic!("expected an unknown attribute, got {other:?}"),
+            }
+        }
+    }
+
+    /// RFC 4271 §5 and RFC 4760 §3 assign the type codes an implementation
+    /// switches on. A wrong code makes a well-known attribute unrecognised
+    /// (§6.3 *Unrecognized Well-known Attribute*, session reset) or turns
+    /// MP_REACH into MP_UNREACH, which withdraws exactly the routes it meant to
+    /// advertise.
+    #[test]
+    fn the_attribute_type_codes_are_the_ones_the_rfcs_assign() {
+        let code = |a: PathAttribute| {
+            let mut b = Vec::new();
+            a.encode(&mut b, true);
+            (b[0], b[1])
+        };
+        // (flags, type code). Well-known transitive is 0x40, optional
+        // non-transitive 0x80, optional transitive 0xc0 (RFC 4271 §4.3).
+        assert_eq!(code(PathAttribute::Origin(Origin::Igp)), (0x40, 1));
+        assert_eq!(code(PathAttribute::AsPath(vec![])), (0x40, 2));
+        assert_eq!(code(PathAttribute::NextHop(ip([10, 0, 0, 1]))), (0x40, 3));
+        assert_eq!(code(PathAttribute::MultiExitDisc(0)), (0x80, 4));
+        assert_eq!(code(PathAttribute::LocalPref(0)), (0x40, 5));
+        assert_eq!(code(PathAttribute::AtomicAggregate), (0x40, 6));
+        assert_eq!(code(PathAttribute::Aggregator { asn: 1, id: ip([1, 2, 3, 4]) }), (0xc0, 7));
+        assert_eq!(code(PathAttribute::Communities(vec![])), (0xc0, 8));
+        assert_eq!(code(PathAttribute::OriginatorId(ip([1, 2, 3, 4]))), (0x80, 9));
+        assert_eq!(code(PathAttribute::ClusterList(vec![])), (0x80, 10));
+        assert_eq!(
+            code(PathAttribute::MpReachNlri {
+                afi: 2,
+                safi: 1,
+                next_hop: vec![0u8; 16],
+                nlri: vec![],
+            }),
+            (0x80, 14),
+            "MP_REACH_NLRI is optional non-transitive, type 14"
+        );
+        assert_eq!(
+            code(PathAttribute::MpUnreachNlri { afi: 2, safi: 1, withdrawn: vec![] }),
+            (0x80, 15),
+            "MP_UNREACH_NLRI is optional non-transitive, type 15"
+        );
+        assert_eq!(code(PathAttribute::ExtendedCommunities(vec![])), (0xc0, 16));
+        assert_eq!(code(PathAttribute::LargeCommunities(vec![])), (0xc0, 32));
+        assert_eq!(code(PathAttribute::OnlyToCustomer(1)), (0xc0, 35));
+    }
+
+    /// RFC 4271 §5.1.1 numbers ORIGIN: 0 IGP, 1 EGP, 2 INCOMPLETE. It is the
+    /// second-to-last tie-break in §9.1.2's decision process, so getting the
+    /// numbering wrong silently inverts route preference between two otherwise
+    /// equal paths — and `origin_roundtrips` above only checks the enum against
+    /// itself.
+    #[test]
+    fn the_origin_codes_are_the_ones_the_rfc_assigns() {
+        for (o, code) in [(Origin::Igp, 0u8), (Origin::Egp, 1), (Origin::Incomplete, 2)] {
+            assert_eq!(o.as_u8(), code, "{o:?} is ORIGIN {code}");
+            assert_eq!(Origin::from_u8(code), Some(o));
+            let mut b = Vec::new();
+            PathAttribute::Origin(o).encode(&mut b, true);
+            assert_eq!(b[2], 1, "an ORIGIN value is one octet");
+            assert_eq!(b[3], code, "the value is the code itself");
+        }
+        assert_eq!(Origin::from_u8(3), None);
+    }
+
+    /// RFC 4271 §4.3 and RFC 5065 §3 number the AS_PATH segment types:
+    /// 1 AS_SET, 2 AS_SEQUENCE, 3 AS_CONFED_SEQUENCE, 4 AS_CONFED_SET. Each
+    /// segment is `[type][count of ASes][ASes]`, where the count is a number of
+    /// *AS numbers*, not octets.
+    ///
+    /// AS_SET and AS_SEQUENCE transposed changes how §9.1.2 measures path
+    /// length (a set counts as 1 regardless of size) and, worse, makes a
+    /// confederation segment look like a public one — so the AS-path a route
+    /// carries out of the confederation is wrong and remote loop detection
+    /// stops working.
+    #[test]
+    fn the_as_path_segment_types_are_the_ones_the_rfcs_assign() {
+        let seg = |s: AsPathSegment| {
+            let mut b = Vec::new();
+            PathAttribute::AsPath(vec![s]).encode(&mut b, true);
+            b
+        };
+        for (s, kind) in [
+            (AsPathSegment::Set(vec![65001, 65002]), 1u8),
+            (AsPathSegment::Sequence(vec![65001, 65002]), 2),
+            (AsPathSegment::ConfedSequence(vec![65001, 65002]), 3),
+            (AsPathSegment::ConfedSet(vec![65001, 65002]), 4),
+        ] {
+            let b = seg(s);
+            assert_eq!(b[3], kind, "the segment type is the first value octet");
+            assert_eq!(b[4], 2, "the count is a number of ASes, not octets");
+            assert_eq!(
+                &b[5..13],
+                &[0, 0, 0xfd, 0xe9, 0, 0, 0xfd, 0xea],
+                "the ASes follow, 4 octets each at the 4-octet width"
+            );
+            assert_eq!(b[2] as usize, b.len() - 3, "the attribute length covers the segment");
+        }
+        // At the 2-octet width the same ASes are half as wide (RFC 6793 §4).
+        let b = {
+            let mut v = Vec::new();
+            PathAttribute::AsPath(vec![AsPathSegment::Sequence(vec![65001, 65002])])
+                .encode(&mut v, false);
+            v
+        };
+        assert_eq!(b[4], 2, "still two ASes");
+        assert_eq!(&b[5..9], &[0xfd, 0xe9, 0xfd, 0xea], "2 octets each");
+    }
+
+    /// RFC 4760 §3 fixes the MP_REACH_NLRI value: AFI 0..2, SAFI 2, Length of
+    /// Next Hop Network Address 3, the next hop, then a *Reserved* octet that
+    /// must be sent as zero, then the NLRI. MP_UNREACH_NLRI (§4) is AFI 0..2,
+    /// SAFI 2, then the withdrawn NLRI — with no next hop and no reserved octet.
+    ///
+    /// The reserved octet is the trap: it sits between the next hop and the
+    /// NLRI, and omitting it (or putting it before the next hop) makes the peer
+    /// read the first NLRI length octet as the reserved field and every prefix
+    /// after that as garbage. §7 then treats the attribute as malformed and the
+    /// whole family is withdrawn.
+    #[test]
+    fn an_mp_reach_value_has_a_reserved_octet_between_the_next_hop_and_the_nlri() {
+        let nh: Vec<u8> = (0x20..0x30).collect(); // 16 octets, a v6 next hop
+        let mut b = Vec::new();
+        PathAttribute::MpReachNlri {
+            afi: crate::AFI_IPV6,
+            safi: crate::SAFI_UNICAST,
+            next_hop: nh.clone(),
+            nlri: vec![p("2001:db8::/32")],
+        }
+        .encode(&mut b, true);
+        let v = &b[3..]; // flags, type, 1-octet length
+        assert_eq!(&v[0..2], &[0, 2], "AFI is bytes 0..2 of the value; IPv6 is 2");
+        assert_eq!(v[2], 1, "SAFI is byte 2; unicast is 1");
+        assert_eq!(v[3], 16, "the Next Hop *length* is byte 3");
+        assert_eq!(&v[4..20], &nh[..], "the next hop itself is bytes 4..20");
+        assert_eq!(v[20], 0, "byte 20 is the Reserved octet and must be zero");
+        assert_eq!(&v[21..], &[32, 0x20, 0x01, 0x0d, 0xb8], "the NLRI starts at byte 21");
+
+        // MP_UNREACH has no next hop and no reserved octet at all.
+        let mut b = Vec::new();
+        PathAttribute::MpUnreachNlri {
+            afi: crate::AFI_IPV6,
+            safi: crate::SAFI_UNICAST,
+            withdrawn: vec![p("2001:db8::/32")],
+        }
+        .encode(&mut b, true);
+        let v = &b[3..];
+        assert_eq!(&v[0..2], &[0, 2], "AFI is bytes 0..2");
+        assert_eq!(v[2], 1, "SAFI is byte 2");
+        assert_eq!(
+            &v[3..],
+            &[32, 0x20, 0x01, 0x0d, 0xb8],
+            "the withdrawn NLRI follows the SAFI directly"
+        );
+    }
+
+    /// The (AFI, SAFI) pairs IANA assigns to the families wren carries. These
+    /// are the numbers a peer's capability negotiation and MP_REACH demuxing
+    /// switch on: get one wrong and the family is either never negotiated or
+    /// the NLRI is handed to the wrong parser.
+    ///
+    /// Asserted on the encoder's own output for the variants that hard-code the
+    /// pair, since nothing else in the crate pins them.
+    #[test]
+    fn the_hard_coded_address_families_use_the_iana_assigned_numbers() {
+        let value = |a: PathAttribute| {
+            let mut b = Vec::new();
+            a.encode(&mut b, true);
+            // Skip flags, type, and the 1- or 2-octet length.
+            let hdr = if b[0] & 0x10 != 0 { 4 } else { 3 };
+            b[hdr..].to_vec()
+        };
+        let evpn = value(PathAttribute::MpReachEvpn { next_hop: vec![10, 0, 0, 1], nlri: vec![] });
+        assert_eq!(&evpn[0..3], &[0, 25, 70], "EVPN is AFI 25 (L2VPN), SAFI 70");
+
+        let ls = value(PathAttribute::MpReachLinkState { next_hop: vec![10, 0, 0, 1], nlri: vec![] });
+        assert_eq!(
+            &ls[0..3],
+            &[0x40, 0x04, 71],
+            "BGP-LS is AFI 16388 (0x4004), SAFI 71"
+        );
+        let ls_u = value(PathAttribute::MpUnreachLinkState { withdrawn: vec![] });
+        assert_eq!(&ls_u[0..3], &[0x40, 0x04, 71]);
+
+        let srp = value(PathAttribute::MpReachSrPolicy {
+            afi: crate::AFI_IPV4,
+            next_hop: vec![10, 0, 0, 1],
+            nlri: vec![],
+        });
+        assert_eq!(&srp[0..3], &[0, 1, 73], "SR Policy is SAFI 73 under the endpoint's AFI");
+        let srp6 = value(PathAttribute::MpUnreachSrPolicy {
+            afi: crate::AFI_IPV6,
+            withdrawn: vec![],
+        });
+        assert_eq!(&srp6[0..3], &[0, 2, 73]);
+
+        let fs = value(PathAttribute::MpUnreachFlowSpec {
+            afi: crate::AFI_IPV4,
+            withdrawn: vec![],
+        });
+        assert_eq!(&fs[0..3], &[0, 1, 133], "FlowSpec is SAFI 133");
+    }
+
+    /// `MpReachSrPolicy`, `MpUnreachSrPolicy`, `MpReachLinkState`,
+    /// `MpUnreachLinkState`, `BgpLs` and `TunnelEncap` are all built and sent by
+    /// the daemon (`wren-daemon/src/bgp.rs`) and, until this test, not one of
+    /// them was exercised anywhere — an encoder change to any of them would
+    /// have compiled, passed the whole suite, and gone out on the wire.
+    ///
+    /// RFC 7752 §3.2 gives the Link-State NLRI its shape (NLRI-Type 0..2, Total
+    /// NLRI Length 2..4, Protocol-ID 4, Identifier 5..13, then descriptor
+    /// TLVs); draft-ietf-idr-segment-routing-te-policy gives the SR Policy NLRI
+    /// its length-in-*bits* leading octet; RFC 9012 §3 gives the Tunnel
+    /// Encapsulation attribute its `Tunnel-Type(2) · Length(2) · Value` TLVs.
+    #[test]
+    fn the_sr_policy_and_link_state_attributes_round_trip_and_keep_their_wire_shape() {
+        use crate::link_state::{BgpLsAttribute, LinkStateNlri, LsObjectKind, LsTlv};
+        use crate::sr_policy::{SrPolicyNlri, TunnelTlv};
+
+        // --- SR Policy NLRI: the leading octet is a length in BITS. ---------
+        let v4 = SrPolicyNlri {
+            distinguisher: 1,
+            color: 100,
+            endpoint: "10.0.0.9".parse().unwrap(),
+        };
+        let attr = PathAttribute::MpReachSrPolicy {
+            afi: crate::AFI_IPV4,
+            next_hop: vec![10, 0, 0, 1],
+            nlri: vec![v4],
+        };
+        let mut b = Vec::new();
+        attr.encode(&mut b, true);
+        let n = &b[3 + 2 + 1 + 1 + 4 + 1..]; // AFI(2) SAFI(1) nhlen(1) nh(4) reserved(1)
+        assert_eq!(n[0], 96, "an IPv4 SR Policy NLRI is 96 bits (12 octets) long");
+        assert_eq!(&n[1..5], &[0, 0, 0, 1], "the distinguisher is 4 octets");
+        assert_eq!(&n[5..9], &[0, 0, 0, 100], "the colour is 4 octets");
+        assert_eq!(&n[9..13], &[10, 0, 0, 9], "the endpoint follows its AFI's width");
+        let (decoded, used) = decode_kept(&b, true).expect("decodes");
+        assert_eq!(decoded, attr);
+        assert_eq!(used, b.len());
+
+        let v6 = SrPolicyNlri {
+            distinguisher: 2,
+            color: 200,
+            endpoint: "2001:db8::9".parse().unwrap(),
+        };
+        let attr = PathAttribute::MpUnreachSrPolicy {
+            afi: crate::AFI_IPV6,
+            withdrawn: vec![v6],
+        };
+        let mut b = Vec::new();
+        attr.encode(&mut b, true);
+        assert_eq!(b[3 + 3], 192, "an IPv6 SR Policy NLRI is 192 bits (24 octets) long");
+        assert_eq!(decode_kept(&b, true).expect("decodes").0, attr);
+
+        // --- Tunnel Encapsulation (RFC 9012 §3): Type(2) Length(2) Value ----
+        let attr = PathAttribute::TunnelEncap(vec![TunnelTlv::Other {
+            tunnel_type: 3, // IP-in-IP: a type wren does not model, kept verbatim
+            value: vec![0xde, 0xad, 0xbe, 0xef],
+        }]);
+        let mut b = Vec::new();
+        attr.encode(&mut b, true);
+        assert_eq!(b[1], 23, "TUNNEL ENCAPSULATION is attribute type 23");
+        assert_eq!(&b[3..5], &[0, 3], "Tunnel-Type is a 2-octet field");
+        assert_eq!(&b[5..7], &[0, 4], "then a 2-octet Length");
+        assert_eq!(&b[7..11], &[0xde, 0xad, 0xbe, 0xef], "then the value");
+        assert_eq!(decode_kept(&b, true).expect("decodes").0, attr);
+
+        // --- Link-State NLRI (RFC 7752 §3.2) --------------------------------
+        let nlri = LinkStateNlri {
+            kind: LsObjectKind::Node,
+            protocol: 2, // IS-IS Level 2
+            identifier: 0,
+            descriptors: vec![LsTlv { typ: 512, value: vec![0, 0, 0xfd, 0xe8] }],
+        };
+        let attr = PathAttribute::MpReachLinkState {
+            next_hop: vec![10, 0, 0, 1],
+            nlri: vec![nlri.clone()],
+        };
+        let mut b = Vec::new();
+        attr.encode(&mut b, true);
+        let n = &b[3 + 2 + 1 + 1 + 4 + 1..]; // AFI(2) SAFI(1) nhlen(1) nh(4) reserved(1)
+        assert_eq!(&n[0..2], &[0, 1], "NLRI-Type is 2 octets; a Node NLRI is 1");
+        assert_eq!(
+            u16::from_be_bytes([n[2], n[3]]) as usize,
+            n.len() - 4,
+            "Total NLRI Length is bytes 2..4 and covers everything after it"
+        );
+        assert_eq!(n[4], 2, "Protocol-ID is byte 4");
+        assert_eq!(&n[5..13], &[0u8; 8], "the Identifier is an 8-octet field at 5..13");
+        assert_eq!(&n[13..17], &[0x02, 0x00, 0, 4], "then the descriptor TLVs (type 512, len 4)");
+        assert_eq!(decode_kept(&b, true).expect("decodes").0, attr);
+
+        let attr = PathAttribute::MpUnreachLinkState { withdrawn: vec![nlri] };
+        let mut b = Vec::new();
+        attr.encode(&mut b, true);
+        assert_eq!(decode_kept(&b, true).expect("decodes").0, attr);
+
+        // --- The BGP-LS attribute itself (type 29) ---------------------------
+        let attr = PathAttribute::BgpLs(BgpLsAttribute::new(vec![
+            LsTlv { typ: 1026, value: b"wren".to_vec() },
+        ]));
+        let mut b = Vec::new();
+        attr.encode(&mut b, true);
+        assert_eq!(b[0], 0x80, "BGP-LS_ATTRIBUTE is optional non-transitive");
+        assert_eq!(b[1], 29, "BGP-LS_ATTRIBUTE is type code 29");
+        assert_eq!(&b[3..5], &[0x04, 0x02], "the node-name TLV type is 1026");
+        assert_eq!(&b[5..7], &[0, 4], "then its 2-octet length");
+        assert_eq!(&b[7..11], b"wren");
+        assert_eq!(decode_kept(&b, true).expect("decodes").0, attr);
     }
 }

@@ -39,10 +39,11 @@ write_a() {  # $1 = aggregate block, $2 = tag
   cat >"$WORK/a_$2.toml" <<EOF
 router-id = "10.0.0.1"
 [bgp]
-enabled  = true
-local-as = 65001
-network  = ["10.50.1.0/24", "10.50.2.0/24"]
+enabled             = true
+local-as            = 65001
+network             = ["10.50.1.0/24", "10.50.2.0/24"]
 $1
+ebgp-require-policy = false
 [[bgp.neighbor]]
 address   = "10.0.0.2"
 remote-as = 65002
@@ -56,8 +57,9 @@ write_a $'[[bgp.aggregate]]\nprefix = "10.50.0.0/16"\nsummary-only = true' summa
 cat >"$WORK/b.toml" <<EOF
 router-id = "10.0.0.2"
 [bgp]
-enabled  = true
-local-as = 65002
+enabled             = true
+local-as            = 65002
+ebgp-require-policy = false
 [[bgp.neighbor]]
 address   = "10.0.0.1"
 remote-as = 65001

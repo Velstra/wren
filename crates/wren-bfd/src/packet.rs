@@ -29,6 +29,11 @@ pub const VERSION: u8 = 1;
 /// The length in octets of the mandatory (no-authentication) Control packet.
 pub const MANDATORY_LEN: usize = 24;
 
+/// The shortest a packet may state its Length as when the `A` bit is set: the
+/// mandatory section plus the two octets an Authentication Section needs before
+/// its own length field can be read (RFC 5880 §6.8.6).
+pub const MIN_AUTHENTICATED_LEN: usize = 26;
+
 /// The session state carried in the two-bit `Sta` field (RFC 5880 §6.8.1).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum State {
@@ -222,7 +227,22 @@ impl ControlPacket {
         if multipoint || detect_mult == 0 {
             return None;
         }
-        if length < MANDATORY_LEN || length > buf.len() {
+        // RFC 5880 §6.8.6: "If the Length field is less than the minimum correct
+        // value (24 if the A bit is clear, or 26 if the A bit is set), the
+        // packet MUST be discarded." The A-bit half was missing, so a packet
+        // claiming authentication while stating a 24-octet length — no room for
+        // an Authentication Section at all — decoded here and was handed on with
+        // `auth_present: true`.
+        //
+        // `wren-daemon` re-checks this before verifying, so the daemon was never
+        // exposed; the gap is in the primitive, which is what the fuzz target
+        // drives and what any second caller would rely on.
+        let min_len = if auth_present {
+            MIN_AUTHENTICATED_LEN
+        } else {
+            MANDATORY_LEN
+        };
+        if length < min_len || length > buf.len() {
             return None;
         }
         let my_discr = u32::from_be_bytes([buf[4], buf[5], buf[6], buf[7]]);
@@ -329,12 +349,49 @@ mod tests {
         assert!(ControlPacket::decode(&b).is_none());
 
         // The A bit is recorded, not rejected — the auth policy is the caller's.
-        let mut b = sample().encode();
+        //
+        // The packet has to be long enough to *have* an Authentication Section
+        // for that to be the question. This used to set the A bit on a bare
+        // 24-octet packet and assert it decoded, which RFC 5880 §6.8.6 says must
+        // be discarded (minimum 26 when A is set); the assertion is about the
+        // policy being deferred, so it is made on a packet that could carry one.
+        let mut b = sample().encode().to_vec();
         b[1] |= 1 << 2; // A bit
+        b[3] = MIN_AUTHENTICATED_LEN as u8;
+        b.extend_from_slice(&[0, 0]); // room for an Authentication Section
         let p = ControlPacket::decode(&b).expect("auth-present packets still decode");
         assert!(p.auth_present);
         // A plain (unauthenticated) packet records the bit as clear.
         assert!(!ControlPacket::decode(&sample().encode()).unwrap().auth_present);
+    }
+
+    #[test]
+    fn the_a_bit_requires_room_for_an_authentication_section_rfc5880() {
+        // §6.8.6: "If the Length field is less than the minimum correct value
+        // (24 if the A bit is clear, or 26 if the A bit is set), the packet MUST
+        // be discarded." Only the 24 half was checked, so a packet claiming
+        // authentication while stating a length with no room for an
+        // Authentication Section decoded and was handed on with
+        // `auth_present: true` — a claim about bytes that are not there.
+        for stated in [MANDATORY_LEN, 25] {
+            let mut b = sample().encode().to_vec();
+            b[1] |= 1 << 2; // A bit
+            b[3] = stated as u8;
+            b.resize(stated.max(MANDATORY_LEN), 0);
+            assert!(
+                ControlPacket::decode(&b).is_none(),
+                "a length of {stated} with the A bit set was accepted"
+            );
+        }
+        // 26 is the floor, not a rejection.
+        let mut b = sample().encode().to_vec();
+        b[1] |= 1 << 2;
+        b[3] = MIN_AUTHENTICATED_LEN as u8;
+        b.extend_from_slice(&[0, 0]);
+        assert!(ControlPacket::decode(&b).is_some(), "the shortest legal authenticated packet was refused");
+        // And with the A bit clear, 24 is still legal — the floor moved only for
+        // the authenticated case.
+        assert!(ControlPacket::decode(&sample().encode()).is_some());
     }
 
     #[test]
@@ -352,5 +409,143 @@ mod tests {
     #[test]
     fn too_short_is_none() {
         assert!(ControlPacket::decode(&[0u8; 10]).is_none());
+    }
+
+    /// RFC 5880 §4.1 fixes the 24-octet mandatory section: Detect Mult 2,
+    /// Length 3, My Discriminator 4..8, Your Discriminator 8..12, Desired Min
+    /// TX Interval 12..16, Required Min RX Interval 16..20, Required Min Echo
+    /// RX Interval 20..24 — all big-endian.
+    ///
+    /// `encodes_the_first_two_octets_per_the_bit_layout` above covers bytes 0
+    /// and 1 only; everything past them is round-trip-only, and a round trip
+    /// cannot see a swap. My/Your Discriminator transposed means the peer's
+    /// §6.8.6 demultiplexing never finds the session, so the adjacency never
+    /// leaves Down. Desired-Min-TX and Required-Min-RX transposed silently
+    /// negotiates the wrong timers: with asymmetric intervals the detect time
+    /// is computed from the wrong number and the session either flaps or takes
+    /// far longer than configured to notice a failure.
+    #[test]
+    fn the_mandatory_section_writes_each_field_at_the_offset_the_rfc_names() {
+        let p = ControlPacket {
+            detect_mult: 5,
+            my_discr: 0x0a0b_0c0d,
+            your_discr: 0x1122_3344,
+            desired_min_tx: 0x0004_93e0,     // 300000
+            required_min_rx: 0x000f_4240,    // 1000000
+            required_min_echo_rx: 0x0000_03e8, // 1000
+            ..sample()
+        };
+        let b = p.encode();
+        assert_eq!(b.len(), 24, "the mandatory section is 24 octets");
+        assert_eq!(b[2], 5, "Detect Mult is byte 2");
+        assert_eq!(b[3], 24, "Length is byte 3");
+        assert_eq!(&b[4..8], &[0x0a, 0x0b, 0x0c, 0x0d], "My Discriminator is 4..8");
+        assert_eq!(&b[8..12], &[0x11, 0x22, 0x33, 0x44], "Your Discriminator is 8..12");
+        assert_eq!(&b[12..16], &[0x00, 0x04, 0x93, 0xe0], "Desired Min TX is 12..16");
+        assert_eq!(&b[16..20], &[0x00, 0x0f, 0x42, 0x40], "Required Min RX is 16..20");
+        assert_eq!(&b[20..24], &[0x00, 0x00, 0x03, 0xe8], "Required Min Echo RX is 20..24");
+    }
+
+    /// RFC 5880 §4.1 assigns each flag its own bit of byte 1, below the 2-bit
+    /// State field: P = 0x20, F = 0x10, C = 0x08, A = 0x04, D = 0x02, M = 0x01.
+    ///
+    /// P and F are the Poll Sequence (§6.5). Transpose them and a poll is
+    /// answered with another poll rather than a final, so the sequence never
+    /// terminates and the two ends renegotiate timers forever. The encoder must
+    /// also leave A and M clear — it never authenticates or multipoints — and
+    /// setting M would make every conformant peer discard the packet (§6.8.6).
+    #[test]
+    fn each_control_flag_occupies_the_bit_the_rfc_assigns_it() {
+        let base = ControlPacket {
+            state: State::AdminDown, // Sta = 0b00, so byte 1 is the flags alone
+            poll: false,
+            final_: false,
+            cpi: false,
+            demand: false,
+            ..sample()
+        };
+        let only = |f: &dyn Fn(&mut ControlPacket)| {
+            let mut p = base;
+            f(&mut p);
+            p.encode()[1]
+        };
+        assert_eq!(only(&|p| p.poll = true), 0x20, "P is bit 5 (0x20)");
+        assert_eq!(only(&|p| p.final_ = true), 0x10, "F is bit 4 (0x10)");
+        assert_eq!(only(&|p| p.cpi = true), 0x08, "C is bit 3 (0x08)");
+        assert_eq!(only(&|p| p.demand = true), 0x02, "D is bit 1 (0x02)");
+        assert_eq!(base.encode()[1], 0x00, "no flags set leaves byte 1 zero");
+        // A (0x04) and M (0x01) are never set by the encoder.
+        let all = ControlPacket {
+            poll: true,
+            final_: true,
+            cpi: true,
+            demand: true,
+            ..base
+        };
+        assert_eq!(all.encode()[1] & 0x04, 0, "the A bit is never set by encode");
+        assert_eq!(all.encode()[1] & 0x01, 0, "the M bit is never set by encode");
+        assert_eq!(all.encode()[1], 0x3a, "P|F|C|D with State AdminDown");
+    }
+
+    /// RFC 5880 §4.1 numbers the State field: AdminDown 0, Down 1, Init 2, Up 3,
+    /// in the top two bits of byte 1.
+    ///
+    /// This is the value the peer's §6.8.6 state machine switches on. Renumber
+    /// Init and Up and the peer reads a neighbour that has just come up as
+    /// still initialising — the three-way handshake never completes and BFD
+    /// never declares the path alive, so nothing that depends on it (a RIP or
+    /// BGP session using BFD for fast failure detection) ever gets its fast
+    /// detection.
+    #[test]
+    fn the_state_field_uses_the_codes_the_rfc_assigns() {
+        for (state, bits) in [
+            (State::AdminDown, 0b00u8),
+            (State::Down, 0b01),
+            (State::Init, 0b10),
+            (State::Up, 0b11),
+        ] {
+            assert_eq!(state.to_bits(), bits, "{state:?} is state code {bits}");
+            assert_eq!(State::from_bits(bits), state);
+            let p = ControlPacket {
+                state,
+                poll: false,
+                final_: false,
+                cpi: false,
+                demand: false,
+                your_discr: 1, // non-zero so Init/Up are legal to encode
+                ..sample()
+            };
+            assert_eq!(p.encode()[1] >> 6, bits, "State is the top 2 bits of byte 1");
+        }
+    }
+
+    /// RFC 5880 §4.1 numbers the Diagnostic codes 0..=8, in the low five bits of
+    /// byte 0. They are what an operator sees as the reason a session went down;
+    /// a wrong code turns "the neighbour signalled it is going away" into
+    /// "control detection time expired" in every log and `show` output on the
+    /// far side.
+    #[test]
+    fn the_diagnostic_field_uses_the_codes_the_rfc_assigns() {
+        for (diag, code) in [
+            (Diag::None, 0u8),
+            (Diag::ControlDetectionTimeExpired, 1),
+            (Diag::EchoFunctionFailed, 2),
+            (Diag::NeighborSignaledDown, 3),
+            // 4 (Forwarding Plane Reset), 5 (Path Down), 6 (Concatenated Path
+            // Down) and 8 (Reverse Concatenated Path Down) have no named
+            // variant; they travel as `Other` and must keep their raw code.
+            (Diag::Other(4), 4),
+            (Diag::Other(5), 5),
+            (Diag::Other(6), 6),
+            (Diag::AdministrativelyDown, 7),
+            (Diag::Other(8), 8),
+        ] {
+            assert_eq!(diag.code(), code, "{diag:?} is diagnostic code {code}");
+            assert_eq!(Diag::from_code(code), diag);
+            let p = ControlPacket { diag, ..sample() };
+            let b0 = p.encode()[0];
+            assert_eq!(b0 & 0x1f, code, "Diag is the low 5 bits of byte 0");
+            assert_eq!(b0 >> 5, 1, "Version 1 stays in the top 3 bits");
+        }
     }
 }

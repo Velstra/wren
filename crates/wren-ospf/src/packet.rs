@@ -1085,4 +1085,234 @@ mod tests {
         let body = [0xff, 0xff, 0xff, 0xff]; // count = 4_294_967_295, no LSA data
         assert_eq!(decode_lsu(&body), Err(DecodeError::BadLsa));
     }
+
+    // =======================================================================
+    // Byte-offset assertions (RFC 2328 Appendix A.3)
+    //
+    // The tests above encode with wren and decode with wren. That cannot see a
+    // field written at the wrong offset, because the decoder reads it back from
+    // the same wrong offset — the shape of the Router-LSA flag bug, which only
+    // FRR could see. The tests below name the offset the RFC names.
+    // =======================================================================
+
+    /// RFC 2328 §A.3.1 fixes the 24-byte common header: Version 0, Type 1,
+    /// Packet length 2..4, Router ID 4..8, Area ID 8..12, Checksum 12..14,
+    /// AuType 14..16, Authentication 16..24.
+    ///
+    /// Router ID and Area ID transposed is the dangerous one: it round-trips
+    /// perfectly and puts wren in the wrong area on every neighbour, so §10.5
+    /// rejects the Hello (area mismatch) and the adjacency never forms at all.
+    #[test]
+    fn the_common_header_writes_each_field_at_the_offset_the_rfc_names() {
+        let pkt = Packet::hello(
+            Header {
+                router_id: Ipv4Addr::new(1, 2, 3, 4),
+                area_id: Ipv4Addr::new(0, 0, 0, 42),
+            },
+            Hello {
+                network_mask: Ipv4Addr::new(255, 255, 255, 0),
+                hello_interval: 10,
+                options: OPT_E,
+                router_priority: 1,
+                dead_interval: 40,
+                designated_router: Ipv4Addr::UNSPECIFIED,
+                backup_designated_router: Ipv4Addr::UNSPECIFIED,
+                neighbors: vec![],
+            },
+        );
+        let b = pkt.encode();
+        assert_eq!(b[0], 2, "Version is byte 0 and OSPFv2 is 2");
+        assert_eq!(b[1], 1, "Type is byte 1 and a Hello is 1");
+        assert_eq!(
+            u16::from_be_bytes([b[2], b[3]]) as usize,
+            b.len(),
+            "Packet length is bytes 2..4 and covers the whole OSPF packet"
+        );
+        assert_eq!(&b[4..8], &[1, 2, 3, 4], "Router ID is bytes 4..8");
+        assert_eq!(&b[8..12], &[0, 0, 0, 42], "Area ID is bytes 8..12");
+        assert_ne!(&b[12..14], &[0, 0], "Checksum is bytes 12..14 and is filled in");
+        assert_eq!(&b[14..16], &[0, 0], "AuType is bytes 14..16, 0 for Null auth");
+        assert_eq!(&b[16..24], &[0u8; 8], "the 8 Authentication bytes are 16..24");
+    }
+
+    /// The decode side, against bytes laid out by hand — the half a round trip
+    /// cannot check. This is a minimal Hello with its checksum computed
+    /// externally by the standard 16-bit ones-complement sum.
+    #[test]
+    fn a_hand_built_hello_decodes_with_every_field_from_its_rfc_offset() {
+        let mut w = vec![
+            2, 1, 0, 44, // version, type, length = 24 + 20
+            10, 0, 0, 9, // Router ID
+            0, 0, 0, 1, // Area ID
+            0, 0, // checksum (filled below)
+            0, 0, // AuType = Null
+            0, 0, 0, 0, 0, 0, 0, 0, // Authentication
+            255, 255, 255, 0, // Network Mask
+            0, 10, // HelloInterval = 10
+            0x02, // Options = E-bit
+            5,    // Rtr Pri = 5
+            0, 0, 0, 40, // RouterDeadInterval = 40
+            10, 0, 0, 9, // Designated Router
+            10, 0, 0, 8, // Backup Designated Router
+        ];
+        assert_eq!(w.len(), 44);
+        let csum = packet_checksum(&w);
+        w[12..14].copy_from_slice(&csum.to_be_bytes());
+
+        let p = Packet::decode(&w).expect("a well-formed Hello decodes");
+        assert_eq!(p.header.router_id, Ipv4Addr::new(10, 0, 0, 9));
+        assert_eq!(p.header.area_id, Ipv4Addr::new(0, 0, 0, 1));
+        let h = p.as_hello().expect("it is a Hello");
+        assert_eq!(h.network_mask, Ipv4Addr::new(255, 255, 255, 0));
+        assert_eq!(h.hello_interval, 10);
+        assert_eq!(h.options, OPT_E);
+        assert_eq!(h.router_priority, 5);
+        assert_eq!(h.dead_interval, 40);
+        assert_eq!(h.designated_router, Ipv4Addr::new(10, 0, 0, 9));
+        assert_eq!(h.backup_designated_router, Ipv4Addr::new(10, 0, 0, 8));
+        assert!(h.neighbors.is_empty());
+    }
+
+    /// RFC 2328 §A.3.2: a Hello body is Network Mask 0..4, HelloInterval 4..6,
+    /// Options 6, Rtr Pri 7, RouterDeadInterval 8..12, Designated Router 12..16,
+    /// Backup Designated Router 16..20, then the neighbour list.
+    ///
+    /// Options and Rtr Pri transposed round-trips but tells peers a priority of
+    /// 2 and an options byte of 1 — the E-bit is then clear, so §10.5 refuses
+    /// the Hello over an external-routing-capability mismatch and the adjacency
+    /// never forms. Swapping DR and BDR silently re-runs §9.4's election wrong.
+    #[test]
+    fn a_hello_body_is_encoded_in_the_rfc_field_order() {
+        let pkt = Packet::hello(
+            sample_header(),
+            Hello {
+                network_mask: Ipv4Addr::new(255, 255, 0, 0),
+                hello_interval: 0x000a,
+                options: OPT_E,
+                router_priority: 7,
+                dead_interval: 0x0000_0028,
+                designated_router: Ipv4Addr::new(10, 0, 0, 1),
+                backup_designated_router: Ipv4Addr::new(10, 0, 0, 2),
+                neighbors: vec![Ipv4Addr::new(10, 0, 0, 3)],
+            },
+        );
+        let b = pkt.encode();
+        let body = &b[HEADER_LEN..];
+        assert_eq!(&body[0..4], &[255, 255, 0, 0], "Network Mask is bytes 0..4");
+        assert_eq!(&body[4..6], &[0x00, 0x0a], "HelloInterval is bytes 4..6");
+        assert_eq!(body[6], OPT_E, "Options is byte 6");
+        assert_eq!(body[7], 7, "Rtr Pri is byte 7");
+        assert_eq!(&body[8..12], &[0, 0, 0, 0x28], "RouterDeadInterval is bytes 8..12");
+        assert_eq!(&body[12..16], &[10, 0, 0, 1], "Designated Router is bytes 12..16");
+        assert_eq!(&body[16..20], &[10, 0, 0, 2], "Backup DR is bytes 16..20");
+        assert_eq!(&body[20..24], &[10, 0, 0, 3], "the neighbour list starts at byte 20");
+        assert_eq!(body.len(), 24);
+    }
+
+    /// RFC 2328 §A.3.3: a Database Description body is Interface MTU 0..2,
+    /// Options 2, the I/M/MS flag byte 3, DD sequence number 4..8, then LSA
+    /// headers. §A.3.3 also fixes the flag *bits*: MS is 0x01, M is 0x02 and I
+    /// is 0x04 — not their declaration order.
+    ///
+    /// Get the bit values wrong and both routers believe they are master (or
+    /// both slave); §10.8 then deadlocks the exchange and the adjacency sticks
+    /// in ExStart forever. A round trip through wren's own constants cannot see
+    /// it, because both sides use the same constants.
+    #[test]
+    fn a_database_description_body_and_its_flag_bits_match_the_rfc() {
+        assert_eq!(DD_FLAG_MASTER, 0x01, "MS is the low bit of the flag byte");
+        assert_eq!(DD_FLAG_MORE, 0x02, "M is 0x02");
+        assert_eq!(DD_FLAG_INIT, 0x04, "I is 0x04");
+
+        let pkt = Packet::database_description(
+            sample_header(),
+            DatabaseDescription {
+                interface_mtu: 1500,
+                options: OPT_E,
+                flags: DD_FLAG_INIT | DD_FLAG_MORE | DD_FLAG_MASTER,
+                dd_sequence: 0x1234_5678,
+                lsa_headers: vec![],
+            },
+        );
+        let b = pkt.encode();
+        assert_eq!(b[1], 2, "a DD packet is Type 2");
+        let body = &b[HEADER_LEN..];
+        assert_eq!(&body[0..2], &[0x05, 0xdc], "Interface MTU 1500 is bytes 0..2");
+        assert_eq!(body[2], OPT_E, "Options is byte 2");
+        assert_eq!(body[3], 0x07, "the I|M|MS flag byte is byte 3");
+        assert_eq!(&body[4..8], &[0x12, 0x34, 0x56, 0x78], "DD sequence is bytes 4..8");
+        assert_eq!(body.len(), DD_FIXED_LEN);
+    }
+
+    /// RFC 2328 §A.3.4: each Link State Request entry is a *32-bit* LS type
+    /// (bytes 0..4, the value in the low octet), Link State ID 4..8, Advertising
+    /// Router 8..12. Encoding the type as a single byte would shift both ids by
+    /// three and make every request name an LSA nobody has.
+    #[test]
+    fn a_link_state_request_entry_uses_a_32_bit_ls_type_field() {
+        let pkt = Packet::link_state_request(
+            sample_header(),
+            LinkStateRequest {
+                entries: vec![LsRequest {
+                    ls_type: LsType::AsExternal, // 5
+                    link_state_id: Ipv4Addr::new(10, 1, 0, 0),
+                    advertising_router: Ipv4Addr::new(10, 0, 0, 9),
+                }],
+            },
+        );
+        let body = &pkt.encode()[HEADER_LEN..];
+        assert_eq!(&body[0..4], &[0, 0, 0, 5], "LS type is a 32-bit field at 0..4");
+        assert_eq!(&body[4..8], &[10, 1, 0, 0], "Link State ID is bytes 4..8");
+        assert_eq!(&body[8..12], &[10, 0, 0, 9], "Advertising Router is bytes 8..12");
+        assert_eq!(body.len(), LS_REQUEST_LEN);
+    }
+
+    /// RFC 2328 §A.3.5: a Link State Update body opens with a 32-bit count of
+    /// the LSAs that follow, then the LSAs back to back.
+    #[test]
+    fn a_link_state_update_body_opens_with_a_32_bit_lsa_count() {
+        let one = Lsa {
+            header: sample_lsa_header([10, 0, 0, 1]),
+            body: LsaBody::Router(RouterLsa { flags: 0, links: vec![] }),
+        };
+        let pkt = Packet::link_state_update(
+            sample_header(),
+            LinkStateUpdate { lsas: vec![one.clone(), one] },
+        );
+        let b = pkt.encode();
+        let body = &b[HEADER_LEN..];
+        assert_eq!(&body[0..4], &[0, 0, 0, 2], "# LSAs is a 32-bit field at 0..4");
+        // Each LSA declares its own length in bytes 18..20 of its header, and the
+        // two must exactly fill the body.
+        let first_len = u16::from_be_bytes([body[4 + 18], body[4 + 19]]) as usize;
+        assert_eq!(body.len(), 4 + 2 * first_len, "the LSAs are packed back to back");
+    }
+
+    /// RFC 2328 §A.3.1: the checksum is the standard IP checksum over the whole
+    /// packet with the 64-bit authentication field (bytes 16..24) **excluded**
+    /// from the sum, not merely zeroed.
+    ///
+    /// Include it and a simple-password packet's checksum changes with the
+    /// password, so the peer — which excludes it, per the RFC — rejects every
+    /// packet as corrupt. A round trip cannot see this because wren computes
+    /// and verifies with the same routine.
+    #[test]
+    fn the_checksum_excludes_the_authentication_field() {
+        let null = sample_hello().encode_auth(&Auth::Null);
+        let pw = sample_hello().encode_auth(&Auth::Simple(b"secret12".to_vec()));
+        // The two packets differ only in the AuType and the auth field.
+        assert_ne!(&null[14..24], &pw[14..24]);
+        // AuType (14..16) *is* summed, so the checksums are allowed to differ
+        // there; force the AuTypes equal and the checksums must then match.
+        let mut probe = pw.clone();
+        probe[14..16].copy_from_slice(&null[14..16]);
+        probe[12] = 0;
+        probe[13] = 0;
+        let recomputed = packet_checksum(&probe);
+        assert_eq!(
+            recomputed,
+            u16::from_be_bytes([null[12], null[13]]),
+            "changing only the 8 authentication bytes must not change the checksum"
+        );
+    }
 }

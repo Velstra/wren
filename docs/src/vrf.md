@@ -99,9 +99,15 @@ local-as = 65001
 vrf      = "blue"            # sessions + learned routes use table 100
 
 [[bgp.neighbor]]
-address   = "10.9.0.2"       # reachable on an interface enslaved to blue
-remote-as = 65002
+address        = "10.9.0.2"  # reachable on an interface enslaved to blue
+remote-as      = 65002
+require-policy = false       # or give it an import/export policy — see below
 ```
+
+A VRF does not change the edge: this is still an eBGP session, so RFC 8212
+default-deny applies to it and a policy-less peer exchanges nothing. Either attach
+an `import`/`export` filter as usual or, as here, opt the neighbour out — see
+[Default-deny without policy](protocols/bgp.md#default-deny-without-policy-rfc-8212).
 
 For the VRF to be a real forwarding context, create the Linux VRF device and enslave
 its interfaces with `ip` (or networkd) — Wren installs into the table, it does not

@@ -49,8 +49,9 @@ write_r1() {  # $1 = extra neighbour line, $2 = tag
   cat >"$WORK/r1_$2.toml" <<EOF
 router-id = "10.0.0.1"
 [bgp]
-enabled  = true
-local-as = 65001
+enabled             = true
+local-as            = 65001
+ebgp-require-policy = false
 [[bgp.neighbor]]
 address       = "10.0.0.2"
 remote-as     = 65002
@@ -68,8 +69,9 @@ write_r2() {  # $1 = tag
   cat >"$WORK/r2_$1.toml" <<EOF
 router-id = "10.0.0.2"
 [bgp]
-enabled  = true
-local-as = 65002
+enabled             = true
+local-as            = 65002
+ebgp-require-policy = false
 [[bgp.neighbor]]
 address   = "10.0.0.11"
 remote-as = 65099
