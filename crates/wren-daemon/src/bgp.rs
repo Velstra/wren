@@ -24,8 +24,8 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt::Write as _;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -33,35 +33,33 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
-use tokio::time::{sleep, sleep_until, timeout, Instant};
+use tokio::time::{Instant, sleep, sleep_until, timeout};
 use tracing::{debug, info, warn};
 
 use wren_bgp::attr::{
-    reconstruct_as_path, AsPathSegment, Origin, PathAttribute, FLAG_OPTIONAL, FLAG_PARTIAL,
-    FLAG_TRANSITIVE,
+    AsPathSegment, FLAG_OPTIONAL, FLAG_PARTIAL, FLAG_TRANSITIVE, Origin, PathAttribute,
+    reconstruct_as_path,
 };
-use wren_bgp::capability::{BgpRole, Capability, ADD_PATH_BOTH, ADD_PATH_RECEIVE, ADD_PATH_SEND};
+use wren_bgp::capability::{ADD_PATH_BOTH, ADD_PATH_RECEIVE, ADD_PATH_SEND, BgpRole, Capability};
 use wren_bgp::community::format_community;
-use wren_bgp::decision::{Path, DEFAULT_LOCAL_PREF};
-use wren_bgp::evpn::{encap_ext_community, Esi, EvpnNlri, Rd, TUNNEL_TYPE_VXLAN};
+use wren_bgp::decision::{DEFAULT_LOCAL_PREF, Path};
+use wren_bgp::evpn::{Esi, EvpnNlri, Rd, TUNNEL_TYPE_VXLAN, encap_ext_community};
 use wren_bgp::evpn_rib::{
-    build_router_mac, EviChange, EviTable, EvpnRib, EvpnRibEvent, IpVrfChange, IpVrfTable,
+    EviChange, EviTable, EvpnRib, EvpnRibEvent, IpVrfChange, IpVrfTable, build_router_mac,
 };
 use wren_bgp::ext_community::format_ext_community;
 use wren_bgp::flowspec::{Action as FsAction, FlowSpec};
-use wren_bgp::flowspec_rib::{actions_of, FlowSpecNlri, FlowSpecRib, FlowSpecRibEvent};
-use wren_bgp::sr_policy::{
-    SrPolicyEncoding, SrPolicyNlri, TunnelTlv, SAFI_SR_POLICY,
-};
-use wren_bgp::sr_policy_rib::{SrPolicyEntry, SrPolicyRib, SrPolicyRibEvent};
-use wren_bgp::link_state::{BgpLsAttribute, LinkStateNlri, AFI_LINK_STATE, SAFI_LINK_STATE};
-use wren_bgp::link_state_rib::{LinkStateEntry, LinkStateRib, LinkStateRibEvent};
-use wren_bgp::fsm::{Action, BgpFsm, Event, State, CODE_CEASE, CODE_OPEN_MESSAGE};
+use wren_bgp::flowspec_rib::{FlowSpecNlri, FlowSpecRib, FlowSpecRibEvent, actions_of};
+use wren_bgp::fsm::{Action, BgpFsm, CODE_CEASE, CODE_OPEN_MESSAGE, Event, State};
 use wren_bgp::large_community::format_large_community;
+use wren_bgp::link_state::{AFI_LINK_STATE, BgpLsAttribute, LinkStateNlri, SAFI_LINK_STATE};
+use wren_bgp::link_state_rib::{LinkStateEntry, LinkStateRib, LinkStateRibEvent};
 use wren_bgp::message::{AddPath, Message, Notification, Open, Update};
 use wren_bgp::rib::{BgpRib, RibEvent};
 use wren_bgp::rpki::{Roa, RoaTable, Validity};
-use wren_bgp::srv6::{behavior, build_service_sid, Srv6ServiceSid, Srv6ServiceTlv, Srv6Sid};
+use wren_bgp::sr_policy::{SAFI_SR_POLICY, SrPolicyEncoding, SrPolicyNlri, TunnelTlv};
+use wren_bgp::sr_policy_rib::{SrPolicyEntry, SrPolicyRib, SrPolicyRibEvent};
+use wren_bgp::srv6::{Srv6ServiceSid, Srv6ServiceTlv, Srv6Sid, behavior, build_service_sid};
 use wren_bgp::{
     AFI_IPV4, AFI_IPV6, AFI_L2VPN, AS_TRANS, HEADER_LEN, MARKER, MAX_MESSAGE_LEN, PORT, SAFI_EVPN,
     SAFI_FLOWSPEC, SAFI_UNICAST, VERSION,
@@ -669,7 +667,11 @@ fn evpn_srv6_tlvs(evpn: &EvpnConfig, vni: u32, is_imet: bool) -> Option<Vec<Srv6
 /// The discriminator is 2 — distinct from the L2 unicast (0) and multicast (1)
 /// values, because one SID value maps to exactly one behaviour on the egress and
 /// an L3 VNI may coincide numerically with an L2 one.
-fn ip_vrf_srv6_tlvs(evpn: &EvpnConfig, l3_vni: u32, prefix: &Prefix) -> Option<Vec<Srv6ServiceTlv>> {
+fn ip_vrf_srv6_tlvs(
+    evpn: &EvpnConfig,
+    l3_vni: u32,
+    prefix: &Prefix,
+) -> Option<Vec<Srv6ServiceTlv>> {
     let (loc, len) = evpn.srv6_locator?;
     let behavior = if prefix.addr().is_ipv4() {
         behavior::END_DT4
@@ -1222,7 +1224,11 @@ pub fn render_bgp_flowspec(rib: &FlowSpecRib) -> String {
         let action = if actions.is_empty() {
             "no-action".to_string()
         } else {
-            actions.iter().map(|a| a.to_string()).collect::<Vec<_>>().join(", ")
+            actions
+                .iter()
+                .map(|a| a.to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
         };
         let _ = writeln!(out, "{nlri}  ->  {action}  from {}", path.peer_addr);
     }
@@ -1289,7 +1295,7 @@ fn render_binding_sid(bsid: &wren_bgp::sr_policy::BindingSid) -> String {
 /// the topology a controller consumes; wren does not export its own IGP into BGP-LS.
 pub fn render_bgp_linkstate(rib: &LinkStateRib) -> String {
     use wren_bgp::link_state::{
-        format_router_id, LsObjectKind, TLV_LOCAL_NODE_DESCRIPTORS, TLV_REMOTE_NODE_DESCRIPTORS,
+        LsObjectKind, TLV_LOCAL_NODE_DESCRIPTORS, TLV_REMOTE_NODE_DESCRIPTORS, format_router_id,
     };
     if rib.is_empty() {
         return "no link-state objects\n".to_string();
@@ -1375,8 +1381,12 @@ pub fn render_evpn_vnis(
             }
             out.push('\n');
         }
-        for vtep in table.iter_vteps() {
-            let _ = writeln!(out, "  flood -> {vtep}");
+        for (vtep, srv6_sid) in table.iter_vteps() {
+            let _ = write!(out, "  flood -> {vtep}");
+            if let Some(sid) = srv6_sid {
+                let _ = write!(out, " srv6 {}", wren_bgp::srv6::sid_to_string(sid));
+            }
+            out.push('\n');
         }
     }
     for (vrf, table) in ip_vrfs {
@@ -1461,6 +1471,15 @@ pub enum EvpnEvent {
         vni: u32,
         /// The VTEP to flood BUM traffic toward.
         vtep: IpAddr,
+        /// The advertised `End.DT2M` (flood) service SID when the route rides
+        /// SRv6, else `None`.
+        ///
+        /// Deliberately a *different* SID from the `End.DT2U` one a
+        /// [`Self::MacUpdate`] carries: RFC 9252 binds a SID to exactly one
+        /// behaviour, so a BUM copy sent to the unicast SID is bridged to a single
+        /// MAC on arrival rather than flooded — every other workload on the segment
+        /// silently misses it.
+        srv6_sid: Option<Srv6Sid>,
     },
     /// Remove a remote VTEP from `vni`'s BUM flood set.
     FloodWithdraw {
@@ -1519,7 +1538,11 @@ fn evpn_event_for(vni: u32, change: &EviChange) -> EvpnEvent {
             srv6_sid: entry.srv6_sid,
         },
         EviChange::MacForgotten { mac, .. } => EvpnEvent::MacWithdraw { vni, mac: *mac },
-        EviChange::VtepAdded { vtep } => EvpnEvent::FloodUpdate { vni, vtep: *vtep },
+        EviChange::VtepAdded { vtep, srv6_sid } => EvpnEvent::FloodUpdate {
+            vni,
+            vtep: *vtep,
+            srv6_sid: *srv6_sid,
+        },
         EviChange::VtepRemoved { vtep } => EvpnEvent::FloodWithdraw { vni, vtep: *vtep },
     }
 }
@@ -1575,10 +1598,11 @@ async fn subscribe_evpn(
                 return;
             }
         }
-        for vtep in table.iter_vteps() {
+        for (vtep, srv6_sid) in table.iter_vteps() {
             let ev = EvpnEvent::FloodUpdate {
                 vni: inst.vni,
                 vtep: *vtep,
+                srv6_sid: *srv6_sid,
             };
             if sub.events.send(ev).await.is_err() {
                 return;
@@ -2028,7 +2052,8 @@ pub async fn run(
         if !should_initiate(peer.passive, peer.shutdown) {
             continue;
         }
-        let cancel = spawn_bgp_connector(peer, cfg.local_as, &members, local.clone(), conn_tx.clone());
+        let cancel =
+            spawn_bgp_connector(peer, cfg.local_as, &members, local.clone(), conn_tx.clone());
         connector_cancels.insert(peer.addr, cancel);
     }
     // Drop our original sender; `conn_tx`, the listener and the connectors keep theirs,
@@ -2780,7 +2805,7 @@ pub async fn run(
                         &sessions,
                         &teardown_tx,
                     )
-                        .await;
+                    .await;
                 }
             }
             PeerMsg::RefreshRequest { peer: p, conn_id } => {
@@ -2828,7 +2853,16 @@ pub async fn run(
                     } else {
                         info!(peer = %p, count = s.prefixes.len(), "BGP graceful restart complete; flushing un-refreshed routes");
                     }
-                    flush_stale(p, s.prefixes, &mut rib, vrf_table, &updates, &sessions, &teardown_tx).await;
+                    flush_stale(
+                        p,
+                        s.prefixes,
+                        &mut rib,
+                        vrf_table,
+                        &updates,
+                        &sessions,
+                        &teardown_tx,
+                    )
+                    .await;
                 }
             }
             PeerMsg::Update {
@@ -2954,10 +2988,8 @@ pub async fn run(
                 // so the peer keeps talking and its withdrawals above are still honoured.
                 // What was dropped is counted per peer (`show bgp neighbors`), because a
                 // policy that silently eats every route is as hard to diagnose as none.
-                let peer_require_policy = local
-                    .peers
-                    .get(&peer)
-                    .is_some_and(|pp| pp.require_policy);
+                let peer_require_policy =
+                    local.peers.get(&peer).is_some_and(|pp| pp.require_policy);
                 let import_deny =
                     rfc8212_deny(peer_require_policy, facts.from_ebgp, import.is_some());
                 if import_deny {
@@ -2982,7 +3014,8 @@ pub async fn run(
                     .get(&peer)
                     .and_then(|pp| pp.role)
                     .map(BgpRole::complement);
-                let (otc_reject, otc_add) = otc_ingress(remote_role, otc_from_update(&update), facts.as_);
+                let (otc_reject, otc_add) =
+                    otc_ingress(remote_role, otc_from_update(&update), facts.as_);
                 if otc_reject {
                     debug!(peer = %peer, "RFC 9234 OTC route leak; reachability rejected");
                 }
@@ -3019,7 +3052,9 @@ pub async fn run(
                 }
                 // IPv6 reachability: MP_REACH_NLRI carries its own next hop (RFC 4760).
                 // A link-local next hop (RFC 2545) is pinned to the ingress interface.
-                if let Some((nh6, nlri, is_link_local)) = mp_reach_v6(&update).filter(|_| !reject_reach) {
+                if let Some((nh6, nlri, is_link_local)) =
+                    mp_reach_v6(&update).filter(|_| !reject_reach)
+                {
                     let iface = if is_link_local {
                         ingress_iface.clone()
                     } else {
@@ -3585,7 +3620,12 @@ async fn propagate_addpath(
         }
         let empty = advertised.is_empty();
         if !gone.is_empty() {
-            fanout(tx, peer, SessionCmd::WithdrawAddPath(prefix, gone), teardown);
+            fanout(
+                tx,
+                peer,
+                SessionCmd::WithdrawAddPath(prefix, gone),
+                teardown,
+            );
         }
         if !desired.is_empty() {
             let routes: Vec<AddPathRoute> = desired
@@ -3831,7 +3871,11 @@ pub fn effective_require_policy(global: Option<bool>, per_neighbor: Option<bool>
 ///     AS (§5 ingress 3).
 ///
 /// With no configured role the procedures do not apply (`(false, None)`).
-fn otc_ingress(remote_role: Option<BgpRole>, otc_in: Option<u32>, peer_as: u32) -> (bool, Option<u32>) {
+fn otc_ingress(
+    remote_role: Option<BgpRole>,
+    otc_in: Option<u32>,
+    peer_as: u32,
+) -> (bool, Option<u32>) {
     let Some(role) = remote_role else {
         return (false, None);
     };
@@ -3842,8 +3886,11 @@ fn otc_ingress(remote_role: Option<BgpRole>, otc_in: Option<u32>, peer_as: u32) 
             (leak, None)
         }
         None => {
-            let add = matches!(role, BgpRole::Provider | BgpRole::Peer | BgpRole::RouteServer)
-                .then_some(peer_as);
+            let add = matches!(
+                role,
+                BgpRole::Provider | BgpRole::Peer | BgpRole::RouteServer
+            )
+            .then_some(peer_as);
             (false, add)
         }
     }
@@ -4012,7 +4059,10 @@ fn mp_unreach_flowspec(update: &Update) -> Vec<FlowSpecNlri> {
             PathAttribute::MpUnreachFlowSpec { afi, withdrawn } => Some(
                 withdrawn
                     .iter()
-                    .map(|spec| FlowSpecNlri { afi: *afi, spec: spec.clone() })
+                    .map(|spec| FlowSpecNlri {
+                        afi: *afi,
+                        spec: spec.clone(),
+                    })
                     .collect(),
             ),
             _ => None,
@@ -4046,9 +4096,7 @@ fn mp_unreach_srpolicy(update: &Update) -> Vec<SrPolicyNlri> {
 /// (type 23, RFC 9012) — the candidate's preference, binding SID and segment lists.
 fn srpolicy_from_update(update: &Update) -> Option<SrPolicyEncoding> {
     update.attributes.iter().find_map(|a| match a {
-        PathAttribute::TunnelEncap(tlvs) => {
-            wren_bgp::sr_policy::sr_policy_of(tlvs).cloned()
-        }
+        PathAttribute::TunnelEncap(tlvs) => wren_bgp::sr_policy::sr_policy_of(tlvs).cloned(),
         _ => None,
     })
 }
@@ -4190,9 +4238,7 @@ fn flowspec_event_for(ev: &FlowSpecRibEvent) -> FlowSpecEvent {
             nlri: nlri.clone(),
             actions: actions_of(path),
         },
-        FlowSpecRibEvent::Withdrawn(nlri) => FlowSpecEvent::RuleWithdraw {
-            nlri: nlri.clone(),
-        },
+        FlowSpecRibEvent::Withdrawn(nlri) => FlowSpecEvent::RuleWithdraw { nlri: nlri.clone() },
     }
 }
 
@@ -5838,8 +5884,7 @@ impl Session<'_> {
                     // or confed-eBGP). Without a confederation both are `local_as`.
                     let my_as =
                         open_my_as(self.peer_type, self.eff_local_as(), self.eff_external_as());
-                    let mut open =
-                        Open::new(VERSION, my_as, self.local_hold, self.local.router_id);
+                    let mut open = Open::new(VERSION, my_as, self.local_hold, self.local.router_id);
                     // ADD-PATH (RFC 7911): when configured for this peer, advertise the
                     // ability to both send and receive multiple IPv4-unicast paths.
                     if self.add_path_cfg {
@@ -6340,9 +6385,7 @@ impl Session<'_> {
         // of the address, `ceil(len/8)` (RFC 4271 §4.3), and four more for an
         // ADD-PATH Path Identifier where the family carries one. Pinned to the
         // encoder by `split_matches_the_encoders_prefix_cost`.
-        let cost = |p: &Prefix| {
-            (if add_path { 4 } else { 0 }) + 1 + p.len().div_ceil(8) as usize
-        };
+        let cost = |p: &Prefix| (if add_path { 4 } else { 0 }) + 1 + p.len().div_ceil(8) as usize;
 
         let mut out = Vec::new();
         let mut chunk: Vec<Prefix> = Vec::new();
@@ -7143,7 +7186,12 @@ mod tests {
         // Build the actual OPEN the daemon sends: My-AS = override, Hold Time = the
         // per-neighbour `hold-time` override (30s here), so both ride the wire.
         let per_neighbor_hold = or_default(Some(30u16), wren_bgp::DEFAULT_HOLD_TIME);
-        let open = Open::new(VERSION, ebgp_my_as, per_neighbor_hold, Ipv4Addr::new(10, 0, 0, 1));
+        let open = Open::new(
+            VERSION,
+            ebgp_my_as,
+            per_neighbor_hold,
+            Ipv4Addr::new(10, 0, 0, 1),
+        );
         assert_eq!(open.effective_as(), 65099);
         assert_eq!(open.hold_time, 30);
     }
@@ -7155,7 +7203,12 @@ mod tests {
         assert_eq!(open_my_as(PeerType::Ebgp, eff, eff), 65001);
         // No `hold-time` override → the global default is proposed.
         let hold = or_default(None::<u16>, wren_bgp::DEFAULT_HOLD_TIME);
-        let open = Open::new(VERSION, open_my_as(PeerType::Ebgp, eff, eff), hold, Ipv4Addr::new(10, 0, 0, 1));
+        let open = Open::new(
+            VERSION,
+            open_my_as(PeerType::Ebgp, eff, eff),
+            hold,
+            Ipv4Addr::new(10, 0, 0, 1),
+        );
         assert_eq!(open.effective_as(), 65001);
         assert_eq!(open.hold_time, wren_bgp::DEFAULT_HOLD_TIME);
     }
@@ -7203,27 +7256,57 @@ mod tests {
         assert_eq!(otc_ingress(None, Some(65001), 65001), (false, None));
 
         // From a Provider/Peer/RS with no OTC: stamp OTC = the remote AS (§5 ingress 3).
-        assert_eq!(otc_ingress(Some(BgpRole::Provider), None, 65001), (false, Some(65001)));
-        assert_eq!(otc_ingress(Some(BgpRole::Peer), None, 65001), (false, Some(65001)));
-        assert_eq!(otc_ingress(Some(BgpRole::RouteServer), None, 65001), (false, Some(65001)));
+        assert_eq!(
+            otc_ingress(Some(BgpRole::Provider), None, 65001),
+            (false, Some(65001))
+        );
+        assert_eq!(
+            otc_ingress(Some(BgpRole::Peer), None, 65001),
+            (false, Some(65001))
+        );
+        assert_eq!(
+            otc_ingress(Some(BgpRole::RouteServer), None, 65001),
+            (false, Some(65001))
+        );
 
         // From a Customer/RS-Client with no OTC: nothing added.
-        assert_eq!(otc_ingress(Some(BgpRole::Customer), None, 65001), (false, None));
-        assert_eq!(otc_ingress(Some(BgpRole::RouteServerClient), None, 65001), (false, None));
+        assert_eq!(
+            otc_ingress(Some(BgpRole::Customer), None, 65001),
+            (false, None)
+        );
+        assert_eq!(
+            otc_ingress(Some(BgpRole::RouteServerClient), None, 65001),
+            (false, None)
+        );
     }
 
     #[test]
     fn otc_ingress_rejects_leaked_routes() {
         // A route carrying OTC from a Customer or RS-Client is a leak (§5 ingress 1).
-        assert_eq!(otc_ingress(Some(BgpRole::Customer), Some(65009), 65001), (true, None));
-        assert_eq!(otc_ingress(Some(BgpRole::RouteServerClient), Some(65009), 65001), (true, None));
+        assert_eq!(
+            otc_ingress(Some(BgpRole::Customer), Some(65009), 65001),
+            (true, None)
+        );
+        assert_eq!(
+            otc_ingress(Some(BgpRole::RouteServerClient), Some(65009), 65001),
+            (true, None)
+        );
 
         // From a Peer: a leak only when the OTC value is not that peer's AS (§5 ingress 2).
-        assert_eq!(otc_ingress(Some(BgpRole::Peer), Some(65009), 65001), (true, None));
-        assert_eq!(otc_ingress(Some(BgpRole::Peer), Some(65001), 65001), (false, None));
+        assert_eq!(
+            otc_ingress(Some(BgpRole::Peer), Some(65009), 65001),
+            (true, None)
+        );
+        assert_eq!(
+            otc_ingress(Some(BgpRole::Peer), Some(65001), 65001),
+            (false, None)
+        );
 
         // From a Provider/RS, a route with OTC already set is legitimate (kept).
-        assert_eq!(otc_ingress(Some(BgpRole::Provider), Some(65009), 65001), (false, None));
+        assert_eq!(
+            otc_ingress(Some(BgpRole::Provider), Some(65009), 65001),
+            (false, None)
+        );
     }
 
     #[test]
@@ -8016,10 +8099,14 @@ mod tests {
             other => panic!("expected a type-5 IP Prefix route, got {other:?}"),
         }
         // Export RT, the VXLAN encapsulation community, and the Router's MAC.
-        assert!(r.ext_communities.contains(&wren_bgp::evpn_rib::auto_route_target(65001, 50100)));
-        assert!(r
-            .ext_communities
-            .contains(&encap_ext_community(TUNNEL_TYPE_VXLAN)));
+        assert!(
+            r.ext_communities
+                .contains(&wren_bgp::evpn_rib::auto_route_target(65001, 50100))
+        );
+        assert!(
+            r.ext_communities
+                .contains(&encap_ext_community(TUNNEL_TYPE_VXLAN))
+        );
         assert!(r.ext_communities.contains(&build_router_mac(mac)));
         // Next hop is our VTEP — that is what the remote tunnels toward.
         assert_eq!(r.next_hop, vtep_next_hop_octets(ip([10, 0, 0, 1])));
@@ -8056,14 +8143,19 @@ mod tests {
             .collect();
         assert_eq!(
             behaviors,
-            vec![wren_bgp::srv6::behavior::END_DT4, wren_bgp::srv6::behavior::END_DT6]
+            vec![
+                wren_bgp::srv6::behavior::END_DT4,
+                wren_bgp::srv6::behavior::END_DT6
+            ]
         );
         // No Router's MAC: an End.DT4/DT6 egress does an IP lookup, so there is no
         // inner Ethernet header for one to address.
-        assert!(!routes[0]
-            .ext_communities
-            .iter()
-            .any(|ec| ec[0] == 0x06 && ec[1] == 0x03));
+        assert!(
+            !routes[0]
+                .ext_communities
+                .iter()
+                .any(|ec| ec[0] == 0x06 && ec[1] == 0x03)
+        );
     }
 
     /// `show evpn` must render the L3 view too — an operator debugging inter-subnet
@@ -8089,7 +8181,9 @@ mod tests {
         let ev = rib
             .update(ip([10, 0, 0, 9]), nlri, path)
             .expect("a new best path");
-        table.apply(&ev).expect("the route imports into this IP-VRF");
+        table
+            .apply(&ev)
+            .expect("the route imports into this IP-VRF");
         let out = render_evpn_vnis(&[], &[(vrf, table)]);
         assert!(out.contains("IP-VRF tenant-a l3vni 50100"), "{out}");
         assert!(
@@ -8197,8 +8291,7 @@ mod split_updates_tests {
     #[test]
     fn ipv6_mp_reach_splits_within_the_limit() {
         let base = 0x2001_0db8_0000_0000_0000_0000_0000_0000u128;
-        let prefixes: Vec<Prefix> =
-            (0..2000u128).map(|i| v6(base + (i << 64), 128)).collect();
+        let prefixes: Vec<Prefix> = (0..2000u128).map(|i| v6(base + (i << 64), 128)).collect();
         let msgs = Session::split_updates(&prefixes, false, true, v6_update);
         assert!(msgs.len() > 1, "2000 /128s must not fit one message");
 
@@ -8220,7 +8313,11 @@ mod split_updates_tests {
                 }
             }
         }
-        assert_eq!(count, prefixes.len(), "the IPv6 split lost or duplicated a prefix");
+        assert_eq!(
+            count,
+            prefixes.len(),
+            "the IPv6 split lost or duplicated a prefix"
+        );
     }
 
     /// A set that fits in one message is still one message — the split must not

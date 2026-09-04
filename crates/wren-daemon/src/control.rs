@@ -30,10 +30,10 @@ use crate::bgp::{
 use crate::isis::{IsisQuery, IsisQueryRequest};
 #[cfg(feature = "ospf")]
 use crate::ospf::{OspfQuery, OspfQueryRequest};
-#[cfg(feature = "pim")]
-use crate::pim::{PimQuery, PimQueryRequest};
 #[cfg(feature = "ospf3")]
 use crate::ospf3::{Ospf3Query, Ospf3QueryRequest};
+#[cfg(feature = "pim")]
+use crate::pim::{PimQuery, PimQueryRequest};
 use crate::query::OwnedQuery;
 #[cfg(feature = "rip")]
 use crate::rip::{RipQuery, RipQueryRequest};
@@ -384,7 +384,7 @@ fn format_route_event(event: &RouteEvent) -> String {
 /// ```text
 /// + evpn vni <vni> mac <mac> [ip <ip>] vtep <vtep> [srv6 <sid>]  (remote MAC learn/change)
 /// - evpn vni <vni> mac <mac>                          (remote MAC withdraw)
-/// + evpn vni <vni> flood <vtep>                       (BUM flood VTEP add)
+/// + evpn vni <vni> flood <vtep> [srv6 <sid>]          (BUM flood VTEP add)
 /// - evpn vni <vni> flood <vtep>                       (BUM flood VTEP remove)
 /// + evpn l3vni <vni> prefix <p> vtep <v> [router-mac <m>] [gw <g>] [srv6 <sid>]
 ///                                                     (remote subnet learn/change)
@@ -423,8 +423,20 @@ fn format_evpn_event(event: &EvpnEvent) -> String {
         EvpnEvent::MacWithdraw { vni, mac } => {
             let _ = writeln!(out, "- evpn vni {vni} mac {}", fmt_mac(mac));
         }
-        EvpnEvent::FloodUpdate { vni, vtep } => {
-            let _ = writeln!(out, "+ evpn vni {vni} flood {vtep}");
+        EvpnEvent::FloodUpdate {
+            vni,
+            vtep,
+            srv6_sid,
+        } => {
+            let _ = write!(out, "+ evpn vni {vni} flood {vtep}");
+            // The End.DT2M SID, when the peer runs SRv6. Without it a consumer on
+            // an SRv6 fabric has a flood *peer* and no flood *target*: the VTEP
+            // address identifies the advertiser but is not something an SRv6
+            // datapath can encapsulate toward, so BUM traffic simply stops.
+            if let Some(sid) = srv6_sid {
+                let _ = write!(out, " srv6 {}", wren_bgp::srv6::sid_to_string(sid));
+            }
+            out.push('\n');
         }
         EvpnEvent::FloodWithdraw { vni, vtep } => {
             let _ = writeln!(out, "- evpn vni {vni} flood {vtep}");
@@ -858,7 +870,11 @@ async fn stream_flowspec(
         return Ok(());
     };
     let (tx, mut rx) = mpsc::channel(crate::bgp::FLOWSPEC_SUBSCRIBER_CAP);
-    if subscribe.send(FlowSpecSubscribe { events: tx }).await.is_err() {
+    if subscribe
+        .send(FlowSpecSubscribe { events: tx })
+        .await
+        .is_err()
+    {
         reader
             .get_mut()
             .write_all(b"error: bgp unavailable\n")
@@ -956,12 +972,13 @@ mod flowspec_monitor_tests {
     use wren_bgp::flowspec_rib::FlowSpecNlri;
 
     fn rule() -> FlowSpecNlri {
-        let mut spec = FlowSpec { components: Vec::new() };
+        let mut spec = FlowSpec {
+            components: Vec::new(),
+        };
         spec.components.push(Component::DestPrefix(
             "10.0.0.0/24".parse::<wren_core::Prefix>().unwrap(),
         ));
-        spec.components
-            .push(Component::IpProto(vec![NumOp::eq(6)]));
+        spec.components.push(Component::IpProto(vec![NumOp::eq(6)]));
         FlowSpecNlri::v4(spec)
     }
 
@@ -1031,7 +1048,9 @@ mod flowspec_monitor_tests {
     /// consumer would program a v6 match into a v4 table.
     #[test]
     fn ipv6_rules_are_tagged() {
-        let mut spec = FlowSpec { components: Vec::new() };
+        let mut spec = FlowSpec {
+            components: Vec::new(),
+        };
         spec.components.push(Component::DestPrefix(
             "2001:db8::/32".parse::<wren_core::Prefix>().unwrap(),
         ));
@@ -1107,10 +1126,19 @@ mod tests {
         assert_eq!(parse_bgp_query("show bgp roa"), Some(BgpQuery::Roa));
         assert_eq!(parse_bgp_query("show bgp roas"), Some(BgpQuery::Roa));
         assert_eq!(parse_bgp_query("show bgp evpn"), Some(BgpQuery::Evpn));
-        assert_eq!(parse_bgp_query("show bgp flowspec"), Some(BgpQuery::FlowSpec));
-        assert_eq!(parse_bgp_query("show bgp sr-policy"), Some(BgpQuery::SrPolicy));
+        assert_eq!(
+            parse_bgp_query("show bgp flowspec"),
+            Some(BgpQuery::FlowSpec)
+        );
+        assert_eq!(
+            parse_bgp_query("show bgp sr-policy"),
+            Some(BgpQuery::SrPolicy)
+        );
         assert_eq!(parse_bgp_query("show sr-policy"), Some(BgpQuery::SrPolicy));
-        assert_eq!(parse_bgp_query("show bgp link-state"), Some(BgpQuery::LinkState));
+        assert_eq!(
+            parse_bgp_query("show bgp link-state"),
+            Some(BgpQuery::LinkState)
+        );
         assert_eq!(parse_bgp_query("show evpn"), Some(BgpQuery::EvpnVnis));
     }
 
@@ -1477,8 +1505,27 @@ mod tests {
             "- evpn vni 10100 mac 02:00:5e:00:00:01\n"
         );
         assert_eq!(
-            format_evpn_event(&EvpnEvent::FloodUpdate { vni: 10100, vtep }),
+            format_evpn_event(&EvpnEvent::FloodUpdate {
+                vni: 10100,
+                vtep,
+                srv6_sid: None
+            }),
             "+ evpn vni 10100 flood 10.0.0.1\n"
+        );
+        // The flood line on an SRv6 fabric carries the End.DT2M SID. Without it a
+        // consumer knows *who* to flood to and has no address to flood *at*: the
+        // VTEP identifies the advertiser, and an SRv6 datapath cannot encapsulate
+        // toward it. Note this is a different SID from the End.DT2U one above —
+        // discriminator 1 rather than 0 — because one SID means one behaviour.
+        let flood_sid: wren_bgp::srv6::Srv6Sid =
+            std::net::Ipv6Addr::new(0xfc00, 0, 1, 1, 0x2774, 0, 0, 0).octets();
+        assert_eq!(
+            format_evpn_event(&EvpnEvent::FloodUpdate {
+                vni: 10100,
+                vtep,
+                srv6_sid: Some(flood_sid),
+            }),
+            "+ evpn vni 10100 flood 10.0.0.1 srv6 fc00:0:1:1:2774::\n"
         );
         assert_eq!(
             format_evpn_event(&EvpnEvent::FloodWithdraw { vni: 10100, vtep }),
