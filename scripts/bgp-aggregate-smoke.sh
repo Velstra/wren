@@ -35,6 +35,8 @@ WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 
 # A — originates the two more-specifics; the aggregate block is filled per phase.
+# The block goes last among the plain keys: a `[[bgp.aggregate]]` header swallows
+# every key written after it, so `ebgp-require-policy` must come before it.
 write_a() {  # $1 = aggregate block, $2 = tag
   cat >"$WORK/a_$2.toml" <<EOF
 router-id = "10.0.0.1"
@@ -42,8 +44,8 @@ router-id = "10.0.0.1"
 enabled             = true
 local-as            = 65001
 network             = ["10.50.1.0/24", "10.50.2.0/24"]
-$1
 ebgp-require-policy = false
+$1
 [[bgp.neighbor]]
 address   = "10.0.0.2"
 remote-as = 65002

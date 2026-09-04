@@ -6,6 +6,55 @@ follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **OSPF ignores a Hello from off its own subnet (RFC 2328 §8.2).** A router
+  with two subnets on one LAN runs an OSPF interface per address and sends a
+  Hello from each, both with its Router ID. The one from the other subnet was
+  let in: it sat in Init as a second neighbour entry, and it took part in the
+  DR election under the same Router ID. Whichever entry the election read
+  first decided the DR *address* our Router-LSA named on its transit link —
+  and when that was the address on the other subnet, no Network-LSA matched
+  it, the SPF tree ended at this router, and not one route was computed while
+  every database was in perfect agreement. Against FRR that was one restart
+  in two. On broadcast and NBMA links a packet whose source is not on the
+  interface's network is now dropped at the door, as the RFC says; the
+  comparison is not made on point-to-point links.
+- **OSPF no longer asks the kernel for a route with no next hop.** The SPF
+  hands back the segment this router sits on (and any destination whose
+  gateway it could not resolve) with an empty gateway set, and the runner
+  passed that on as an on-link route with no interface. The netlink backend
+  wrote it with interface index 0, the kernel answered `No such device`, and
+  the router retried it every reconcile tick for as long as the adjacency
+  lasted — `FIB install failed; queued for retry` every fifteen seconds on
+  every OSPF box. Such a prefix stays off the announced set: the kernel's own
+  connected route already covers the segment, and a route without a next hop
+  is not a route. Each SPF run now also logs, at info, how many routers the
+  tree reached and how many routes came out of it; the routes themselves are
+  at debug.
+- **`scripts/bgp-aggregate-smoke.sh` tested nothing in two of its three
+  phases.** The aggregate block was written above `ebgp-require-policy`, and a
+  `[[bgp.aggregate]]` header swallows every key after it — the daemon refused
+  the file (`unknown field`) and both aggregate phases failed against an empty
+  table. The key now precedes the block; the test is green and means it.
+- **A type-3 IMET route's SRv6 SID reaches the EVPN monitor stream.** The flood
+  lines were `+ evpn vni <vni> flood <vtep>` with no room for a service SID, so a
+  consumer on an SRv6 data plane learned *who* to flood to and had nothing to
+  flood *at*: the VTEP address identifies the advertiser, and an SRv6 datapath
+  cannot encapsulate toward it. The line is now
+  `+ evpn vni <vni> flood <vtep> [srv6 <sid>]`, and `EviTable` keeps each flood
+  peer's advertised `End.DT2M` SID alongside it.
+
+  The SID is deliberately a different one from the `End.DT2U` SID a type-2 route
+  carries: RFC 9252 binds a SID to exactly one behaviour, so a BUM copy sent to
+  the unicast SID is bridged to a single MAC on arrival and every other workload
+  on the segment misses it.
+
+  Re-advertisement with a *changed* SID now counts as a forwarding change too. It
+  did not before — membership alone decided — so a peer that moved its locator, or
+  moved between SRv6 and VXLAN, kept being flooded to a SID it no longer
+  terminates.
+
 ### Added
 
 - **`wren check` — resolve a configuration without starting anything.** Parse,

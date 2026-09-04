@@ -1076,6 +1076,40 @@ mod tests {
         db
     }
 
+    /// The segment `checks.ospfinterop` builds, LSA for LSA: this router is the
+    /// BDR on a broadcast link whose DR is a third-party ASBR (FRR), whose
+    /// Router-LSA carries the transit link plus a stub for a second subnet on
+    /// the same interface, and whose type-5 announces a blackholed static. The
+    /// route to that static must come out via the DR's interface address.
+    #[test]
+    fn a_type5_from_the_dr_across_a_broadcast_link_yields_a_route() {
+        let me = [10, 7, 0, 1];
+        let dr = [10, 7, 0, 2];
+        let mut area = Lsdb::new();
+        area.install(router_lsa(me, 0, vec![transit(dr, me, 10)], 1));
+        area.install(router_lsa(
+            dr,
+            crate::lsa::RTR_FLAG_E,
+            vec![transit(dr, dr, 10), stub([192, 168, 1, 0], [255, 255, 255, 0], 10)],
+            1,
+        ));
+        area.install(network_lsa(dr, dr, [255, 255, 255, 0], vec![dr, me]));
+        let intra = compute(&area, ip(me));
+        assert_eq!(intra.routers.get(&ip(dr)), Some(&10), "the DR is on the tree at the link cost");
+        assert_eq!(find(&intra, "10.7.0.0/24").gateways, Vec::<Ipv4Addr>::new());
+        assert_eq!(find(&intra, "192.168.1.0/24").gateways, vec![ip(dr)]);
+
+        let mut ext = Lsdb::new();
+        ext.install(external_lsa(dr, [203, 0, 113, 0], [255, 255, 255, 0], 20, true));
+        let routes = external_routes(&ext, &intra, ip(me));
+        let r = routes
+            .iter()
+            .find(|r| r.prefix.to_string() == "203.0.113.0/24")
+            .expect("the DR's external reaches the BDR");
+        assert_eq!(r.cost, 20);
+        assert_eq!(r.gateways, vec![ip(dr)]);
+    }
+
     #[test]
     fn external_type2_cost_is_the_metric_alone() {
         let area = area_with_asbr();

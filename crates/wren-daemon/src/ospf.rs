@@ -240,6 +240,20 @@ impl Iface {
         let mask = u32::from(len_to_mask(self.mask_len));
         Ipv4Addr::from(u32::from(self.addr) & mask)
     }
+
+    /// Whether `addr` lies on this interface's own subnet (RFC 2328 §8.2).
+    fn on_link(&self, addr: Ipv4Addr) -> bool {
+        on_same_subnet(addr, self.addr, self.mask_len)
+    }
+}
+
+/// RFC 2328 §8.2: on a multi-access link a packet's source must be on the
+/// receiving interface's network — both addresses masked with the interface
+/// mask compare equal. A /0 makes everything on-link, a /32 only the address
+/// itself.
+fn on_same_subnet(a: Ipv4Addr, b: Ipv4Addr, mask_len: u8) -> bool {
+    let mask = u32::from(len_to_mask(mask_len));
+    u32::from(a) & mask == u32::from(b) & mask
 }
 
 /// Per-area link-state state. Types 1–4 are area-scoped, so each area has its own
@@ -882,6 +896,28 @@ impl Ospf {
         // the Router-LSA and the Grace-LSA all speak in Router IDs — so the two
         // travel separately from here on rather than one standing in for the
         // other.
+        // RFC 2328 §8.2: on a multi-access link the source must be on this
+        // interface's own subnet; the comparison is not made on point-to-point
+        // links. A router with two subnets on one LAN runs an OSPF interface
+        // per address and sends a Hello from each — the one from the other
+        // subnet carries our neighbour's Router ID but a DR address that is
+        // no network of ours. Let in, it sat in Init as a second neighbour
+        // entry (harmless), took part in the DR election under the same Router
+        // ID (not harmless) and, whichever entry the election happened to read
+        // first, could hand our Router-LSA a transit link to a DR address on
+        // the *other* subnet: no Network-LSA matches it, the SPF tree ends at
+        // this router, and not one route is computed — with every database in
+        // perfect agreement. `checks.ospfinterop` (FRR peer) failed that way
+        // one restart in two.
+        if self.ifaces[idx].fsm.iface_type.elects_dr() && !self.ifaces[idx].on_link(pkt.src) {
+            debug!(
+                interface = %self.ifaces[idx].name,
+                src = %pkt.src,
+                network = %self.ifaces[idx].network(),
+                "ignoring OSPF packet from off-link source (RFC 2328 §8.2)"
+            );
+            return;
+        }
         let router_id = packet.header.router_id;
         let nbr_id = if self.ifaces[idx].fsm.iface_type.elects_dr() {
             pkt.src
@@ -2310,6 +2346,39 @@ impl Ospf {
             }
         }
 
+        // One line per run at info — the counts say whether the tree reached
+        // anybody; the routes themselves are debug.
+        info!(
+            routers = merged.routers.len(),
+            externals = self.external_lsdb.iter_type(LsType::AsExternal).count(),
+            routes = chosen.len(),
+            "OSPF SPF done"
+        );
+        debug!(
+            routers = ?merged.routers,
+            nexthops = ?merged.router_nexthops,
+            routes = ?chosen
+                .iter()
+                .map(|(p, r)| format!("{p} cost {} via {:?}", r.cost, r.gateways))
+                .collect::<Vec<_>>(),
+            "OSPF SPF result"
+        );
+        // A route with no gateway is one of two things, and neither is for the
+        // FIB: the segment this router sits on itself (§16.1 puts every directly
+        // attached network on the tree at one hop, and the kernel's own connected
+        // route already covers it — the router refuses to touch those anyway), or
+        // a destination whose next hop could not be resolved from the neighbour's
+        // LSA. `to_route` turns an empty gateway set into an on-link next hop with
+        // no interface, which the netlink backend writes as interface index 0 —
+        // `No such device`, retried every reconcile tick for as long as the
+        // adjacency lasts. Keep such a prefix off the announced set entirely.
+        chosen.retain(|prefix, r| {
+            let keep = !r.gateways.is_empty();
+            if !keep {
+                debug!(%prefix, cost = r.cost, "OSPF route has no gateway (directly attached or unresolved); not installed");
+            }
+            keep
+        });
         let new_prefixes: HashSet<Prefix> = chosen.keys().copied().collect();
         let vrf_table = self.cfg.vrf_table;
         for r in chosen.values() {
@@ -2990,6 +3059,19 @@ fn clear_acked_lsas(retransmit_list: &mut HashMap<LsaKey, Lsa>, acked: &[LsaHead
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_source_is_on_link_only_within_the_interface_mask() {
+        use super::on_same_subnet;
+        use std::net::Ipv4Addr;
+        let me = Ipv4Addr::new(10, 7, 0, 1);
+        assert!(on_same_subnet(Ipv4Addr::new(10, 7, 0, 2), me, 24));
+        // The peer's second subnet on the same wire is not our network.
+        assert!(!on_same_subnet(Ipv4Addr::new(192, 168, 1, 2), me, 24));
+        assert!(on_same_subnet(Ipv4Addr::new(192, 168, 1, 2), me, 0));
+        assert!(!on_same_subnet(Ipv4Addr::new(10, 7, 0, 2), me, 32));
+        assert!(on_same_subnet(me, me, 32));
+    }
+
     use super::*;
 
     #[test]
