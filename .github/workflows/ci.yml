@@ -147,6 +147,36 @@ jobs:
           fi
           echo "unprivileged user + network namespaces work."
 
+      # A user namespace may *use* a network device type; it may not make the
+      # kernel load the module for one. Autoloading is refused to unprivileged
+      # namespaces, so on a runner where nothing has loaded `vrf` yet, the
+      # `ip link add … type vrf` every VRF smoke starts with answers "Unknown
+      # device type" — six smokes failing on a module rather than on routing.
+      # Load them here, where there is sudo, and prove it from inside a
+      # namespace rather than from `lsmod`, which says nothing about what an
+      # unprivileged namespace is actually allowed to make.
+      - name: Load the netdev modules the smokes create
+        run: |
+          sudo modprobe -a veth dummy || true
+          # `vrf` is not in the runner's kernel at all: Ubuntu's cloud kernels
+          # keep it in linux-modules-extra, which the image does not install, so
+          # `modprobe vrf` answers "Module vrf not found". Fetch that package
+          # before deciding anything.
+          if ! sudo modprobe vrf 2>/dev/null; then
+            sudo apt-get update -qq
+            sudo apt-get install -y "linux-modules-extra-$(uname -r)"
+            sudo modprobe vrf
+          fi
+          # Proved from inside a namespace, not from lsmod: lsmod says what the
+          # host has, not what an unprivileged namespace is allowed to make —
+          # and autoloading is refused there, which is why the module has to be
+          # loaded out here first.
+          if ! unshare -Urn ip link add blue type vrf table 100; then
+            echo "::error::a vrf device cannot be made inside a user namespace, so every VRF smoke would fail on the device rather than on the routing."
+            exit 1
+          fi
+          echo "veth, dummy and vrf can be made inside a user namespace."
+
       - name: Run rootless convergence smokes
         run: |
           set -uo pipefail
@@ -204,6 +234,36 @@ jobs:
             echo "::error::unprivileged user namespaces are unavailable on this runner — the smokes cannot run."
             exit 1
           fi
+
+      # A user namespace may *use* a network device type; it may not make the
+      # kernel load the module for one. Autoloading is refused to unprivileged
+      # namespaces, so on a runner where nothing has loaded `vrf` yet, the
+      # `ip link add … type vrf` every VRF smoke starts with answers "Unknown
+      # device type" — six smokes failing on a module rather than on routing.
+      # Load them here, where there is sudo, and prove it from inside a
+      # namespace rather than from `lsmod`, which says nothing about what an
+      # unprivileged namespace is actually allowed to make.
+      - name: Load the netdev modules the smokes create
+        run: |
+          sudo modprobe -a veth dummy || true
+          # `vrf` is not in the runner's kernel at all: Ubuntu's cloud kernels
+          # keep it in linux-modules-extra, which the image does not install, so
+          # `modprobe vrf` answers "Module vrf not found". Fetch that package
+          # before deciding anything.
+          if ! sudo modprobe vrf 2>/dev/null; then
+            sudo apt-get update -qq
+            sudo apt-get install -y "linux-modules-extra-$(uname -r)"
+            sudo modprobe vrf
+          fi
+          # Proved from inside a namespace, not from lsmod: lsmod says what the
+          # host has, not what an unprivileged namespace is allowed to make —
+          # and autoloading is refused there, which is why the module has to be
+          # loaded out here first.
+          if ! unshare -Urn ip link add blue type vrf table 100; then
+            echo "::error::a vrf device cannot be made inside a user namespace, so every VRF smoke would fail on the device rather than on the routing."
+            exit 1
+          fi
+          echo "veth, dummy and vrf can be made inside a user namespace."
 
       - name: scripts/run-all-tests.sh
         run: bash scripts/run-all-tests.sh
