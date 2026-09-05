@@ -157,9 +157,22 @@ jobs:
       # unprivileged namespace is actually allowed to make.
       - name: Load the netdev modules the smokes create
         run: |
-          sudo modprobe -a veth dummy vrf || true
+          sudo modprobe -a veth dummy || true
+          # `vrf` is not in the runner's kernel at all: Ubuntu's cloud kernels
+          # keep it in linux-modules-extra, which the image does not install, so
+          # `modprobe vrf` answers "Module vrf not found". Fetch that package
+          # before deciding anything.
+          if ! sudo modprobe vrf 2>/dev/null; then
+            sudo apt-get update -qq
+            sudo apt-get install -y "linux-modules-extra-$(uname -r)"
+            sudo modprobe vrf
+          fi
+          # Proved from inside a namespace, not from lsmod: lsmod says what the
+          # host has, not what an unprivileged namespace is allowed to make —
+          # and autoloading is refused there, which is why the module has to be
+          # loaded out here first.
           if ! unshare -Urn ip link add blue type vrf table 100; then
-            echo "::error::a vrf device cannot be made inside a user namespace — the kernel module is not loaded and an unprivileged namespace may not load it."
+            echo "::error::a vrf device cannot be made inside a user namespace, so every VRF smoke would fail on the device rather than on the routing."
             exit 1
           fi
           echo "veth, dummy and vrf can be made inside a user namespace."
@@ -232,9 +245,22 @@ jobs:
       # unprivileged namespace is actually allowed to make.
       - name: Load the netdev modules the smokes create
         run: |
-          sudo modprobe -a veth dummy vrf || true
+          sudo modprobe -a veth dummy || true
+          # `vrf` is not in the runner's kernel at all: Ubuntu's cloud kernels
+          # keep it in linux-modules-extra, which the image does not install, so
+          # `modprobe vrf` answers "Module vrf not found". Fetch that package
+          # before deciding anything.
+          if ! sudo modprobe vrf 2>/dev/null; then
+            sudo apt-get update -qq
+            sudo apt-get install -y "linux-modules-extra-$(uname -r)"
+            sudo modprobe vrf
+          fi
+          # Proved from inside a namespace, not from lsmod: lsmod says what the
+          # host has, not what an unprivileged namespace is allowed to make —
+          # and autoloading is refused there, which is why the module has to be
+          # loaded out here first.
           if ! unshare -Urn ip link add blue type vrf table 100; then
-            echo "::error::a vrf device cannot be made inside a user namespace — the kernel module is not loaded and an unprivileged namespace may not load it."
+            echo "::error::a vrf device cannot be made inside a user namespace, so every VRF smoke would fail on the device rather than on the routing."
             exit 1
           fi
           echo "veth, dummy and vrf can be made inside a user namespace."
