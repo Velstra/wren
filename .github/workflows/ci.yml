@@ -147,6 +147,23 @@ jobs:
           fi
           echo "unprivileged user + network namespaces work."
 
+      # A user namespace may *use* a network device type; it may not make the
+      # kernel load the module for one. Autoloading is refused to unprivileged
+      # namespaces, so on a runner where nothing has loaded `vrf` yet, the
+      # `ip link add … type vrf` every VRF smoke starts with answers "Unknown
+      # device type" — six smokes failing on a module rather than on routing.
+      # Load them here, where there is sudo, and prove it from inside a
+      # namespace rather than from `lsmod`, which says nothing about what an
+      # unprivileged namespace is actually allowed to make.
+      - name: Load the netdev modules the smokes create
+        run: |
+          sudo modprobe -a veth dummy vrf || true
+          if ! unshare -Urn ip link add blue type vrf table 100; then
+            echo "::error::a vrf device cannot be made inside a user namespace — the kernel module is not loaded and an unprivileged namespace may not load it."
+            exit 1
+          fi
+          echo "veth, dummy and vrf can be made inside a user namespace."
+
       - name: Run rootless convergence smokes
         run: |
           set -uo pipefail
@@ -204,6 +221,23 @@ jobs:
             echo "::error::unprivileged user namespaces are unavailable on this runner — the smokes cannot run."
             exit 1
           fi
+
+      # A user namespace may *use* a network device type; it may not make the
+      # kernel load the module for one. Autoloading is refused to unprivileged
+      # namespaces, so on a runner where nothing has loaded `vrf` yet, the
+      # `ip link add … type vrf` every VRF smoke starts with answers "Unknown
+      # device type" — six smokes failing on a module rather than on routing.
+      # Load them here, where there is sudo, and prove it from inside a
+      # namespace rather than from `lsmod`, which says nothing about what an
+      # unprivileged namespace is actually allowed to make.
+      - name: Load the netdev modules the smokes create
+        run: |
+          sudo modprobe -a veth dummy vrf || true
+          if ! unshare -Urn ip link add blue type vrf table 100; then
+            echo "::error::a vrf device cannot be made inside a user namespace — the kernel module is not loaded and an unprivileged namespace may not load it."
+            exit 1
+          fi
+          echo "veth, dummy and vrf can be made inside a user namespace."
 
       - name: scripts/run-all-tests.sh
         run: bash scripts/run-all-tests.sh
