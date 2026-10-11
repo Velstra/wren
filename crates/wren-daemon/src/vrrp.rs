@@ -43,6 +43,37 @@ const ETH_P_ARP: u16 = 0x0806;
 /// The IPv6 all-nodes multicast group, the destination for an unsolicited NA.
 const ALL_NODES_V6: Ipv6Addr = Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 1);
 
+/// Retry startup announcements, then refresh neighbor learning while master.
+/// A successful send only means the local kernel accepted the frame; a switch
+/// recovering at the same time may still miss it.
+#[derive(Default)]
+struct AnnouncementTimer {
+    deadline: Option<Instant>,
+    retries: u8,
+}
+
+impl AnnouncementTimer {
+    fn arm(&mut self, now: Instant) {
+        self.retries = 2;
+        self.deadline = Some(now + Duration::from_secs(1));
+    }
+
+    fn cancel(&mut self) {
+        self.deadline = None;
+        self.retries = 0;
+    }
+
+    fn due(&mut self, now: Instant) -> bool {
+        if !self.deadline.is_some_and(|deadline| now >= deadline) {
+            return false;
+        }
+        self.retries = self.retries.saturating_sub(1);
+        let delay = if self.retries > 0 { 1 } else { 30 };
+        self.deadline = Some(now + Duration::from_secs(delay));
+        true
+    }
+}
+
 /// One virtual router as resolved by `main.rs` from `[[vrrp]]`.
 pub struct InstanceConfig {
     /// The interface the virtual router runs on.
@@ -117,6 +148,7 @@ struct Instance {
     adver_deadline: Option<Instant>,
     /// When the master is declared down (Backup only).
     master_down_deadline: Option<Instant>,
+    announcements: AnnouncementTimer,
 }
 
 /// Run every configured virtual router until cancelled. `queries` answers
@@ -193,6 +225,7 @@ pub async fn run(
             tracked_down: false,
             adver_deadline: None,
             master_down_deadline: None,
+            announcements: AnnouncementTimer::default(),
         };
         info!(
             vrid = inst.fsm.vrid(),
@@ -259,6 +292,9 @@ pub async fn run(
                         let actions = inst.fsm.on_master_down_timer();
                         apply_actions(inst, actions).await;
                     }
+                    if inst.announcements.due(now) {
+                        announce_vips(inst);
+                    }
                 }
             }
             Some(req) = queries.recv() => {
@@ -272,7 +308,7 @@ pub async fn run(
 fn next_deadline(instances: &[Instance]) -> Option<Instant> {
     instances
         .iter()
-        .flat_map(|i| [i.adver_deadline, i.master_down_deadline])
+        .flat_map(|i| [i.adver_deadline, i.master_down_deadline, i.announcements.deadline])
         .flatten()
         .min()
 }
@@ -283,8 +319,14 @@ async fn apply_actions(inst: &mut Instance, actions: Vec<Action>) {
         match action {
             Action::SendAdvert => send_advert(inst, inst.fsm.priority()).await,
             Action::SendAdvertZero => send_advert(inst, 0).await,
-            Action::AssumeVip => assume_vip(inst),
-            Action::ReleaseVip => release_vip(inst),
+            Action::AssumeVip => {
+                assume_vip(inst);
+                inst.announcements.arm(Instant::now());
+            }
+            Action::ReleaseVip => {
+                inst.announcements.cancel();
+                release_vip(inst);
+            }
             Action::ArmAdverTimer(cs) => {
                 inst.adver_deadline = Some(Instant::now() + cs_to_dur(cs));
                 inst.master_down_deadline = None; // mutually exclusive with backup
@@ -391,6 +433,12 @@ fn assume_vip(inst: &Instance) {
             Ok(()) => debug!(%vip, "virtual IP assigned"),
             Err(e) => warn!(%vip, error = %e, "assigning virtual IP"),
         }
+    }
+    announce_vips(inst);
+}
+
+fn announce_vips(inst: &Instance) {
+    for vip in &inst.addresses {
         // Announced where it is reachable, with that link's own MAC: a host on
         // the served segment must learn the address against a MAC it can send
         // to, which is not the election link's.
@@ -844,6 +892,27 @@ pub fn parse_vrrp_query(line: &str) -> Option<VrrpQuery> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn neighbor_announcements_retry_refresh_and_stop_on_release() {
+        let start = std::time::Instant::now();
+        let mut timer = super::AnnouncementTimer::default();
+        assert!(!timer.due(start));
+        timer.arm(start);
+        assert!(!timer.due(start + std::time::Duration::from_millis(999)));
+        assert!(timer.due(start + std::time::Duration::from_secs(1)));
+        assert!(timer.due(start + std::time::Duration::from_secs(2)));
+        assert!(!timer.due(start + std::time::Duration::from_secs(31)));
+        assert!(timer.due(start + std::time::Duration::from_secs(32)));
+        // Release must cancel both retries and periodic refresh. A backup must
+        // never overwrite the newly elected master's neighbor entry.
+        timer.cancel();
+        assert!(!timer.due(start + std::time::Duration::from_secs(100)));
+        timer.arm(start);
+        timer.cancel();
+        assert!(!timer.due(start + std::time::Duration::from_secs(1)));
+        timer.arm(start);
+        assert!(timer.due(start + std::time::Duration::from_secs(1)));
+    }
     use super::*;
 
     #[test]
