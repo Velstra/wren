@@ -134,7 +134,7 @@ pub async fn run(
         let (ifindex, std_sock) = open_vrrp_socket(&cfg.interface, ipv6)
             .with_context(|| format!("opening VRRP socket on {:?}", cfg.interface))?;
         let sock = Arc::new(UdpSocket::from_std(std_sock).context("registering VRRP socket")?);
-        let primary = iface_primary(&cfg.interface, ipv6).unwrap_or(if ipv6 {
+        let primary = iface_primary(&cfg.interface, ipv6, &cfg.addresses).unwrap_or(if ipv6 {
             IpAddr::V6(Ipv6Addr::UNSPECIFIED)
         } else {
             IpAddr::V4(Ipv4Addr::UNSPECIFIED)
@@ -201,8 +201,10 @@ pub async fn run(
             family = if ipv6 { "ipv6" } else { "ipv4" },
             "VRRP virtual router starting",
         );
-        let actions = inst.fsm.on_startup();
-        apply_actions(&mut inst, actions).await;
+        if !primary.is_unspecified() {
+            let actions = inst.fsm.on_startup();
+            apply_actions(&mut inst, actions).await;
+        }
         instances.push(inst);
     }
     drop(adv_tx); // the reader tasks hold their own clones
@@ -232,6 +234,7 @@ pub async fn run(
             }
             _ = track_poll.tick() => {
                 for inst in instances.iter_mut() {
+                    poll_primary(inst).await;
                     poll_tracking(inst).await;
                 }
             }
@@ -293,6 +296,29 @@ async fn apply_actions(inst: &mut Instance, actions: Vec<Action>) {
             Action::CancelAdverTimer => inst.adver_deadline = None,
             Action::CancelMasterDownTimer => inst.master_down_deadline = None,
         }
+    }
+}
+
+/// DHCP and address changes can occur after the daemon starts. Never elect
+/// ourselves using an unspecified address or a VIP left by an earlier election.
+async fn poll_primary(inst: &mut Instance) {
+    let next = iface_primary(&inst.ifname, inst.ipv6, &inst.addresses);
+    if next == Some(inst.primary) || (next.is_none() && inst.primary.is_unspecified()) {
+        return;
+    }
+    info!(vrid = inst.fsm.vrid(), interface = %inst.ifname, primary = ?next,
+        "VRRP interface address changed; restarting election");
+    let actions = inst.fsm.on_shutdown();
+    apply_actions(inst, actions).await;
+    inst.primary = next.unwrap_or(if inst.ipv6 {
+        IpAddr::V6(Ipv6Addr::UNSPECIFIED)
+    } else {
+        IpAddr::V4(Ipv4Addr::UNSPECIFIED)
+    });
+    inst.fsm.set_local_primary(inst.primary);
+    if next.is_some() {
+        let actions = inst.fsm.on_startup();
+        apply_actions(inst, actions).await;
     }
 }
 
@@ -585,7 +611,7 @@ fn bind_to_device(fd: i32, ifname: &str) -> Result<()> {
 
 /// The primary address of `ifname` for the family: the first global IPv4, or the
 /// interface's IPv6 link-local (the source VRRPv3 uses for IPv6 advertisements).
-fn iface_primary(ifname: &str, ipv6: bool) -> Option<IpAddr> {
+fn iface_primary(ifname: &str, ipv6: bool, virtual_addresses: &[IpAddr]) -> Option<IpAddr> {
     let mut head: *mut libc::ifaddrs = std::ptr::null_mut();
     // SAFETY: getifaddrs allocates a list into `head`, freed below.
     if unsafe { libc::getifaddrs(&mut head) } != 0 {
@@ -605,7 +631,7 @@ fn iface_primary(ifname: &str, ipv6: bool) -> Option<IpAddr> {
                     // SAFETY: AF_INET sockaddr is a sockaddr_in.
                     let sin = unsafe { &*(node.ifa_addr as *const libc::sockaddr_in) };
                     let ip = Ipv4Addr::from(u32::from_be(sin.sin_addr.s_addr));
-                    if !ip.is_loopback() && !ip.is_unspecified() {
+                    if eligible_primary(IpAddr::V4(ip), ipv6, virtual_addresses) {
                         result = Some(IpAddr::V4(ip));
                         break;
                     }
@@ -614,7 +640,7 @@ fn iface_primary(ifname: &str, ipv6: bool) -> Option<IpAddr> {
                     let sin6 = unsafe { &*(node.ifa_addr as *const libc::sockaddr_in6) };
                     let ip = Ipv6Addr::from(sin6.sin6_addr.s6_addr);
                     // VRRPv3 IPv6 advertisements are sourced from the link-local.
-                    if (ip.segments()[0] & 0xffc0) == 0xfe80 {
+                    if eligible_primary(IpAddr::V6(ip), ipv6, virtual_addresses) {
                         result = Some(IpAddr::V6(ip));
                         break;
                     }
@@ -626,6 +652,15 @@ fn iface_primary(ifname: &str, ipv6: bool) -> Option<IpAddr> {
     // SAFETY: `head` came from getifaddrs and is freed exactly once.
     unsafe { libc::freeifaddrs(head) };
     result
+}
+
+/// Only a real interface address can identify this router in an election.
+fn eligible_primary(ip: IpAddr, ipv6: bool, virtual_addresses: &[IpAddr]) -> bool {
+    if virtual_addresses.contains(&ip) { return false; }
+    match ip {
+        IpAddr::V4(ip) => !ipv6 && !ip.is_loopback() && !ip.is_unspecified() && !ip.is_multicast() && !ip.is_broadcast(),
+        IpAddr::V6(ip) => ipv6 && (ip.segments()[0] & 0xffc0) == 0xfe80,
+    }
 }
 
 /// Read the MAC of `ifname` via the namespace-aware `SIOCGIFHWADDR` ioctl.
@@ -810,6 +845,19 @@ pub fn parse_vrrp_query(line: &str) -> Option<VrrpQuery> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn election_source_excludes_vips_and_unusable_addresses() {
+        let vip = "192.0.2.254".parse().unwrap();
+        assert!(!eligible_primary(vip, false, &[vip]));
+        for ip in ["0.0.0.0", "127.0.0.1", "224.0.0.18", "255.255.255.255"] {
+            assert!(!eligible_primary(ip.parse().unwrap(), false, &[]));
+        }
+        assert!(eligible_primary("192.0.2.10".parse().unwrap(), false, &[vip]));
+        assert!(eligible_primary("fe80::1".parse().unwrap(), true, &[]));
+        assert!(!eligible_primary("2001:db8::1".parse().unwrap(), true, &[]));
+        assert!(!eligible_primary("fe80::1".parse().unwrap(), true, &["fe80::1".parse().unwrap()]));
+    }
 
     #[test]
     fn ipv4_payload_skips_the_header_by_ihl() {

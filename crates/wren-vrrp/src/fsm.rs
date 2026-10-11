@@ -172,6 +172,15 @@ impl Vrrp {
         }
     }
 
+    /// Refresh the election tie-breaker after the interface address changes.
+    /// The runner relinquishes the old election before updating this address.
+    pub fn set_local_primary(&mut self, primary: IpAddr) {
+        self.cfg.local_primary = primary;
+        if self.state == State::Master {
+            self.master_addr = Some(primary);
+        }
+    }
+
     /// Shutdown: relinquish the address and return to Initialize.
     pub fn on_shutdown(&mut self) -> Vec<Action> {
         let actions = match self.state {
@@ -283,6 +292,23 @@ fn addr_gt(a: IpAddr, b: IpAddr) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn address_recovery_updates_master_identity_and_tie_breaker() {
+        let mut router = Vrrp::new(cfg(100, true, "0.0.0.0"));
+        router.set_local_primary("192.0.2.10".parse().unwrap());
+        router.on_startup();
+        router.on_master_down_timer();
+        assert_eq!(router.master_addr(), Some("192.0.2.10".parse().unwrap()));
+        router.on_shutdown();
+        router.set_local_primary("192.0.2.30".parse().unwrap());
+        router.on_startup();
+        router.on_master_down_timer();
+        assert!(router.on_advertisement(100, 100, "192.0.2.20".parse().unwrap()).is_empty());
+        assert_eq!(router.state(), State::Master);
+        router.on_advertisement(100, 100, "192.0.2.40".parse().unwrap());
+        assert_eq!(router.state(), State::Backup);
+    }
 
     fn cfg(priority: u8, preempt: bool, primary: &str) -> VrrpConfig {
         VrrpConfig {
