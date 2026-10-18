@@ -1107,7 +1107,7 @@ mod tests {
     fn ipv4_via_ipv6_kernel_acceptance() {
         let mut fib = KernelFib::new().expect("open kernel fib");
         let route = Route::new(
-            p("10.123.0.0/16"),
+            p("10.123.1.0/24"),
             Protocol::Bgp,
             vec![NextHop::via("2001:db8::2".parse().unwrap())],
             0,
@@ -1141,7 +1141,7 @@ mod tests {
     fn ecmp_kernel_acceptance() {
         let mut fib = KernelFib::new().expect("open kernel fib");
         let route = Route::new(
-            p("10.123.0.0/16"),
+            p("10.123.2.0/24"),
             Protocol::Ospf,
             vec![
                 NextHop::via("192.168.1.2".parse().unwrap()),
@@ -1178,7 +1178,10 @@ mod tests {
     #[ignore = "needs CAP_NET_ADMIN + 192.168.{1,2}.0/24 on two ifaces; run under unshare -Urn"]
     fn replace_single_path_with_multipath_acceptance() {
         let mut fib = KernelFib::new().expect("open kernel fib");
-        let dst = p("10.123.0.0/16");
+        // Each kernel test owns its prefix. A route left by another test may
+        // have a different metric and coexist with this one; selecting the
+        // first matching prefix would then inspect an unrelated route.
+        let dst = p("10.123.3.0/24");
         let single =
             Route::new(dst, Protocol::Bgp, vec![NextHop::via("192.168.1.2".parse().unwrap())], 1);
         fib.apply(&FibChange::Install(single)).expect("install the single path");
