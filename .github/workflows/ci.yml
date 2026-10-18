@@ -183,6 +183,7 @@ jobs:
           # A representative subset — one per major protocol path — kept small so
           # CI stays fast. The rest run nightly.
           smokes=(
+            netlink-kernel-smoke.sh        # IPv4/v6 next hops + ECMP replacement
             bgp-redistribute-smoke.sh      # BGP
             ospf-redistribute-smoke.sh     # OSPFv2
             ospf3-show-smoke.sh            # OSPFv3
