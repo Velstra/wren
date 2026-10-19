@@ -25,9 +25,9 @@
 //! other runners grants it.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::fmt::Write as _;
 use std::io;
 use std::mem;
-use std::fmt::Write as _;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV6};
 use std::os::raw::c_void;
 use std::os::unix::io::FromRawFd;
@@ -62,8 +62,8 @@ use wren_ospfv3::{
     OPT_E, OPT_R, OPT_V6,
 };
 
-use crate::sockopt::{setsockopt_int, setsockopt_struct};
 use crate::router::RouteUpdate;
+use crate::sockopt::{setsockopt_int, setsockopt_struct};
 
 /// How often (seconds) the housekeeping timer advances dead/wait timers.
 const HOUSEKEEPING_SECS: u64 = 1;
@@ -908,8 +908,7 @@ impl Ospf {
         let recv_master = dd.flags & DD_FLAG_MASTER != 0;
         let recv_init = dd.flags & DD_FLAG_INIT != 0;
         if crate::ospf::dd_seqnum_mismatch(recv_init, recv_master, master) {
-            let acts = self
-                .ifaces[idx]
+            let acts = self.ifaces[idx]
                 .neighbors
                 .get_mut(&nbr_id)
                 .unwrap()
@@ -1177,8 +1176,7 @@ impl Ospf {
         }
 
         if bad_ls_req {
-            let acts = self
-                .ifaces[idx]
+            let acts = self.ifaces[idx]
                 .neighbors
                 .get_mut(&nbr_id)
                 .unwrap()
@@ -1890,8 +1888,7 @@ impl Ospf {
                 }
             }
         }
-        let added: Vec<(Ipv6Addr, u32)> =
-            full.difference(&self.bfd_registered).copied().collect();
+        let added: Vec<(Ipv6Addr, u32)> = full.difference(&self.bfd_registered).copied().collect();
         for (addr, scope) in added {
             let _ = self
                 .bfd_register
@@ -2426,7 +2423,11 @@ mod tests {
                 ls_checksum: 0,
                 length: 0,
             },
-            body: LsaBody::Router(RouterLsa { flags: 0, options: 0, links: vec![] }),
+            body: LsaBody::Router(RouterLsa {
+                flags: 0,
+                options: 0,
+                links: vec![],
+            }),
         }
     }
 

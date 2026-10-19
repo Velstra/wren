@@ -77,7 +77,11 @@ impl fmt::Display for RouteDistinguisher {
                 write!(f, "{asn}:{num}")
             }
             // Unknown type: print the raw octets rather than guess.
-            _ => write!(f, "0x{}", b.iter().map(|x| format!("{x:02x}")).collect::<String>()),
+            _ => write!(
+                f,
+                "0x{}",
+                b.iter().map(|x| format!("{x:02x}")).collect::<String>()
+            ),
         }
     }
 }

@@ -211,7 +211,11 @@ pub async fn run(
             fsm,
             ifname: cfg.interface.clone(),
             ifindex,
-            addr_ifname: if addr_ifindex == ifindex { cfg.interface.clone() } else { addr_ifname },
+            addr_ifname: if addr_ifindex == ifindex {
+                cfg.interface.clone()
+            } else {
+                addr_ifname
+            },
             addr_ifindex,
             addr_mac,
             primary,
@@ -308,7 +312,13 @@ pub async fn run(
 fn next_deadline(instances: &[Instance]) -> Option<Instant> {
     instances
         .iter()
-        .flat_map(|i| [i.adver_deadline, i.master_down_deadline, i.announcements.deadline])
+        .flat_map(|i| {
+            [
+                i.adver_deadline,
+                i.master_down_deadline,
+                i.announcements.deadline,
+            ]
+        })
         .flatten()
         .min()
 }
@@ -383,7 +393,9 @@ async fn poll_tracking(inst: &mut Instance) {
         );
     }
     let effective = if any_down {
-        inst.base_priority.saturating_sub(inst.priority_decrement).max(1)
+        inst.base_priority
+            .saturating_sub(inst.priority_decrement)
+            .max(1)
     } else {
         inst.base_priority
     };
@@ -511,7 +523,13 @@ fn render_instances(instances: &[Instance]) -> String {
 }
 
 /// Read, validate and forward advertisements for one instance to the central loop.
-async fn read_loop(idx: usize, sock: Arc<UdpSocket>, vrid: u8, ipv6: bool, tx: mpsc::Sender<AdvIn>) {
+async fn read_loop(
+    idx: usize,
+    sock: Arc<UdpSocket>,
+    vrid: u8,
+    ipv6: bool,
+    tx: mpsc::Sender<AdvIn>,
+) {
     let mut buf = [0u8; 1500];
     let dst = mcast(ipv6);
     loop {
@@ -615,8 +633,13 @@ fn open_vrrp_socket(ifname: &str, ipv6: bool) -> Result<(u32, std::net::UdpSocke
         mreq.ipv6mr_interface = ifindex;
         setsockopt_struct(fd, libc::IPPROTO_IPV6, libc::IPV6_ADD_MEMBERSHIP, &mreq)
             .context("IPV6_ADD_MEMBERSHIP ff02::12")?;
-        setsockopt_int(fd, libc::IPPROTO_IPV6, libc::IPV6_MULTICAST_IF, ifindex as i32)
-            .context("IPV6_MULTICAST_IF")?;
+        setsockopt_int(
+            fd,
+            libc::IPPROTO_IPV6,
+            libc::IPV6_MULTICAST_IF,
+            ifindex as i32,
+        )
+        .context("IPV6_MULTICAST_IF")?;
         setsockopt_int(fd, libc::IPPROTO_IPV6, libc::IPV6_MULTICAST_LOOP, 0)?;
         setsockopt_int(fd, libc::IPPROTO_IPV6, libc::IPV6_MULTICAST_HOPS, VRRP_TTL)?;
         setsockopt_int(fd, libc::IPPROTO_IPV6, libc::IPV6_UNICAST_HOPS, VRRP_TTL)?;
@@ -630,7 +653,8 @@ fn open_vrrp_socket(ifname: &str, ipv6: bool) -> Result<(u32, std::net::UdpSocke
         // SAFETY: ip_mreqn is plain POD; only the interface index matters here.
         let mut ifreq: libc::ip_mreqn = unsafe { mem::zeroed() };
         ifreq.imr_ifindex = ifindex as libc::c_int;
-        setsockopt_struct(fd, libc::IPPROTO_IP, libc::IP_MULTICAST_IF, &ifreq).context("IP_MULTICAST_IF")?;
+        setsockopt_struct(fd, libc::IPPROTO_IP, libc::IP_MULTICAST_IF, &ifreq)
+            .context("IP_MULTICAST_IF")?;
         setsockopt_int(fd, libc::IPPROTO_IP, libc::IP_MULTICAST_LOOP, 0)?;
         setsockopt_int(fd, libc::IPPROTO_IP, libc::IP_MULTICAST_TTL, VRRP_TTL)?;
         setsockopt_int(fd, libc::IPPROTO_IP, libc::IP_TTL, VRRP_TTL)?;
@@ -652,7 +676,8 @@ fn bind_to_device(fd: i32, ifname: &str) -> Result<()> {
         )
     };
     if rc < 0 {
-        return Err(io::Error::last_os_error()).with_context(|| format!("SO_BINDTODEVICE {ifname:?}"));
+        return Err(io::Error::last_os_error())
+            .with_context(|| format!("SO_BINDTODEVICE {ifname:?}"));
     }
     Ok(())
 }
@@ -704,9 +729,17 @@ fn iface_primary(ifname: &str, ipv6: bool, virtual_addresses: &[IpAddr]) -> Opti
 
 /// Only a real interface address can identify this router in an election.
 fn eligible_primary(ip: IpAddr, ipv6: bool, virtual_addresses: &[IpAddr]) -> bool {
-    if virtual_addresses.contains(&ip) { return false; }
+    if virtual_addresses.contains(&ip) {
+        return false;
+    }
     match ip {
-        IpAddr::V4(ip) => !ipv6 && !ip.is_loopback() && !ip.is_unspecified() && !ip.is_multicast() && !ip.is_broadcast(),
+        IpAddr::V4(ip) => {
+            !ipv6
+                && !ip.is_loopback()
+                && !ip.is_unspecified()
+                && !ip.is_multicast()
+                && !ip.is_broadcast()
+        }
         IpAddr::V6(ip) => ipv6 && (ip.segments()[0] & 0xffc0) == 0xfe80,
     }
 }
@@ -794,7 +827,7 @@ fn send_gratuitous_arp(ifindex: u32, mac: [u8; 6], vip: Ipv4Addr) -> io::Result<
     arp[6..8].copy_from_slice(&1u16.to_be_bytes()); // oper: request
     arp[8..14].copy_from_slice(&mac); // sender hardware address
     arp[14..18].copy_from_slice(&vip.octets()); // sender protocol address
-    // target hardware address left zero; target protocol address = our VIP.
+                                                // target hardware address left zero; target protocol address = our VIP.
     arp[24..28].copy_from_slice(&vip.octets());
 
     // Destination: the broadcast MAC, via sockaddr_ll.
@@ -805,7 +838,12 @@ fn send_gratuitous_arp(ifindex: u32, mac: [u8; 6], vip: Ipv4Addr) -> io::Result<
     sll.sll_halen = 6;
     sll.sll_addr[..6].copy_from_slice(&[0xff; 6]);
 
-    let rc = sendto_sockaddr(fd, &arp, &sll as *const _ as *const libc::sockaddr, mem::size_of::<libc::sockaddr_ll>());
+    let rc = sendto_sockaddr(
+        fd,
+        &arp,
+        &sll as *const _ as *const libc::sockaddr,
+        mem::size_of::<libc::sockaddr_ll>(),
+    );
     // SAFETY: closing the fd we opened.
     unsafe { libc::close(fd) };
     rc
@@ -828,7 +866,12 @@ fn send_unsolicited_na(ifindex: u32, mac: [u8; 6], vip: Ipv6Addr) -> io::Result<
     }
     // NDP requires a hop limit of 255; pin egress to the interface.
     let _ = setsockopt_int(fd, libc::IPPROTO_IPV6, libc::IPV6_MULTICAST_HOPS, VRRP_TTL);
-    let _ = setsockopt_int(fd, libc::IPPROTO_IPV6, libc::IPV6_MULTICAST_IF, ifindex as i32);
+    let _ = setsockopt_int(
+        fd,
+        libc::IPPROTO_IPV6,
+        libc::IPV6_MULTICAST_IF,
+        ifindex as i32,
+    );
 
     // Neighbor Advertisement (RFC 4861 §4.4): override flag set, target = the VIP,
     // with a Target Link-Layer Address option carrying our MAC.
@@ -847,14 +890,24 @@ fn send_unsolicited_na(ifindex: u32, mac: [u8; 6], vip: Ipv6Addr) -> io::Result<
     sa.sin6_addr.s6_addr = ALL_NODES_V6.octets();
     sa.sin6_scope_id = ifindex;
 
-    let rc = sendto_sockaddr(fd, &na, &sa as *const _ as *const libc::sockaddr, mem::size_of::<libc::sockaddr_in6>());
+    let rc = sendto_sockaddr(
+        fd,
+        &na,
+        &sa as *const _ as *const libc::sockaddr,
+        mem::size_of::<libc::sockaddr_in6>(),
+    );
     // SAFETY: closing the fd we opened.
     unsafe { libc::close(fd) };
     rc
 }
 
 /// `sendto(fd, buf, 0, addr, addrlen)`, mapping a negative return to an error.
-fn sendto_sockaddr(fd: i32, buf: &[u8], addr: *const libc::sockaddr, addrlen: usize) -> io::Result<()> {
+fn sendto_sockaddr(
+    fd: i32,
+    buf: &[u8],
+    addr: *const libc::sockaddr,
+    addrlen: usize,
+) -> io::Result<()> {
     // SAFETY: `buf` and `addr` are valid for the call; `addrlen` matches the struct.
     let sent = unsafe {
         libc::sendto(
@@ -922,10 +975,18 @@ mod tests {
         for ip in ["0.0.0.0", "127.0.0.1", "224.0.0.18", "255.255.255.255"] {
             assert!(!eligible_primary(ip.parse().unwrap(), false, &[]));
         }
-        assert!(eligible_primary("192.0.2.10".parse().unwrap(), false, &[vip]));
+        assert!(eligible_primary(
+            "192.0.2.10".parse().unwrap(),
+            false,
+            &[vip]
+        ));
         assert!(eligible_primary("fe80::1".parse().unwrap(), true, &[]));
         assert!(!eligible_primary("2001:db8::1".parse().unwrap(), true, &[]));
-        assert!(!eligible_primary("fe80::1".parse().unwrap(), true, &["fe80::1".parse().unwrap()]));
+        assert!(!eligible_primary(
+            "fe80::1".parse().unwrap(),
+            true,
+            &["fe80::1".parse().unwrap()]
+        ));
     }
 
     #[test]
@@ -943,7 +1004,10 @@ mod tests {
 
     #[test]
     fn parse_vrrp_query_understands_show_vrrp() {
-        assert!(matches!(parse_vrrp_query("show vrrp"), Some(VrrpQuery::Instances)));
+        assert!(matches!(
+            parse_vrrp_query("show vrrp"),
+            Some(VrrpQuery::Instances)
+        ));
         assert!(matches!(
             parse_vrrp_query("show vrrp instances"),
             Some(VrrpQuery::Instances)

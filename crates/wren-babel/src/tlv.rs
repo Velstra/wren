@@ -525,22 +525,48 @@ mod tests {
             let b = Packet::new(vec![t]).encode();
             (b[4], b.len())
         };
-        assert_eq!(first_two(Tlv::Pad1), (0, 5), "Pad1 is type 0 and one octet total");
+        assert_eq!(
+            first_two(Tlv::Pad1),
+            (0, 5),
+            "Pad1 is type 0 and one octet total"
+        );
         assert_eq!(first_two(Tlv::PadN(3)).0, 1, "PadN is type 1");
-        assert_eq!(first_two(Tlv::AckReq { nonce: 0, interval: 0 }).0, 2, "AckReq is 2");
+        assert_eq!(
+            first_two(Tlv::AckReq {
+                nonce: 0,
+                interval: 0
+            })
+            .0,
+            2,
+            "AckReq is 2"
+        );
         assert_eq!(first_two(Tlv::Ack { nonce: 0 }).0, 3, "Ack is 3");
         assert_eq!(
-            first_two(Tlv::Hello { flags: 0, seqno: 0, interval: 0 }).0,
+            first_two(Tlv::Hello {
+                flags: 0,
+                seqno: 0,
+                interval: 0
+            })
+            .0,
             4,
             "Hello is 4"
         );
         assert_eq!(
-            first_two(Tlv::Ihu { rxcost: 0, interval: 0, address: None }).0,
+            first_two(Tlv::Ihu {
+                rxcost: 0,
+                interval: 0,
+                address: None
+            })
+            .0,
             5,
             "IHU is 5"
         );
         assert_eq!(first_two(Tlv::RouterId([0; 8])).0, 6, "Router-Id is 6");
-        assert_eq!(first_two(Tlv::RouteRequest { prefix: None }).0, 9, "Route Req is 9");
+        assert_eq!(
+            first_two(Tlv::RouteRequest { prefix: None }).0,
+            9,
+            "Route Req is 9"
+        );
         // Pad1 really is a single octet: two of them plus an Ack frame correctly.
         let b = Packet::new(vec![Tlv::Pad1, Tlv::Pad1, Tlv::Ack { nonce: 7 }]).encode();
         assert_eq!(&b[4..6], &[0, 0], "two bare Pad1 octets");
@@ -577,7 +603,11 @@ mod tests {
         assert_eq!(&v[4..6], &[0x00, 0x64], "Interval is bytes 4..6");
         assert_eq!(&v[6..8], &[0x11, 0x22], "Seqno is bytes 6..8");
         assert_eq!(&v[8..10], &[0x33, 0x44], "Metric is bytes 8..10");
-        assert_eq!(&v[10..13], &[10, 9, 8], "the prefix is ceil(24/8) = 3 octets");
+        assert_eq!(
+            &v[10..13],
+            &[10, 9, 8],
+            "the prefix is ceil(24/8) = 3 octets"
+        );
         assert_eq!(b[5] as usize, 13, "the TLV Length covers exactly the body");
         assert_eq!(b.len(), 4 + 2 + 13);
 
@@ -593,8 +623,16 @@ mod tests {
         let v = &b[6..];
         assert_eq!(v[0], 2, "AE 2 is IPv6");
         assert_eq!(v[2], 32, "Plen 32");
-        assert_eq!(&v[8..10], &[0xff, 0xff], "an infinity metric retracts the route");
-        assert_eq!(&v[10..14], &[0x20, 0x01, 0x0d, 0xb8], "four prefix octets for a /32");
+        assert_eq!(
+            &v[8..10],
+            &[0xff, 0xff],
+            "an infinity metric retracts the route"
+        );
+        assert_eq!(
+            &v[10..14],
+            &[0x20, 0x01, 0x0d, 0xb8],
+            "four prefix octets for a /32"
+        );
         assert_eq!(b[5] as usize, 14);
     }
 
@@ -620,7 +658,12 @@ mod tests {
         assert_eq!(&v[6..10], &[10, 0, 0, 2], "the address follows at byte 6");
 
         // With no address the AE is 0 (wildcard) and the body stops at 6 octets.
-        let b = Packet::new(vec![Tlv::Ihu { rxcost: 1, interval: 2, address: None }]).encode();
+        let b = Packet::new(vec![Tlv::Ihu {
+            rxcost: 1,
+            interval: 2,
+            address: None,
+        }])
+        .encode();
         assert_eq!(b[6], 0, "AE 0 means no address is present");
         assert_eq!(b[5], 6, "the body is just the six fixed octets");
     }

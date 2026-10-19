@@ -137,7 +137,11 @@ fn max_len(addr: &IpAddr) -> u8 {
 fn mask(addr: IpAddr, len: u8) -> IpAddr {
     match addr {
         IpAddr::V4(a) => {
-            let m = if len == 0 { 0 } else { u32::MAX << (32 - len as u32) };
+            let m = if len == 0 {
+                0
+            } else {
+                u32::MAX << (32 - len as u32)
+            };
             IpAddr::V4(Ipv4Addr::from(u32::from(a) & m))
         }
         IpAddr::V6(a) => {
@@ -629,9 +633,7 @@ mod tests {
 
     #[test]
     fn protocol_preferences_order_connected_static_igp_bgp() {
-        assert!(
-            Protocol::Connected.default_preference() > Protocol::Static.default_preference()
-        );
+        assert!(Protocol::Connected.default_preference() > Protocol::Static.default_preference());
         assert!(Protocol::Static.default_preference() > Protocol::Rip.default_preference());
         assert!(Protocol::Ospf.default_preference() > Protocol::Bgp.default_preference());
     }
@@ -647,7 +649,12 @@ mod tests {
         assert!(matches!(change, FibChange::Install(ref r) if r.protocol == Protocol::Rip));
 
         // A static route (higher preference) supersedes it → install the static.
-        let stat = Route::new(dst, Protocol::Static, vec![NextHop::via(gw("192.0.2.254"))], 0);
+        let stat = Route::new(
+            dst,
+            Protocol::Static,
+            vec![NextHop::via(gw("192.0.2.254"))],
+            0,
+        );
         let change = rib.update(stat).unwrap();
         assert!(matches!(change, FibChange::Install(ref r) if r.protocol == Protocol::Static));
 
@@ -664,12 +671,22 @@ mod tests {
         let dst = p("203.0.113.0/24");
         rib.update(Route {
             source: 1,
-            ..Route::new(dst, Protocol::Rip, vec![NextHop::via(gw("198.51.100.1"))], 10)
+            ..Route::new(
+                dst,
+                Protocol::Rip,
+                vec![NextHop::via(gw("198.51.100.1"))],
+                10,
+            )
         });
         let better = rib
             .update(Route {
                 source: 2,
-                ..Route::new(dst, Protocol::Rip, vec![NextHop::via(gw("198.51.100.2"))], 3)
+                ..Route::new(
+                    dst,
+                    Protocol::Rip,
+                    vec![NextHop::via(gw("198.51.100.2"))],
+                    3,
+                )
             })
             .unwrap();
         assert!(matches!(better, FibChange::Install(ref r) if r.metric == 3));
@@ -679,15 +696,33 @@ mod tests {
     fn rib_withdraw_falls_back_then_removes() {
         let mut rib = Rib::new();
         let dst = p("10.0.0.0/24");
-        rib.update(Route::new(dst, Protocol::Static, vec![NextHop::via(gw("192.0.2.1"))], 0));
-        rib.update(Route::new(dst, Protocol::Rip, vec![NextHop::via(gw("192.0.2.2"))], 5));
+        rib.update(Route::new(
+            dst,
+            Protocol::Static,
+            vec![NextHop::via(gw("192.0.2.1"))],
+            0,
+        ));
+        rib.update(Route::new(
+            dst,
+            Protocol::Rip,
+            vec![NextHop::via(gw("192.0.2.2"))],
+            5,
+        ));
 
         // Withdraw the static → RIP becomes best (install change).
-        let change = rib.withdraw(RT_TABLE_MAIN, dst, Protocol::Static, 0).unwrap();
+        let change = rib
+            .withdraw(RT_TABLE_MAIN, dst, Protocol::Static, 0)
+            .unwrap();
         assert!(matches!(change, FibChange::Install(ref r) if r.protocol == Protocol::Rip));
 
         // Withdraw the last route → remove.
-        assert_eq!(rib.withdraw(RT_TABLE_MAIN, dst, Protocol::Rip, 0).unwrap(), FibChange::Remove { table: RT_TABLE_MAIN, prefix: dst });
+        assert_eq!(
+            rib.withdraw(RT_TABLE_MAIN, dst, Protocol::Rip, 0).unwrap(),
+            FibChange::Remove {
+                table: RT_TABLE_MAIN,
+                prefix: dst
+            }
+        );
         assert!(rib.is_empty());
     }
 
@@ -696,8 +731,12 @@ mod tests {
         let mut rib = Rib::new();
         let mut fib = MemoryFib::default();
         let dst = p("10.9.0.0/16");
-        if let Some(c) = rib.update(Route::new(dst, Protocol::Static, vec![NextHop::dev("eth0")], 0))
-        {
+        if let Some(c) = rib.update(Route::new(
+            dst,
+            Protocol::Static,
+            vec![NextHop::dev("eth0")],
+            0,
+        )) {
             fib.apply(&c).unwrap();
         }
         assert_eq!(fib.installed.len(), 1);

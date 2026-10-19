@@ -222,7 +222,11 @@ fn external_routes_of_type(
         let Ok(prefix) = Prefix::new(IpAddr::V4(lsa.header.link_state_id), plen) else {
             continue;
         };
-        let gateways = intra.router_nexthops.get(&asbr).cloned().unwrap_or_default();
+        let gateways = intra
+            .router_nexthops
+            .get(&asbr)
+            .cloned()
+            .unwrap_or_default();
         add_route(map, prefix, total, &gateways);
     }
     // Merge: an E1 route wins outright, so only take an E2 route for a prefix no
@@ -347,23 +351,17 @@ impl Spf<'_> {
     /// A parent with gateways already set passes them down unchanged; a parent
     /// that is the root or a directly-attached network resolves a fresh gateway
     /// (the neighbour's own interface address, from its LSA).
-    fn initial_gateways(
-        &self,
-        v: Vertex,
-        v_gateways: &[Ipv4Addr],
-        w: Vertex,
-    ) -> Vec<Ipv4Addr> {
+    fn initial_gateways(&self, v: Vertex, v_gateways: &[Ipv4Addr], w: Vertex) -> Vec<Ipv4Addr> {
         if !v_gateways.is_empty() {
             return v_gateways.to_vec();
         }
         match (v, w) {
             // Root reaches a point-to-point neighbour: its gateway is the far end
             // of the link, read from the neighbour's reverse link.
-            (Vertex::Router(rid), Vertex::Router(w_id)) if rid == self.root => {
-                self.reverse_p2p_address(w_id, rid)
-                    .map(|a| vec![a])
-                    .unwrap_or_default()
-            }
+            (Vertex::Router(rid), Vertex::Router(w_id)) if rid == self.root => self
+                .reverse_p2p_address(w_id, rid)
+                .map(|a| vec![a])
+                .unwrap_or_default(),
             // A network one hop from the root: connected (no gateway).
             (Vertex::Router(rid), Vertex::Network(_)) if rid == self.root => vec![],
             // A router across a directly-attached network: its gateway is its own
@@ -516,7 +514,12 @@ impl Spf<'_> {
 
 /// Insert or fold a route into the by-prefix table: a strictly lower cost
 /// replaces, an equal cost merges next hops (ECMP), a higher cost is dropped.
-fn add_route(map: &mut BTreeMap<Prefix, SpfRoute>, prefix: Prefix, cost: u32, gateways: &[Ipv4Addr]) {
+fn add_route(
+    map: &mut BTreeMap<Prefix, SpfRoute>,
+    prefix: Prefix,
+    cost: u32,
+    gateways: &[Ipv4Addr],
+) {
     match map.get_mut(&prefix) {
         None => {
             map.insert(
@@ -841,7 +844,10 @@ mod tests {
 
         let res = compute(&db, ip([1, 1, 1, 1]));
         assert_eq!(res.routers.get(&ip([2, 2, 2, 2])), None);
-        assert!(res.routes.iter().all(|r| r.prefix.to_string() != "192.168.2.0/24"));
+        assert!(res
+            .routes
+            .iter()
+            .all(|r| r.prefix.to_string() != "192.168.2.0/24"));
     }
 
     #[test]
@@ -947,7 +953,11 @@ mod tests {
         // interface address on BOTH networks — the ECMP that the fix preserves.
         let far = find(&res, "192.168.3.0/24");
         assert_eq!(far.cost, 11);
-        assert_eq!(far.gateways.len(), 2, "both transit paths must survive as ECMP");
+        assert_eq!(
+            far.gateways.len(),
+            2,
+            "both transit paths must survive as ECMP"
+        );
         assert!(far.gateways.contains(&ip([10, 0, 1, 3])));
         assert!(far.gateways.contains(&ip([10, 0, 2, 3])));
     }
@@ -982,14 +992,24 @@ mod tests {
         assert_eq!(far.protocol, Protocol::Ospf);
         assert_eq!(far.metric, 11);
         assert_eq!(far.preference, Protocol::Ospf.default_preference());
-        assert_eq!(far.nexthops, vec![NextHop::via(IpAddr::V4(ip([10, 0, 12, 2])))]);
+        assert_eq!(
+            far.nexthops,
+            vec![NextHop::via(IpAddr::V4(ip([10, 0, 12, 2])))]
+        );
 
         // The connected stub maps to a single on-link next hop.
         let local = routes
             .iter()
             .find(|r| r.prefix.to_string() == "192.168.1.0/24")
             .unwrap();
-        assert_eq!(local.nexthops, vec![NextHop { gateway: None, iface: None, weight: 1 }]);
+        assert_eq!(
+            local.nexthops,
+            vec![NextHop {
+                gateway: None,
+                iface: None,
+                weight: 1
+            }]
+        );
     }
 
     /// A two-router area where R2 is an ABR injecting a summary for a far network.
@@ -1009,7 +1029,12 @@ mod tests {
             1,
         ));
         // The ABR summarises 192.168.99.0/24 (in another area) at cost 5.
-        db.install(summary_lsa([2, 2, 2, 2], [192, 168, 99, 0], [255, 255, 255, 0], 5));
+        db.install(summary_lsa(
+            [2, 2, 2, 2],
+            [192, 168, 99, 0],
+            [255, 255, 255, 0],
+            5,
+        ));
         db
     }
 
@@ -1048,25 +1073,48 @@ mod tests {
     fn inter_area_skips_unreachable_infinity_and_self() {
         let mut db = area_with_abr();
         // A summary from an ABR not on the SPF tree → unreachable, skipped.
-        db.install(summary_lsa([9, 9, 9, 9], [203, 0, 113, 0], [255, 255, 255, 0], 1));
+        db.install(summary_lsa(
+            [9, 9, 9, 9],
+            [203, 0, 113, 0],
+            [255, 255, 255, 0],
+            1,
+        ));
         // A summary at LSInfinity → skipped.
-        db.install(summary_lsa([2, 2, 2, 2], [198, 51, 100, 0], [255, 255, 255, 0], crate::LS_INFINITY));
+        db.install(summary_lsa(
+            [2, 2, 2, 2],
+            [198, 51, 100, 0],
+            [255, 255, 255, 0],
+            crate::LS_INFINITY,
+        ));
         let intra = compute(&db, ip([1, 1, 1, 1]));
         let inter = inter_area_routes(&db, &intra, ip([1, 1, 1, 1]));
         let dests: Vec<String> = inter.iter().map(|r| r.prefix.to_string()).collect();
         assert!(dests.contains(&"192.168.99.0/24".to_string()));
-        assert!(!dests.contains(&"203.0.113.0/24".to_string()), "unreachable ABR skipped");
-        assert!(!dests.contains(&"198.51.100.0/24".to_string()), "LSInfinity skipped");
+        assert!(
+            !dests.contains(&"203.0.113.0/24".to_string()),
+            "unreachable ABR skipped"
+        );
+        assert!(
+            !dests.contains(&"198.51.100.0/24".to_string()),
+            "LSInfinity skipped"
+        );
 
         // A summary we originated ourselves is skipped (self_id = the ABR).
         let self_inter = inter_area_routes(&db, &compute(&db, ip([2, 2, 2, 2])), ip([2, 2, 2, 2]));
-        assert!(self_inter.iter().all(|r| r.prefix.to_string() != "192.168.99.0/24"));
+        assert!(self_inter
+            .iter()
+            .all(|r| r.prefix.to_string() != "192.168.99.0/24"));
     }
 
     /// A two-router area where R2 is an ASBR injecting an external destination.
     fn area_with_asbr() -> Lsdb {
         let mut db = Lsdb::new();
-        db.install(router_lsa([1, 1, 1, 1], 0, vec![p2p([2, 2, 2, 2], [10, 0, 12, 1], 10)], 1));
+        db.install(router_lsa(
+            [1, 1, 1, 1],
+            0,
+            vec![p2p([2, 2, 2, 2], [10, 0, 12, 1], 10)],
+            1,
+        ));
         db.install(router_lsa(
             [2, 2, 2, 2],
             crate::lsa::RTR_FLAG_E,
@@ -1090,17 +1138,30 @@ mod tests {
         area.install(router_lsa(
             dr,
             crate::lsa::RTR_FLAG_E,
-            vec![transit(dr, dr, 10), stub([192, 168, 1, 0], [255, 255, 255, 0], 10)],
+            vec![
+                transit(dr, dr, 10),
+                stub([192, 168, 1, 0], [255, 255, 255, 0], 10),
+            ],
             1,
         ));
         area.install(network_lsa(dr, dr, [255, 255, 255, 0], vec![dr, me]));
         let intra = compute(&area, ip(me));
-        assert_eq!(intra.routers.get(&ip(dr)), Some(&10), "the DR is on the tree at the link cost");
+        assert_eq!(
+            intra.routers.get(&ip(dr)),
+            Some(&10),
+            "the DR is on the tree at the link cost"
+        );
         assert_eq!(find(&intra, "10.7.0.0/24").gateways, Vec::<Ipv4Addr>::new());
         assert_eq!(find(&intra, "192.168.1.0/24").gateways, vec![ip(dr)]);
 
         let mut ext = Lsdb::new();
-        ext.install(external_lsa(dr, [203, 0, 113, 0], [255, 255, 255, 0], 20, true));
+        ext.install(external_lsa(
+            dr,
+            [203, 0, 113, 0],
+            [255, 255, 255, 0],
+            20,
+            true,
+        ));
         let routes = external_routes(&ext, &intra, ip(me));
         let r = routes
             .iter()
@@ -1116,7 +1177,13 @@ mod tests {
         let intra = compute(&area, ip([1, 1, 1, 1]));
         // The type-5 LSAs live in their own AS-wide database.
         let mut ext = Lsdb::new();
-        ext.install(external_lsa([2, 2, 2, 2], [203, 0, 113, 0], [255, 255, 255, 0], 20, true));
+        ext.install(external_lsa(
+            [2, 2, 2, 2],
+            [203, 0, 113, 0],
+            [255, 255, 255, 0],
+            20,
+            true,
+        ));
         let routes = external_routes(&ext, &intra, ip([1, 1, 1, 1]));
         let r = routes
             .iter()
@@ -1131,7 +1198,12 @@ mod tests {
     fn nssa_type7_route_is_computed_like_an_external() {
         // R2 is the in-area NSSA ASBR; its type-7 lives in the AREA database.
         let mut db = area_with_asbr();
-        db.install(nssa_lsa([2, 2, 2, 2], [10, 99, 0, 0], [255, 255, 255, 0], 20));
+        db.install(nssa_lsa(
+            [2, 2, 2, 2],
+            [10, 99, 0, 0],
+            [255, 255, 255, 0],
+            20,
+        ));
         let intra = compute(&db, ip([1, 1, 1, 1]));
         let routes = nssa_routes(&db, &intra, ip([1, 1, 1, 1]));
         let r = routes
@@ -1140,9 +1212,11 @@ mod tests {
             .expect("nssa route present");
         assert_eq!(r.cost, 20); // E2 metric alone
         assert_eq!(r.gateways, vec![ip([10, 0, 12, 2])]); // via the ASBR
-        // The originating ASBR derives no route from its own type-7.
+                                                          // The originating ASBR derives no route from its own type-7.
         let self_routes = nssa_routes(&db, &compute(&db, ip([2, 2, 2, 2])), ip([2, 2, 2, 2]));
-        assert!(self_routes.iter().all(|r| r.prefix.to_string() != "10.99.0.0/24"));
+        assert!(self_routes
+            .iter()
+            .all(|r| r.prefix.to_string() != "10.99.0.0/24"));
     }
 
     #[test]
@@ -1150,9 +1224,18 @@ mod tests {
         let area = area_with_asbr();
         let intra = compute(&area, ip([1, 1, 1, 1]));
         let mut ext = Lsdb::new();
-        ext.install(external_lsa([2, 2, 2, 2], [203, 0, 113, 0], [255, 255, 255, 0], 20, false));
+        ext.install(external_lsa(
+            [2, 2, 2, 2],
+            [203, 0, 113, 0],
+            [255, 255, 255, 0],
+            20,
+            false,
+        ));
         let routes = external_routes(&ext, &intra, ip([1, 1, 1, 1]));
-        let r = routes.iter().find(|r| r.prefix.to_string() == "203.0.113.0/24").unwrap();
+        let r = routes
+            .iter()
+            .find(|r| r.prefix.to_string() == "203.0.113.0/24")
+            .unwrap();
         // E1: 10 (to the ASBR) + 20 (metric).
         assert_eq!(r.cost, 30);
     }
@@ -1187,10 +1270,25 @@ mod tests {
         ));
         let intra = compute(&db, ip([1, 1, 1, 1]));
         let mut ext = Lsdb::new();
-        ext.install(external_lsa([2, 2, 2, 2], [203, 0, 113, 0], [255, 255, 255, 0], 20, false));
-        ext.install(external_lsa([3, 3, 3, 3], [203, 0, 113, 0], [255, 255, 255, 0], 5, true));
+        ext.install(external_lsa(
+            [2, 2, 2, 2],
+            [203, 0, 113, 0],
+            [255, 255, 255, 0],
+            20,
+            false,
+        ));
+        ext.install(external_lsa(
+            [3, 3, 3, 3],
+            [203, 0, 113, 0],
+            [255, 255, 255, 0],
+            5,
+            true,
+        ));
         let routes = external_routes(&ext, &intra, ip([1, 1, 1, 1]));
-        let r = routes.iter().find(|r| r.prefix.to_string() == "203.0.113.0/24").unwrap();
+        let r = routes
+            .iter()
+            .find(|r| r.prefix.to_string() == "203.0.113.0/24")
+            .unwrap();
         assert_eq!(r.cost, 30, "the E1 route must win over the cheaper E2");
     }
 
@@ -1198,13 +1296,25 @@ mod tests {
     fn external_skips_unreachable_and_self() {
         let area = area_with_asbr();
         let mut ext = Lsdb::new();
-        ext.install(external_lsa([9, 9, 9, 9], [198, 51, 100, 0], [255, 255, 255, 0], 20, true));
+        ext.install(external_lsa(
+            [9, 9, 9, 9],
+            [198, 51, 100, 0],
+            [255, 255, 255, 0],
+            20,
+            true,
+        ));
         // ASBR 9.9.9.9 is not on the tree → skipped.
         let intra = compute(&area, ip([1, 1, 1, 1]));
         assert!(external_routes(&ext, &intra, ip([1, 1, 1, 1])).is_empty());
         // From the ASBR's own perspective its self-originated LSA is skipped.
         let mut ours = Lsdb::new();
-        ours.install(external_lsa([2, 2, 2, 2], [203, 0, 113, 0], [255, 255, 255, 0], 20, true));
+        ours.install(external_lsa(
+            [2, 2, 2, 2],
+            [203, 0, 113, 0],
+            [255, 255, 255, 0],
+            20,
+            true,
+        ));
         let intra2 = compute(&area, ip([2, 2, 2, 2]));
         assert!(external_routes(&ours, &intra2, ip([2, 2, 2, 2])).is_empty());
     }

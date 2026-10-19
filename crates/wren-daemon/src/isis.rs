@@ -64,8 +64,8 @@ use wren_isis::{
 };
 
 use crate::connected;
-use crate::sockopt::setsockopt_struct;
 use crate::router::{Redistribution, RouteUpdate};
+use crate::sockopt::setsockopt_struct;
 
 /// The lifetime stamped on an originated LSP (seconds). Refreshed before expiry.
 const LSP_LIFETIME: u16 = 1200;
@@ -387,18 +387,12 @@ fn lsp_id_max() -> LspId {
 /// fragment's end is the next fragment's start), so a neighbour can still detect,
 /// in any range, an LSP it holds that we no longer advertise. An empty database
 /// yields a single empty fragment covering the whole space.
-fn csnp_fragments(
-    entries: Vec<LspEntry>,
-    max_per: usize,
-) -> Vec<(LspId, LspId, Vec<LspEntry>)> {
+fn csnp_fragments(entries: Vec<LspEntry>, max_per: usize) -> Vec<(LspId, LspId, Vec<LspEntry>)> {
     if entries.is_empty() {
         return vec![(lsp_id_min(), lsp_id_max(), Vec::new())];
     }
     let max_per = max_per.max(1);
-    let chunks: Vec<Vec<LspEntry>> = entries
-        .chunks(max_per)
-        .map(<[LspEntry]>::to_vec)
-        .collect();
+    let chunks: Vec<Vec<LspEntry>> = entries.chunks(max_per).map(<[LspEntry]>::to_vec).collect();
     let n = chunks.len();
     let mut frags = Vec::with_capacity(n);
     for (i, chunk) in chunks.into_iter().enumerate() {
@@ -933,7 +927,8 @@ impl Isis {
         // higher sequence and re-originate so our real LSP (a fresh, full-lifetime
         // instance) supersedes the foreign one. The pseudonode LSP is refreshed by
         // the DIS housekeeping path.
-        if lsp.lsp_id == LspId::new(self.cfg.system_id, 0, 0) && lsp.sequence_number > self.own_seq[li]
+        if lsp.lsp_id == LspId::new(self.cfg.system_id, 0, 0)
+            && lsp.sequence_number > self.own_seq[li]
         {
             self.own_seq[li] = lsp.sequence_number;
             self.reoriginate(level).await;
@@ -1401,9 +1396,8 @@ impl Isis {
                         Some(_) => 1,                            // Initializing
                         None => 2,                               // Down
                     };
-                    let neighbor = nbr.and_then(|(sysid, n)| {
-                        n.p2p_neighbor_ext_id.map(|ext| (sysid.0, ext))
-                    });
+                    let neighbor =
+                        nbr.and_then(|(sysid, n)| n.p2p_neighbor_ext_id.map(|ext| (sysid.0, ext)));
                     tlvs.push(Tlv::P2pThreeWay {
                         adj_state,
                         ext_local_circuit_id: iface.local_circuit_id as u32,
@@ -2150,7 +2144,8 @@ fn read_mac(ifname: &str) -> Result<[u8; 6]> {
     // SAFETY: `ifr` is a 40-byte `ifreq` buffer; SIOCGIFHWADDR fills it in place.
     let rc = unsafe { libc::ioctl(guard.0, SIOCGIFHWADDR, ifr.as_mut_ptr()) };
     if rc < 0 {
-        return Err(io::Error::last_os_error()).with_context(|| format!("SIOCGIFHWADDR {ifname:?}"));
+        return Err(io::Error::last_os_error())
+            .with_context(|| format!("SIOCGIFHWADDR {ifname:?}"));
     }
     let mut mac = [0u8; 6];
     mac.copy_from_slice(&ifr[18..24]); // 16 (name) + 2 (sa_family) → sa_data

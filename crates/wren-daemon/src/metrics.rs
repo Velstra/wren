@@ -78,7 +78,12 @@ mod tests {
     #[test]
     fn sample_with_labels_is_escaped_and_ordered() {
         let mut out = String::new();
-        sample(&mut out, "wren_up", &[("neighbor", "10.0.0.2"), ("asn", "65002")], 1);
+        sample(
+            &mut out,
+            "wren_up",
+            &[("neighbor", "10.0.0.2"), ("asn", "65002")],
+            1,
+        );
         assert_eq!(out, "wren_up{neighbor=\"10.0.0.2\",asn=\"65002\"} 1\n");
     }
 

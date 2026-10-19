@@ -29,8 +29,12 @@ const K: [u32; 64] = [
 
 /// The 16-byte MD5 digest of `input` (RFC 1321).
 pub fn md5(input: &[u8]) -> [u8; 16] {
-    let (mut a0, mut b0, mut c0, mut d0) =
-        (0x6745_2301u32, 0xefcd_ab89u32, 0x98ba_dcfeu32, 0x1032_5476u32);
+    let (mut a0, mut b0, mut c0, mut d0) = (
+        0x6745_2301u32,
+        0xefcd_ab89u32,
+        0x98ba_dcfeu32,
+        0x1032_5476u32,
+    );
 
     // Pad: append 0x80, then zeros up to 56 mod 64, then the 64-bit little-endian
     // bit length.
@@ -90,7 +94,10 @@ mod tests {
         assert_eq!(hex(md5(b"")), "d41d8cd98f00b204e9800998ecf8427e");
         assert_eq!(hex(md5(b"a")), "0cc175b9c0f1b6a831c399e269772661");
         assert_eq!(hex(md5(b"abc")), "900150983cd24fb0d6963f7d28e17f72");
-        assert_eq!(hex(md5(b"message digest")), "f96b697d7cb7938d525a2f31aaf161d0");
+        assert_eq!(
+            hex(md5(b"message digest")),
+            "f96b697d7cb7938d525a2f31aaf161d0"
+        );
         assert_eq!(
             hex(md5(b"abcdefghijklmnopqrstuvwxyz")),
             "c3fcd3d76192e4007dfb496cca67e13b"

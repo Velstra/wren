@@ -508,7 +508,12 @@ impl PathAttribute {
                     out.extend_from_slice(c);
                 }
             }
-            PathAttribute::MpReachNlri { afi, safi, next_hop, nlri } => {
+            PathAttribute::MpReachNlri {
+                afi,
+                safi,
+                next_hop,
+                nlri,
+            } => {
                 out.extend_from_slice(&afi.to_be_bytes());
                 out.push(*safi);
                 out.push(next_hop.len() as u8);
@@ -518,7 +523,11 @@ impl PathAttribute {
                     encode_prefix_any(out, p);
                 }
             }
-            PathAttribute::MpUnreachNlri { afi, safi, withdrawn } => {
+            PathAttribute::MpUnreachNlri {
+                afi,
+                safi,
+                withdrawn,
+            } => {
                 out.extend_from_slice(&afi.to_be_bytes());
                 out.push(*safi);
                 for p in withdrawn {
@@ -542,7 +551,11 @@ impl PathAttribute {
                     encode_evpn_nlri(out, n);
                 }
             }
-            PathAttribute::MpReachFlowSpec { afi, next_hop, nlri } => {
+            PathAttribute::MpReachFlowSpec {
+                afi,
+                next_hop,
+                nlri,
+            } => {
                 out.extend_from_slice(&afi.to_be_bytes());
                 out.push(SAFI_FLOWSPEC);
                 out.push(next_hop.len() as u8);
@@ -559,7 +572,11 @@ impl PathAttribute {
                     n.encode(out);
                 }
             }
-            PathAttribute::MpReachSrPolicy { afi, next_hop, nlri } => {
+            PathAttribute::MpReachSrPolicy {
+                afi,
+                next_hop,
+                nlri,
+            } => {
                 out.extend_from_slice(&afi.to_be_bytes());
                 out.push(SAFI_SR_POLICY);
                 out.push(next_hop.len() as u8);
@@ -766,10 +783,18 @@ impl PathAttribute {
                     PathAttribute::MpReachEvpn { next_hop, nlri }
                 } else if safi == SAFI_FLOWSPEC {
                     let nlri = decode_flowspec_nlris(&value[nh_end + 1..])?;
-                    PathAttribute::MpReachFlowSpec { afi, next_hop, nlri }
+                    PathAttribute::MpReachFlowSpec {
+                        afi,
+                        next_hop,
+                        nlri,
+                    }
                 } else if safi == SAFI_SR_POLICY {
                     let nlri = decode_sr_policy_nlris(&value[nh_end + 1..], afi)?;
-                    PathAttribute::MpReachSrPolicy { afi, next_hop, nlri }
+                    PathAttribute::MpReachSrPolicy {
+                        afi,
+                        next_hop,
+                        nlri,
+                    }
                 } else if afi == AFI_LINK_STATE && safi == SAFI_LINK_STATE {
                     let nlri = decode_ls_nlris(&value[nh_end + 1..])?;
                     PathAttribute::MpReachLinkState { next_hop, nlri }
@@ -805,7 +830,12 @@ impl PathAttribute {
                         return None;
                     }
                     let nlri = decode_mp_prefixes(&value[nh_end + 1..], afi)?;
-                    PathAttribute::MpReachNlri { afi, safi, next_hop, nlri }
+                    PathAttribute::MpReachNlri {
+                        afi,
+                        safi,
+                        next_hop,
+                        nlri,
+                    }
                 }
             }
             Self::MP_UNREACH_NLRI => {
@@ -835,7 +865,11 @@ impl PathAttribute {
                         return None;
                     }
                     let withdrawn = decode_mp_prefixes(&value[3..], afi)?;
-                    PathAttribute::MpUnreachNlri { afi, safi, withdrawn }
+                    PathAttribute::MpUnreachNlri {
+                        afi,
+                        safi,
+                        withdrawn,
+                    }
                 }
             }
             Self::ORIGINATOR_ID => {
@@ -964,7 +998,10 @@ fn unicast_next_hop_len(afi: u16, nh_len: usize) -> bool {
 /// reached; what is left is the plain prefix encoding, which only IPv4 and IPv6
 /// unicast use here.
 fn known_family(afi: u16, safi: u8) -> bool {
-    matches!((afi, safi), (AFI_IPV4, SAFI_UNICAST) | (AFI_IPV6, SAFI_UNICAST))
+    matches!(
+        (afi, safi),
+        (AFI_IPV4, SAFI_UNICAST) | (AFI_IPV6, SAFI_UNICAST)
+    )
 }
 
 fn decode_mp_prefixes(buf: &[u8], afi: u16) -> Option<Vec<Prefix>> {
@@ -1210,7 +1247,11 @@ mod tests {
     fn four_octet_as_path_roundtrips_at_full_width() {
         // ASes beyond 65535 only survive the 4-octet encoding.
         roundtrip_w(
-            PathAttribute::AsPath(vec![AsPathSegment::Sequence(vec![196_618, 65001, 4_200_000_000])]),
+            PathAttribute::AsPath(vec![AsPathSegment::Sequence(vec![
+                196_618,
+                65001,
+                4_200_000_000,
+            ])]),
             true,
         );
     }
@@ -1237,7 +1278,10 @@ mod tests {
         let p = PathAttribute::As4Path(vec![AsPathSegment::Sequence(vec![196_618, 4_200_000_000])]);
         roundtrip_w(p.clone(), false);
         roundtrip_w(p, true);
-        let agg = PathAttribute::As4Aggregator { asn: 196_618, id: ip([10, 0, 0, 1]) };
+        let agg = PathAttribute::As4Aggregator {
+            asn: 196_618,
+            id: ip([10, 0, 0, 1]),
+        };
         roundtrip_w(agg.clone(), false);
         roundtrip_w(agg, true);
     }
@@ -1249,9 +1293,18 @@ mod tests {
         roundtrip(PathAttribute::LocalPref(150));
         roundtrip(PathAttribute::AtomicAggregate);
         // A 2-octet-range aggregator AS survives both widths.
-        roundtrip(PathAttribute::Aggregator { asn: 65001, id: ip([10, 0, 0, 1]) });
+        roundtrip(PathAttribute::Aggregator {
+            asn: 65001,
+            id: ip([10, 0, 0, 1]),
+        });
         // A 4-octet aggregator AS only survives the 4-octet width.
-        roundtrip_w(PathAttribute::Aggregator { asn: 196_618, id: ip([10, 0, 0, 1]) }, true);
+        roundtrip_w(
+            PathAttribute::Aggregator {
+                asn: 196_618,
+                id: ip([10, 0, 0, 1]),
+            },
+            true,
+        );
     }
 
     #[test]
@@ -1279,7 +1332,11 @@ mod tests {
         assert_eq!(buf[1], 4);
 
         let mut buf = Vec::new();
-        PathAttribute::Aggregator { asn: 1, id: ip([1, 2, 3, 4]) }.encode(&mut buf, true);
+        PathAttribute::Aggregator {
+            asn: 1,
+            id: ip([1, 2, 3, 4]),
+        }
+        .encode(&mut buf, true);
         assert_eq!(buf[0], FLAG_OPTIONAL | FLAG_TRANSITIVE);
 
         let mut buf = Vec::new();
@@ -1290,8 +1347,12 @@ mod tests {
 
     #[test]
     fn communities_roundtrip() {
-        use crate::community::{NO_EXPORT, NO_ADVERTISE};
-        roundtrip(PathAttribute::Communities(vec![0xFDE9_0064, NO_EXPORT, NO_ADVERTISE]));
+        use crate::community::{NO_ADVERTISE, NO_EXPORT};
+        roundtrip(PathAttribute::Communities(vec![
+            0xFDE9_0064,
+            NO_EXPORT,
+            NO_ADVERTISE,
+        ]));
         roundtrip(PathAttribute::Communities(vec![])); // empty list is legal
     }
 
@@ -1311,7 +1372,7 @@ mod tests {
             [0x02, 0x03, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01], // ro:65536:1
         ]));
         roundtrip(PathAttribute::ExtendedCommunities(vec![])); // empty list is legal
-        // Flags are optional-transitive, type 8.
+                                                               // Flags are optional-transitive, type 8.
         let mut buf = Vec::new();
         PathAttribute::Communities(vec![1]).encode(&mut buf, true);
         assert_eq!(buf[0], FLAG_OPTIONAL | FLAG_TRANSITIVE);
@@ -1329,7 +1390,9 @@ mod tests {
         let attr = PathAttribute::MpReachNlri {
             afi: AFI_IPV6,
             safi: SAFI_UNICAST,
-            next_hop: std::net::Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1).octets().to_vec(),
+            next_hop: std::net::Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1)
+                .octets()
+                .to_vec(),
             nlri: vec![p("2001:db8:99::/64"), p("2001:db8:a::/48")],
         };
         roundtrip(attr.clone());
@@ -1344,7 +1407,9 @@ mod tests {
     fn mp_reach_nlri_carries_a_linklocal_next_hop() {
         use crate::{AFI_IPV6, SAFI_UNICAST};
         // RFC 2545: a 32-octet next hop is global + link-local.
-        let mut nh = std::net::Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1).octets().to_vec();
+        let mut nh = std::net::Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1)
+            .octets()
+            .to_vec();
         nh.extend_from_slice(&std::net::Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1).octets());
         roundtrip(PathAttribute::MpReachNlri {
             afi: AFI_IPV6,
@@ -1419,7 +1484,7 @@ mod tests {
         roundtrip(PathAttribute::MpUnreachEvpn { withdrawn: vec![] });
     }
 
-        /// Build a raw MP_REACH value: AFI(2) · SAFI · NHLen · NextHop · Reserved ·
+    /// Build a raw MP_REACH value: AFI(2) · SAFI · NHLen · NextHop · Reserved ·
     /// NLRI, with one 2001:db8::/64 in it.
     fn mp_reach_value(afi: u16, safi: u8, nh: &[u8]) -> Vec<u8> {
         let mut v = afi.to_be_bytes().to_vec();
@@ -1427,8 +1492,8 @@ mod tests {
         v.push(nh.len() as u8);
         v.extend_from_slice(nh);
         v.push(0); // Reserved
-        // The NLRI has to match the family, or an IPv4 decode of an IPv6 /64
-        // fails on the prefix length rather than on the next hop this is about.
+                   // The NLRI has to match the family, or an IPv4 decode of an IPv6 /64
+                   // fails on the prefix length rather than on the next hop this is about.
         if afi == AFI_IPV6 {
             v.extend_from_slice(&[64, 0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0]);
         } else {
@@ -1565,7 +1630,10 @@ mod tests {
                 components: vec![Component::DestPrefix("10.50.0.0/24".parse().unwrap())],
             }],
         });
-        roundtrip(PathAttribute::MpUnreachFlowSpec { afi: AFI_IPV4, withdrawn: vec![] });
+        roundtrip(PathAttribute::MpUnreachFlowSpec {
+            afi: AFI_IPV4,
+            withdrawn: vec![],
+        });
     }
 
     #[test]
@@ -1633,12 +1701,9 @@ mod tests {
         // ORIGIN is exactly 1 octet, NEXT_HOP exactly 4, MED/LOCAL_PREF exactly 4
         // (RFC 7606 §5). A longer value is malformed, not silently truncated.
         assert!(PathAttribute::decode(&[FLAG_TRANSITIVE, 1, 2, 0, 0], true).is_none()); // ORIGIN len 2
-        assert!(
-            PathAttribute::decode(&[FLAG_TRANSITIVE, 3, 5, 192, 0, 2, 1, 9], true).is_none()
-        ); // NEXT_HOP len 5
-        assert!(
-            PathAttribute::decode(&[FLAG_OPTIONAL, 4, 5, 0, 0, 0, 5, 0], true).is_none()
-        ); // MED len 5
+        assert!(PathAttribute::decode(&[FLAG_TRANSITIVE, 3, 5, 192, 0, 2, 1, 9], true).is_none()); // NEXT_HOP len 5
+        assert!(PathAttribute::decode(&[FLAG_OPTIONAL, 4, 5, 0, 0, 0, 5, 0], true).is_none());
+        // MED len 5
     }
 
     #[test]
@@ -1652,13 +1717,40 @@ mod tests {
         );
         // AGGREGATOR (type 7) is exactly asn_len + 4 (8 octets with a 4-octet AS);
         // the exact form decodes, a padded one is discarded (RFC 7606 §7.7).
-        assert!(
-            decode_kept(&[FLAG_OPTIONAL | FLAG_TRANSITIVE, 7, 8, 0, 0, 0, 1, 10, 0, 0, 1], true)
-                .is_some()
-        );
+        assert!(decode_kept(
+            &[
+                FLAG_OPTIONAL | FLAG_TRANSITIVE,
+                7,
+                8,
+                0,
+                0,
+                0,
+                1,
+                10,
+                0,
+                0,
+                1
+            ],
+            true
+        )
+        .is_some());
         assert_eq!(
             PathAttribute::decode(
-                &[FLAG_OPTIONAL | FLAG_TRANSITIVE, 7, 10, 0, 0, 0, 1, 10, 0, 0, 1, 9, 9],
+                &[
+                    FLAG_OPTIONAL | FLAG_TRANSITIVE,
+                    7,
+                    10,
+                    0,
+                    0,
+                    0,
+                    1,
+                    10,
+                    0,
+                    0,
+                    1,
+                    9,
+                    9
+                ],
                 true
             ),
             Some((AttrOutcome::Discard { type_code: 7 }, 13))
@@ -1678,17 +1770,27 @@ mod tests {
         // pair below is the same wrong-length value, once with canonical flags
         // (discard) and once with broken flags (withdraw).
         let bad_len = |flags: u8| PathAttribute::decode(&[flags, 6, 1, 0], true);
-        assert!(matches!(bad_len(FLAG_TRANSITIVE), Some((AttrOutcome::Discard { .. }, _))));
+        assert!(matches!(
+            bad_len(FLAG_TRANSITIVE),
+            Some((AttrOutcome::Discard { .. }, _))
+        ));
         // ATOMIC_AGGREGATE is well-known transitive: Optional or Partial is a conflict.
         assert!(bad_len(FLAG_OPTIONAL | FLAG_TRANSITIVE).is_none());
         assert!(bad_len(FLAG_TRANSITIVE | FLAG_PARTIAL).is_none());
 
         // AGGREGATOR is optional transitive, so Partial is legal but dropping either
         // defining bit is not.
-        let agg = |flags: u8| PathAttribute::decode(&[flags, 7, 10, 0, 0, 0, 1, 10, 0, 0, 1, 9, 9], true);
+        let agg =
+            |flags: u8| PathAttribute::decode(&[flags, 7, 10, 0, 0, 0, 1, 10, 0, 0, 1, 9, 9], true);
         let canonical = FLAG_OPTIONAL | FLAG_TRANSITIVE;
-        assert!(matches!(agg(canonical), Some((AttrOutcome::Discard { .. }, _))));
-        assert!(matches!(agg(canonical | FLAG_PARTIAL), Some((AttrOutcome::Discard { .. }, _))));
+        assert!(matches!(
+            agg(canonical),
+            Some((AttrOutcome::Discard { .. }, _))
+        ));
+        assert!(matches!(
+            agg(canonical | FLAG_PARTIAL),
+            Some((AttrOutcome::Discard { .. }, _))
+        ));
         assert!(agg(FLAG_TRANSITIVE).is_none());
         assert!(agg(FLAG_OPTIONAL).is_none());
     }
@@ -1799,7 +1901,11 @@ mod tests {
         let mut b = Vec::new();
         unknown(256).encode(&mut b, true);
         assert_eq!(b[0] & 0x10, 0x10, "256 octets sets the Extended Length bit");
-        assert_eq!(&b[2..4], &[0x01, 0x00], "the length is 2 octets at 2..4, big-endian");
+        assert_eq!(
+            &b[2..4],
+            &[0x01, 0x00],
+            "the length is 2 octets at 2..4, big-endian"
+        );
         assert_eq!(b.len(), 4 + 256, "4 octets of header");
 
         // And both come back intact through the decoder. (An `Unknown` keeps the
@@ -1811,7 +1917,9 @@ mod tests {
             let (got, used) = decode_kept(&b, true).expect("decodes");
             assert_eq!(used, b.len(), "the header width is read back correctly");
             match got {
-                PathAttribute::Unknown { type_code, value, .. } => {
+                PathAttribute::Unknown {
+                    type_code, value, ..
+                } => {
                     assert_eq!(type_code, 200);
                     assert_eq!(value.len(), n, "a {n}-octet value survives");
                     assert!(value.iter().all(|&x| x == 0xab));
@@ -1841,9 +1949,18 @@ mod tests {
         assert_eq!(code(PathAttribute::MultiExitDisc(0)), (0x80, 4));
         assert_eq!(code(PathAttribute::LocalPref(0)), (0x40, 5));
         assert_eq!(code(PathAttribute::AtomicAggregate), (0x40, 6));
-        assert_eq!(code(PathAttribute::Aggregator { asn: 1, id: ip([1, 2, 3, 4]) }), (0xc0, 7));
+        assert_eq!(
+            code(PathAttribute::Aggregator {
+                asn: 1,
+                id: ip([1, 2, 3, 4])
+            }),
+            (0xc0, 7)
+        );
         assert_eq!(code(PathAttribute::Communities(vec![])), (0xc0, 8));
-        assert_eq!(code(PathAttribute::OriginatorId(ip([1, 2, 3, 4]))), (0x80, 9));
+        assert_eq!(
+            code(PathAttribute::OriginatorId(ip([1, 2, 3, 4]))),
+            (0x80, 9)
+        );
         assert_eq!(code(PathAttribute::ClusterList(vec![])), (0x80, 10));
         assert_eq!(
             code(PathAttribute::MpReachNlri {
@@ -1856,7 +1973,11 @@ mod tests {
             "MP_REACH_NLRI is optional non-transitive, type 14"
         );
         assert_eq!(
-            code(PathAttribute::MpUnreachNlri { afi: 2, safi: 1, withdrawn: vec![] }),
+            code(PathAttribute::MpUnreachNlri {
+                afi: 2,
+                safi: 1,
+                withdrawn: vec![]
+            }),
             (0x80, 15),
             "MP_UNREACH_NLRI is optional non-transitive, type 15"
         );
@@ -1872,7 +1993,11 @@ mod tests {
     /// itself.
     #[test]
     fn the_origin_codes_are_the_ones_the_rfc_assigns() {
-        for (o, code) in [(Origin::Igp, 0u8), (Origin::Egp, 1), (Origin::Incomplete, 2)] {
+        for (o, code) in [
+            (Origin::Igp, 0u8),
+            (Origin::Egp, 1),
+            (Origin::Incomplete, 2),
+        ] {
             assert_eq!(o.as_u8(), code, "{o:?} is ORIGIN {code}");
             assert_eq!(Origin::from_u8(code), Some(o));
             let mut b = Vec::new();
@@ -1914,7 +2039,11 @@ mod tests {
                 &[0, 0, 0xfd, 0xe9, 0, 0, 0xfd, 0xea],
                 "the ASes follow, 4 octets each at the 4-octet width"
             );
-            assert_eq!(b[2] as usize, b.len() - 3, "the attribute length covers the segment");
+            assert_eq!(
+                b[2] as usize,
+                b.len() - 3,
+                "the attribute length covers the segment"
+            );
         }
         // At the 2-octet width the same ASes are half as wide (RFC 6793 §4).
         let b = {
@@ -1949,12 +2078,20 @@ mod tests {
         }
         .encode(&mut b, true);
         let v = &b[3..]; // flags, type, 1-octet length
-        assert_eq!(&v[0..2], &[0, 2], "AFI is bytes 0..2 of the value; IPv6 is 2");
+        assert_eq!(
+            &v[0..2],
+            &[0, 2],
+            "AFI is bytes 0..2 of the value; IPv6 is 2"
+        );
         assert_eq!(v[2], 1, "SAFI is byte 2; unicast is 1");
         assert_eq!(v[3], 16, "the Next Hop *length* is byte 3");
         assert_eq!(&v[4..20], &nh[..], "the next hop itself is bytes 4..20");
         assert_eq!(v[20], 0, "byte 20 is the Reserved octet and must be zero");
-        assert_eq!(&v[21..], &[32, 0x20, 0x01, 0x0d, 0xb8], "the NLRI starts at byte 21");
+        assert_eq!(
+            &v[21..],
+            &[32, 0x20, 0x01, 0x0d, 0xb8],
+            "the NLRI starts at byte 21"
+        );
 
         // MP_UNREACH has no next hop and no reserved octet at all.
         let mut b = Vec::new();
@@ -1990,10 +2127,16 @@ mod tests {
             let hdr = if b[0] & 0x10 != 0 { 4 } else { 3 };
             b[hdr..].to_vec()
         };
-        let evpn = value(PathAttribute::MpReachEvpn { next_hop: vec![10, 0, 0, 1], nlri: vec![] });
+        let evpn = value(PathAttribute::MpReachEvpn {
+            next_hop: vec![10, 0, 0, 1],
+            nlri: vec![],
+        });
         assert_eq!(&evpn[0..3], &[0, 25, 70], "EVPN is AFI 25 (L2VPN), SAFI 70");
 
-        let ls = value(PathAttribute::MpReachLinkState { next_hop: vec![10, 0, 0, 1], nlri: vec![] });
+        let ls = value(PathAttribute::MpReachLinkState {
+            next_hop: vec![10, 0, 0, 1],
+            nlri: vec![],
+        });
         assert_eq!(
             &ls[0..3],
             &[0x40, 0x04, 71],
@@ -2007,7 +2150,11 @@ mod tests {
             next_hop: vec![10, 0, 0, 1],
             nlri: vec![],
         });
-        assert_eq!(&srp[0..3], &[0, 1, 73], "SR Policy is SAFI 73 under the endpoint's AFI");
+        assert_eq!(
+            &srp[0..3],
+            &[0, 1, 73],
+            "SR Policy is SAFI 73 under the endpoint's AFI"
+        );
         let srp6 = value(PathAttribute::MpUnreachSrPolicy {
             afi: crate::AFI_IPV6,
             withdrawn: vec![],
@@ -2051,10 +2198,17 @@ mod tests {
         let mut b = Vec::new();
         attr.encode(&mut b, true);
         let n = &b[3 + 2 + 1 + 1 + 4 + 1..]; // AFI(2) SAFI(1) nhlen(1) nh(4) reserved(1)
-        assert_eq!(n[0], 96, "an IPv4 SR Policy NLRI is 96 bits (12 octets) long");
+        assert_eq!(
+            n[0], 96,
+            "an IPv4 SR Policy NLRI is 96 bits (12 octets) long"
+        );
         assert_eq!(&n[1..5], &[0, 0, 0, 1], "the distinguisher is 4 octets");
         assert_eq!(&n[5..9], &[0, 0, 0, 100], "the colour is 4 octets");
-        assert_eq!(&n[9..13], &[10, 0, 0, 9], "the endpoint follows its AFI's width");
+        assert_eq!(
+            &n[9..13],
+            &[10, 0, 0, 9],
+            "the endpoint follows its AFI's width"
+        );
         let (decoded, used) = decode_kept(&b, true).expect("decodes");
         assert_eq!(decoded, attr);
         assert_eq!(used, b.len());
@@ -2070,7 +2224,11 @@ mod tests {
         };
         let mut b = Vec::new();
         attr.encode(&mut b, true);
-        assert_eq!(b[3 + 3], 192, "an IPv6 SR Policy NLRI is 192 bits (24 octets) long");
+        assert_eq!(
+            b[3 + 3],
+            192,
+            "an IPv6 SR Policy NLRI is 192 bits (24 octets) long"
+        );
         assert_eq!(decode_kept(&b, true).expect("decodes").0, attr);
 
         // --- Tunnel Encapsulation (RFC 9012 §3): Type(2) Length(2) Value ----
@@ -2091,7 +2249,10 @@ mod tests {
             kind: LsObjectKind::Node,
             protocol: 2, // IS-IS Level 2
             identifier: 0,
-            descriptors: vec![LsTlv { typ: 512, value: vec![0, 0, 0xfd, 0xe8] }],
+            descriptors: vec![LsTlv {
+                typ: 512,
+                value: vec![0, 0, 0xfd, 0xe8],
+            }],
         };
         let attr = PathAttribute::MpReachLinkState {
             next_hop: vec![10, 0, 0, 1],
@@ -2107,19 +2268,30 @@ mod tests {
             "Total NLRI Length is bytes 2..4 and covers everything after it"
         );
         assert_eq!(n[4], 2, "Protocol-ID is byte 4");
-        assert_eq!(&n[5..13], &[0u8; 8], "the Identifier is an 8-octet field at 5..13");
-        assert_eq!(&n[13..17], &[0x02, 0x00, 0, 4], "then the descriptor TLVs (type 512, len 4)");
+        assert_eq!(
+            &n[5..13],
+            &[0u8; 8],
+            "the Identifier is an 8-octet field at 5..13"
+        );
+        assert_eq!(
+            &n[13..17],
+            &[0x02, 0x00, 0, 4],
+            "then the descriptor TLVs (type 512, len 4)"
+        );
         assert_eq!(decode_kept(&b, true).expect("decodes").0, attr);
 
-        let attr = PathAttribute::MpUnreachLinkState { withdrawn: vec![nlri] };
+        let attr = PathAttribute::MpUnreachLinkState {
+            withdrawn: vec![nlri],
+        };
         let mut b = Vec::new();
         attr.encode(&mut b, true);
         assert_eq!(decode_kept(&b, true).expect("decodes").0, attr);
 
         // --- The BGP-LS attribute itself (type 29) ---------------------------
-        let attr = PathAttribute::BgpLs(BgpLsAttribute::new(vec![
-            LsTlv { typ: 1026, value: b"wren".to_vec() },
-        ]));
+        let attr = PathAttribute::BgpLs(BgpLsAttribute::new(vec![LsTlv {
+            typ: 1026,
+            value: b"wren".to_vec(),
+        }]));
         let mut b = Vec::new();
         attr.encode(&mut b, true);
         assert_eq!(b[0], 0x80, "BGP-LS_ATTRIBUTE is optional non-transitive");

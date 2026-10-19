@@ -22,7 +22,7 @@
 use std::net::{Ipv4Addr, Ipv6Addr};
 
 use crate::hmac;
-use crate::lsa::{checksum_valid, Lsa, LsType, LsaHeader, LSA_HEADER_LEN};
+use crate::lsa::{checksum_valid, LsType, Lsa, LsaHeader, LSA_HEADER_LEN};
 use crate::{packet_checksum, VERSION};
 
 /// The five OSPF packet types (§A.3.1, the Type field) — the same five as OSPFv2.
@@ -960,7 +960,10 @@ mod tests {
                 interface_mtu: 1500,
                 flags: DD_FLAG_INIT | DD_FLAG_MORE | DD_FLAG_MASTER,
                 dd_sequence: 0x1234_5678,
-                lsa_headers: vec![sample_lsa_header([0, 0, 0, 1]), sample_lsa_header([0, 0, 0, 2])],
+                lsa_headers: vec![
+                    sample_lsa_header([0, 0, 0, 1]),
+                    sample_lsa_header([0, 0, 0, 2]),
+                ],
             },
         );
         let bytes = pkt.encode(SRC, ALL_SPF_ROUTERS);
@@ -1047,12 +1050,18 @@ mod tests {
     fn lsu_discards_an_lsa_with_a_bad_checksum() {
         let lsa = |lsid: [u8; 4]| Lsa {
             header: sample_lsa_header(lsid),
-            body: LsaBody::Router(RouterLsa { flags: 0, options: OPT_V6, links: vec![] }),
+            body: LsaBody::Router(RouterLsa {
+                flags: 0,
+                options: OPT_V6,
+                links: vec![],
+            }),
         };
         // A two-LSA update; encode stamps each with a valid Fletcher checksum.
         let mut body = Vec::new();
         encode_lsu(
-            &LinkStateUpdate { lsas: vec![lsa([1, 1, 1, 1]), lsa([2, 2, 2, 2])] },
+            &LinkStateUpdate {
+                lsas: vec![lsa([1, 1, 1, 1]), lsa([2, 2, 2, 2])],
+            },
             &mut body,
         );
         // Flip a byte of the second LSA's stored ls_checksum field so decoding still
@@ -1064,7 +1073,10 @@ mod tests {
         let decoded = decode_lsu(&body).expect("packet still frames");
         // The corrupt LSA is discarded; the intact one survives.
         assert_eq!(decoded.lsas.len(), 1);
-        assert_eq!(decoded.lsas[0].header.link_state_id, Ipv4Addr::new(1, 1, 1, 1));
+        assert_eq!(
+            decoded.lsas[0].header.link_state_id,
+            Ipv4Addr::new(1, 1, 1, 1)
+        );
     }
 
     #[test]
@@ -1098,7 +1110,10 @@ mod tests {
         let pkt = Packet::link_state_ack(
             sample_header(),
             LinkStateAck {
-                lsa_headers: vec![sample_lsa_header([0, 0, 0, 1]), sample_lsa_header([0, 0, 0, 9])],
+                lsa_headers: vec![
+                    sample_lsa_header([0, 0, 0, 1]),
+                    sample_lsa_header([0, 0, 0, 9]),
+                ],
             },
         );
         let bytes = pkt.encode(SRC, ALL_SPF_ROUTERS);
@@ -1155,7 +1170,11 @@ mod tests {
         );
         assert_eq!(&b[4..8], &[1, 2, 3, 4], "Router ID is bytes 4..8");
         assert_eq!(&b[8..12], &[0, 0, 0, 42], "Area ID is bytes 8..12");
-        assert_ne!(&b[12..14], &[0, 0], "Checksum is bytes 12..14 and is filled in");
+        assert_ne!(
+            &b[12..14],
+            &[0, 0],
+            "Checksum is bytes 12..14 and is filled in"
+        );
         assert_eq!(b[14], 42, "Instance ID is byte 14");
         assert_eq!(b[15], 0, "byte 15 is reserved and must be zero");
     }
@@ -1205,7 +1224,11 @@ mod tests {
             },
         );
         let b = pkt.encode(SRC, ALL_SPF_ROUTERS);
-        assert_eq!(&b[16..20], &[0x11, 0x12, 0x13, 0x14], "Interface ID is bytes 16..20");
+        assert_eq!(
+            &b[16..20],
+            &[0x11, 0x12, 0x13, 0x14],
+            "Interface ID is bytes 16..20"
+        );
         assert_eq!(b[20], 7, "Rtr Pri is byte 20");
         assert_eq!(
             u32::from_be_bytes([0, b[21], b[22], b[23]]),
@@ -1213,10 +1236,22 @@ mod tests {
             "Options is a 24-bit field at bytes 21..24"
         );
         assert_eq!(&b[24..26], &[0x00, 0x0a], "HelloInterval is bytes 24..26");
-        assert_eq!(&b[26..28], &[0x00, 0x28], "RouterDeadInterval is bytes 26..28");
-        assert_eq!(&b[28..32], &[10, 0, 0, 1], "Designated Router ID is bytes 28..32");
+        assert_eq!(
+            &b[26..28],
+            &[0x00, 0x28],
+            "RouterDeadInterval is bytes 26..28"
+        );
+        assert_eq!(
+            &b[28..32],
+            &[10, 0, 0, 1],
+            "Designated Router ID is bytes 28..32"
+        );
         assert_eq!(&b[32..36], &[10, 0, 0, 2], "Backup DR ID is bytes 32..36");
-        assert_eq!(&b[36..40], &[10, 0, 0, 3], "the neighbour list starts at byte 36");
+        assert_eq!(
+            &b[36..40],
+            &[10, 0, 0, 3],
+            "the neighbour list starts at byte 36"
+        );
         assert_eq!(b.len(), 40);
     }
 
@@ -1254,10 +1289,18 @@ mod tests {
             OPT_V6 | OPT_E,
             "Options is a 24-bit field at bytes 17..20"
         );
-        assert_eq!(&b[20..22], &[0x05, 0xdc], "Interface MTU 1500 is bytes 20..22");
+        assert_eq!(
+            &b[20..22],
+            &[0x05, 0xdc],
+            "Interface MTU 1500 is bytes 20..22"
+        );
         assert_eq!(b[22], 0, "byte 22 is reserved and must be zero");
         assert_eq!(b[23], 0x07, "the I|M|MS flag byte is byte 23");
-        assert_eq!(&b[24..28], &[0x12, 0x34, 0x56, 0x78], "DD sequence is bytes 24..28");
+        assert_eq!(
+            &b[24..28],
+            &[0x12, 0x34, 0x56, 0x78],
+            "DD sequence is bytes 24..28"
+        );
         assert_eq!(b.len(), 28);
     }
 
@@ -1283,10 +1326,18 @@ mod tests {
         );
         let b = pkt.encode(SRC, ALL_SPF_ROUTERS);
         let e = &b[16..28];
-        assert_eq!(&e[0..2], &[0, 0], "bytes 0..2 of the entry are reserved zeros");
+        assert_eq!(
+            &e[0..2],
+            &[0, 0],
+            "bytes 0..2 of the entry are reserved zeros"
+        );
         assert_eq!(&e[2..4], &[0x40, 0x05], "the 16-bit LS Type is bytes 2..4");
         assert_eq!(&e[4..8], &[10, 1, 0, 0], "Link State ID is bytes 4..8");
-        assert_eq!(&e[8..12], &[10, 0, 0, 9], "Advertising Router is bytes 8..12");
+        assert_eq!(
+            &e[8..12],
+            &[10, 0, 0, 9],
+            "Advertising Router is bytes 8..12"
+        );
         assert_eq!(b.len(), 16 + 12);
     }
 }

@@ -255,7 +255,10 @@ mod checksum_tests {
         let mut region: Vec<u8> = (0u8..24).collect();
         let csum = fletcher16(&mut region, 14);
         assert_ne!(csum, 0, "a non-trivial body yields a non-zero checksum");
-        assert!(fletcher16_valid(&region), "freshly stamped region validates");
+        assert!(
+            fletcher16_valid(&region),
+            "freshly stamped region validates"
+        );
         // Corrupt a byte -> validation fails.
         region[3] ^= 0xff;
         assert!(!fletcher16_valid(&region));

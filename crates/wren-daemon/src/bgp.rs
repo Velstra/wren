@@ -24,8 +24,8 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt::Write as _;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -33,33 +33,33 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
-use tokio::time::{Instant, sleep, sleep_until, timeout};
+use tokio::time::{sleep, sleep_until, timeout, Instant};
 use tracing::{debug, info, warn};
 
 use wren_bgp::attr::{
-    AsPathSegment, FLAG_OPTIONAL, FLAG_PARTIAL, FLAG_TRANSITIVE, Origin, PathAttribute,
-    reconstruct_as_path,
+    reconstruct_as_path, AsPathSegment, Origin, PathAttribute, FLAG_OPTIONAL, FLAG_PARTIAL,
+    FLAG_TRANSITIVE,
 };
-use wren_bgp::capability::{ADD_PATH_BOTH, ADD_PATH_RECEIVE, ADD_PATH_SEND, BgpRole, Capability};
+use wren_bgp::capability::{BgpRole, Capability, ADD_PATH_BOTH, ADD_PATH_RECEIVE, ADD_PATH_SEND};
 use wren_bgp::community::format_community;
-use wren_bgp::decision::{DEFAULT_LOCAL_PREF, Path};
-use wren_bgp::evpn::{Esi, EvpnNlri, Rd, TUNNEL_TYPE_VXLAN, encap_ext_community};
+use wren_bgp::decision::{Path, DEFAULT_LOCAL_PREF};
+use wren_bgp::evpn::{encap_ext_community, Esi, EvpnNlri, Rd, TUNNEL_TYPE_VXLAN};
 use wren_bgp::evpn_rib::{
-    EviChange, EviTable, EvpnRib, EvpnRibEvent, IpVrfChange, IpVrfTable, build_router_mac,
+    build_router_mac, EviChange, EviTable, EvpnRib, EvpnRibEvent, IpVrfChange, IpVrfTable,
 };
 use wren_bgp::ext_community::format_ext_community;
 use wren_bgp::flowspec::{Action as FsAction, FlowSpec};
-use wren_bgp::flowspec_rib::{FlowSpecNlri, FlowSpecRib, FlowSpecRibEvent, actions_of};
-use wren_bgp::fsm::{Action, BgpFsm, CODE_CEASE, CODE_OPEN_MESSAGE, Event, State};
+use wren_bgp::flowspec_rib::{actions_of, FlowSpecNlri, FlowSpecRib, FlowSpecRibEvent};
+use wren_bgp::fsm::{Action, BgpFsm, Event, State, CODE_CEASE, CODE_OPEN_MESSAGE};
 use wren_bgp::large_community::format_large_community;
-use wren_bgp::link_state::{AFI_LINK_STATE, BgpLsAttribute, LinkStateNlri, SAFI_LINK_STATE};
+use wren_bgp::link_state::{BgpLsAttribute, LinkStateNlri, AFI_LINK_STATE, SAFI_LINK_STATE};
 use wren_bgp::link_state_rib::{LinkStateEntry, LinkStateRib, LinkStateRibEvent};
 use wren_bgp::message::{AddPath, Message, Notification, Open, Update};
 use wren_bgp::rib::{BgpRib, RibEvent};
 use wren_bgp::rpki::{Roa, RoaTable, Validity};
-use wren_bgp::sr_policy::{SAFI_SR_POLICY, SrPolicyEncoding, SrPolicyNlri, TunnelTlv};
+use wren_bgp::sr_policy::{SrPolicyEncoding, SrPolicyNlri, TunnelTlv, SAFI_SR_POLICY};
 use wren_bgp::sr_policy_rib::{SrPolicyEntry, SrPolicyRib, SrPolicyRibEvent};
-use wren_bgp::srv6::{Srv6ServiceSid, Srv6ServiceTlv, Srv6Sid, behavior, build_service_sid};
+use wren_bgp::srv6::{behavior, build_service_sid, Srv6ServiceSid, Srv6ServiceTlv, Srv6Sid};
 use wren_bgp::{
     AFI_IPV4, AFI_IPV6, AFI_L2VPN, AS_TRANS, HEADER_LEN, MARKER, MAX_MESSAGE_LEN, PORT, SAFI_EVPN,
     SAFI_FLOWSPEC, SAFI_UNICAST, VERSION,
@@ -1295,7 +1295,7 @@ fn render_binding_sid(bsid: &wren_bgp::sr_policy::BindingSid) -> String {
 /// the topology a controller consumes; wren does not export its own IGP into BGP-LS.
 pub fn render_bgp_linkstate(rib: &LinkStateRib) -> String {
     use wren_bgp::link_state::{
-        LsObjectKind, TLV_LOCAL_NODE_DESCRIPTORS, TLV_REMOTE_NODE_DESCRIPTORS, format_router_id,
+        format_router_id, LsObjectKind, TLV_LOCAL_NODE_DESCRIPTORS, TLV_REMOTE_NODE_DESCRIPTORS,
     };
     if rib.is_empty() {
         return "no link-state objects\n".to_string();
@@ -4783,7 +4783,7 @@ fn set_tcp_ao(fd: i32, peer: IpAddr, key: &str, key_id: u8) -> std::io::Result<(
     let alg = b"hmac(sha1)";
     ao.alg_name[..alg.len()].copy_from_slice(alg);
     ao.set_flags = 0b11; // set_current | set_rnext: use this key right away
-    // A full host match for the peer address: /32 for IPv4, /128 for IPv6.
+                         // A full host match for the peer address: /32 for IPv4, /128 for IPv6.
     ao.prefix = if peer.is_ipv6() { 128 } else { 32 };
     ao.sndid = key_id;
     ao.rcvid = key_id;
@@ -8099,14 +8099,12 @@ mod tests {
             other => panic!("expected a type-5 IP Prefix route, got {other:?}"),
         }
         // Export RT, the VXLAN encapsulation community, and the Router's MAC.
-        assert!(
-            r.ext_communities
-                .contains(&wren_bgp::evpn_rib::auto_route_target(65001, 50100))
-        );
-        assert!(
-            r.ext_communities
-                .contains(&encap_ext_community(TUNNEL_TYPE_VXLAN))
-        );
+        assert!(r
+            .ext_communities
+            .contains(&wren_bgp::evpn_rib::auto_route_target(65001, 50100)));
+        assert!(r
+            .ext_communities
+            .contains(&encap_ext_community(TUNNEL_TYPE_VXLAN)));
         assert!(r.ext_communities.contains(&build_router_mac(mac)));
         // Next hop is our VTEP — that is what the remote tunnels toward.
         assert_eq!(r.next_hop, vtep_next_hop_octets(ip([10, 0, 0, 1])));
@@ -8150,12 +8148,10 @@ mod tests {
         );
         // No Router's MAC: an End.DT4/DT6 egress does an IP lookup, so there is no
         // inner Ethernet header for one to address.
-        assert!(
-            !routes[0]
-                .ext_communities
-                .iter()
-                .any(|ec| ec[0] == 0x06 && ec[1] == 0x03)
-        );
+        assert!(!routes[0]
+            .ext_communities
+            .iter()
+            .any(|ec| ec[0] == 0x06 && ec[1] == 0x03));
     }
 
     /// `show evpn` must render the L3 view too — an operator debugging inter-subnet

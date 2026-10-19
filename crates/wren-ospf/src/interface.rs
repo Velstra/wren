@@ -342,7 +342,10 @@ mod tests {
     fn lone_router_becomes_dr_with_no_backup() {
         // A single eligible router on a fresh segment: DR=self, BDR=none.
         let me = cand([1, 1, 1, 1], 1, NONE, NONE);
-        assert_eq!(elect_dr_bdr(&[me], ip([1, 1, 1, 1])), (ip([1, 1, 1, 1]), ip(NONE)));
+        assert_eq!(
+            elect_dr_bdr(&[me], ip([1, 1, 1, 1])),
+            (ip([1, 1, 1, 1]), ip(NONE))
+        );
     }
 
     #[test]

@@ -57,8 +57,8 @@ use wren_ospf::{
     OPT_E, OPT_NP,
 };
 
-use crate::sockopt::{setsockopt_int, setsockopt_struct};
 use crate::router::{Redistribution, RouteUpdate};
+use crate::sockopt::{setsockopt_int, setsockopt_struct};
 
 /// How often (seconds) the housekeeping timer advances dead/wait timers.
 const HOUSEKEEPING_SECS: u64 = 1;
@@ -632,8 +632,11 @@ pub async fn run(
 
     // Seed the external set from the from-config statics (`redistribute-static`);
     // RIB-based redistribution then adds to it over the run.
-    let externals: BTreeMap<Prefix, u32> =
-        cfg.redistribute.iter().map(|r| (r.prefix, r.metric)).collect();
+    let externals: BTreeMap<Prefix, u32> = cfg
+        .redistribute
+        .iter()
+        .map(|r| (r.prefix, r.metric))
+        .collect();
     let mut ospf = Ospf {
         cfg,
         ifaces,
@@ -801,7 +804,11 @@ impl Ospf {
     /// LSAs are ordered by (type, link-state-id, advertising-router) for a stable list.
     fn lsa_infos(&self) -> Vec<OspfLsaInfo> {
         fn sort_key(l: &OspfLsaInfo) -> (u8, u32, u32) {
-            (l.ls_type.as_u8(), u32::from(l.link_state_id), u32::from(l.advertising_router))
+            (
+                l.ls_type.as_u8(),
+                u32::from(l.link_state_id),
+                u32::from(l.advertising_router),
+            )
         }
         let mut out = Vec::new();
         for (area_id, area) in &self.areas {
@@ -925,7 +932,10 @@ impl Ospf {
             router_id
         };
         match packet.body {
-            Body::Hello(h) => self.handle_hello(idx, nbr_id, router_id, pkt.src, &h, now).await,
+            Body::Hello(h) => {
+                self.handle_hello(idx, nbr_id, router_id, pkt.src, &h, now)
+                    .await
+            }
             Body::DatabaseDescription(dd) => self.handle_dd(idx, nbr_id, &dd).await,
             Body::LinkStateRequest(req) => self.handle_lsr(idx, nbr_id, &req).await,
             Body::LinkStateUpdate(upd) => self.handle_lsu(idx, nbr_id, upd, now).await,
@@ -1211,8 +1221,7 @@ impl Ospf {
         let recv_master = dd.flags & DD_FLAG_MASTER != 0;
         let recv_init = dd.flags & DD_FLAG_INIT != 0;
         if dd_seqnum_mismatch(recv_init, recv_master, master) {
-            let acts = self
-                .ifaces[idx]
+            let acts = self.ifaces[idx]
                 .neighbors
                 .get_mut(&nbr_id)
                 .unwrap()
@@ -1363,7 +1372,9 @@ impl Ospf {
     /// restarts — forwarding continues uninterrupted. A Grace-LSA received at MaxAge is
     /// the restarting router signalling completion, so we exit helper mode at once.
     fn handle_grace_lsa(&mut self, nbr_id: Ipv4Addr, lsa: &Lsa, now: u64) {
-        let LsaBody::Opaque(o) = &lsa.body else { return };
+        let LsaBody::Opaque(o) = &lsa.body else {
+            return;
+        };
         let Some(grace) = wren_ospf::grace::GraceLsa::decode(&o.data) else {
             debug!(neighbor = %nbr_id, "ignoring malformed Grace-LSA");
             return;
@@ -1388,7 +1399,13 @@ impl Ospf {
         let deadline = now + period;
         let fresh = self
             .helping
-            .insert(nbr_id, GrHelper { deadline, seen_at_entry })
+            .insert(
+                nbr_id,
+                GrHelper {
+                    deadline,
+                    seen_at_entry,
+                },
+            )
             .is_none();
         if fresh {
             info!(neighbor = %nbr_id, grace_period = period, reason = ?grace.reason, "OSPF graceful-restart helper: entering helper mode");
@@ -1552,8 +1569,7 @@ impl Ospf {
         }
 
         if bad_ls_req {
-            let acts = self
-                .ifaces[idx]
+            let acts = self.ifaces[idx]
                 .neighbors
                 .get_mut(&nbr_id)
                 .unwrap()
@@ -1702,8 +1718,7 @@ impl Ospf {
         let was_asbr = self.is_asbr();
         let mut to_flood = Vec::new();
         let mut want = HashSet::new();
-        let externals: Vec<(Prefix, u32)> =
-            self.externals.iter().map(|(p, m)| (*p, *m)).collect();
+        let externals: Vec<(Prefix, u32)> = self.externals.iter().map(|(p, m)| (*p, *m)).collect();
         for (prefix, metric) in externals {
             let net = match prefix.addr() {
                 IpAddr::V4(a) => a,
@@ -1766,8 +1781,12 @@ impl Ospf {
     /// AS. The forwarding address is left `0.0.0.0` (forward via the originator),
     /// matching what the SPF resolves.
     async fn originate_nssa(&mut self) {
-        let nssa_areas: Vec<Ipv4Addr> =
-            self.areas.keys().copied().filter(|a| self.is_nssa(*a)).collect();
+        let nssa_areas: Vec<Ipv4Addr> = self
+            .areas
+            .keys()
+            .copied()
+            .filter(|a| self.is_nssa(*a))
+            .collect();
         for area in nssa_areas {
             let mut to_flood = Vec::new();
             let mut want = HashSet::new();
@@ -2083,8 +2102,12 @@ impl Ospf {
     /// the `is_abr` guard in [`Ospf::originate_summaries`], so only an ABR injects it;
     /// the cost is the same `stub_default_cost` a stub default uses.
     async fn originate_nssa_default(&mut self) {
-        let areas: Vec<Ipv4Addr> =
-            self.areas.keys().copied().filter(|a| self.wants_nssa_default(*a)).collect();
+        let areas: Vec<Ipv4Addr> = self
+            .areas
+            .keys()
+            .copied()
+            .filter(|a| self.wants_nssa_default(*a))
+            .collect();
         for area in areas {
             let lsa = Lsa {
                 header: {
@@ -2112,8 +2135,12 @@ impl Ospf {
     /// P-bit gating) is a refinement left for later. The forwarding address is
     /// carried through unchanged (`0.0.0.0` ⇒ forward via us, the translator).
     async fn translate_nssa(&mut self) {
-        let nssa_areas: Vec<Ipv4Addr> =
-            self.areas.keys().copied().filter(|a| self.is_nssa(*a)).collect();
+        let nssa_areas: Vec<Ipv4Addr> = self
+            .areas
+            .keys()
+            .copied()
+            .filter(|a| self.is_nssa(*a))
+            .collect();
         let mut to_flood = Vec::new();
         let mut want = HashSet::new();
         for area in &nssa_areas {
@@ -2121,8 +2148,7 @@ impl Ospf {
                 .lsdb
                 .iter_type(LsType::Nssa)
                 .filter(|l| {
-                    l.header.advertising_router != self.cfg.router_id
-                        && l.header.ls_age < MAX_AGE
+                    l.header.advertising_router != self.cfg.router_id && l.header.ls_age < MAX_AGE
                 })
                 .cloned()
                 .collect();
@@ -2189,7 +2215,9 @@ impl Ospf {
                     ls_checksum: 0,
                     length: 0,
                 },
-                body: LsaBody::Opaque(OpaqueLsa { data: grace.encode() }),
+                body: LsaBody::Opaque(OpaqueLsa {
+                    data: grace.encode(),
+                }),
             };
             let bytes = self.packet(
                 iface.area,
@@ -2415,7 +2443,8 @@ impl Ospf {
             .helping
             .iter()
             .filter(|(id, h)| {
-                self.neighbor_last_seen(**id).is_some_and(|seen| seen > h.seen_at_entry)
+                self.neighbor_last_seen(**id)
+                    .is_some_and(|seen| seen > h.seen_at_entry)
             })
             .map(|(id, _)| *id)
             .collect();
@@ -2529,7 +2558,8 @@ impl Ospf {
                 continue;
             }
             if let Some(mut n) = self.ifaces[idx].neighbors.remove(&id) {
-                n.fsm.handle(NeighborEvent::InactivityTimer, NeighborContext::default());
+                n.fsm
+                    .handle(NeighborEvent::InactivityTimer, NeighborContext::default());
                 info!(interface = %self.ifaces[idx].name, neighbor = %id, %peer, "OSPF neighbour down (BFD)");
                 changed = true;
             }
@@ -2780,8 +2810,7 @@ impl Ospf {
     /// Every LSA header to describe on an adjacency in `area`: the area's own
     /// database plus the AS-wide external (type-5) LSAs.
     fn db_headers(&self, area: Ipv4Addr) -> Vec<LsaHeader> {
-        let mut headers: Vec<LsaHeader> =
-            self.areas[&area].lsdb.iter().map(|l| l.header).collect();
+        let mut headers: Vec<LsaHeader> = self.areas[&area].lsdb.iter().map(|l| l.header).collect();
         // Stub and NSSA areas carry no AS-external (type-5) LSAs, so they are left
         // out of the Database Description too — otherwise a neighbour would request
         // a type-5 we will never flood into the area and stall in Loading. (A type-7
@@ -3087,13 +3116,23 @@ mod tests {
         };
         assert_eq!(render_ospf_database(&[]), "no ospf lsas\n");
         let out = render_ospf_database(&[
-            lsa(Some(Ipv4Addr::new(0, 0, 0, 0)), LsType::Router, [1, 1, 1, 1], [1, 1, 1, 1], Some(0)),
+            lsa(
+                Some(Ipv4Addr::new(0, 0, 0, 0)),
+                LsType::Router,
+                [1, 1, 1, 1],
+                [1, 1, 1, 1],
+                Some(0),
+            ),
             lsa(None, LsType::AsExternal, [10, 9, 0, 0], [2, 2, 2, 2], None),
         ]);
-        assert!(out.contains("area 0.0.0.0 router id 1.1.1.1 adv-router 1.1.1.1 seq 0x80000001 age 42 flags none"));
+        assert!(out.contains(
+            "area 0.0.0.0 router id 1.1.1.1 adv-router 1.1.1.1 seq 0x80000001 age 42 flags none"
+        ));
         assert!(out.contains("as-external external id 10.9.0.0 adv-router 2.2.2.2 seq 0x80000001"));
         // Only a Router-LSA has them, so nothing else grows a flags column.
-        assert!(!out.lines().any(|l| l.starts_with("as-external") && l.contains("flags")));
+        assert!(!out
+            .lines()
+            .any(|l| l.starts_with("as-external") && l.contains("flags")));
     }
 
     /// The flags a Router-LSA carries are named, not printed as a hex byte.
@@ -3166,7 +3205,10 @@ mod tests {
                 ls_checksum: 0,
                 length: wren_ospf::lsa::LSA_HEADER_LEN as u16,
             },
-            body: LsaBody::Router(wren_ospf::lsa::RouterLsa { flags: 0, links: vec![] }),
+            body: LsaBody::Router(wren_ospf::lsa::RouterLsa {
+                flags: 0,
+                links: vec![],
+            }),
         }
     }
 
@@ -3186,8 +3228,14 @@ mod tests {
         stale_b.ls_seq = 3; // older than the pending seq 9
         clear_acked_lsas(&mut rxmt, &[ack_a, stale_b]);
 
-        assert!(!rxmt.contains_key(&a.key()), "current-instance ack clears the entry");
-        assert!(rxmt.contains_key(&b.key()), "stale ack keeps the newer pending instance");
+        assert!(
+            !rxmt.contains_key(&a.key()),
+            "current-instance ack clears the entry"
+        );
+        assert!(
+            rxmt.contains_key(&b.key()),
+            "stale ack keeps the newer pending instance"
+        );
 
         // A fresh ack for B's real instance now clears it.
         clear_acked_lsas(&mut rxmt, &[b.header]);

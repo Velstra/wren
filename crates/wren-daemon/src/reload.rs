@@ -332,7 +332,11 @@ fn stop_slot(slot: &mut Slot) {
 /// shutdown into it, and call the slot's respawn closure. Returns whether a generation
 /// actually started (the closure returns `None` when the protocol is disabled or its
 /// config failed to resolve — already logged).
-fn spawn_generation(global: &watch::Sender<bool>, slot: &mut Slot, cfg: &wren_config::Config) -> bool {
+fn spawn_generation(
+    global: &watch::Sender<bool>,
+    slot: &mut Slot,
+    cfg: &wren_config::Config,
+) -> bool {
     let (stop_tx, stop_rx) = watch::channel(false);
     spawn_shutdown_relay(global, stop_tx.clone());
     match (slot.respawn)(cfg, stop_rx) {
@@ -418,7 +422,7 @@ mod tests {
         new.insert("10.0.0.0/24".into(), "via 10.0.0.1".into()); // unchanged
         new.insert("10.0.1.0/24".into(), "via 10.0.0.2".into()); // changed next hop
         new.insert("10.0.3.0/24".into(), "via 10.0.0.1".into()); // added
-        // 10.0.2.0/24 removed
+                                                                 // 10.0.2.0/24 removed
 
         let d = diff_keyed(&old, &new);
         assert_eq!(d.added, vec!["10.0.3.0/24".to_string()]);
