@@ -744,7 +744,11 @@ mod tests {
 
         assert_eq!(q(true, 0)[8], 0x08, "S alone is 0x08");
         assert_eq!(q(true, 7)[8], 0x0f, "S plus the maximum QRV is 0x0f");
-        assert_eq!(q(false, 7)[8] & 0xf0, 0, "the top four bits are Resv and stay zero");
+        assert_eq!(
+            q(false, 7)[8] & 0xf0,
+            0,
+            "the top four bits are Resv and stay zero"
+        );
     }
 
     /// RFC 3376 §4.2.4 fixes the Group Record: Record Type 0, **Aux Data Len in
@@ -764,14 +768,23 @@ mod tests {
             sources: vec![ip("10.0.0.1"), ip("10.0.0.2")],
             aux: vec![0xde, 0xad, 0xbe, 0xef, 0x01, 0x02, 0x03, 0x04], // 8 octets = 2 words
         };
-        let b = Message::V3Report { records: vec![rec.clone()] }.encode();
+        let b = Message::V3Report {
+            records: vec![rec.clone()],
+        }
+        .encode();
         assert_eq!(b[0], 0x22, "a Version 3 Membership Report is Type 0x22");
         assert_eq!(b[1], 0, "byte 1 is Reserved");
         assert_eq!(&b[4..6], &[0, 0], "bytes 4..6 are Reserved");
         assert_eq!(&b[6..8], &[0, 1], "Number of Group Records is bytes 6..8");
         let r = &b[8..];
-        assert_eq!(r[0], 4, "Record Type is byte 0; CHANGE_TO_EXCLUDE_MODE is 4");
-        assert_eq!(r[1], 2, "Aux Data Len is byte 1, in 32-bit words — 8 octets is 2");
+        assert_eq!(
+            r[0], 4,
+            "Record Type is byte 0; CHANGE_TO_EXCLUDE_MODE is 4"
+        );
+        assert_eq!(
+            r[1], 2,
+            "Aux Data Len is byte 1, in 32-bit words — 8 octets is 2"
+        );
         assert_eq!(&r[2..4], &[0, 2], "Number of Sources is bytes 2..4");
         assert_eq!(&r[4..8], &[239, 9, 9, 9], "Multicast Address is bytes 4..8");
         assert_eq!(&r[8..12], &[10, 0, 0, 1], "the sources follow the group");

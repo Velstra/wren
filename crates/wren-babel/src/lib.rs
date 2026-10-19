@@ -347,9 +347,15 @@ mod tests {
     #[test]
     fn rejects_bad_magic_and_version() {
         assert_eq!(Packet::decode(&[0, 2, 0, 0]), Err(DecodeError::BadMagic(0)));
-        assert_eq!(Packet::decode(&[42, 9, 0, 0]), Err(DecodeError::BadVersion(9)));
+        assert_eq!(
+            Packet::decode(&[42, 9, 0, 0]),
+            Err(DecodeError::BadVersion(9))
+        );
         assert_eq!(Packet::decode(&[42]), Err(DecodeError::TooShort));
-        assert_eq!(Packet::decode(&[42, 2, 0, 5]), Err(DecodeError::BadBodyLength));
+        assert_eq!(
+            Packet::decode(&[42, 2, 0, 5]),
+            Err(DecodeError::BadBodyLength)
+        );
     }
 
     #[test]

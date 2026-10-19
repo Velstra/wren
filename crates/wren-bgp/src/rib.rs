@@ -81,7 +81,10 @@ impl BgpRib {
     /// An empty RIB that installs up to `max_paths` equal-cost paths per
     /// destination as ECMP (BGP multipath). `max_paths` is clamped to at least 1.
     pub fn with_max_paths(max_paths: usize) -> Self {
-        Self { max_paths: max_paths.max(1), ..Self::new() }
+        Self {
+            max_paths: max_paths.max(1),
+            ..Self::new()
+        }
     }
 
     /// Record (or replace) the path `peer` offers for `prefix` (with no ADD-PATH
@@ -101,7 +104,10 @@ impl BgpRib {
         prefix: Prefix,
         path: Path,
     ) -> Option<RibEvent> {
-        self.entries.entry(prefix).or_default().insert((peer, path_id), path);
+        self.entries
+            .entry(prefix)
+            .or_default()
+            .insert((peer, path_id), path);
         self.reselect(prefix)
     }
 
@@ -184,9 +190,11 @@ impl BgpRib {
     /// With ADD-PATH (RFC 7911) a destination can have several — used by
     /// `show bgp paths` to list them.
     pub fn iter_paths(&self) -> impl Iterator<Item = (&Prefix, IpAddr, u32, &Path)> {
-        self.entries
-            .iter()
-            .flat_map(|(pfx, peers)| peers.iter().map(move |(&(peer, id), path)| (pfx, peer, id, path)))
+        self.entries.iter().flat_map(|(pfx, peers)| {
+            peers
+                .iter()
+                .map(move |(&(peer, id), path)| (pfx, peer, id, path))
+        })
     }
 
     /// Iterate every prefix's best path, in prefix order.
@@ -241,7 +249,9 @@ impl BgpRib {
             }
             None => {
                 self.hops.remove(&prefix);
-                self.best.remove(&prefix).map(|_| RibEvent::Withdrawn(prefix))
+                self.best
+                    .remove(&prefix)
+                    .map(|_| RibEvent::Withdrawn(prefix))
             }
         }
     }
@@ -363,7 +373,11 @@ mod tests {
     fn first_path_is_selected_best() {
         let mut rib = BgpRib::new();
         let dst = pfx("10.0.0.0/8");
-        let ev = rib.update(ip([10, 0, 0, 1]), dst, path(DEFAULT_LOCAL_PREF, [10, 0, 0, 1]));
+        let ev = rib.update(
+            ip([10, 0, 0, 1]),
+            dst,
+            path(DEFAULT_LOCAL_PREF, [10, 0, 0, 1]),
+        );
         assert!(matches!(ev, Some(RibEvent::Best { prefix, .. }) if prefix == dst));
         assert!(rib.best(&dst).is_some());
         assert_eq!(rib.len(), 1);
@@ -382,7 +396,9 @@ mod tests {
         assert!(matches!(ev, Some(RibEvent::Best { ref path, .. }) if path.peer_addr == p2));
 
         // A worse path from a third peer changes nothing.
-        assert!(rib.update(ip([10, 0, 0, 3]), dst, path(50, [10, 0, 0, 3])).is_none());
+        assert!(rib
+            .update(ip([10, 0, 0, 3]), dst, path(50, [10, 0, 0, 3]))
+            .is_none());
 
         // Withdraw the winner → fall back to the next best (peer 1).
         let ev = rib.withdraw(p2, dst).unwrap();
@@ -461,10 +477,14 @@ mod tests {
     fn multipath_is_off_by_default() {
         let mut rib = BgpRib::new();
         let dst = pfx("10.99.0.0/24");
-        let ev = rib.update(ip([10, 0, 0, 1]), dst, path(100, [10, 0, 0, 1])).unwrap();
+        let ev = rib
+            .update(ip([10, 0, 0, 1]), dst, path(100, [10, 0, 0, 1]))
+            .unwrap();
         assert!(matches!(ev, RibEvent::Best { ref hops, .. } if hops.len() == 1));
         // A second equal-cost path changes nothing without multipath.
-        assert!(rib.update(ip([10, 1, 0, 1]), dst, path(100, [10, 1, 0, 1])).is_none());
+        assert!(rib
+            .update(ip([10, 1, 0, 1]), dst, path(100, [10, 1, 0, 1]))
+            .is_none());
     }
 
     #[test]
@@ -474,7 +494,9 @@ mod tests {
         rib.update(ip([10, 0, 0, 1]), dst, path(100, [10, 0, 0, 1]));
         rib.update(ip([10, 1, 0, 1]), dst, path(100, [10, 1, 0, 1]));
         // A third equal path exceeds the cap of 2 → the installed set is unchanged.
-        assert!(rib.update(ip([10, 2, 0, 1]), dst, path(100, [10, 2, 0, 1])).is_none());
+        assert!(rib
+            .update(ip([10, 2, 0, 1]), dst, path(100, [10, 2, 0, 1]))
+            .is_none());
         assert_eq!(rib.hops.get(&dst).map(|h| h.len()), Some(2));
     }
 

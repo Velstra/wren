@@ -191,7 +191,9 @@ impl RouteTable {
             // (which is never "strictly better" than itself) must not be rejected.
             // Feasibility otherwise gates only the selection of *other* routes.
             let feasible = self.is_selected_route(&key)
-                || self.sources.is_feasible(prefix, router_id, seqno, advertised);
+                || self
+                    .sources
+                    .is_feasible(prefix, router_id, seqno, advertised);
             self.routes.insert(
                 key,
                 RouteEntry {
@@ -321,7 +323,15 @@ mod tests {
     #[test]
     fn first_route_is_selected_and_sets_feasibility_distance() {
         let mut t = RouteTable::new();
-        let ev = t.update(pfx("10.0.0.0/8"), RID, ip("fe80::1"), ip("fe80::1"), 1, 100, 10);
+        let ev = t.update(
+            pfx("10.0.0.0/8"),
+            RID,
+            ip("fe80::1"),
+            ip("fe80::1"),
+            1,
+            100,
+            10,
+        );
         assert_eq!(
             ev,
             Some(BabelEvent::Select {
@@ -375,13 +385,15 @@ mod tests {
         // computed metric wins.
         t.update(dst, RID, ip("fe80::1"), ip("fe80::1"), 1, 100, 50); // metric 150
         let ev = t.update(dst, RID, ip("fe80::2"), ip("fe80::2"), 2, 100, 10); // metric 110
-        assert!(matches!(ev, Some(BabelEvent::Select { next_hop, .. }) if next_hop == ip("fe80::2")));
+        assert!(
+            matches!(ev, Some(BabelEvent::Select { next_hop, .. }) if next_hop == ip("fe80::2"))
+        );
 
         // Losing the best neighbour falls back to the other.
         let evs = t.neighbour_lost(ip("fe80::2"));
-        assert!(evs
-            .iter()
-            .any(|e| matches!(e, BabelEvent::Select { next_hop, .. } if *next_hop == ip("fe80::1"))));
+        assert!(evs.iter().any(
+            |e| matches!(e, BabelEvent::Select { next_hop, .. } if *next_hop == ip("fe80::1"))
+        ));
     }
 
     #[test]
@@ -390,7 +402,15 @@ mod tests {
         let dst = pfx("10.0.0.0/8");
         t.update(dst, RID, ip("fe80::1"), ip("fe80::1"), 1, 100, 0);
         // A retraction (infinite metric) from the only neighbour withdraws it.
-        let ev = t.update(dst, RID, ip("fe80::1"), ip("fe80::1"), 1, METRIC_INFINITY, 0);
+        let ev = t.update(
+            dst,
+            RID,
+            ip("fe80::1"),
+            ip("fe80::1"),
+            1,
+            METRIC_INFINITY,
+            0,
+        );
         assert_eq!(ev, Some(BabelEvent::Retract(dst)));
         assert!(t.is_empty());
     }

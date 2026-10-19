@@ -423,7 +423,13 @@ pub fn add_address(ifname: &str, addr: IpAddr, prefix_len: u8) -> Result<(), Fib
 /// `CAP_NET_ADMIN`. Used by the VRRP runner to release a virtual IP on becoming
 /// backup. Deleting an absent address returns an error the caller may ignore.
 pub fn del_address(ifname: &str, addr: IpAddr, prefix_len: u8) -> Result<(), FibError> {
-    address_op(RTM_DELADDR, NLM_F_REQUEST | NLM_F_ACK, ifname, addr, prefix_len)
+    address_op(
+        RTM_DELADDR,
+        NLM_F_REQUEST | NLM_F_ACK,
+        ifname,
+        addr,
+        prefix_len,
+    )
 }
 
 /// Build and send one `ifaddrmsg` (with `IFA_LOCAL` + `IFA_ADDRESS`) to the kernel
@@ -435,7 +441,8 @@ fn address_op(
     addr: IpAddr,
     prefix_len: u8,
 ) -> Result<(), FibError> {
-    let ifindex = if_index(ifname).ok_or_else(|| FibError(format!("unknown interface {ifname:?}")))?;
+    let ifindex =
+        if_index(ifname).ok_or_else(|| FibError(format!("unknown interface {ifname:?}")))?;
     let octets = addr_octets(&addr);
     // struct ifaddrmsg { family, prefixlen, flags, scope, index }
     let mut payload = Vec::with_capacity(8 + 2 * (4 + octets.len()));
@@ -506,8 +513,8 @@ fn build_route_msg(
     buf[16] = af(&dst); // rtm_family
     buf[17] = prefix.len(); // rtm_dst_len
                             // 18 rtm_src_len, 19 rtm_tos = 0
-    // The VRF's table id: it fits the one-octet rtm_table field up to 255; a larger
-    // id sets rtm_table to "unspecified" and travels in the RTA_TABLE attribute below.
+                            // The VRF's table id: it fits the one-octet rtm_table field up to 255; a larger
+                            // id sets rtm_table to "unspecified" and travels in the RTA_TABLE attribute below.
     buf[20] = if table <= u8::MAX as u32 {
         table as u8
     } else {
@@ -527,8 +534,8 @@ fn build_route_msg(
     match route {
         Some(r) => {
             buf[21] = rtprot(r.protocol); // rtm_protocol
-            // Universe scope if any next-hop has a gateway; link scope for purely
-            // on-link routes (a connected/dev route the kernel forwards directly).
+                                          // Universe scope if any next-hop has a gateway; link scope for purely
+                                          // on-link routes (a connected/dev route the kernel forwards directly).
             let any_gateway = r.nexthops.iter().any(|n| n.gateway.is_some());
             // A discard route has no next-hop at all, so it is neither on-link
             // nor via anything: universe scope, like the kernel's own.
@@ -550,7 +557,7 @@ fn build_route_msg(
         Some(r) if r.nexthops.is_empty() => RTN_BLACKHOLE,
         _ => RTN_UNICAST,
     }; // rtm_type
-                           // 24..28 rtm_flags = 0
+       // 24..28 rtm_flags = 0
 
     // --- attributes ---
     // Destination (omitted for the default route, where dst_len == 0).
@@ -590,7 +597,7 @@ fn build_route_msg(
     buf[4..6].copy_from_slice(&nlmsg_type.to_ne_bytes()); // nlmsg_type
     buf[6..8].copy_from_slice(&flags.to_ne_bytes()); // nlmsg_flags
     buf[8..12].copy_from_slice(&seq.to_ne_bytes()); // nlmsg_seq
-                                                     // 12..16 nlmsg_pid = 0 (kernel assigns on bind)
+                                                    // 12..16 nlmsg_pid = 0 (kernel assigns on bind)
     debug_assert_eq!(buf.len(), align4(buf.len()));
     buf
 }
@@ -605,7 +612,10 @@ const FIB_MAX_RETRIES: u32 = 3;
 /// is a real answer that a retry cannot change.
 fn is_transient_errno(errno: i32) -> bool {
     // EAGAIN == EWOULDBLOCK on Linux, so the two need not be listed separately.
-    matches!(errno, libc::EINTR | libc::EAGAIN | libc::ENOBUFS | libc::EBUSY)
+    matches!(
+        errno,
+        libc::EINTR | libc::EAGAIN | libc::ENOBUFS | libc::EBUSY
+    )
 }
 
 /// A failed netlink round-trip: the [`FibError`] to surface, plus the raw errno (when
@@ -971,7 +981,7 @@ mod tests {
         assert_eq!(u16::from_ne_bytes([msg[4], msg[5]]), RTM_DELROUTE);
         assert_eq!(msg[21], RTPROT_UNSPEC); // rtm_protocol — wildcard
         assert_eq!(msg[22], RT_SCOPE_NOWHERE); // rtm_scope — wildcard
-        // The destination key is still present so the kernel can find the route.
+                                               // The destination key is still present so the kernel can find the route.
         assert!(has_attr(&msg, RTA_DST, &[10, 20, 0, 0]));
     }
 
@@ -993,7 +1003,14 @@ mod tests {
             vec![NextHop::dev("eth0")],
             0,
         );
-        let msg = build_route_msg(RTM_NEWROUTE, 0, 2, &onlink.prefix, onlink.table, Some(&onlink));
+        let msg = build_route_msg(
+            RTM_NEWROUTE,
+            0,
+            2,
+            &onlink.prefix,
+            onlink.table,
+            Some(&onlink),
+        );
         assert_eq!(msg[22], RT_SCOPE_LINK); // no gateway → link scope
         assert_eq!(msg[21], RTPROT_KERNEL); // connected → kernel proto
     }
@@ -1182,9 +1199,14 @@ mod tests {
         // have a different metric and coexist with this one; selecting the
         // first matching prefix would then inspect an unrelated route.
         let dst = p("10.123.3.0/24");
-        let single =
-            Route::new(dst, Protocol::Bgp, vec![NextHop::via("192.168.1.2".parse().unwrap())], 1);
-        fib.apply(&FibChange::Install(single)).expect("install the single path");
+        let single = Route::new(
+            dst,
+            Protocol::Bgp,
+            vec![NextHop::via("192.168.1.2".parse().unwrap())],
+            1,
+        );
+        fib.apply(&FibChange::Install(single))
+            .expect("install the single path");
         let multi = Route::new(
             dst,
             Protocol::Bgp,
@@ -1197,8 +1219,15 @@ mod tests {
         fib.apply(&FibChange::Install(multi.clone()))
             .expect("kernel accepts replacing the single path with cross-interface multipath");
         let back = fib.owned_routes().expect("dump routes");
-        let got = back.iter().find(|r| r.prefix == dst).expect("the route is present");
-        assert_eq!(got.nexthops.len(), 2, "both ECMP next-hops installed after the replace");
+        let got = back
+            .iter()
+            .find(|r| r.prefix == dst)
+            .expect("the route is present");
+        assert_eq!(
+            got.nexthops.len(),
+            2,
+            "both ECMP next-hops installed after the replace"
+        );
     }
 
     #[test]
@@ -1232,7 +1261,14 @@ mod tests {
             vec![NextHop::via("192.0.2.1".parse().unwrap())],
             0,
         );
-        let msg = build_route_msg(RTM_NEWROUTE, 0, 1, &connected.prefix, connected.table, Some(&connected));
+        let msg = build_route_msg(
+            RTM_NEWROUTE,
+            0,
+            1,
+            &connected.prefix,
+            connected.table,
+            Some(&connected),
+        );
         assert_eq!(parse_route(&msg), None);
     }
 

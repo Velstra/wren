@@ -252,7 +252,12 @@ pub async fn run(
     if rx4.is_none() && rx6.is_none() {
         anyhow::bail!("BFD could not bind any control socket on port {CONTROL_PORT}");
     }
-    info!(port = CONTROL_PORT, ipv4 = rx4.is_some(), ipv6 = rx6.is_some(), "BFD listening");
+    info!(
+        port = CONTROL_PORT,
+        ipv4 = rx4.is_some(),
+        ipv6 = rx6.is_some(),
+        "BFD listening"
+    );
 
     // Sessions are created on registration. Discriminators come from a per-process
     // counter — unique on this system, which is all the single-hop demux (by source
@@ -280,7 +285,11 @@ pub async fn run(
                     None
                 }
             };
-            info!(ipv4 = v4.is_some(), ipv6 = v6.is_some(), "BFD Echo enabled (UDP {ECHO_PORT})");
+            info!(
+                ipv4 = v4.is_some(),
+                ipv6 = v6.is_some(),
+                "BFD Echo enabled (UDP {ECHO_PORT})"
+            );
             (v4, v6)
         }
         None => (None, None),
@@ -368,7 +377,9 @@ async fn echo_recv_opt(sock: &Option<EchoSock>) -> Option<Vec<u8>> {
 /// session by the local discriminator carried in the payload and (re)arm its Echo
 /// detection by recording the receipt time.
 fn on_echo_receive(sessions: &mut HashMap<PeerKey, PeerSession>, pkt: &[u8]) {
-    let Some((discr, _seq)) = bfd_echo::parse_echo(pkt) else { return };
+    let Some((discr, _seq)) = bfd_echo::parse_echo(pkt) else {
+        return;
+    };
     for s in sessions.values_mut() {
         if s.sess.local_discr() == discr {
             if let Some(echo) = s.echo.as_mut() {
@@ -506,7 +517,13 @@ async fn handle_command(
     cmd: BfdCommand,
 ) {
     match cmd {
-        BfdCommand::Register { peer, scope_id, consumer, notify, auth } => {
+        BfdCommand::Register {
+            peer,
+            scope_id,
+            consumer,
+            notify,
+            auth,
+        } => {
             let key = (peer, scope_id);
             if let Some(s) = sessions.get_mut(&key) {
                 s.subscribers.insert(consumer, notify);
@@ -565,7 +582,11 @@ async fn handle_command(
                 },
             );
         }
-        BfdCommand::Deregister { peer, scope_id, consumer } => {
+        BfdCommand::Deregister {
+            peer,
+            scope_id,
+            consumer,
+        } => {
             let key = (peer, scope_id);
             if let Some(s) = sessions.get_mut(&key) {
                 s.subscribers.remove(&consumer);
@@ -621,13 +642,19 @@ fn bind_rx_v6() -> Result<UdpSocket> {
 async fn build_tx_socket(peer: IpAddr, scope_id: u32) -> Result<UdpSocket> {
     match peer {
         IpAddr::V4(v4) => {
-            let sock = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).await.context("binding tx socket")?;
+            let sock = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))
+                .await
+                .context("binding tx socket")?;
             sock.set_ttl(SINGLE_HOP_TTL).context("setting TTL 255")?;
-            sock.connect((v4, CONTROL_PORT)).await.context("connecting tx socket")?;
+            sock.connect((v4, CONTROL_PORT))
+                .await
+                .context("connecting tx socket")?;
             Ok(sock)
         }
         IpAddr::V6(v6) => {
-            let sock = UdpSocket::bind((Ipv6Addr::UNSPECIFIED, 0)).await.context("binding v6 tx socket")?;
+            let sock = UdpSocket::bind((Ipv6Addr::UNSPECIFIED, 0))
+                .await
+                .context("binding v6 tx socket")?;
             setsockopt_int(
                 sock.as_raw_fd(),
                 libc::IPPROTO_IPV6,
@@ -653,8 +680,12 @@ fn notify_down(s: &PeerSession) {
 /// matching session, fold it into the FSM, and (re)arm that session's detection
 /// timer. A transition out of Up to Down notifies the subscribers.
 fn on_receive(sessions: &mut HashMap<PeerKey, PeerSession>, buf: &[u8], key: PeerKey) {
-    let Some(s) = sessions.get_mut(&key) else { return };
-    let Some(pkt) = ControlPacket::decode(buf) else { return };
+    let Some(s) = sessions.get_mut(&key) else {
+        return;
+    };
+    let Some(pkt) = ControlPacket::decode(buf) else {
+        return;
+    };
     // Authentication policy (RFC 5880 §6.8.6): a session configured for auth requires
     // a present, valid Authentication Section; an unauthenticated session rejects any
     // packet that carries one.
@@ -852,7 +883,12 @@ mod tests {
         let v6 = SocketAddr::V6(SocketAddrV6::new("fe80::1".parse().unwrap(), 3784, 0, 7));
         assert_eq!(key_of(v6), (IpAddr::V6("fe80::1".parse().unwrap()), 7));
         // A global IPv6 source is unscoped.
-        let g = SocketAddr::V6(SocketAddrV6::new("2001:db8::1".parse().unwrap(), 3784, 0, 7));
+        let g = SocketAddr::V6(SocketAddrV6::new(
+            "2001:db8::1".parse().unwrap(),
+            3784,
+            0,
+            7,
+        ));
         assert_eq!(key_of(g), (IpAddr::V6("2001:db8::1".parse().unwrap()), 0));
     }
 }

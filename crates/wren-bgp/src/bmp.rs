@@ -110,7 +110,11 @@ impl PerPeerHeader {
         timestamp_secs: u32,
         timestamp_micros: u32,
     ) -> Self {
-        let flags = if address.is_ipv6() { PEER_FLAG_V_IPV6 } else { 0 };
+        let flags = if address.is_ipv6() {
+            PEER_FLAG_V_IPV6
+        } else {
+            0
+        };
         PerPeerHeader {
             peer_type: peer_type::GLOBAL_INSTANCE,
             flags,
@@ -257,7 +261,14 @@ mod tests {
         for msg in [
             initiation("r1", "wren"),
             termination(0),
-            peer_up(&pph(), "10.0.0.1".parse().unwrap(), 179, 50000, &[1, 2, 3], &[4, 5]),
+            peer_up(
+                &pph(),
+                "10.0.0.1".parse().unwrap(),
+                179,
+                50000,
+                &[1, 2, 3],
+                &[4, 5],
+            ),
             peer_down(&pph(), peer_down_reason::REMOTE_NO_NOTIFICATION, &[]),
             route_monitoring(&pph(), &[9; 23]),
         ] {
@@ -286,7 +297,13 @@ mod tests {
 
     #[test]
     fn ipv6_peer_sets_the_v_flag_and_full_address() {
-        let h = PerPeerHeader::global("2001:db8::2".parse().unwrap(), 65002, "10.0.0.2".parse().unwrap(), 0, 0);
+        let h = PerPeerHeader::global(
+            "2001:db8::2".parse().unwrap(),
+            65002,
+            "10.0.0.2".parse().unwrap(),
+            0,
+            0,
+        );
         assert_eq!(h.flags, PEER_FLAG_V_IPV6);
         let mut out = Vec::new();
         h.encode(&mut out);
@@ -307,7 +324,14 @@ mod tests {
 
     #[test]
     fn peer_up_embeds_both_opens_and_the_ports() {
-        let msg = peer_up(&pph(), "10.0.0.1".parse().unwrap(), 179, 50000, &[0xAA; 29], &[0xBB; 29]);
+        let msg = peer_up(
+            &pph(),
+            "10.0.0.1".parse().unwrap(),
+            179,
+            50000,
+            &[0xAA; 29],
+            &[0xBB; 29],
+        );
         let (ty, len) = parse_common_header(&msg).unwrap();
         assert_eq!(ty, msg_type::PEER_UP);
         assert_eq!(len, msg.len());
@@ -326,7 +350,10 @@ mod tests {
         let (ty, _) = parse_common_header(&msg).unwrap();
         assert_eq!(ty, msg_type::ROUTE_MONITORING);
         assert!(msg.ends_with(&update));
-        assert_eq!(msg.len(), COMMON_HEADER_LEN + PER_PEER_HEADER_LEN + update.len());
+        assert_eq!(
+            msg.len(),
+            COMMON_HEADER_LEN + PER_PEER_HEADER_LEN + update.len()
+        );
     }
 
     #[test]

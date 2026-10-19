@@ -17,7 +17,7 @@
 use std::collections::BTreeMap;
 use std::net::Ipv4Addr;
 
-use crate::lsa::{Lsa, LsType, LsaHeader, Scope};
+use crate::lsa::{LsType, Lsa, LsaHeader, Scope};
 use crate::MAX_AGE;
 
 /// The identity that names an LSA across its instances: type, Link State ID and
@@ -198,7 +198,10 @@ mod tests {
         assert_eq!(db.len(), 1);
         assert_eq!(db.install(router_lsa([10, 0, 0, 1], 6, 1)), Install::Newer);
         assert_eq!(db.install(router_lsa([10, 0, 0, 1], 6, 1)), Install::Same);
-        assert_eq!(db.install(router_lsa([10, 0, 0, 1], 5, 1)), Install::HaveNewer);
+        assert_eq!(
+            db.install(router_lsa([10, 0, 0, 1], 5, 1)),
+            Install::HaveNewer
+        );
         let k = (LsType::Router, [0, 0, 0, 0].into(), [10, 0, 0, 1].into());
         assert_eq!(db.get(&k).unwrap().header.ls_seq, 6);
     }

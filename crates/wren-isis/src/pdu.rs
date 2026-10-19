@@ -648,7 +648,10 @@ mod tests {
         // fail — the zero lifetime must make decode skip that verification.
         bytes[24] = 0;
         bytes[25] = 0;
-        match Pdu::decode(&bytes).expect("purge decodes despite zero checksum").body {
+        match Pdu::decode(&bytes)
+            .expect("purge decodes despite zero checksum")
+            .body
+        {
             PduBody::Lsp(l) => assert_eq!(l.remaining_lifetime, 0),
             _ => panic!("not an LSP"),
         }
@@ -785,8 +788,16 @@ mod tests {
         assert_eq!(flags_off, 26, "the LSP fixed header is 27 octets (§9.8)");
 
         let f = |p, a, o, t| lsp(p, a, o, t).encode()[flags_off];
-        assert_eq!(f(true, 0, false, IsLevel::L1) & 0x80, 0x80, "P is bit 8 (0x80)");
-        assert_eq!(f(false, 0, true, IsLevel::L1) & 0x04, 0x04, "OL is bit 3 (0x04)");
+        assert_eq!(
+            f(true, 0, false, IsLevel::L1) & 0x80,
+            0x80,
+            "P is bit 8 (0x80)"
+        );
+        assert_eq!(
+            f(false, 0, true, IsLevel::L1) & 0x04,
+            0x04,
+            "OL is bit 3 (0x04)"
+        );
         assert_eq!(
             f(false, 0b0001, false, IsLevel::L1) & 0x78,
             0x08,
@@ -802,10 +813,18 @@ mod tests {
             0x40,
             "the error-metric ATT bit is bit 7 (0x40), the highest of the four"
         );
-        assert_eq!(f(false, 0, false, IsLevel::L1) & 0x03, 0b01, "IS-type is bits 2..1");
+        assert_eq!(
+            f(false, 0, false, IsLevel::L1) & 0x03,
+            0b01,
+            "IS-type is bits 2..1"
+        );
         assert_eq!(f(false, 0, false, IsLevel::L1L2) & 0x03, 0b11);
         // Nothing bleeds outside its own field.
-        assert_eq!(f(true, 0b1111, true, IsLevel::L1L2), 0xff, "all bits set = 0xff");
+        assert_eq!(
+            f(true, 0b1111, true, IsLevel::L1L2),
+            0xff,
+            "all bits set = 0xff"
+        );
         assert_eq!(f(false, 0, false, IsLevel::L1), 0b01, "only IS-type set");
         // The half the old test never checked, and the bug it hid: a Level-2 LSP
         // must carry IS Type 3 (§9.8), not the unused value 2 that the Circuit
@@ -872,8 +891,14 @@ mod tests {
             }),
         };
         let b = pdu.encode();
-        assert_eq!(b[0], 0x83, "byte 0 is the intradomain routeing discriminator");
-        assert_eq!(b[1], 27, "byte 1 is the fixed header length — 27 for an LSP");
+        assert_eq!(
+            b[0], 0x83,
+            "byte 0 is the intradomain routeing discriminator"
+        );
+        assert_eq!(
+            b[1], 27,
+            "byte 1 is the fixed header length — 27 for an LSP"
+        );
         assert_eq!(b[2], 1, "byte 2 is the Version/Protocol ID Extension");
         assert_eq!(b[3], 0, "byte 3 is the ID Length, 0 meaning the default 6");
         assert_eq!(b[4], 20, "byte 4 is the PDU type — an L2 LSP is 20");
@@ -901,11 +926,19 @@ mod tests {
         ] {
             assert_eq!(t.as_u8(), code, "{t:?} is PDU type {code}");
             assert_eq!(PduType::from_u8(code), Some(t));
-            assert_eq!(t.fixed_header_len(), hdr, "{t:?} has a {hdr}-octet fixed header");
+            assert_eq!(
+                t.fixed_header_len(),
+                hdr,
+                "{t:?} has a {hdr}-octet fixed header"
+            );
         }
         // 19, 21, 22 and 23 are unassigned between the LSP and CSNP blocks.
         for bad in [0u8, 14, 19, 21, 22, 23, 28] {
-            assert_eq!(PduType::from_u8(bad), None, "{bad} is not an IS-IS PDU type");
+            assert_eq!(
+                PduType::from_u8(bad),
+                None,
+                "{bad} is not an IS-IS PDU type"
+            );
         }
     }
 
@@ -940,7 +973,11 @@ mod tests {
             b.len(),
             "PDU Length is bytes 8..10 and covers the whole PDU"
         );
-        assert_eq!(&b[10..12], &[0x04, 0xb0], "Remaining Lifetime is bytes 10..12");
+        assert_eq!(
+            &b[10..12],
+            &[0x04, 0xb0],
+            "Remaining Lifetime is bytes 10..12"
+        );
         assert_eq!(
             &b[12..18],
             &[0x19, 0x21, 0x68, 0x00, 0x10, 0x01],
@@ -948,7 +985,11 @@ mod tests {
         );
         assert_eq!(b[18], 0x02, "the pseudonode octet is byte 18");
         assert_eq!(b[19], 0x03, "the LSP number (fragment) is byte 19");
-        assert_eq!(&b[20..24], &[0x11, 0x22, 0x33, 0x44], "Sequence Number is 20..24");
+        assert_eq!(
+            &b[20..24],
+            &[0x11, 0x22, 0x33, 0x44],
+            "Sequence Number is 20..24"
+        );
         assert_ne!(&b[24..26], &[0, 0], "the Checksum at 24..26 is filled in");
 
         // The checksum covers bytes 12.. (LSP ID onward) and not the lifetime:
@@ -995,16 +1036,28 @@ mod tests {
             "PDU Length is bytes 17..19"
         );
         assert_eq!(b[19], 64, "Priority is byte 19");
-        assert_eq!(&b[20..26], &[7, 8, 9, 10, 11, 12], "the LAN ID System ID is 20..26");
+        assert_eq!(
+            &b[20..26],
+            &[7, 8, 9, 10, 11, 12],
+            "the LAN ID System ID is 20..26"
+        );
         assert_eq!(b[26], 1, "the LAN ID pseudonode octet is byte 26");
-        assert_eq!(b.len(), 27, "an empty LAN Hello is exactly its 27-octet header");
+        assert_eq!(
+            b.len(),
+            27,
+            "an empty LAN Hello is exactly its 27-octet header"
+        );
 
         // Bit 8 of the priority octet is reserved and must never be set.
         let mut hi = pdu.clone();
         if let PduBody::LanHello(h) = &mut hi.body {
             h.priority = 0xff;
         }
-        assert_eq!(hi.encode()[19] & 0x80, 0, "the priority octet's top bit is reserved");
+        assert_eq!(
+            hi.encode()[19] & 0x80,
+            0,
+            "the priority octet's top bit is reserved"
+        );
     }
 
     /// ISO 10589 §9.10: a CSNP is PDU Length 8..10, Source ID 10..16, source

@@ -107,7 +107,10 @@ pub fn parse_upcall(buf: &[u8]) -> Option<Upcall> {
         return None; // too short, or a real IP datagram (protocol byte != 0)
     }
     let msgtype = buf[8];
-    if !matches!(msgtype, IGMPMSG_NOCACHE | IGMPMSG_WRONGVIF | IGMPMSG_WHOLEPKT) {
+    if !matches!(
+        msgtype,
+        IGMPMSG_NOCACHE | IGMPMSG_WRONGVIF | IGMPMSG_WHOLEPKT
+    ) {
         return None;
     }
     // im_vif at offset 10, im_vif_hi at 11 (a VIF index can exceed 255).

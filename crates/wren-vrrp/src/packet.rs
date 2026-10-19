@@ -299,15 +299,24 @@ mod tests {
         // Wrong version.
         let mut wrong = bytes.clone();
         wrong[0] = (2 << 4) | TYPE_ADVERTISEMENT;
-        assert_eq!(Advertisement::decode(&wrong, false), Err(DecodeError::Version(2)));
+        assert_eq!(
+            Advertisement::decode(&wrong, false),
+            Err(DecodeError::Version(2))
+        );
         // Wrong type.
         let mut wt = bytes.clone();
         wt[0] = (VERSION << 4) | 2;
         assert_eq!(Advertisement::decode(&wt, false), Err(DecodeError::Type(2)));
         // Truncated header.
-        assert_eq!(Advertisement::decode(&bytes[..5], false), Err(DecodeError::Short));
+        assert_eq!(
+            Advertisement::decode(&bytes[..5], false),
+            Err(DecodeError::Short)
+        );
         // Count says one address but the list is missing.
-        assert_eq!(Advertisement::decode(&bytes[..HEADER_LEN], false), Err(DecodeError::Short));
+        assert_eq!(
+            Advertisement::decode(&bytes[..HEADER_LEN], false),
+            Err(DecodeError::Short)
+        );
     }
 
     #[test]
@@ -322,7 +331,10 @@ mod tests {
         let dst = IpAddr::V4(MCAST_V4);
         let bytes = adv.encode(src, dst);
         // A well-formed, correctly-checksummed advert decodes through the safe path.
-        assert_eq!(Advertisement::decode_verified(&bytes, false, src, dst).unwrap(), adv);
+        assert_eq!(
+            Advertisement::decode_verified(&bytes, false, src, dst).unwrap(),
+            adv
+        );
         // Flipping a priority byte (a VIP-hijack attempt) invalidates the checksum,
         // so the safe path refuses to hand back an Advertisement at all.
         let mut spoofed = bytes.clone();
@@ -344,6 +356,11 @@ mod tests {
         let bytes = adv.encode(v4("10.0.0.2"), IpAddr::V4(MCAST_V4));
         // Top nibble of the rsvd/interval field stays zero.
         assert_eq!(bytes[4] & 0xf0, 0);
-        assert_eq!(Advertisement::decode(&bytes, false).unwrap().max_adver_int_cs, 0x0fff);
+        assert_eq!(
+            Advertisement::decode(&bytes, false)
+                .unwrap()
+                .max_adver_int_cs,
+            0x0fff
+        );
     }
 }

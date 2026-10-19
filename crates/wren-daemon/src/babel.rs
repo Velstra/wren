@@ -43,12 +43,14 @@ use tokio::time::MissedTickBehavior;
 use tracing::{debug, info, warn};
 
 use wren_babel::tlv::Tlv;
-use wren_babel::{BabelEvent, NeighbourTable, Packet, RouteTable, METRIC_INFINITY, MULTICAST, PORT};
+use wren_babel::{
+    BabelEvent, NeighbourTable, Packet, RouteTable, METRIC_INFINITY, MULTICAST, PORT,
+};
 use wren_core::{NextHop, Prefix, Protocol, Route};
 
 use crate::connected;
-use crate::sockopt::{setsockopt_int, setsockopt_struct};
 use crate::router::{Redistribution, RouteUpdate};
+use crate::sockopt::{setsockopt_int, setsockopt_struct};
 
 /// Send a Hello (and per-neighbour IHUs) this often (seconds).
 const HELLO_SECS: u64 = 4;
@@ -557,7 +559,8 @@ async fn handle_datagram(
                                 .insert(*prefix, (router_id, *seqno, route_metric(&ev)));
                         }
                     }
-                    forward_event_pinned(&mut state.relayed, ev, &iface.name, vrf_table, updates).await;
+                    forward_event_pinned(&mut state.relayed, ev, &iface.name, vrf_table, updates)
+                        .await;
                     changed = true;
                 }
             }
@@ -692,7 +695,13 @@ fn build_update_tlvs(state: &State) -> Vec<Tlv> {
     }
     // One-shot retractions for redistributed routes that just went away.
     for prefix in &state.retractions {
-        push_update(state.router_id, OUR_SEQNO, METRIC_INFINITY, *prefix, &mut tlvs);
+        push_update(
+            state.router_id,
+            OUR_SEQNO,
+            METRIC_INFINITY,
+            *prefix,
+            &mut tlvs,
+        );
     }
     for (prefix, (rid, seqno, metric)) in &state.relayed {
         // Don't re-advertise a route we also originate ourselves.

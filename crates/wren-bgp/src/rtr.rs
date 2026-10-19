@@ -52,11 +52,29 @@ pub enum Pdu {
     /// Cache → router: the start of a response, naming the session.
     CacheResponse { session_id: u16 },
     /// Cache → router: one IPv4 ROA (announce or withdraw).
-    IPv4Prefix { announce: bool, prefix_len: u8, max_len: u8, addr: Ipv4Addr, asn: u32 },
+    IPv4Prefix {
+        announce: bool,
+        prefix_len: u8,
+        max_len: u8,
+        addr: Ipv4Addr,
+        asn: u32,
+    },
     /// Cache → router: one IPv6 ROA (announce or withdraw).
-    IPv6Prefix { announce: bool, prefix_len: u8, max_len: u8, addr: Ipv6Addr, asn: u32 },
+    IPv6Prefix {
+        announce: bool,
+        prefix_len: u8,
+        max_len: u8,
+        addr: Ipv6Addr,
+        asn: u32,
+    },
     /// Cache → router: the end of a response, with the new serial and timers.
-    EndOfData { session_id: u16, serial: u32, refresh: u32, retry: u32, expire: u32 },
+    EndOfData {
+        session_id: u16,
+        serial: u32,
+        refresh: u32,
+        retry: u32,
+        expire: u32,
+    },
     /// Cache → router: drop your cached state and Reset Query afresh.
     CacheReset,
     /// Cache → router: an error, with the protocol error code (RFC 8210 §12).
@@ -115,7 +133,13 @@ impl Pdu {
             Pdu::CacheResponse { session_id } => {
                 header(&mut out, pdu_type::CACHE_RESPONSE, *session_id, 8)
             }
-            Pdu::IPv4Prefix { announce, prefix_len, max_len, addr, asn } => {
+            Pdu::IPv4Prefix {
+                announce,
+                prefix_len,
+                max_len,
+                addr,
+                asn,
+            } => {
                 header(&mut out, pdu_type::IPV4_PREFIX, 0, 20);
                 out.push(if *announce { FLAG_ANNOUNCE } else { 0 });
                 out.push(*prefix_len);
@@ -124,7 +148,13 @@ impl Pdu {
                 out.extend_from_slice(&addr.octets());
                 out.extend_from_slice(&asn.to_be_bytes());
             }
-            Pdu::IPv6Prefix { announce, prefix_len, max_len, addr, asn } => {
+            Pdu::IPv6Prefix {
+                announce,
+                prefix_len,
+                max_len,
+                addr,
+                asn,
+            } => {
                 header(&mut out, pdu_type::IPV6_PREFIX, 0, 32);
                 out.push(if *announce { FLAG_ANNOUNCE } else { 0 });
                 out.push(*prefix_len);
@@ -133,7 +163,13 @@ impl Pdu {
                 out.extend_from_slice(&addr.octets());
                 out.extend_from_slice(&asn.to_be_bytes());
             }
-            Pdu::EndOfData { session_id, serial, refresh, retry, expire } => {
+            Pdu::EndOfData {
+                session_id,
+                serial,
+                refresh,
+                retry,
+                expire,
+            } => {
                 header(&mut out, pdu_type::END_OF_DATA, *session_id, 24);
                 out.extend_from_slice(&serial.to_be_bytes());
                 out.extend_from_slice(&refresh.to_be_bytes());
@@ -172,14 +208,22 @@ impl Pdu {
         match pdu_type {
             pdu_type::SERIAL_NOTIFY => {
                 let serial = be_u32(body, 0)?;
-                Ok(Pdu::SerialNotify { session_id: u16_field, serial })
+                Ok(Pdu::SerialNotify {
+                    session_id: u16_field,
+                    serial,
+                })
             }
             pdu_type::SERIAL_QUERY => {
                 let serial = be_u32(body, 0)?;
-                Ok(Pdu::SerialQuery { session_id: u16_field, serial })
+                Ok(Pdu::SerialQuery {
+                    session_id: u16_field,
+                    serial,
+                })
             }
             pdu_type::RESET_QUERY => Ok(Pdu::ResetQuery),
-            pdu_type::CACHE_RESPONSE => Ok(Pdu::CacheResponse { session_id: u16_field }),
+            pdu_type::CACHE_RESPONSE => Ok(Pdu::CacheResponse {
+                session_id: u16_field,
+            }),
             pdu_type::IPV4_PREFIX => {
                 if body.len() < 12 {
                     return Err(RtrError::BadLength);
@@ -224,15 +268,40 @@ impl Pdu {
     /// (`true`) or a withdraw (`false`). `None` for every non-prefix PDU.
     pub fn to_roa(&self) -> Option<(Roa, bool)> {
         let (prefix, max_len, asn, announce) = match self {
-            Pdu::IPv4Prefix { announce, prefix_len, max_len, addr, asn } => {
-                (Prefix::new((*addr).into(), *prefix_len).ok()?, *max_len, *asn, *announce)
-            }
-            Pdu::IPv6Prefix { announce, prefix_len, max_len, addr, asn } => {
-                (Prefix::new((*addr).into(), *prefix_len).ok()?, *max_len, *asn, *announce)
-            }
+            Pdu::IPv4Prefix {
+                announce,
+                prefix_len,
+                max_len,
+                addr,
+                asn,
+            } => (
+                Prefix::new((*addr).into(), *prefix_len).ok()?,
+                *max_len,
+                *asn,
+                *announce,
+            ),
+            Pdu::IPv6Prefix {
+                announce,
+                prefix_len,
+                max_len,
+                addr,
+                asn,
+            } => (
+                Prefix::new((*addr).into(), *prefix_len).ok()?,
+                *max_len,
+                *asn,
+                *announce,
+            ),
             _ => return None,
         };
-        Some((Roa { prefix, max_length: max_len, origin_as: asn }, announce))
+        Some((
+            Roa {
+                prefix,
+                max_length: max_len,
+                origin_as: asn,
+            },
+            announce,
+        ))
     }
 }
 
@@ -264,8 +333,14 @@ mod tests {
 
     #[test]
     fn round_trips_every_pdu() {
-        roundtrip(Pdu::SerialNotify { session_id: 7, serial: 42 });
-        roundtrip(Pdu::SerialQuery { session_id: 7, serial: 42 });
+        roundtrip(Pdu::SerialNotify {
+            session_id: 7,
+            serial: 42,
+        });
+        roundtrip(Pdu::SerialQuery {
+            session_id: 7,
+            serial: 42,
+        });
         roundtrip(Pdu::ResetQuery);
         roundtrip(Pdu::CacheResponse { session_id: 7 });
         roundtrip(Pdu::IPv4Prefix {
@@ -282,7 +357,13 @@ mod tests {
             addr: "2001:db8::".parse().unwrap(),
             asn: 65001,
         });
-        roundtrip(Pdu::EndOfData { session_id: 7, serial: 42, refresh: 3600, retry: 600, expire: 7200 });
+        roundtrip(Pdu::EndOfData {
+            session_id: 7,
+            serial: 42,
+            refresh: 3600,
+            retry: 600,
+            expire: 7200,
+        });
         roundtrip(Pdu::CacheReset);
         roundtrip(Pdu::ErrorReport { code: 2 });
     }
@@ -322,8 +403,15 @@ mod tests {
 
     #[test]
     fn router_key_is_recognised_but_unsupported() {
-        let pdu = Pdu::Unsupported { pdu_type: pdu_type::ROUTER_KEY };
+        let pdu = Pdu::Unsupported {
+            pdu_type: pdu_type::ROUTER_KEY,
+        };
         let bytes = pdu.encode();
-        assert_eq!(Pdu::decode(&bytes), Ok(Pdu::Unsupported { pdu_type: pdu_type::ROUTER_KEY }));
+        assert_eq!(
+            Pdu::decode(&bytes),
+            Ok(Pdu::Unsupported {
+                pdu_type: pdu_type::ROUTER_KEY
+            })
+        );
     }
 }

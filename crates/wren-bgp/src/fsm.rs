@@ -206,14 +206,20 @@ impl BgpFsm {
             (OpenSent, HoldTimerExpires) => {
                 self.state = Idle;
                 vec![
-                    SendNotification { code: CODE_HOLD_TIMER_EXPIRED, subcode: 0 },
+                    SendNotification {
+                        code: CODE_HOLD_TIMER_EXPIRED,
+                        subcode: 0,
+                    },
                     DropTcp,
                 ]
             }
             (OpenSent, OpenError) => {
                 self.state = Idle;
                 vec![
-                    SendNotification { code: CODE_OPEN_MESSAGE, subcode: 0 },
+                    SendNotification {
+                        code: CODE_OPEN_MESSAGE,
+                        subcode: 0,
+                    },
                     DropTcp,
                 ]
             }
@@ -231,7 +237,10 @@ impl BgpFsm {
             (OpenConfirm, HoldTimerExpires) => {
                 self.state = Idle;
                 vec![
-                    SendNotification { code: CODE_HOLD_TIMER_EXPIRED, subcode: 0 },
+                    SendNotification {
+                        code: CODE_HOLD_TIMER_EXPIRED,
+                        subcode: 0,
+                    },
                     DropTcp,
                 ]
             }
@@ -247,7 +256,10 @@ impl BgpFsm {
             (Established, HoldTimerExpires) => {
                 self.state = Idle;
                 vec![
-                    SendNotification { code: CODE_HOLD_TIMER_EXPIRED, subcode: 0 },
+                    SendNotification {
+                        code: CODE_HOLD_TIMER_EXPIRED,
+                        subcode: 0,
+                    },
                     DropTcp,
                     SessionDown,
                 ]
@@ -268,7 +280,10 @@ impl BgpFsm {
             | (Established, OpenReceived) => {
                 self.state = Idle;
                 let mut acts = vec![
-                    SendNotification { code: CODE_FSM_ERROR, subcode: 0 },
+                    SendNotification {
+                        code: CODE_FSM_ERROR,
+                        subcode: 0,
+                    },
                     DropTcp,
                 ];
                 if was_established {
@@ -293,7 +308,10 @@ mod tests {
     #[test]
     fn full_session_bringup() {
         let mut fsm = BgpFsm::new();
-        assert_eq!(fsm.handle(ManualStart), vec![StartConnectRetryTimer, ConnectTcp]);
+        assert_eq!(
+            fsm.handle(ManualStart),
+            vec![StartConnectRetryTimer, ConnectTcp]
+        );
         assert_eq!(fsm.state(), Connect);
         assert_eq!(
             fsm.handle(TcpConnected),
@@ -305,7 +323,10 @@ mod tests {
             vec![SendKeepalive, StartKeepaliveTimer, RestartHoldTimer]
         );
         assert_eq!(fsm.state(), OpenConfirm);
-        assert_eq!(fsm.handle(KeepAliveReceived), vec![RestartHoldTimer, SessionEstablished]);
+        assert_eq!(
+            fsm.handle(KeepAliveReceived),
+            vec![RestartHoldTimer, SessionEstablished]
+        );
         assert_eq!(fsm.state(), Established);
         assert!(fsm.is_established());
     }
@@ -317,7 +338,13 @@ mod tests {
         let mut fsm = BgpFsm { state: OpenSent };
         assert_eq!(
             fsm.handle(KeepAliveReceived),
-            vec![SendNotification { code: CODE_FSM_ERROR, subcode: 0 }, DropTcp]
+            vec![
+                SendNotification {
+                    code: CODE_FSM_ERROR,
+                    subcode: 0
+                },
+                DropTcp
+            ]
         );
         assert_eq!(fsm.state(), Idle);
 
@@ -325,7 +352,13 @@ mod tests {
         let mut fsm = BgpFsm { state: OpenConfirm };
         assert_eq!(
             fsm.handle(UpdateReceived),
-            vec![SendNotification { code: CODE_FSM_ERROR, subcode: 0 }, DropTcp]
+            vec![
+                SendNotification {
+                    code: CODE_FSM_ERROR,
+                    subcode: 0
+                },
+                DropTcp
+            ]
         );
         assert_eq!(fsm.state(), Idle);
 
@@ -333,7 +366,14 @@ mod tests {
         let mut fsm = BgpFsm { state: Established };
         assert_eq!(
             fsm.handle(OpenReceived),
-            vec![SendNotification { code: CODE_FSM_ERROR, subcode: 0 }, DropTcp, SessionDown]
+            vec![
+                SendNotification {
+                    code: CODE_FSM_ERROR,
+                    subcode: 0
+                },
+                DropTcp,
+                SessionDown
+            ]
         );
         assert_eq!(fsm.state(), Idle);
     }
@@ -354,7 +394,10 @@ mod tests {
         assert_eq!(
             acts,
             vec![
-                SendNotification { code: CODE_HOLD_TIMER_EXPIRED, subcode: 0 },
+                SendNotification {
+                    code: CODE_HOLD_TIMER_EXPIRED,
+                    subcode: 0
+                },
                 DropTcp,
                 SessionDown,
             ]
@@ -368,14 +411,30 @@ mod tests {
         let acts = fsm.handle(ManualStop);
         assert_eq!(
             acts,
-            vec![SendNotification { code: CODE_CEASE, subcode: 0 }, DropTcp, SessionDown]
+            vec![
+                SendNotification {
+                    code: CODE_CEASE,
+                    subcode: 0
+                },
+                DropTcp,
+                SessionDown
+            ]
         );
         assert_eq!(fsm.state(), Idle);
 
         // From OpenSent (not yet up) there is no SessionDown to flush.
         let mut fsm = BgpFsm { state: OpenSent };
         let acts = fsm.handle(ManualStop);
-        assert_eq!(acts, vec![SendNotification { code: CODE_CEASE, subcode: 0 }, DropTcp]);
+        assert_eq!(
+            acts,
+            vec![
+                SendNotification {
+                    code: CODE_CEASE,
+                    subcode: 0
+                },
+                DropTcp
+            ]
+        );
     }
 
     #[test]
@@ -403,7 +462,13 @@ mod tests {
         let mut fsm = BgpFsm { state: OpenSent };
         assert_eq!(
             fsm.handle(OpenError),
-            vec![SendNotification { code: CODE_OPEN_MESSAGE, subcode: 0 }, DropTcp]
+            vec![
+                SendNotification {
+                    code: CODE_OPEN_MESSAGE,
+                    subcode: 0
+                },
+                DropTcp
+            ]
         );
         assert_eq!(fsm.state(), Idle);
     }

@@ -319,7 +319,10 @@ mod tests {
     fn a_sealed_pdu_verifies_and_a_tampered_one_does_not() {
         let a = auth();
         let mut pdu = hello_bytes(auth_tlv(&a));
-        assert!(!a.verify(&pdu), "the Apad placeholder is not a valid digest");
+        assert!(
+            !a.verify(&pdu),
+            "the Apad placeholder is not a valid digest"
+        );
         a.seal(&mut pdu);
         assert!(a.verify(&pdu), "sealing makes it verify");
 
@@ -361,13 +364,22 @@ mod tests {
         // cover it were RFC 5310 §4 not excluding it explicitly.)
         let mut aged = pdu.clone();
         aged[LSP_LIFETIME].copy_from_slice(&600u16.to_be_bytes());
-        assert_ne!(aged[LSP_LIFETIME], pdu[LSP_LIFETIME], "the lifetime did change");
-        assert!(a.verify(&aged), "ageing an LSP must not invalidate its digest");
+        assert_ne!(
+            aged[LSP_LIFETIME], pdu[LSP_LIFETIME],
+            "the lifetime did change"
+        );
+        assert!(
+            a.verify(&aged),
+            "ageing an LSP must not invalidate its digest"
+        );
 
         // Same for a rewritten checksum field.
         let mut rechecked = pdu.clone();
         rechecked[LSP_CHECKSUM].copy_from_slice(&0x1234u16.to_be_bytes());
-        assert!(a.verify(&rechecked), "a rewritten checksum must not invalidate it");
+        assert!(
+            a.verify(&rechecked),
+            "a rewritten checksum must not invalidate it"
+        );
 
         // A field that is *not* excluded still breaks it.
         let mut forged = pdu.clone();
@@ -432,7 +444,10 @@ mod tests {
         sha.seal(&mut s);
 
         assert!(md5.verify(&m) && sha.verify(&s), "each verifies its own");
-        assert!(!sha.verify(&m), "an HMAC-MD5 PDU does not satisfy HMAC-SHA-256");
+        assert!(
+            !sha.verify(&m),
+            "an HMAC-MD5 PDU does not satisfy HMAC-SHA-256"
+        );
         assert!(!md5.verify(&s), "nor the other way round");
 
         // Truncated input of every length must be rejected, never indexed past.
@@ -458,7 +473,10 @@ mod tests {
         assert!(!a.verify(&clear_pdu), "cleartext does not satisfy HMAC");
         let mut crypto_pdu = hello_bytes(auth_tlv(&a));
         a.seal(&mut crypto_pdu);
-        assert!(!clear.verify(&crypto_pdu), "HMAC does not satisfy cleartext");
+        assert!(
+            !clear.verify(&crypto_pdu),
+            "HMAC does not satisfy cleartext"
+        );
 
         // Truncated input of every length must be rejected, never indexed past.
         for n in 0..crypto_pdu.len() {

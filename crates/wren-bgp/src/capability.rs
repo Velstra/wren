@@ -180,12 +180,15 @@ impl Capability {
             Capability::RouteRefresh => {
                 out.push(0); // no value
             }
-            Capability::GracefulRestart { restart_state, restart_time, families } => {
+            Capability::GracefulRestart {
+                restart_state,
+                restart_time,
+                families,
+            } => {
                 // Value: Restart Flags(4 bits) · Restart Time(12 bits), then a
                 // 4-octet (AFI(2) · SAFI(1) · Flags(1)) tuple per family.
                 out.push(2 + 4 * families.len() as u8);
-                let hdr: u16 =
-                    ((*restart_state as u16) << 15) | (restart_time & 0x0FFF);
+                let hdr: u16 = ((*restart_state as u16) << 15) | (restart_time & 0x0FFF);
                 out.extend_from_slice(&hdr.to_be_bytes());
                 for (afi, safi, preserved) in families {
                     out.extend_from_slice(&afi.to_be_bytes());
@@ -261,11 +264,15 @@ impl Capability {
                     ));
                     o += 4;
                 }
-                Capability::GracefulRestart { restart_state, restart_time, families }
+                Capability::GracefulRestart {
+                    restart_state,
+                    restart_time,
+                    families,
+                }
             }
-            CAP_FOUR_OCTET_AS if value.len() == 4 => {
-                Capability::FourOctetAs(u32::from_be_bytes([value[0], value[1], value[2], value[3]]))
-            }
+            CAP_FOUR_OCTET_AS if value.len() == 4 => Capability::FourOctetAs(u32::from_be_bytes([
+                value[0], value[1], value[2], value[3],
+            ])),
             CAP_ADD_PATH if value.len() % 4 == 0 => {
                 let mut families = Vec::new();
                 let mut o = 0;
@@ -377,7 +384,10 @@ mod tests {
     #[test]
     fn multiprotocol_capability_roundtrips() {
         use crate::{AFI_IPV6, SAFI_UNICAST};
-        let caps = vec![Capability::Multiprotocol { afi: AFI_IPV6, safi: SAFI_UNICAST }];
+        let caps = vec![Capability::Multiprotocol {
+            afi: AFI_IPV6,
+            safi: SAFI_UNICAST,
+        }];
         let opt = encode_optional_parameters(&caps);
         // type 2, then [cap 1, len 4, AFI hi/lo, reserved 0, SAFI].
         assert_eq!(opt[0], OPT_PARAM_CAPABILITIES);
@@ -404,7 +414,10 @@ mod tests {
         let caps = vec![Capability::GracefulRestart {
             restart_state: true,
             restart_time: 120,
-            families: vec![(AFI_IPV4, SAFI_UNICAST, true), (AFI_IPV6, SAFI_UNICAST, false)],
+            families: vec![
+                (AFI_IPV4, SAFI_UNICAST, true),
+                (AFI_IPV6, SAFI_UNICAST, false),
+            ],
         }];
         let opt = encode_optional_parameters(&caps);
         // type 2 (capabilities param), then [cap 64, len 2 + 2*4 = 10].
@@ -466,8 +479,14 @@ mod tests {
     fn bgp_roles_are_complementary() {
         assert_eq!(BgpRole::Provider.complement(), BgpRole::Customer);
         assert_eq!(BgpRole::Customer.complement(), BgpRole::Provider);
-        assert_eq!(BgpRole::RouteServer.complement(), BgpRole::RouteServerClient);
-        assert_eq!(BgpRole::RouteServerClient.complement(), BgpRole::RouteServer);
+        assert_eq!(
+            BgpRole::RouteServer.complement(),
+            BgpRole::RouteServerClient
+        );
+        assert_eq!(
+            BgpRole::RouteServerClient.complement(),
+            BgpRole::RouteServer
+        );
         assert_eq!(BgpRole::Peer.complement(), BgpRole::Peer);
     }
 

@@ -16,8 +16,7 @@ use crate::attr::{AttrOutcome, PathAttribute};
 use crate::capability::{encode_optional_parameters, parse_optional_parameters, Capability};
 use crate::{
     as_trans_fit, decode_prefix, encode_prefix, MessageType, AFI_IPV4, HEADER_LEN, MARKER,
-    MAX_MESSAGE_LEN,
-    SAFI_UNICAST, VERSION,
+    MAX_MESSAGE_LEN, SAFI_UNICAST, VERSION,
 };
 
 /// An OPEN message body (§4.2): the parameters two speakers agree on to start a
@@ -122,7 +121,9 @@ impl Open {
     /// Whether this OPEN advertised the Route Refresh capability (RFC 2918 §3) —
     /// i.e. the peer will honour a ROUTE-REFRESH we send by re-advertising.
     pub fn supports_route_refresh(&self) -> bool {
-        self.capabilities.iter().any(|c| matches!(c, Capability::RouteRefresh))
+        self.capabilities
+            .iter()
+            .any(|c| matches!(c, Capability::RouteRefresh))
     }
 
     /// The peer's ADD-PATH Send/Receive flags for the given `(AFI, SAFI)` family
@@ -202,7 +203,9 @@ pub struct AddPath {
 
 impl AddPath {
     /// No family has ADD-PATH — the classic single-path encoding.
-    pub const NONE: AddPath = AddPath { ipv4_unicast: false };
+    pub const NONE: AddPath = AddPath {
+        ipv4_unicast: false,
+    };
 
     /// ADD-PATH for IPv4 unicast only.
     pub const fn ipv4(on: bool) -> AddPath {
@@ -242,7 +245,11 @@ impl Update {
         } else {
             Update {
                 withdrawn: vec![],
-                attributes: vec![PathAttribute::MpUnreachNlri { afi, safi, withdrawn: vec![] }],
+                attributes: vec![PathAttribute::MpUnreachNlri {
+                    afi,
+                    safi,
+                    withdrawn: vec![],
+                }],
                 nlri: vec![],
                 ..Default::default()
             }
@@ -258,9 +265,11 @@ impl Update {
         }
         match self.attributes.as_slice() {
             [] => Some((AFI_IPV4, SAFI_UNICAST)),
-            [PathAttribute::MpUnreachNlri { afi, safi, withdrawn }] if withdrawn.is_empty() => {
-                Some((*afi, *safi))
-            }
+            [PathAttribute::MpUnreachNlri {
+                afi,
+                safi,
+                withdrawn,
+            }] if withdrawn.is_empty() => Some((*afi, *safi)),
             // An empty EVPN MP_UNREACH decodes into the EVPN-specific variant.
             [PathAttribute::MpUnreachEvpn { withdrawn }] if withdrawn.is_empty() => {
                 Some((crate::AFI_L2VPN, crate::SAFI_EVPN))
@@ -746,8 +755,14 @@ mod tests {
     fn roundtrip_w(msg: Message, four_octet: bool) {
         let bytes = msg.encode(four_octet, AddPath::NONE);
         assert_eq!(&bytes[..16], &MARKER);
-        assert_eq!(u16::from_be_bytes([bytes[16], bytes[17]]) as usize, bytes.len());
-        assert_eq!(Message::decode(&bytes, four_octet, AddPath::NONE).expect("decodes"), msg);
+        assert_eq!(
+            u16::from_be_bytes([bytes[16], bytes[17]]) as usize,
+            bytes.len()
+        );
+        assert_eq!(
+            Message::decode(&bytes, four_octet, AddPath::NONE).expect("decodes"),
+            msg
+        );
     }
 
     #[test]
@@ -791,10 +806,19 @@ mod tests {
 
         let msg = frame_update(&update_body(&attrs));
         let decoded = Message::decode(&msg, true, AddPath::NONE).expect("decodes, not a reset");
-        let Message::Update(u) = decoded else { panic!("expected UPDATE") };
-        assert_eq!(u.withdrawn, vec![p("10.0.0.0/24")], "NLRI must be withdrawn");
+        let Message::Update(u) = decoded else {
+            panic!("expected UPDATE")
+        };
+        assert_eq!(
+            u.withdrawn,
+            vec![p("10.0.0.0/24")],
+            "NLRI must be withdrawn"
+        );
         assert!(u.nlri.is_empty(), "no NLRI is advertised");
-        assert!(u.attributes.is_empty(), "attributes are dropped on treat-as-withdraw");
+        assert!(
+            u.attributes.is_empty(),
+            "attributes are dropped on treat-as-withdraw"
+        );
     }
 
     #[test]
@@ -808,8 +832,14 @@ mod tests {
 
         let msg = frame_update(&update_body(&attrs));
         let decoded = Message::decode(&msg, true, AddPath::NONE).expect("decodes, not a reset");
-        let Message::Update(u) = decoded else { panic!("expected UPDATE") };
-        assert_eq!(u.withdrawn, vec![p("10.0.0.0/24")], "NLRI must be withdrawn");
+        let Message::Update(u) = decoded else {
+            panic!("expected UPDATE")
+        };
+        assert_eq!(
+            u.withdrawn,
+            vec![p("10.0.0.0/24")],
+            "NLRI must be withdrawn"
+        );
         assert!(u.nlri.is_empty());
         assert!(u.attributes.is_empty());
     }
@@ -848,7 +878,9 @@ mod tests {
         let bare = mp_reach_ipv6(&[0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
         let decoded = Message::decode(&frame_update(&mp_only_body(&bare)), true, AddPath::NONE)
             .expect("treat-as-withdraw, not a session reset");
-        let Message::Update(u) = decoded else { panic!("expected UPDATE") };
+        let Message::Update(u) = decoded else {
+            panic!("expected UPDATE")
+        };
         assert!(
             u.attributes.is_empty(),
             "an MP_REACH with no ORIGIN or AS_PATH was accepted: {:?}",
@@ -863,9 +895,13 @@ mod tests {
         ok.extend_from_slice(&bare);
         let decoded = Message::decode(&frame_update(&mp_only_body(&ok)), true, AddPath::NONE)
             .expect("decodes");
-        let Message::Update(u) = decoded else { panic!("expected UPDATE") };
+        let Message::Update(u) = decoded else {
+            panic!("expected UPDATE")
+        };
         assert!(
-            u.attributes.iter().any(|a| matches!(a, PathAttribute::MpReachNlri { .. })),
+            u.attributes
+                .iter()
+                .any(|a| matches!(a, PathAttribute::MpReachNlri { .. })),
             "a complete MP UPDATE was rejected: {:?}",
             u.attributes
         );
@@ -886,9 +922,13 @@ mod tests {
         ]));
         let decoded = Message::decode(&frame_update(&mp_only_body(&attrs)), true, AddPath::NONE)
             .expect("decodes");
-        let Message::Update(u) = decoded else { panic!("expected UPDATE") };
+        let Message::Update(u) = decoded else {
+            panic!("expected UPDATE")
+        };
         assert!(
-            u.attributes.iter().any(|a| matches!(a, PathAttribute::MpReachNlri { .. })),
+            u.attributes
+                .iter()
+                .any(|a| matches!(a, PathAttribute::MpReachNlri { .. })),
             "an MP UPDATE was rejected for lacking a NEXT_HOP it must not carry"
         );
     }
@@ -909,7 +949,10 @@ mod tests {
         m.extend_from_slice(&body);
         assert_eq!(m.len(), MAX_MESSAGE_LEN + 1);
         assert!(
-            matches!(Message::decode(&m, true, AddPath::NONE), Err(DecodeError::BadLength { .. })),
+            matches!(
+                Message::decode(&m, true, AddPath::NONE),
+                Err(DecodeError::BadLength { .. })
+            ),
             "a {}-octet message was accepted",
             m.len()
         );
@@ -950,11 +993,20 @@ mod tests {
             m.extend_from_slice(&body);
             Message::decode(&m, true, AddPath::NONE)
         };
-        assert!(open(0, [10, 0, 0, 1]).is_err(), "AS 0 was accepted in an OPEN");
-        assert!(open(65001, [0, 0, 0, 0]).is_err(), "a zero BGP Identifier was accepted");
+        assert!(
+            open(0, [10, 0, 0, 1]).is_err(),
+            "AS 0 was accepted in an OPEN"
+        );
+        assert!(
+            open(65001, [0, 0, 0, 0]).is_err(),
+            "a zero BGP Identifier was accepted"
+        );
         // AS_TRANS is not this case: a four-octet speaker puts it here on purpose.
         assert!(open(23456, [10, 0, 0, 1]).is_ok(), "AS_TRANS was refused");
-        assert!(open(65001, [10, 0, 0, 1]).is_ok(), "a valid OPEN was refused");
+        assert!(
+            open(65001, [10, 0, 0, 1]).is_ok(),
+            "a valid OPEN was refused"
+        );
     }
 
     #[test]
@@ -963,7 +1015,10 @@ mod tests {
         // selection, so a malformed one is discarded on its own — the UPDATE's NLRI
         // stays *advertised* rather than being withdrawn as a malformed MED would be.
         // type 6 len 1 (must be 0); type 7 len 10 (must be 8 at a 4-octet AS width).
-        for broken in [vec![0x40, 6, 1, 0], vec![0xC0, 7, 10, 0, 0, 0, 1, 10, 0, 0, 1, 9, 9]] {
+        for broken in [
+            vec![0x40, 6, 1, 0],
+            vec![0xC0, 7, 10, 0, 0, 0, 1, 10, 0, 0, 1, 9, 9],
+        ] {
             let type_code = broken[1];
             let mut attrs = Vec::new();
             PathAttribute::Origin(Origin::Igp).encode(&mut attrs, true);
@@ -977,9 +1032,20 @@ mod tests {
             else {
                 panic!("expected UPDATE")
             };
-            assert_eq!(u.nlri, vec![p("10.0.0.0/24")], "type {type_code}: NLRI is kept");
-            assert!(u.withdrawn.is_empty(), "type {type_code}: nothing withdrawn");
-            assert_eq!(u.attributes.len(), 3, "type {type_code}: only the good three");
+            assert_eq!(
+                u.nlri,
+                vec![p("10.0.0.0/24")],
+                "type {type_code}: NLRI is kept"
+            );
+            assert!(
+                u.withdrawn.is_empty(),
+                "type {type_code}: nothing withdrawn"
+            );
+            assert_eq!(
+                u.attributes.len(),
+                3,
+                "type {type_code}: only the good three"
+            );
             assert!(
                 !u.attributes.iter().any(|a| a.type_code() == type_code),
                 "type {type_code}: the malformed attribute itself is gone"
@@ -1027,8 +1093,13 @@ mod tests {
             body.extend_from_slice(&broken);
             let msg = frame_update(&body);
             let decoded = Message::decode(&msg, true, AddPath::NONE).expect("decodes, not a reset");
-            let Message::Update(u) = decoded else { panic!("expected UPDATE") };
-            assert!(u.attributes.is_empty(), "the malformed MP attribute is dropped");
+            let Message::Update(u) = decoded else {
+                panic!("expected UPDATE")
+            };
+            assert!(
+                u.attributes.is_empty(),
+                "the malformed MP attribute is dropped"
+            );
             assert!(u.nlri.is_empty());
             assert!(u.withdrawn.is_empty());
 
@@ -1038,8 +1109,14 @@ mod tests {
             attrs.extend_from_slice(&broken);
             let msg = frame_update(&update_body(&attrs));
             let decoded = Message::decode(&msg, true, AddPath::NONE).expect("decodes, not a reset");
-            let Message::Update(u) = decoded else { panic!("expected UPDATE") };
-            assert_eq!(u.withdrawn, vec![p("10.0.0.0/24")], "NLRI must be withdrawn");
+            let Message::Update(u) = decoded else {
+                panic!("expected UPDATE")
+            };
+            assert_eq!(
+                u.withdrawn,
+                vec![p("10.0.0.0/24")],
+                "NLRI must be withdrawn"
+            );
             assert!(u.nlri.is_empty());
         }
     }
@@ -1054,7 +1131,8 @@ mod tests {
         PathAttribute::NextHop(ip([10, 0, 0, 1])).encode(&mut attrs, true);
 
         let msg = frame_update(&update_body(&attrs));
-        let Message::Update(u) = Message::decode(&msg, true, AddPath::NONE).expect("decodes") else {
+        let Message::Update(u) = Message::decode(&msg, true, AddPath::NONE).expect("decodes")
+        else {
             panic!("expected UPDATE")
         };
         assert_eq!(u.nlri, vec![p("10.0.0.0/24")], "NLRI is advertised");
@@ -1066,16 +1144,33 @@ mod tests {
     fn route_refresh_roundtrips() {
         use crate::{AFI_IPV4, AFI_IPV6, SAFI_UNICAST};
         // Header (19) + AFI(2) + Reserved(1) + SAFI(1) = 23 octets, type 5.
-        let bytes = Message::RouteRefresh { afi: AFI_IPV4, safi: SAFI_UNICAST }.encode(true, AddPath::NONE);
+        let bytes = Message::RouteRefresh {
+            afi: AFI_IPV4,
+            safi: SAFI_UNICAST,
+        }
+        .encode(true, AddPath::NONE);
         assert_eq!(bytes.len(), HEADER_LEN + 4);
         assert_eq!(bytes[18], 5); // ROUTE-REFRESH type code
-        roundtrip(Message::RouteRefresh { afi: AFI_IPV4, safi: SAFI_UNICAST });
-        roundtrip(Message::RouteRefresh { afi: AFI_IPV6, safi: SAFI_UNICAST });
+        roundtrip(Message::RouteRefresh {
+            afi: AFI_IPV4,
+            safi: SAFI_UNICAST,
+        });
+        roundtrip(Message::RouteRefresh {
+            afi: AFI_IPV6,
+            safi: SAFI_UNICAST,
+        });
         // A wrong-length body is rejected.
-        let mut short = Message::RouteRefresh { afi: AFI_IPV4, safi: SAFI_UNICAST }.encode(true, AddPath::NONE);
+        let mut short = Message::RouteRefresh {
+            afi: AFI_IPV4,
+            safi: SAFI_UNICAST,
+        }
+        .encode(true, AddPath::NONE);
         short.truncate(HEADER_LEN + 3);
         short[17] = (HEADER_LEN + 3) as u8;
-        assert!(matches!(Message::decode(&short, true, AddPath::NONE), Err(DecodeError::Malformed)));
+        assert!(matches!(
+            Message::decode(&short, true, AddPath::NONE),
+            Err(DecodeError::Malformed)
+        ));
     }
 
     #[test]
@@ -1111,7 +1206,10 @@ mod tests {
         assert_eq!(v6.end_of_rib(), Some((AFI_IPV6, SAFI_UNICAST)));
         roundtrip(Message::Update(v6));
         // A real withdrawal is not an End-of-RIB marker.
-        let real = Update { withdrawn: vec![p("10.0.0.0/8")], ..Update::default() };
+        let real = Update {
+            withdrawn: vec![p("10.0.0.0/8")],
+            ..Update::default()
+        };
         assert_eq!(real.end_of_rib(), None);
     }
 
@@ -1222,7 +1320,8 @@ mod tests {
         };
         // Encode toward the legacy peer (four_octet = false).
         let bytes = Message::Update(update).encode(false, AddPath::NONE);
-        let Message::Update(decoded) = Message::decode(&bytes, false, AddPath::NONE).unwrap() else {
+        let Message::Update(decoded) = Message::decode(&bytes, false, AddPath::NONE).unwrap()
+        else {
             panic!("not an update");
         };
 
@@ -1233,7 +1332,10 @@ mod tests {
         });
         assert_eq!(
             as_path,
-            Some(vec![AsPathSegment::Sequence(vec![crate::AS_TRANS as u32, 65001])])
+            Some(vec![AsPathSegment::Sequence(vec![
+                crate::AS_TRANS as u32,
+                65001
+            ])])
         );
         // … but AS4_PATH preserved the real value, and reconstruction restores it.
         let as4 = decoded.attributes.iter().find_map(|a| match a {
@@ -1259,19 +1361,32 @@ mod tests {
     fn decode_rejects_bad_marker_length_type_version() {
         let mut bytes = Message::Keepalive.encode(true, AddPath::NONE);
         bytes[0] ^= 0x01;
-        assert_eq!(Message::decode(&bytes, true, AddPath::NONE), Err(DecodeError::BadMarker));
+        assert_eq!(
+            Message::decode(&bytes, true, AddPath::NONE),
+            Err(DecodeError::BadMarker)
+        );
 
         let mut bytes = Message::Keepalive.encode(true, AddPath::NONE);
         bytes.push(0); // length field no longer matches
-        assert!(matches!(Message::decode(&bytes, true, AddPath::NONE), Err(DecodeError::BadLength { .. })));
+        assert!(matches!(
+            Message::decode(&bytes, true, AddPath::NONE),
+            Err(DecodeError::BadLength { .. })
+        ));
 
         let mut bytes = Message::Keepalive.encode(true, AddPath::NONE);
         bytes[18] = 9; // bad type
-        assert_eq!(Message::decode(&bytes, true, AddPath::NONE), Err(DecodeError::BadType(9)));
+        assert_eq!(
+            Message::decode(&bytes, true, AddPath::NONE),
+            Err(DecodeError::BadType(9))
+        );
 
-        let mut bytes = Message::Open(Open::new(VERSION, 1, 90, ip([1, 1, 1, 1]))).encode(true, AddPath::NONE);
+        let mut bytes =
+            Message::Open(Open::new(VERSION, 1, 90, ip([1, 1, 1, 1]))).encode(true, AddPath::NONE);
         bytes[HEADER_LEN] = 3; // version 3
-        assert_eq!(Message::decode(&bytes, true, AddPath::NONE), Err(DecodeError::BadVersion(3)));
+        assert_eq!(
+            Message::decode(&bytes, true, AddPath::NONE),
+            Err(DecodeError::BadVersion(3))
+        );
     }
 
     // =======================================================================
@@ -1304,7 +1419,11 @@ mod tests {
 
         let b = Message::Keepalive.encode(true, AddPath::NONE);
         assert_eq!(&b[0..16], &[0xffu8; 16], "the Marker is 16 octets of 0xff");
-        assert_eq!(&b[16..18], &[0, 19], "Length is bytes 16..18; a KEEPALIVE is 19");
+        assert_eq!(
+            &b[16..18],
+            &[0, 19],
+            "Length is bytes 16..18; a KEEPALIVE is 19"
+        );
         assert_eq!(b[18], 4, "Type is byte 18");
         assert_eq!(b.len(), 19, "a KEEPALIVE is header-only");
     }
@@ -1331,7 +1450,11 @@ mod tests {
         let b = msg.encode(true, AddPath::NONE);
         assert_eq!(b[18], 1, "an OPEN is Type 1");
         assert_eq!(b[19], 4, "Version is byte 19");
-        assert_eq!(&b[20..22], &[0xfd, 0xe8], "My Autonomous System is bytes 20..22");
+        assert_eq!(
+            &b[20..22],
+            &[0xfd, 0xe8],
+            "My Autonomous System is bytes 20..22"
+        );
         assert_eq!(&b[22..24], &[0x00, 0x5a], "Hold Time is bytes 22..24");
         assert_eq!(&b[24..28], &[10, 0, 0, 1], "BGP Identifier is bytes 24..28");
         assert_eq!(b[28], 0, "Optional Parameters Length is byte 28");
@@ -1359,12 +1482,28 @@ mod tests {
         let b = msg.encode(true, AddPath::NONE);
         assert_eq!(b[18], 2, "an UPDATE is Type 2");
         // One withdrawn /24 is 4 octets: a length byte plus three prefix octets.
-        assert_eq!(&b[19..21], &[0, 4], "Withdrawn Routes Length is bytes 19..21");
-        assert_eq!(&b[21..25], &[24, 192, 0, 2], "the withdrawn prefix follows it");
+        assert_eq!(
+            &b[19..21],
+            &[0, 4],
+            "Withdrawn Routes Length is bytes 19..21"
+        );
+        assert_eq!(
+            &b[21..25],
+            &[24, 192, 0, 2],
+            "the withdrawn prefix follows it"
+        );
         // ORIGIN is 4 octets on the wire: flags, type, length, value.
-        assert_eq!(&b[25..27], &[0, 4], "Total Path Attribute Length follows the withdrawals");
+        assert_eq!(
+            &b[25..27],
+            &[0, 4],
+            "Total Path Attribute Length follows the withdrawals"
+        );
         assert_eq!(&b[27..31], &[0x40, 1, 1, 0], "the ORIGIN attribute");
-        assert_eq!(&b[31..], &[24, 10, 0, 0], "the NLRI runs to the end of the message");
+        assert_eq!(
+            &b[31..],
+            &[24, 10, 0, 0],
+            "the NLRI runs to the end of the message"
+        );
         assert_eq!(
             u16::from_be_bytes([b[16], b[17]]) as usize,
             b.len(),
@@ -1410,8 +1549,11 @@ mod tests {
     /// refresh the wrong address family (or none).
     #[test]
     fn a_route_refresh_body_has_a_reserved_octet_between_afi_and_safi() {
-        let b = Message::RouteRefresh { afi: crate::AFI_IPV6, safi: crate::SAFI_UNICAST }
-            .encode(true, AddPath::NONE);
+        let b = Message::RouteRefresh {
+            afi: crate::AFI_IPV6,
+            safi: crate::SAFI_UNICAST,
+        }
+        .encode(true, AddPath::NONE);
         assert_eq!(b[18], 5, "a ROUTE-REFRESH is Type 5");
         assert_eq!(&b[19..21], &[0, 2], "AFI is bytes 19..21; IPv6 is 2");
         assert_eq!(b[21], 0, "byte 21 is Reserved and must be zero");

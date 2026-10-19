@@ -15,7 +15,7 @@
 
 use std::net::Ipv4Addr;
 
-use crate::lsa::{checksum_valid, Lsa, LsType, LsaHeader, LSA_HEADER_LEN};
+use crate::lsa::{checksum_valid, LsType, Lsa, LsaHeader, LSA_HEADER_LEN};
 use crate::{ip_checksum, VERSION};
 
 /// The five OSPF packet types (§A.3.1, the Type field).
@@ -520,13 +520,19 @@ impl Packet {
         let body_end = match auth {
             Auth::Md5 { .. } => {
                 if stated + MD5_LEN != buf.len() || stated < HEADER_LEN {
-                    return Err(DecodeError::BadLength { stated: stated as u16, actual: buf.len() });
+                    return Err(DecodeError::BadLength {
+                        stated: stated as u16,
+                        actual: buf.len(),
+                    });
                 }
                 stated
             }
             Auth::Null | Auth::Simple(_) => {
                 if stated != buf.len() {
-                    return Err(DecodeError::BadLength { stated: stated as u16, actual: buf.len() });
+                    return Err(DecodeError::BadLength {
+                        stated: stated as u16,
+                        actual: buf.len(),
+                    });
                 }
                 stated
             }
@@ -815,12 +821,17 @@ mod tests {
     fn lsu_discards_an_lsa_with_a_bad_checksum() {
         let lsa = |lsid: [u8; 4]| Lsa {
             header: sample_lsa_header(lsid),
-            body: LsaBody::Router(RouterLsa { flags: 0, links: vec![] }),
+            body: LsaBody::Router(RouterLsa {
+                flags: 0,
+                links: vec![],
+            }),
         };
         // A two-LSA update; encode stamps each with a valid Fletcher checksum.
         let mut body = Vec::new();
         encode_lsu(
-            &LinkStateUpdate { lsas: vec![lsa([1, 1, 1, 1]), lsa([2, 2, 2, 2])] },
+            &LinkStateUpdate {
+                lsas: vec![lsa([1, 1, 1, 1]), lsa([2, 2, 2, 2])],
+            },
             &mut body,
         );
         // Flip a byte of the second LSA's stored ls_checksum field so decoding
@@ -832,7 +843,10 @@ mod tests {
         let decoded = decode_lsu(&body).expect("packet still frames");
         // The corrupt LSA is discarded; the intact one survives.
         assert_eq!(decoded.lsas.len(), 1);
-        assert_eq!(decoded.lsas[0].header.link_state_id, Ipv4Addr::new(1, 1, 1, 1));
+        assert_eq!(
+            decoded.lsas[0].header.link_state_id,
+            Ipv4Addr::new(1, 1, 1, 1)
+        );
     }
 
     #[test]
@@ -905,7 +919,10 @@ mod tests {
                 options: OPT_E,
                 flags: DD_FLAG_INIT | DD_FLAG_MORE | DD_FLAG_MASTER,
                 dd_sequence: 0x1234_5678,
-                lsa_headers: vec![sample_lsa_header([10, 0, 0, 1]), sample_lsa_header([10, 0, 0, 2])],
+                lsa_headers: vec![
+                    sample_lsa_header([10, 0, 0, 1]),
+                    sample_lsa_header([10, 0, 0, 2]),
+                ],
             },
         );
         let bytes = pkt.encode();
@@ -983,15 +1000,24 @@ mod tests {
         let upd = decoded.as_link_state_update().unwrap();
         assert_eq!(upd.lsas.len(), 2);
         // Lsa::encode recomputes length+checksum, so compare bodies + identities.
-        assert_eq!(upd.lsas[0].body, pkt.as_link_state_update().unwrap().lsas[0].body);
-        assert_eq!(upd.lsas[0].key(), pkt.as_link_state_update().unwrap().lsas[0].key());
+        assert_eq!(
+            upd.lsas[0].body,
+            pkt.as_link_state_update().unwrap().lsas[0].body
+        );
+        assert_eq!(
+            upd.lsas[0].key(),
+            pkt.as_link_state_update().unwrap().lsas[0].key()
+        );
     }
 
     #[test]
     fn truncated_lsu_is_bad_lsa_not_panic() {
         let lsa = Lsa {
             header: sample_lsa_header([10, 0, 0, 1]),
-            body: LsaBody::Router(RouterLsa { flags: 0, links: vec![] }),
+            body: LsaBody::Router(RouterLsa {
+                flags: 0,
+                links: vec![],
+            }),
         };
         let pkt = Packet::link_state_update(sample_header(), LinkStateUpdate { lsas: vec![lsa] });
         let mut bytes = pkt.encode();
@@ -1012,7 +1038,10 @@ mod tests {
         let pkt = Packet::link_state_ack(
             sample_header(),
             LinkStateAck {
-                lsa_headers: vec![sample_lsa_header([10, 0, 0, 1]), sample_lsa_header([192, 168, 0, 0])],
+                lsa_headers: vec![
+                    sample_lsa_header([10, 0, 0, 1]),
+                    sample_lsa_header([192, 168, 0, 0]),
+                ],
             },
         );
         let bytes = pkt.encode();
@@ -1032,37 +1061,68 @@ mod tests {
             Packet::decode_auth(&bytes, &Auth::Simple(b"other".to_vec())),
             Err(DecodeError::BadAuth)
         );
-        assert_eq!(Packet::decode_auth(&bytes, &Auth::Null), Err(DecodeError::BadAuth));
+        assert_eq!(
+            Packet::decode_auth(&bytes, &Auth::Null),
+            Err(DecodeError::BadAuth)
+        );
     }
 
     #[test]
     fn md5_auth_appends_a_digest_and_rejects_tampering() {
-        let auth = Auth::Md5 { key_id: 7, key: b"sharedsecret".to_vec(), seq: 0x0102_0304 };
+        let auth = Auth::Md5 {
+            key_id: 7,
+            key: b"sharedsecret".to_vec(),
+            seq: 0x0102_0304,
+        };
         let mut bytes = sample_hello().encode_auth(&auth);
         assert_eq!(u16::from_be_bytes([bytes[14], bytes[15]]), AU_CRYPTO);
         // The 16-byte digest is appended beyond the OSPF length field.
         let stated = u16::from_be_bytes([bytes[2], bytes[3]]) as usize;
         assert_eq!(bytes.len(), stated + 16);
         assert_eq!(bytes[18], 7); // key id in the auth field
-        // The right key verifies.
+                                  // The right key verifies.
         assert_eq!(Packet::decode_auth(&bytes, &auth).unwrap(), sample_hello());
         // A wrong key id, a wrong key, and a flipped body byte are all rejected.
-        let wrong_id = Auth::Md5 { key_id: 8, key: b"sharedsecret".to_vec(), seq: 0 };
-        assert_eq!(Packet::decode_auth(&bytes, &wrong_id), Err(DecodeError::BadAuth));
-        let wrong_key = Auth::Md5 { key_id: 7, key: b"different".to_vec(), seq: 0 };
-        assert_eq!(Packet::decode_auth(&bytes, &wrong_key), Err(DecodeError::BadAuth));
+        let wrong_id = Auth::Md5 {
+            key_id: 8,
+            key: b"sharedsecret".to_vec(),
+            seq: 0,
+        };
+        assert_eq!(
+            Packet::decode_auth(&bytes, &wrong_id),
+            Err(DecodeError::BadAuth)
+        );
+        let wrong_key = Auth::Md5 {
+            key_id: 7,
+            key: b"different".to_vec(),
+            seq: 0,
+        };
+        assert_eq!(
+            Packet::decode_auth(&bytes, &wrong_key),
+            Err(DecodeError::BadAuth)
+        );
         bytes[HEADER_LEN] ^= 0xff;
-        assert_eq!(Packet::decode_auth(&bytes, &auth), Err(DecodeError::BadAuth));
+        assert_eq!(
+            Packet::decode_auth(&bytes, &auth),
+            Err(DecodeError::BadAuth)
+        );
     }
 
     #[test]
     fn crypto_seq_reads_the_md5_sequence_and_ignores_other_schemes() {
         // A crypto (AuType 2) packet exposes its sequence for anti-replay tracking.
-        let auth = Auth::Md5 { key_id: 3, key: b"k".to_vec(), seq: 0xdead_beef };
+        let auth = Auth::Md5 {
+            key_id: 3,
+            key: b"k".to_vec(),
+            seq: 0xdead_beef,
+        };
         let bytes = sample_hello().encode_auth(&auth);
         assert_eq!(super::crypto_seq(&bytes), Some(0xdead_beef));
         // Null and simple-password packets carry no cryptographic sequence.
-        assert_eq!(super::crypto_seq(&sample_hello().encode_auth(&Auth::Null)), None);
+        assert_eq!(
+            super::crypto_seq(&sample_hello().encode_auth(&Auth::Null)),
+            None
+        );
         let simple = sample_hello().encode_auth(&Auth::Simple(b"pw".to_vec()));
         assert_eq!(super::crypto_seq(&simple), None);
         // A truncated buffer yields None rather than panicking.
@@ -1130,9 +1190,21 @@ mod tests {
         );
         assert_eq!(&b[4..8], &[1, 2, 3, 4], "Router ID is bytes 4..8");
         assert_eq!(&b[8..12], &[0, 0, 0, 42], "Area ID is bytes 8..12");
-        assert_ne!(&b[12..14], &[0, 0], "Checksum is bytes 12..14 and is filled in");
-        assert_eq!(&b[14..16], &[0, 0], "AuType is bytes 14..16, 0 for Null auth");
-        assert_eq!(&b[16..24], &[0u8; 8], "the 8 Authentication bytes are 16..24");
+        assert_ne!(
+            &b[12..14],
+            &[0, 0],
+            "Checksum is bytes 12..14 and is filled in"
+        );
+        assert_eq!(
+            &b[14..16],
+            &[0, 0],
+            "AuType is bytes 14..16, 0 for Null auth"
+        );
+        assert_eq!(
+            &b[16..24],
+            &[0u8; 8],
+            "the 8 Authentication bytes are 16..24"
+        );
     }
 
     /// The decode side, against bytes laid out by hand — the half a round trip
@@ -1148,7 +1220,7 @@ mod tests {
             0, 0, // AuType = Null
             0, 0, 0, 0, 0, 0, 0, 0, // Authentication
             255, 255, 255, 0, // Network Mask
-            0, 10, // HelloInterval = 10
+            0, 10,   // HelloInterval = 10
             0x02, // Options = E-bit
             5,    // Rtr Pri = 5
             0, 0, 0, 40, // RouterDeadInterval = 40
@@ -1202,10 +1274,22 @@ mod tests {
         assert_eq!(&body[4..6], &[0x00, 0x0a], "HelloInterval is bytes 4..6");
         assert_eq!(body[6], OPT_E, "Options is byte 6");
         assert_eq!(body[7], 7, "Rtr Pri is byte 7");
-        assert_eq!(&body[8..12], &[0, 0, 0, 0x28], "RouterDeadInterval is bytes 8..12");
-        assert_eq!(&body[12..16], &[10, 0, 0, 1], "Designated Router is bytes 12..16");
+        assert_eq!(
+            &body[8..12],
+            &[0, 0, 0, 0x28],
+            "RouterDeadInterval is bytes 8..12"
+        );
+        assert_eq!(
+            &body[12..16],
+            &[10, 0, 0, 1],
+            "Designated Router is bytes 12..16"
+        );
         assert_eq!(&body[16..20], &[10, 0, 0, 2], "Backup DR is bytes 16..20");
-        assert_eq!(&body[20..24], &[10, 0, 0, 3], "the neighbour list starts at byte 20");
+        assert_eq!(
+            &body[20..24],
+            &[10, 0, 0, 3],
+            "the neighbour list starts at byte 20"
+        );
         assert_eq!(body.len(), 24);
     }
 
@@ -1237,10 +1321,18 @@ mod tests {
         let b = pkt.encode();
         assert_eq!(b[1], 2, "a DD packet is Type 2");
         let body = &b[HEADER_LEN..];
-        assert_eq!(&body[0..2], &[0x05, 0xdc], "Interface MTU 1500 is bytes 0..2");
+        assert_eq!(
+            &body[0..2],
+            &[0x05, 0xdc],
+            "Interface MTU 1500 is bytes 0..2"
+        );
         assert_eq!(body[2], OPT_E, "Options is byte 2");
         assert_eq!(body[3], 0x07, "the I|M|MS flag byte is byte 3");
-        assert_eq!(&body[4..8], &[0x12, 0x34, 0x56, 0x78], "DD sequence is bytes 4..8");
+        assert_eq!(
+            &body[4..8],
+            &[0x12, 0x34, 0x56, 0x78],
+            "DD sequence is bytes 4..8"
+        );
         assert_eq!(body.len(), DD_FIXED_LEN);
     }
 
@@ -1261,9 +1353,17 @@ mod tests {
             },
         );
         let body = &pkt.encode()[HEADER_LEN..];
-        assert_eq!(&body[0..4], &[0, 0, 0, 5], "LS type is a 32-bit field at 0..4");
+        assert_eq!(
+            &body[0..4],
+            &[0, 0, 0, 5],
+            "LS type is a 32-bit field at 0..4"
+        );
         assert_eq!(&body[4..8], &[10, 1, 0, 0], "Link State ID is bytes 4..8");
-        assert_eq!(&body[8..12], &[10, 0, 0, 9], "Advertising Router is bytes 8..12");
+        assert_eq!(
+            &body[8..12],
+            &[10, 0, 0, 9],
+            "Advertising Router is bytes 8..12"
+        );
         assert_eq!(body.len(), LS_REQUEST_LEN);
     }
 
@@ -1273,19 +1373,32 @@ mod tests {
     fn a_link_state_update_body_opens_with_a_32_bit_lsa_count() {
         let one = Lsa {
             header: sample_lsa_header([10, 0, 0, 1]),
-            body: LsaBody::Router(RouterLsa { flags: 0, links: vec![] }),
+            body: LsaBody::Router(RouterLsa {
+                flags: 0,
+                links: vec![],
+            }),
         };
         let pkt = Packet::link_state_update(
             sample_header(),
-            LinkStateUpdate { lsas: vec![one.clone(), one] },
+            LinkStateUpdate {
+                lsas: vec![one.clone(), one],
+            },
         );
         let b = pkt.encode();
         let body = &b[HEADER_LEN..];
-        assert_eq!(&body[0..4], &[0, 0, 0, 2], "# LSAs is a 32-bit field at 0..4");
+        assert_eq!(
+            &body[0..4],
+            &[0, 0, 0, 2],
+            "# LSAs is a 32-bit field at 0..4"
+        );
         // Each LSA declares its own length in bytes 18..20 of its header, and the
         // two must exactly fill the body.
         let first_len = u16::from_be_bytes([body[4 + 18], body[4 + 19]]) as usize;
-        assert_eq!(body.len(), 4 + 2 * first_len, "the LSAs are packed back to back");
+        assert_eq!(
+            body.len(),
+            4 + 2 * first_len,
+            "the LSAs are packed back to back"
+        );
     }
 
     /// RFC 2328 §A.3.1: the checksum is the standard IP checksum over the whole

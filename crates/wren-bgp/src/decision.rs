@@ -120,7 +120,12 @@ impl Path {
     /// AS_PATH length, so the RIB's own tie-break stays sensible if it ever sees
     /// more than one BGP candidate for a prefix.
     pub fn to_route(&self, prefix: Prefix) -> Route {
-        Route::new(prefix, Protocol::Bgp, vec![self.next_hop_entry()], self.as_path_len() as u32)
+        Route::new(
+            prefix,
+            Protocol::Bgp,
+            vec![self.next_hop_entry()],
+            self.as_path_len() as u32,
+        )
     }
 
     /// Turn this (best) path into a RIB route for `prefix` carrying several
@@ -271,7 +276,10 @@ mod tests {
 
     #[test]
     fn local_pref_wins_first() {
-        let hi = Path { local_pref: 200, ..base() };
+        let hi = Path {
+            local_pref: 200,
+            ..base()
+        };
         // Even with a longer AS_PATH and worse origin, higher LOCAL_PREF wins.
         let lo = Path {
             local_pref: 100,
@@ -285,45 +293,91 @@ mod tests {
 
     #[test]
     fn shorter_as_path_then_origin() {
-        let short = Path { as_path: vec![AsPathSegment::Sequence(vec![65001])], ..base() };
-        let long = Path { as_path: vec![AsPathSegment::Sequence(vec![65001, 65002, 65003])], ..base() };
+        let short = Path {
+            as_path: vec![AsPathSegment::Sequence(vec![65001])],
+            ..base()
+        };
+        let long = Path {
+            as_path: vec![AsPathSegment::Sequence(vec![65001, 65002, 65003])],
+            ..base()
+        };
         assert!(is_better(&short, &long));
 
         // Equal length → lower ORIGIN wins.
-        let igp = Path { origin: Origin::Igp, ..base() };
-        let inc = Path { origin: Origin::Incomplete, ..base() };
+        let igp = Path {
+            origin: Origin::Igp,
+            ..base()
+        };
+        let inc = Path {
+            origin: Origin::Incomplete,
+            ..base()
+        };
         assert!(is_better(&igp, &inc));
     }
 
     #[test]
     fn med_compared_only_within_same_peer_as() {
-        let lo_med = Path { med: 50, peer_as: 65001, ..base() };
-        let hi_med = Path { med: 100, peer_as: 65001, ..base() };
+        let lo_med = Path {
+            med: 50,
+            peer_as: 65001,
+            ..base()
+        };
+        let hi_med = Path {
+            med: 100,
+            peer_as: 65001,
+            ..base()
+        };
         assert!(is_better(&lo_med, &hi_med));
 
         // Different peer ASes → MED is not compared; the two are otherwise equal,
         // so neither dominates on MED alone (the tie falls through to peer id).
-        let a = Path { med: 100, peer_as: 65001, ..base() };
-        let b = Path { med: 50, peer_as: 65002, ..base() };
+        let a = Path {
+            med: 100,
+            peer_as: 65001,
+            ..base()
+        };
+        let b = Path {
+            med: 50,
+            peer_as: 65002,
+            ..base()
+        };
         assert!(!(is_better(&a, &b) && is_better(&b, &a)));
     }
 
     #[test]
     fn ebgp_preferred_over_ibgp() {
-        let ebgp = Path { from_ebgp: true, ..base() };
-        let ibgp = Path { from_ebgp: false, ..base() };
+        let ebgp = Path {
+            from_ebgp: true,
+            ..base()
+        };
+        let ibgp = Path {
+            from_ebgp: false,
+            ..base()
+        };
         assert!(is_better(&ebgp, &ibgp));
     }
 
     #[test]
     fn igp_metric_then_router_id_tie_breaks() {
-        let near = Path { igp_metric: 5, ..base() };
-        let far = Path { igp_metric: 50, ..base() };
+        let near = Path {
+            igp_metric: 5,
+            ..base()
+        };
+        let far = Path {
+            igp_metric: 50,
+            ..base()
+        };
         assert!(is_better(&near, &far));
 
         // Everything equal → lowest peer id.
-        let lo = Path { peer_id: ip([10, 0, 0, 1]), ..base() };
-        let hi = Path { peer_id: ip([10, 0, 0, 9]), ..base() };
+        let lo = Path {
+            peer_id: ip([10, 0, 0, 1]),
+            ..base()
+        };
+        let hi = Path {
+            peer_id: ip([10, 0, 0, 9]),
+            ..base()
+        };
         assert!(is_better(&lo, &hi));
     }
 
@@ -350,7 +404,11 @@ mod tests {
     fn shorter_cluster_list_breaks_the_tie_before_router_id() {
         // Everything equal but the CLUSTER_LIST length → fewer reflection hops wins,
         // even though the longer-list path has the lower peer id.
-        let short = Path { cluster_list: vec![ip([1, 1, 1, 1])], peer_id: ip([10, 0, 0, 9]), ..base() };
+        let short = Path {
+            cluster_list: vec![ip([1, 1, 1, 1])],
+            peer_id: ip([10, 0, 0, 9]),
+            ..base()
+        };
         let long = Path {
             cluster_list: vec![ip([1, 1, 1, 1]), ip([2, 2, 2, 2])],
             peer_id: ip([10, 0, 0, 1]),
@@ -363,9 +421,19 @@ mod tests {
     #[test]
     fn best_path_picks_the_winner() {
         let paths = vec![
-            Path { local_pref: 100, ..base() },
-            Path { local_pref: 300, peer_id: ip([10, 0, 0, 5]), ..base() }, // best
-            Path { local_pref: 200, ..base() },
+            Path {
+                local_pref: 100,
+                ..base()
+            },
+            Path {
+                local_pref: 300,
+                peer_id: ip([10, 0, 0, 5]),
+                ..base()
+            }, // best
+            Path {
+                local_pref: 200,
+                ..base()
+            },
         ];
         assert_eq!(best_path(&paths), Some(1));
         assert_eq!(best_path(&[]), None);
@@ -377,7 +445,10 @@ mod tests {
         let route = p.to_route("203.0.113.0/24".parse().unwrap());
         assert_eq!(route.protocol, Protocol::Bgp);
         assert_eq!(route.metric, 2); // AS_PATH length
-        assert_eq!(route.nexthops, vec![NextHop::via(IpAddr::V4(ip([192, 0, 2, 1])))]);
+        assert_eq!(
+            route.nexthops,
+            vec![NextHop::via(IpAddr::V4(ip([192, 0, 2, 1])))]
+        );
     }
 
     #[test]
@@ -392,7 +463,10 @@ mod tests {
         let route = p.to_route("2001:db8:99::/64".parse().unwrap());
         assert_eq!(
             route.nexthops,
-            vec![NextHop::via_dev(IpAddr::V6("fe80::1".parse().unwrap()), "eth0")]
+            vec![NextHop::via_dev(
+                IpAddr::V6("fe80::1".parse().unwrap()),
+                "eth0"
+            )]
         );
     }
 
@@ -401,19 +475,50 @@ mod tests {
         let a = base();
         // Same AS_PATH content and every forwarding attribute → eligible, even though
         // the next hop and peer differ (that is the whole point of multipath).
-        let b = Path { next_hop: IpAddr::V4(ip([192, 0, 2, 9])), peer_id: ip([10, 0, 0, 9]), ..base() };
+        let b = Path {
+            next_hop: IpAddr::V4(ip([192, 0, 2, 9])),
+            peer_id: ip([10, 0, 0, 9]),
+            ..base()
+        };
         assert!(multipath_eligible(&a, &b));
 
         // A differing AS_PATH (same length, different AS) is NOT eligible by default.
-        let other_as = Path { as_path: vec![AsPathSegment::Sequence(vec![65001, 65009])], ..base() };
+        let other_as = Path {
+            as_path: vec![AsPathSegment::Sequence(vec![65001, 65009])],
+            ..base()
+        };
         assert!(!multipath_eligible(&a, &other_as));
 
         // Differing LOCAL_PREF / ORIGIN / MED / class / IGP cost each disqualify.
-        assert!(!multipath_eligible(&a, &Path { local_pref: 200, ..base() }));
-        assert!(!multipath_eligible(&a, &Path { origin: Origin::Incomplete, ..base() }));
+        assert!(!multipath_eligible(
+            &a,
+            &Path {
+                local_pref: 200,
+                ..base()
+            }
+        ));
+        assert!(!multipath_eligible(
+            &a,
+            &Path {
+                origin: Origin::Incomplete,
+                ..base()
+            }
+        ));
         assert!(!multipath_eligible(&a, &Path { med: 5, ..base() }));
-        assert!(!multipath_eligible(&a, &Path { from_ebgp: false, ..base() }));
-        assert!(!multipath_eligible(&a, &Path { igp_metric: 99, ..base() }));
+        assert!(!multipath_eligible(
+            &a,
+            &Path {
+                from_ebgp: false,
+                ..base()
+            }
+        ));
+        assert!(!multipath_eligible(
+            &a,
+            &Path {
+                igp_metric: 99,
+                ..base()
+            }
+        ));
     }
 
     #[test]

@@ -37,7 +37,7 @@ env:
 
 jobs:
   test:
-    name: clippy + test (stable)
+    name: fmt + clippy + test (stable)
     if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
     steps:
@@ -46,9 +46,12 @@ jobs:
       - name: Install Rust (stable)
         uses: dtolnay/rust-toolchain@stable
         with:
-          components: clippy
+          components: clippy, rustfmt
 
       - uses: Swatinem/rust-cache@v2
+
+      - name: Formatting (workspace)
+        run: cargo fmt --all --check
 
       - name: Clippy (all targets, warnings are errors)
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
@@ -59,20 +62,7 @@ jobs:
       - name: Test (workspace)
         run: cargo test --workspace --locked
 
-  # What stands in for a formatting gate here.
-  #
-  # `cargo fmt --check` is not run, and this is not an oversight: the committed
-  # source is hand-formatted, and today's rustfmt (1.9.0) rewrites 492 places in
-  # 71 of the 103 source files — mostly splitting expressions that fit well
-  # within 100 columns onto four lines. That is not drift that can be fixed once
-  # and then held: `use_small_heuristics = "Max"` and a widened `fn_call_width`
-  # were both tried against the tree and made it *worse* (946 and 834 rewrites),
-  # so there is no rustfmt configuration that agrees with this codebase. A gate
-  # that would demand reformatting every file to turn green is a gate that gets
-  # switched off, so instead this job checks the things a formatter would have
-  # guaranteed and a human reviewer will not notice: no tab indentation, no
-  # trailing whitespace, and a newline at the end of every file. All three hold
-  # across the tree today, so this job starts green and stays honest.
+  # Formatting and source hygiene are enforced independently.
   hygiene:
     name: source hygiene + shellcheck
     if: github.event_name != 'schedule'

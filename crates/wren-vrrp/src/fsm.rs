@@ -212,12 +212,20 @@ impl Vrrp {
         if self.state != State::Master {
             return vec![];
         }
-        vec![Action::SendAdvert, Action::ArmAdverTimer(self.cfg.advert_int_cs)]
+        vec![
+            Action::SendAdvert,
+            Action::ArmAdverTimer(self.cfg.advert_int_cs),
+        ]
     }
 
     /// An advertisement for our VRID arrived, with the sender's `priority`,
     /// advertised interval `adver_int_cs`, and primary source address `src`.
-    pub fn on_advertisement(&mut self, priority: u8, adver_int_cs: u16, src: IpAddr) -> Vec<Action> {
+    pub fn on_advertisement(
+        &mut self,
+        priority: u8,
+        adver_int_cs: u16,
+        src: IpAddr,
+    ) -> Vec<Action> {
         match self.state {
             State::Initialize => vec![],
             State::Backup => self.advert_in_backup(priority, adver_int_cs, src),
@@ -257,7 +265,10 @@ impl Vrrp {
     fn advert_in_master(&mut self, priority: u8, src: IpAddr) -> Vec<Action> {
         if priority == 0 {
             // A peer is releasing: reassert ourselves immediately.
-            return vec![Action::SendAdvert, Action::ArmAdverTimer(self.cfg.advert_int_cs)];
+            return vec![
+                Action::SendAdvert,
+                Action::ArmAdverTimer(self.cfg.advert_int_cs),
+            ];
         }
         // Yield to a higher-priority peer, or an equal-priority peer with a higher
         // primary address (RFC 5798 §6.4.3 tie-break).
@@ -304,7 +315,9 @@ mod tests {
         router.set_local_primary("192.0.2.30".parse().unwrap());
         router.on_startup();
         router.on_master_down_timer();
-        assert!(router.on_advertisement(100, 100, "192.0.2.20".parse().unwrap()).is_empty());
+        assert!(router
+            .on_advertisement(100, 100, "192.0.2.20".parse().unwrap())
+            .is_empty());
         assert_eq!(router.state(), State::Master);
         router.on_advertisement(100, 100, "192.0.2.40".parse().unwrap());
         assert_eq!(router.state(), State::Backup);
