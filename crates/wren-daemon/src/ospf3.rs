@@ -1656,7 +1656,7 @@ impl Ospf {
         info!(interface = %self.ifaces[idx].name, neighbor = %nbr_id, "OSPFv3 adjacency Full");
         self.originate_externals();
         let externals: Vec<Lsa> = self.external_lsdb.iter()
-            .filter(|lsa| lsa.header.advertising_router == self.cfg.router_id && lsa.header.ls_age < MAX_AGE)
+            .filter(|lsa| lsa.header.advertising_router == self.cfg.router_id)
             .cloned().collect();
         for lsa in externals {
             self.flood_external_except(&lsa, Ipv6Addr::UNSPECIFIED).await;

@@ -2192,6 +2192,12 @@ impl Ospf {
         // flooded to it: external flooding targets Full neighbours only. Send a
         // fresh generation now, including after a rapid withdraw/re-add.
         self.originate_externals().await;
+        let retired: Vec<Lsa> = self.external_lsdb.iter()
+            .filter(|lsa| lsa.header.advertising_router == self.cfg.router_id && lsa.header.ls_age >= MAX_AGE)
+            .cloned().collect();
+        for lsa in retired {
+            self.flood_external_except(&lsa, Ipv4Addr::UNSPECIFIED).await;
+        }
         self.reoriginate_and_flood().await;
         self.run_spf_and_announce().await;
     }
