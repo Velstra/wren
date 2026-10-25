@@ -229,7 +229,7 @@ impl Vrrp {
         match self.state {
             State::Initialize => vec![],
             State::Backup => self.advert_in_backup(priority, adver_int_cs, src),
-            State::Master => self.advert_in_master(priority, src),
+            State::Master => self.advert_in_master(priority, adver_int_cs, src),
         }
     }
 
@@ -262,7 +262,7 @@ impl Vrrp {
         vec![]
     }
 
-    fn advert_in_master(&mut self, priority: u8, src: IpAddr) -> Vec<Action> {
+    fn advert_in_master(&mut self, priority: u8, adver_int_cs: u16, src: IpAddr) -> Vec<Action> {
         if priority == 0 {
             // A peer is releasing: reassert ourselves immediately.
             return vec![
@@ -275,6 +275,7 @@ impl Vrrp {
         let yields = priority > self.cfg.priority
             || (priority == self.cfg.priority && addr_gt(src, self.cfg.local_primary));
         if yields {
+            self.master_adver_int_cs = adver_int_cs.max(1);
             self.state = State::Backup;
             self.master_addr = Some(src);
             vec![
@@ -303,6 +304,18 @@ fn addr_gt(a: IpAddr, b: IpAddr) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn yielding_uses_the_new_masters_interval_for_failure_detection() {
+        let mut router = Vrrp::new(cfg(100, true, "192.0.2.10"));
+        router.on_startup();
+        router.on_master_down_timer();
+        let actions = router.on_advertisement(200, 10, "192.0.2.20".parse().unwrap());
+        assert_eq!(router.state(), State::Backup);
+        assert!(actions.contains(&Action::ReleaseVip));
+        assert!(actions.contains(&Action::ArmMasterDownTimer(36)));
+        assert_eq!(router.master_down_int_cs(), 36);
+    }
 
     #[test]
     fn address_recovery_updates_master_identity_and_tie_breaker() {

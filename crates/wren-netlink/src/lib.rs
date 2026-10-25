@@ -416,6 +416,20 @@ pub fn add_address(ifname: &str, addr: IpAddr, prefix_len: u8) -> Result<(), Fib
         ifname,
         addr,
         prefix_len,
+        0,
+    )
+}
+
+/// Install an elected VIP without IPv6 DAD. Ownership was already arbitrated
+/// by VRRP; ordinary addresses retain normal DAD through [`add_address`].
+pub fn add_virtual_address(ifname: &str, addr: IpAddr, prefix_len: u8) -> Result<(), FibError> {
+    address_op(
+        RTM_NEWADDR,
+        NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_REPLACE,
+        ifname,
+        addr,
+        prefix_len,
+        if addr.is_ipv6() { 0x02 } else { 0 }, // IFA_F_NODAD
     )
 }
 
@@ -429,6 +443,7 @@ pub fn del_address(ifname: &str, addr: IpAddr, prefix_len: u8) -> Result<(), Fib
         ifname,
         addr,
         prefix_len,
+        0,
     )
 }
 
@@ -440,6 +455,7 @@ fn address_op(
     ifname: &str,
     addr: IpAddr,
     prefix_len: u8,
+    address_flags: u8,
 ) -> Result<(), FibError> {
     let ifindex =
         if_index(ifname).ok_or_else(|| FibError(format!("unknown interface {ifname:?}")))?;
@@ -448,7 +464,7 @@ fn address_op(
     let mut payload = Vec::with_capacity(8 + 2 * (4 + octets.len()));
     payload.push(af(&addr));
     payload.push(prefix_len);
-    payload.push(0); // ifa_flags
+    payload.push(address_flags);
     payload.push(RT_SCOPE_UNIVERSE);
     payload.extend_from_slice(&ifindex.to_ne_bytes());
     push_attr(&mut payload, IFA_LOCAL, &octets);
@@ -916,6 +932,28 @@ pub const CREATE_ONLY_FLAGS: u16 = NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NL
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore = "needs CAP_NET_ADMIN + d0; run scripts/netlink-kernel-smoke.sh"]
+    fn elected_ipv6_address_is_immediately_usable_without_dad() {
+        let address = "2001:db8::99".parse().unwrap();
+        add_virtual_address("d0", address, 64).unwrap();
+        add_virtual_address("d0", address, 64).unwrap();
+        let output = std::process::Command::new("ip")
+            .args(["-6", "-o", "address", "show", "dev", "d0"])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let text = String::from_utf8(output.stdout).unwrap();
+        let vip = text
+            .lines()
+            .find(|line| line.contains("2001:db8::99/64"))
+            .unwrap();
+        assert!(vip.contains("nodad"), "{vip}");
+        assert!(!vip.contains("tentative"), "{vip}");
+        assert!(!vip.contains("dadfailed"), "{vip}");
+        del_address("d0", address, 64).unwrap();
+    }
     use wren_core::NextHop;
 
     fn p(s: &str) -> Prefix {
