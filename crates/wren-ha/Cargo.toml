@@ -1,0 +1,16 @@
+[package]
+name = "wren-ha"
+description = "Authenticated witness leases and local HA readiness coordination"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+[dependencies]
+base64 = "0.22"
+anyhow.workspace = true
+serde.workspace = true
+serde_json = "1"
+tokio = { workspace = true, features = ["process"] }
+ring = "0.17.14"
+libc = "0.2"

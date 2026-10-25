@@ -45,6 +45,7 @@ _connected = []
 _rawsock = []
 
 [dependencies]
+wren-ha.workspace = true
 wren-core.workspace = true
 wren-config.workspace = true
 wren-bgp.workspace = true
@@ -67,3 +68,7 @@ tracing-subscriber.workspace = true
 # For the RIP runner's multicast UDP sockets (SO_BINDTODEVICE, IP_ADD_MEMBERSHIP,
 # IP_MULTICAST_IF) set directly via setsockopt — same minimal dep as wren-netlink.
 libc = "0.2"
+
+[[bin]]
+name = "wren-witness"
+path = "src/witness.rs"

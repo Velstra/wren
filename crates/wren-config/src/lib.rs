@@ -34,6 +34,9 @@ use wren_core::{NextHop, Prefix, Protocol, Route};
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
+    /// Witness-authorized, kernel-fenced HA VIP coordination.
+    #[serde(default)]
+    pub ha: Option<wren_ha::Config>,
     /// The router id (a 32-bit id, conventionally written as an IPv4 address).
     #[serde(rename = "router-id")]
     pub router_id: Option<String>,

@@ -652,8 +652,14 @@ async fn main() -> Result<()> {
             Ok(instances) => {
                 let qrx = vrrp_queries_rx.take().expect("vrrp queries rx taken once");
                 let shutdown = supervisor.mark_started("vrrp", vrrp_sig(&cfg));
+                let ha = cfg.ha.clone();
                 proto_handles.push(tokio::spawn(async move {
-                    if let Err(e) = vrrp::run(instances, qrx, shutdown).await {
+                    let result = if let Some(ha) = ha {
+                        vrrp::run_ha(instances, ha, qrx, shutdown).await
+                    } else {
+                        vrrp::run(instances, qrx, shutdown).await
+                    };
+                    if let Err(e) = result {
                         error!(error = %e, "VRRP engine stopped");
                     }
                 }));
@@ -1413,8 +1419,14 @@ async fn main() -> Result<()> {
                     }
                 };
                 let (qtx, qrx) = mpsc::channel(QUERY_QUEUE);
+                let ha = cfg.ha.clone();
                 let join = tokio::spawn(async move {
-                    if let Err(e) = vrrp::run(instances, qrx, stop).await {
+                    let result = if let Some(ha) = ha {
+                        vrrp::run_ha(instances, ha, qrx, stop).await
+                    } else {
+                        vrrp::run(instances, qrx, stop).await
+                    };
+                    if let Err(e) = result {
                         error!(error = %e, "VRRP engine stopped");
                     }
                 });
@@ -2010,9 +2022,11 @@ fn vrrp_sig(cfg: &wren_config::Config) -> reload::Sig {
     // removing an instance restarts the engine.
     reload::Sig::new(
         !cfg.vrrp.is_empty(),
-        cfg.vrrp
-            .iter()
-            .map(|v| format!("{}/{}", v.interface, v.vrid)),
+        cfg.vrrp.iter().map(|v| format!("{v:?}")).chain(
+            cfg.ha
+                .as_ref()
+                .map(|ha| ha.signature().expect("serializable HA configuration")),
+        ),
     )
 }
 

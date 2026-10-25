@@ -79,6 +79,7 @@ impl AnnouncementTimer {
 }
 
 /// One virtual router as resolved by `main.rs` from `[[vrrp]]`.
+#[derive(Clone)]
 pub struct InstanceConfig {
     /// The interface the virtual router runs on.
     pub interface: String,
@@ -309,6 +310,219 @@ pub async fn run(
             Some(req) = queries.recv() => {
                 let _ = req.respond.send(render_instances(&instances));
             }
+        }
+    }
+}
+
+/// All VIPs in a leased HA appliance share one authority, rather than electing
+/// WAN and LAN independently. A paused coordinator cannot extend the absolute
+/// lease deadline consumed by the kernel guard.
+pub async fn run_ha(
+    configs: Vec<InstanceConfig>,
+    config: wren_ha::Config,
+    mut queries: mpsc::Receiver<VrrpQueryRequest>,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+) -> Result<()> {
+    use std::{
+        fs::OpenOptions,
+        os::{fd::AsRawFd, unix::fs::OpenOptionsExt},
+        path::Path,
+    };
+    use wren_ha::{Agent, Authority, Request, Role, AGENT_PATH, ROLE_PATH};
+    config.validate()?;
+    anyhow::ensure!(!configs.is_empty(), "HA requires virtual addresses");
+    std::fs::create_dir_all("/run/velstra/ha")?;
+    let lock = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open("/run/velstra/ha/coordinator.lock")?;
+    anyhow::ensure!(
+        unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0,
+        "HA coordinator is already running"
+    );
+    let mut binding = LeaseBindings {
+        configs,
+        owns: false,
+    };
+    // Remove addresses left by a previously killed process before requesting
+    // new authority. The kernel guard remains closed throughout startup.
+    binding.release();
+    let boot = wren_ha::random()?;
+    let mut role = Role {
+        cluster: config.cluster.clone(),
+        node: config.node,
+        coordinator_boot: boot,
+        authority: Authority::default(),
+        deadline_ns: 0,
+        updated_ns: wren_ha::now_ns(),
+        vips_ready: false,
+        vpn_ready: false,
+        claimed_ready_term: 0,
+        claimed_agent_boot: [0; 16],
+    };
+    wren_ha::write_private(Path::new(ROLE_PATH), &role, false)?;
+    let mut poll = tokio::time::interval(Duration::from_millis(25));
+    poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut announcements = AnnouncementTimer::default();
+    let mut announced_term = 0;
+    let mut rekey = RekeyTask::default();
+    let mut rekey_term = 0;
+    let mut vpn_failed_until = 0;
+    loop {
+        tokio::select! {
+            _ = shutdown.changed() => {
+                role.deadline_ns = 0; role.vips_ready = false;
+                wren_ha::write_private(Path::new(ROLE_PATH), &role, false)?;
+                binding.release();
+                return Ok(());
+            }
+            Some(query) = queries.recv() => {
+                let active = role.deadline_ns > wren_ha::now_ns() && binding.owns;
+                let state = if active { "Master" } else { "Backup" };
+                let mut text = format!("HA {state} node={} term={} owner={} lease-ms={}\n",
+                    config.node, role.authority.term, role.authority.owner,
+                    role.deadline_ns.saturating_sub(wren_ha::now_ns()) / 1_000_000);
+                for c in &binding.configs { text.push_str(&format!("vrid={} interface={} {state} {:?}\n", c.vrid, c.address_interface, c.addresses)); }
+                let _ = query.respond.send(text);
+            }
+            _ = poll.tick() => {
+                let now = wren_ha::now_ns();
+                if rekey.0.as_ref().is_some_and(|task|task.is_finished()) {
+                    let result = rekey.0.take().expect("finished rekey").await;
+                    match result {
+                        Ok(Ok(())) if rekey_term==role.authority.term => role.vpn_ready=true,
+                        Ok(Ok(())) => {},
+                        _ => {warn!("HA VPN reconstruction failed; relinquishing authority");vpn_failed_until=now.saturating_add(1_000_000_000);role.deadline_ns=0;role.vpn_ready=false;}
+                    }
+                }
+                let agent = wren_ha::read_private::<Agent>(Path::new(AGENT_PATH)).ok()
+                    .filter(|a| a.cluster == config.cluster && a.node == config.node
+                        && a.coordinator_boot == boot && a.eligible && wren_ha::fresh(a.updated_ns, now));
+                let healthy = binding.configs.iter().all(|c|
+                    iface_running(&c.address_interface) && iface_index(&c.address_interface).is_some()
+                        && (config.wireguard.contains(&c.address_interface) || read_mac(&c.address_interface).is_some())
+                        && c.track_interfaces.iter().all(|i| iface_running(i)));
+                let request = Request { cluster: config.cluster.clone(), node: config.node,
+                    boot, priority: config.priority, preempt: config.preempt,
+                    ready_term: agent.as_ref().map_or(0, |a| a.ready_term),
+                    policy: agent.as_ref().map_or(role.authority.policy, |a| a.policy),
+                    eligible: healthy && agent.is_some() && now>=vpn_failed_until };
+                match wren_ha::exchange(&config, &request).await {
+                    Ok((reply, deadline)) => {
+                        let same = role.authority == reply.authority;
+                        role.authority = reply.authority;
+                        if reply.granted || !same { role.deadline_ns = deadline; }
+                        if !same {role.vpn_ready=false;rekey.cancel();rekey_term=0;}
+                        if reply.granted { role.claimed_ready_term = request.ready_term; role.claimed_agent_boot = agent.as_ref().map_or([0;16], |a|a.agent_boot); }
+                    }
+                    Err(error) => { debug!(%error, "HA witness unavailable; existing lease cannot be extended"); }
+                }
+                let now = wren_ha::now_ns();
+                let active = healthy && agent.is_some() && now>=vpn_failed_until && role.authority.owner == config.node
+                    && role.authority.boot == boot && role.deadline_ns > now;
+                if active {
+                    match binding.assume() {
+                        Ok(changed) => {role.vips_ready = true;if changed {announced_term=0;}},
+                        Err(error) => { warn!(%error, "HA VIP transaction failed; fencing"); role.deadline_ns = 0; role.vips_ready = false; binding.release(); }
+                    }
+                } else {
+                    role.deadline_ns = 0; role.vips_ready = false;
+                    if binding.owns {binding.release();} announcements.cancel(); announced_term = 0;
+                    rekey.cancel();rekey_term=0;role.vpn_ready=false;
+                }
+                if active && role.vips_ready && agent.as_ref().is_some_and(|a| a.forwarding_term==role.authority.term) && rekey_term!=role.authority.term {
+                    rekey.cancel();rekey_term=role.authority.term;
+                    if config.wireguard.is_empty() {role.vpn_ready=true;}
+                    else {let config=config.clone();let role=role.clone();rekey.0=Some(tokio::spawn(wren_ha::wireguard::promote(config,role)));}
+                }
+                role.updated_ns = now;
+                wren_ha::write_private(Path::new(ROLE_PATH), &role, false)?;
+                // Advertise only after the agent acknowledged opening this term.
+                if binding.owns && agent.as_ref().is_some_and(|a| a.forwarding_term == role.authority.term)
+                    && role.deadline_ns > wren_ha::now_ns() {
+                    if announced_term != role.authority.term {
+                        info!(term=role.authority.term, node=config.node, "HA promoted; announcing all VIPs");
+                        binding.announce(); announcements.arm(Instant::now()); announced_term = role.authority.term;
+                    } else if announcements.due(Instant::now()) { binding.announce(); }
+                }
+            }
+        }
+    }
+}
+
+#[derive(Default)]
+struct RekeyTask(Option<tokio::task::JoinHandle<Result<()>>>);
+impl RekeyTask {
+    fn cancel(&mut self) {
+        if let Some(task) = self.0.take() {
+            task.abort();
+        }
+    }
+}
+impl Drop for RekeyTask {
+    fn drop(&mut self) {
+        self.cancel();
+    }
+}
+
+struct LeaseBindings {
+    configs: Vec<InstanceConfig>,
+    owns: bool,
+}
+impl LeaseBindings {
+    fn assume(&mut self) -> Result<bool> {
+        let mut changed = false;
+        for c in &self.configs {
+            let present = iface_addresses(&c.address_interface).unwrap_or_default();
+            for vip in &c.addresses {
+                if !present.contains(vip) {
+                    wren_netlink::add_virtual_address(&c.address_interface, *vip, c.prefix_len)?;
+                    changed = true;
+                }
+            }
+        }
+        self.owns = true;
+        Ok(changed)
+    }
+    fn release(&mut self) {
+        for c in &self.configs {
+            for vip in &c.addresses {
+                if let Err(error) =
+                    wren_netlink::del_address(&c.address_interface, *vip, c.prefix_len)
+                {
+                    debug!(%error, %vip, "removing HA VIP");
+                }
+            }
+        }
+        self.owns = false;
+    }
+    fn announce(&self) {
+        for c in &self.configs {
+            if let (Some(index), Some(mac)) = (
+                iface_index(&c.address_interface),
+                read_mac(&c.address_interface),
+            ) {
+                for vip in &c.addresses {
+                    let result = match vip {
+                        IpAddr::V4(v4) => send_gratuitous_arp(index, mac, *v4),
+                        IpAddr::V6(v6) => send_unsolicited_na(index, mac, *v6),
+                    };
+                    if let Err(error) = result {
+                        debug!(%error, %vip, "announcing HA VIP");
+                    }
+                }
+            }
+        }
+    }
+}
+impl Drop for LeaseBindings {
+    fn drop(&mut self) {
+        if self.owns {
+            self.release();
         }
     }
 }
