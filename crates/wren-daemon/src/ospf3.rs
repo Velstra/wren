@@ -1133,6 +1133,7 @@ impl Ospf {
                 FloodDecision::Install { .. } => {
                     ack_headers.push(lsa.header);
                     let key = lsa.key();
+                    self.drop_from_request_lists(&key);
                     let third_party = lsa.header.advertising_router != self_id;
                     match scope {
                         wren_ospfv3::lsa::Scope::LinkLocal => {
@@ -1149,6 +1150,14 @@ impl Ospf {
                                     .entry((AS_SCOPE, key))
                                     .or_insert(INITIAL_SEQUENCE_NUMBER);
                                 *slot = lsa.header.ls_seq.wrapping_add(1);
+                                if let Some(retired) = retired_self_external(
+                                    self_id, self.originated_externals.contains(&key), &lsa,
+                                ) {
+                                    self.external_lsdb.install(retired.clone());
+                                    self.flood_external_except(&retired, Ipv6Addr::UNSPECIFIED).await;
+                                    installed = true;
+                                    continue;
+                                }
                                 reclaim_self = true;
                                 continue;
                             }
@@ -1171,7 +1180,6 @@ impl Ospf {
                             self.lsa_installed_at.insert((area, key), now);
                         }
                     }
-                    self.drop_from_request_lists(&key);
                     installed = true;
                 }
                 FloodDecision::DirectAck => ack_headers.push(lsa.header),
@@ -1646,6 +1654,13 @@ impl Ospf {
     /// On reaching Full: re-originate our LSAs, flood them and re-run SPF.
     async fn on_adjacency_full(&mut self, idx: usize, nbr_id: Ipv4Addr) {
         info!(interface = %self.ifaces[idx].name, neighbor = %nbr_id, "OSPFv3 adjacency Full");
+        self.originate_externals();
+        let externals: Vec<Lsa> = self.external_lsdb.iter()
+            .filter(|lsa| lsa.header.advertising_router == self.cfg.router_id && lsa.header.ls_age < MAX_AGE)
+            .cloned().collect();
+        for lsa in externals {
+            self.flood_external_except(&lsa, Ipv6Addr::UNSPECIFIED).await;
+        }
         self.reoriginate_and_flood().await;
         self.run_spf_and_announce().await;
     }
@@ -2462,9 +2477,39 @@ fn shutdown_lsas<'a>(router_id: Ipv4Addr, lsas: impl Iterator<Item = &'a Lsa>) -
         }).collect()
 }
 
+fn retired_self_external(router_id: Ipv4Addr, originated: bool, lsa: &Lsa) -> Option<Lsa> {
+    if originated || lsa.header.advertising_router != router_id || lsa.header.ls_type != LsType::AsExternal {
+        return None;
+    }
+    let mut retired = lsa.clone();
+    retired.header.ls_age = MAX_AGE;
+    Some(retired)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_retired_self_externals_are_purged_after_restart() {
+        let mut lsa = router_lsa([0; 4], [1; 4], 9);
+        lsa.header.ls_type = LsType::AsExternal;
+        lsa.body = LsaBody::AsExternal(AsExternalLsa {
+            external_type2: true, metric: 20,
+            prefix: to_v3_prefix("2001:db8:9::/64".parse().unwrap()).unwrap(),
+            forwarding_address: None, route_tag: None,
+            referenced_ls_type: 0, referenced_link_state_id: None,
+        });
+        let lsa = Lsa::decode(&lsa.encode()).unwrap().0;
+        let own_id = lsa.header.advertising_router;
+        let retired = retired_self_external(own_id, false, &lsa).unwrap();
+        assert_eq!(retired.header.ls_age, MAX_AGE);
+        assert_eq!(retired.header.ls_seq, lsa.header.ls_seq);
+        assert_eq!(retired.body, lsa.body);
+        assert!(retired_self_external(own_id, true, &lsa).is_none());
+        assert!(retired_self_external(Ipv4Addr::new(2, 2, 2, 2), false, &lsa).is_none());
+        assert!(retired_self_external(own_id, false, &router_lsa([0; 4], [1; 4], 9)).is_none());
+    }
 
     #[test]
     fn shutdown_premature_aging_preserves_instance_and_foreign_lsas() {
