@@ -110,7 +110,10 @@ impl EchoSock {
             return Err(io::Error::last_os_error()).context("bind AF_PACKET for BFD Echo");
         }
         Ok(EchoSock {
-            fd: AsyncFd::new(guard).context("registering BFD Echo socket with tokio")?,
+            // SAFETY: RawSock exclusively owns the open descriptor and keeps it
+            // unchanged until AsyncFd deregisters it and drops the owner.
+            fd: unsafe { AsyncFd::register(guard) }
+                .context("registering BFD Echo socket with tokio")?,
             proto_be: eth_p.to_be(),
         })
     }

@@ -2052,7 +2052,10 @@ fn open_isis_socket(ifname: &str) -> Result<(u32, [u8; 6], PacketSock)> {
 
     let snpa = read_mac(ifname).with_context(|| format!("reading MAC of {ifname:?}"))?;
     let sock = PacketSock {
-        fd: AsyncFd::new(guard).context("registering AF_PACKET socket with tokio")?,
+        // SAFETY: RawSock exclusively owns the open descriptor and keeps it
+        // unchanged until AsyncFd deregisters it and drops the owner.
+        fd: unsafe { AsyncFd::register(guard) }
+            .context("registering AF_PACKET socket with tokio")?,
     };
     Ok((ifindex, snpa, sock))
 }
