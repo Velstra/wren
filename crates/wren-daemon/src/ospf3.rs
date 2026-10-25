@@ -511,10 +511,20 @@ pub async fn run(
 
     loop {
         tokio::select! {
-            // Graceful shutdown (M10): OSPFv3 has no goodbye packet, so exit
-            // cleanly and let neighbors drop the adjacency on dead-interval.
-            // (Flushing self-originated LSAs to MaxAge is a follow-up.)
             _ = shutdown.changed() => {
+                ospf.withdraw_self_originated().await;
+                let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+                let mut retry = tokio::time::interval(Duration::from_millis(200));
+                while ospf.ifaces.iter().any(|i| i.neighbors.values().any(|n| !n.retransmit_list.is_empty())) {
+                    tokio::select! {
+                        _ = tokio::time::sleep_until(deadline) => {
+                            warn!("OSPFv3 shutdown withdrawal acknowledgments timed out");
+                            break;
+                        }
+                        _ = retry.tick() => ospf.retransmit_pending().await,
+                        Some(pkt) = pkt_rx.recv() => ospf.handle_packet(&pkt, start.elapsed().as_secs(), true).await,
+                    }
+                }
                 info!("OSPFv3 shutting down");
                 return Ok(());
             }
@@ -524,7 +534,7 @@ pub async fn run(
                     break;
                 };
                 let now = start.elapsed().as_secs();
-                ospf.handle_packet(&pkt, now).await;
+                ospf.handle_packet(&pkt, now, false).await;
             }
             _ = hello.tick() => {
                 ospf.send_hellos().await;
@@ -610,7 +620,7 @@ impl Ospf {
 impl Ospf {
     /// Decode the packet (resolving the destination for the pseudo-header) and
     /// dispatch it.
-    async fn handle_packet(&mut self, pkt: &RawPacket, now: u64) {
+    async fn handle_packet(&mut self, pkt: &RawPacket, now: u64, acks_only: bool) {
         let Some(idx) = self.iface_index(pkt.ifindex) else {
             return;
         };
@@ -648,6 +658,9 @@ impl Ospf {
             }
         }
         let nbr_id = packet.header.router_id;
+        if acks_only && !matches!(&packet.body, Body::LinkStateAck(_)) {
+            return;
+        }
         match packet.body {
             Body::Hello(h) => self.handle_hello(idx, nbr_id, pkt.src, &h, now).await,
             Body::DatabaseDescription(dd) => self.handle_dd(idx, nbr_id, &dd).await,
@@ -1119,6 +1132,7 @@ impl Ospf {
                 FloodDecision::Install { .. } => {
                     ack_headers.push(lsa.header);
                     let key = lsa.key();
+                    self.drop_from_request_lists(&key);
                     let third_party = lsa.header.advertising_router != self_id;
                     match scope {
                         wren_ospfv3::lsa::Scope::LinkLocal => {
@@ -1135,6 +1149,17 @@ impl Ospf {
                                     .entry((AS_SCOPE, key))
                                     .or_insert(INITIAL_SEQUENCE_NUMBER);
                                 *slot = lsa.header.ls_seq.wrapping_add(1);
+                                if let Some(retired) = retired_self_external(
+                                    self_id,
+                                    self.originated_externals.contains(&key),
+                                    &lsa,
+                                ) {
+                                    self.external_lsdb.install(retired.clone());
+                                    self.flood_external_except(&retired, Ipv6Addr::UNSPECIFIED)
+                                        .await;
+                                    installed = true;
+                                    continue;
+                                }
                                 reclaim_self = true;
                                 continue;
                             }
@@ -1157,7 +1182,6 @@ impl Ospf {
                             self.lsa_installed_at.insert((area, key), now);
                         }
                     }
-                    self.drop_from_request_lists(&key);
                     installed = true;
                 }
                 FloodDecision::DirectAck => ack_headers.push(lsa.header),
@@ -1631,8 +1655,59 @@ impl Ospf {
     /// On reaching Full: re-originate our LSAs, flood them and re-run SPF.
     async fn on_adjacency_full(&mut self, idx: usize, nbr_id: Ipv4Addr) {
         info!(interface = %self.ifaces[idx].name, neighbor = %nbr_id, "OSPFv3 adjacency Full");
+        self.originate_externals();
+        let externals: Vec<Lsa> = self
+            .external_lsdb
+            .iter()
+            .filter(|lsa| lsa.header.advertising_router == self.cfg.router_id)
+            .cloned()
+            .collect();
+        for lsa in externals {
+            self.flood_external_except(&lsa, Ipv6Addr::UNSPECIFIED)
+                .await;
+        }
         self.reoriginate_and_flood().await;
         self.run_spf_and_announce().await;
+    }
+
+    /// Withdraw our link-, area- and AS-scoped LSAs before a configuration
+    /// restart; a neighbour must not retain removed IPv6 routes until MaxAge.
+    async fn withdraw_self_originated(&mut self) {
+        for iface in &mut self.ifaces {
+            for neighbor in iface.neighbors.values_mut() {
+                neighbor.retransmit_list.clear();
+            }
+        }
+        let areas: Vec<_> = self
+            .areas
+            .iter()
+            .map(|(id, area)| (*id, shutdown_lsas(self.cfg.router_id, area.lsdb.iter())))
+            .collect();
+        for (area, lsas) in areas {
+            for lsa in lsas {
+                self.flood_lsa(area, &lsa).await;
+            }
+        }
+        for lsa in shutdown_lsas(self.cfg.router_id, self.external_lsdb.iter()) {
+            self.flood_external_except(&lsa, Ipv6Addr::UNSPECIFIED)
+                .await;
+        }
+        let links: Vec<_> = self
+            .ifaces
+            .iter()
+            .enumerate()
+            .map(|(idx, iface)| {
+                (
+                    idx,
+                    shutdown_lsas(self.cfg.router_id, iface.link_lsdb.iter()),
+                )
+            })
+            .collect();
+        for (idx, lsas) in links {
+            for lsa in lsas {
+                self.flood_link_lsa(idx, &lsa).await;
+            }
+        }
     }
 
     /// Flood one area LSA to every Full neighbour on an interface in `area`.
@@ -2408,9 +2483,72 @@ fn clear_acked_lsas(retransmit_list: &mut HashMap<LsaKey, Lsa>, acked: &[LsaHead
     }
 }
 
+fn shutdown_lsas<'a>(router_id: Ipv4Addr, lsas: impl Iterator<Item = &'a Lsa>) -> Vec<Lsa> {
+    lsas.filter(|lsa| lsa.header.advertising_router == router_id && lsa.header.ls_age < MAX_AGE)
+        .map(|lsa| {
+            let mut withdrawn = lsa.clone();
+            withdrawn.header.ls_age = MAX_AGE;
+            withdrawn
+        })
+        .collect()
+}
+
+fn retired_self_external(router_id: Ipv4Addr, originated: bool, lsa: &Lsa) -> Option<Lsa> {
+    if originated
+        || lsa.header.advertising_router != router_id
+        || lsa.header.ls_type != LsType::AsExternal
+    {
+        return None;
+    }
+    let mut retired = lsa.clone();
+    retired.header.ls_age = MAX_AGE;
+    Some(retired)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_retired_self_externals_are_purged_after_restart() {
+        let mut lsa = router_lsa([0; 4], [1; 4], 9);
+        lsa.header.ls_type = LsType::AsExternal;
+        lsa.body = LsaBody::AsExternal(AsExternalLsa {
+            external_type2: true,
+            metric: 20,
+            prefix: to_v3_prefix("2001:db8:9::/64".parse().unwrap()).unwrap(),
+            forwarding_address: None,
+            route_tag: None,
+            referenced_ls_type: 0,
+            referenced_link_state_id: None,
+        });
+        let lsa = Lsa::decode(&lsa.encode()).unwrap().0;
+        let own_id = lsa.header.advertising_router;
+        let retired = retired_self_external(own_id, false, &lsa).unwrap();
+        assert_eq!(retired.header.ls_age, MAX_AGE);
+        assert_eq!(retired.header.ls_seq, lsa.header.ls_seq);
+        assert_eq!(retired.body, lsa.body);
+        assert!(retired_self_external(own_id, true, &lsa).is_none());
+        assert!(retired_self_external(Ipv4Addr::new(2, 2, 2, 2), false, &lsa).is_none());
+        assert!(retired_self_external(own_id, false, &router_lsa([0; 4], [1; 4], 9)).is_none());
+    }
+
+    #[test]
+    fn shutdown_premature_aging_preserves_instance_and_foreign_lsas() {
+        let own = router_lsa([1, 1, 1, 1], [1, 1, 1, 1], 9);
+        let foreign = router_lsa([2, 2, 2, 2], [2, 2, 2, 2], 12);
+        let mut expired = own.clone();
+        expired.header.ls_age = MAX_AGE;
+        let lsas = [own.clone(), foreign.clone(), expired];
+        let withdrawn = shutdown_lsas(own.header.advertising_router, lsas.iter());
+        assert_eq!(withdrawn.len(), 1);
+        assert_eq!(withdrawn[0].header.ls_age, MAX_AGE);
+        assert_eq!(withdrawn[0].header.ls_seq, own.header.ls_seq);
+        assert_eq!(withdrawn[0].key(), own.key());
+        assert_eq!(withdrawn[0].body, own.body);
+        assert_eq!(lsas[0].header.ls_age, 0);
+        assert_eq!(lsas[1], foreign);
+    }
 
     fn router_lsa(id: [u8; 4], adv: [u8; 4], seq: i32) -> Lsa {
         Lsa {
