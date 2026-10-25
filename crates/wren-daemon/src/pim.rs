@@ -232,9 +232,8 @@ pub async fn run(
     let mut hello_tick = tokio::time::interval(cfg.hello_interval);
     hello_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
     hello_tick.reset();
-    let mut jp_tick = tokio::time::interval(Duration::from_secs(
-        wren_pim::DEFAULT_JP_PERIOD_SECS as u64,
-    ));
+    let mut jp_tick =
+        tokio::time::interval(Duration::from_secs(wren_pim::DEFAULT_JP_PERIOD_SECS as u64));
     jp_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let mut housekeep = tokio::time::interval(Duration::from_secs(HOUSEKEEPING_SECS));
     housekeep.set_missed_tick_behavior(MissedTickBehavior::Delay);
@@ -516,7 +515,11 @@ fn find_ifindex_by_vif_or_index(ifaces: &HashMap<u32, PimIface>, ifindex: u32) -
 fn render_neighbors(ifaces: &HashMap<u32, PimIface>) -> String {
     use std::fmt::Write as _;
     let mut out = String::new();
-    let _ = writeln!(out, "{:<12} {:<16} {:<8}", "Interface", "Neighbor", "DR-Prio");
+    let _ = writeln!(
+        out,
+        "{:<12} {:<16} {:<8}",
+        "Interface", "Neighbor", "DR-Prio"
+    );
     let mut ordered: Vec<&PimIface> = ifaces.values().collect();
     ordered.sort_by(|a, b| a.name.cmp(&b.name));
     let mut any = false;
@@ -638,21 +641,19 @@ fn spawn_upcall_reader(sock: Arc<UdpSocket>, tx: mpsc::Sender<Upcall>) {
         let mut buf = vec![0u8; RECV_BUF];
         loop {
             match sock.recv_from(&mut buf).await {
-                Ok((n, _)) => {
-                    match mroute::parse_upcall(&buf[..n]) {
-                        Some(up) => {
-                            if tx.send(up).await.is_err() {
-                                return;
-                            }
+                Ok((n, _)) => match mroute::parse_upcall(&buf[..n]) {
+                    Some(up) => {
+                        if tx.send(up).await.is_err() {
+                            return;
                         }
-                        None => debug!(
-                            len = n,
-                            b0 = buf.first().copied().unwrap_or(0),
-                            b8 = buf.get(8).copied().unwrap_or(0),
-                            "PIM: mroute socket datagram (not an upcall)"
-                        ),
                     }
-                }
+                    None => debug!(
+                        len = n,
+                        b0 = buf.first().copied().unwrap_or(0),
+                        b8 = buf.get(8).copied().unwrap_or(0),
+                        "PIM: mroute socket datagram (not an upcall)"
+                    ),
+                },
                 Err(e) => {
                     warn!(error = %e, "PIM: mroute upcall reader stopping");
                     return;

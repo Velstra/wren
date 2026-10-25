@@ -280,7 +280,11 @@ pub fn netmask_to_len(mask: Ipv4Addr) -> Option<u8> {
     let bits = u32::from(mask);
     let ones = bits.leading_ones();
     // A valid netmask is `ones` set bits followed by all zeros.
-    let expected = if ones == 0 { 0 } else { u32::MAX << (32 - ones) };
+    let expected = if ones == 0 {
+        0
+    } else {
+        u32::MAX << (32 - ones)
+    };
     if bits == expected {
         Some(ones as u8)
     } else {
@@ -387,7 +391,14 @@ impl RipTable {
         } else {
             Some(IpAddr::V4(entry.next_hop))
         };
-        self.process_route(prefix, entry.metric, next_hop, IpAddr::V4(from), ifindex, now)
+        self.process_route(
+            prefix,
+            entry.metric,
+            next_hop,
+            IpAddr::V4(from),
+            ifindex,
+            now,
+        )
     }
 
     /// Process a received distance-vector route, independent of wire format
@@ -627,7 +638,10 @@ impl RipTable {
 
     /// [`adverts`](Self::adverts) formatted as RIPv2 wire entries (IPv4 only).
     pub fn advertise(&self, out_ifindex: u32) -> Vec<Entry> {
-        self.adverts(out_ifindex).iter().filter_map(entry_for).collect()
+        self.adverts(out_ifindex)
+            .iter()
+            .filter_map(entry_for)
+            .collect()
     }
 
     /// [`triggered_adverts`](Self::triggered_adverts) as RIPv2 wire entries.
@@ -749,8 +763,16 @@ mod tests {
     #[test]
     fn response_round_trips_on_the_wire() {
         let msg = Message::response(vec![
-            Entry::route(Ipv4Addr::new(10, 0, 0, 0), Ipv4Addr::new(255, 255, 255, 0), 1),
-            Entry::route(Ipv4Addr::new(192, 168, 1, 0), Ipv4Addr::new(255, 255, 255, 0), 5),
+            Entry::route(
+                Ipv4Addr::new(10, 0, 0, 0),
+                Ipv4Addr::new(255, 255, 255, 0),
+                1,
+            ),
+            Entry::route(
+                Ipv4Addr::new(192, 168, 1, 0),
+                Ipv4Addr::new(255, 255, 255, 0),
+                5,
+            ),
         ]);
         let bytes = msg.encode();
         assert_eq!(bytes.len(), HEADER_LEN + 2 * ENTRY_LEN);
@@ -766,7 +788,7 @@ mod tests {
         let bytes = req.encode();
         assert_eq!(bytes.len(), HEADER_LEN + ENTRY_LEN);
         assert_eq!(bytes[0], 1); // request
-        // family 0, metric 16 at the end of the single RTE.
+                                 // family 0, metric 16 at the end of the single RTE.
         assert_eq!(&bytes[4..6], &[0, 0]);
         assert_eq!(&bytes[20..24], &16u32.to_be_bytes());
         assert!(Message::decode(&bytes).unwrap().is_full_table_request());
@@ -775,8 +797,14 @@ mod tests {
     #[test]
     fn decode_rejects_short_and_misaligned_and_bad_command() {
         assert_eq!(Message::decode(&[2, 2, 0]), Err(RipError::TooShort));
-        assert_eq!(Message::decode(&[2, 2, 0, 0, 1, 2, 3]), Err(RipError::BadLength(3)));
-        assert_eq!(Message::decode(&[9, 2, 0, 0]), Err(RipError::UnknownCommand(9)));
+        assert_eq!(
+            Message::decode(&[2, 2, 0, 0, 1, 2, 3]),
+            Err(RipError::BadLength(3))
+        );
+        assert_eq!(
+            Message::decode(&[9, 2, 0, 0]),
+            Err(RipError::UnknownCommand(9))
+        );
     }
 
     #[test]
@@ -788,7 +816,10 @@ mod tests {
         assert_eq!(r.metric, 3);
         assert_eq!(r.source, 7);
         // Unspecified next hop falls back to the datagram's originator.
-        assert_eq!(r.nexthops[0].gateway, Some(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1))));
+        assert_eq!(
+            r.nexthops[0].gateway,
+            Some(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)))
+        );
     }
 
     // --- RIP table (distance-vector) tests ---
@@ -830,13 +861,20 @@ mod tests {
         t.process(&net([10, 0, 0, 0], 24, 1), a, 2, 0); // via A
         t.process(&net([10, 1, 0, 0], 24, 1), a, 2, 0); // via A
         t.process(&net([10, 2, 0, 0], 24, 1), b, 2, 0); // via B
-        t.add_connected(Prefix::new(IpAddr::V4(Ipv4Addr::new(10, 3, 0, 0)), 24).unwrap(), 2);
+        t.add_connected(
+            Prefix::new(IpAddr::V4(Ipv4Addr::new(10, 3, 0, 0)), 24).unwrap(),
+            2,
+        );
 
         // A's BFD session fails: both of A's routes are expired at once, B's untouched.
         let events = t.expire_via(IpAddr::V4(a), 100);
         assert_eq!(events.len(), 2);
-        assert!(events.contains(&RipEvent::Lost(Prefix::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 0)), 24).unwrap())));
-        assert!(events.contains(&RipEvent::Lost(Prefix::new(IpAddr::V4(Ipv4Addr::new(10, 1, 0, 0)), 24).unwrap())));
+        assert!(events.contains(&RipEvent::Lost(
+            Prefix::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 0)), 24).unwrap()
+        )));
+        assert!(events.contains(&RipEvent::Lost(
+            Prefix::new(IpAddr::V4(Ipv4Addr::new(10, 1, 0, 0)), 24).unwrap()
+        )));
         // A's routes are now unreachable; B's route and the connected one are intact.
         assert_eq!(metric_of(&t.advertise(3), [10, 0, 0, 0]), Some(16));
         assert_eq!(metric_of(&t.advertise(3), [10, 2, 0, 0]), Some(2));
@@ -849,7 +887,14 @@ mod tests {
     fn unreachable_is_not_learned_fresh() {
         let mut t = RipTable::new();
         // metric 16 received → 17 capped to 16 → never installed.
-        assert!(t.process(&net([10, 0, 0, 0], 24, 16), Ipv4Addr::new(192, 0, 2, 1), 2, 0).is_none());
+        assert!(t
+            .process(
+                &net([10, 0, 0, 0], 24, 16),
+                Ipv4Addr::new(192, 0, 2, 1),
+                2,
+                0
+            )
+            .is_none());
         assert!(t.is_empty());
     }
 
@@ -858,7 +903,7 @@ mod tests {
         let mut t = RipTable::new();
         let a = Ipv4Addr::new(192, 0, 2, 1);
         t.process(&net([10, 0, 0, 0], 24, 1), a, 2, 0); // metric 2
-        // The same neighbour now advertises a worse metric — trust it.
+                                                        // The same neighbour now advertises a worse metric — trust it.
         let ev = t.process(&net([10, 0, 0, 0], 24, 4), a, 2, 10).unwrap();
         assert!(matches!(ev, RipEvent::Learned(ref r) if r.metric == 5));
     }
@@ -880,7 +925,12 @@ mod tests {
     #[test]
     fn timeout_then_garbage_collection() {
         let mut t = RipTable::new();
-        t.process(&net([10, 0, 0, 0], 24, 1), Ipv4Addr::new(192, 0, 2, 1), 2, 0);
+        t.process(
+            &net([10, 0, 0, 0], 24, 1),
+            Ipv4Addr::new(192, 0, 2, 1),
+            2,
+            0,
+        );
         // Before the timeout: nothing happens.
         assert!(t.tick(TIMEOUT_SECS - 1).is_empty());
         // At the timeout: the route goes unreachable (Lost) and is poisoned.
@@ -925,7 +975,7 @@ mod tests {
         assert_eq!(metric_of(&t.advertise(2), [192, 0, 2, 0]), Some(5));
         assert_eq!(metric_of(&t.advertise(7), [192, 0, 2, 0]), Some(5));
         assert!(t.has_changes()); // offered as a triggered change immediately
-        // A neighbour cannot displace it, and it never times out on its own.
+                                  // A neighbour cannot displace it, and it never times out on its own.
         let nbr = Ipv4Addr::new(10, 0, 0, 2);
         assert!(t.process(&net([192, 0, 2, 0], 24, 1), nbr, 2, 0).is_none());
         assert!(t.tick(u64::MAX - 1).is_empty());
@@ -966,7 +1016,12 @@ mod tests {
     #[test]
     fn triggered_carries_only_changed_routes_until_cleared() {
         let mut t = RipTable::new();
-        t.process(&net([10, 0, 0, 0], 24, 1), Ipv4Addr::new(192, 0, 2, 1), 2, 0);
+        t.process(
+            &net([10, 0, 0, 0], 24, 1),
+            Ipv4Addr::new(192, 0, 2, 1),
+            2,
+            0,
+        );
         assert!(t.has_changes());
         assert_eq!(t.triggered(3).len(), 1);
         t.clear_changed();
@@ -1006,12 +1061,28 @@ mod tests {
         assert_eq!(b[1], 2, "Version is byte 1");
         assert_eq!(&b[2..4], &[0, 0], "bytes 2..4 must be zero");
         let rte = &b[HEADER_LEN..HEADER_LEN + ENTRY_LEN];
-        assert_eq!(&rte[0..2], &[0, 2], "AFI is bytes 0..2 of the RTE; AF_INET is 2");
+        assert_eq!(
+            &rte[0..2],
+            &[0, 2],
+            "AFI is bytes 0..2 of the RTE; AF_INET is 2"
+        );
         assert_eq!(&rte[2..4], &[0x12, 0x34], "Route Tag is bytes 2..4");
         assert_eq!(&rte[4..8], &[10, 9, 8, 0], "IP Address is bytes 4..8");
-        assert_eq!(&rte[8..12], &[255, 255, 255, 0], "Subnet Mask is bytes 8..12");
-        assert_eq!(&rte[12..16], &[192, 168, 1, 254], "Next Hop is bytes 12..16");
-        assert_eq!(&rte[16..20], &[0, 0, 0, 5], "Metric is bytes 16..20, big-endian");
+        assert_eq!(
+            &rte[8..12],
+            &[255, 255, 255, 0],
+            "Subnet Mask is bytes 8..12"
+        );
+        assert_eq!(
+            &rte[12..16],
+            &[192, 168, 1, 254],
+            "Next Hop is bytes 12..16"
+        );
+        assert_eq!(
+            &rte[16..20],
+            &[0, 0, 0, 5],
+            "Metric is bytes 16..20, big-endian"
+        );
         assert_eq!(b.len(), HEADER_LEN + ENTRY_LEN);
     }
 

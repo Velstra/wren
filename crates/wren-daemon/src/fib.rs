@@ -45,7 +45,9 @@ impl FibHandle {
     /// so an install and a later remove of the same prefix never reorder.
     pub async fn apply(&self, change: FibChange) -> Result<(), FibError> {
         let (reply, rx) = oneshot::channel();
-        self.tx.send(FibJob::Apply(change, reply)).map_err(|_| worker_gone())?;
+        self.tx
+            .send(FibJob::Apply(change, reply))
+            .map_err(|_| worker_gone())?;
         rx.await.unwrap_or_else(|_| Err(worker_gone()))
     }
 
@@ -53,7 +55,9 @@ impl FibHandle {
     /// reconciliation).
     pub async fn owned_routes(&self) -> Result<Vec<Route>, FibError> {
         let (reply, rx) = oneshot::channel();
-        self.tx.send(FibJob::OwnedRoutes(reply)).map_err(|_| worker_gone())?;
+        self.tx
+            .send(FibJob::OwnedRoutes(reply))
+            .map_err(|_| worker_gone())?;
         rx.await.unwrap_or_else(|_| Err(worker_gone()))
     }
 }

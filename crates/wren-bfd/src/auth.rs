@@ -56,7 +56,10 @@ impl AuthType {
 
     /// Whether the sequence number must strictly advance every packet (§6.7).
     fn meticulous(self) -> bool {
-        matches!(self, AuthType::MeticulousKeyedMd5 | AuthType::MeticulousKeyedSha1)
+        matches!(
+            self,
+            AuthType::MeticulousKeyedMd5 | AuthType::MeticulousKeyedSha1
+        )
     }
 }
 
@@ -303,10 +306,7 @@ pub fn md5(msg: &[u8]) -> [u8; 16] {
             } else {
                 (c ^ (b | !d), (7 * i) % 16)
             };
-            let f = f
-                .wrapping_add(a)
-                .wrapping_add(K[i])
-                .wrapping_add(w[g]);
+            let f = f.wrapping_add(a).wrapping_add(K[i]).wrapping_add(w[g]);
             a = d;
             d = c;
             c = b;
@@ -408,7 +408,10 @@ mod tests {
     #[test]
     fn sha1_known_vectors() {
         assert_eq!(hex(&sha1(b"")), "da39a3ee5e6b4b0d3255bfef95601890afd80709");
-        assert_eq!(hex(&sha1(b"abc")), "a9993e364706816aba3e25717850c26c9cd0d89d");
+        assert_eq!(
+            hex(&sha1(b"abc")),
+            "a9993e364706816aba3e25717850c26c9cd0d89d"
+        );
         assert_eq!(
             hex(&sha1(b"The quick brown fox jumps over the lazy dog")),
             "2fd4e1c67a2d28fced849ee1bb76e7391b93eb12"
@@ -430,7 +433,11 @@ mod tests {
     }
 
     fn cfg(ty: AuthType, secret: &[u8]) -> AuthConfig {
-        AuthConfig { auth_type: ty, key_id: 7, secret: secret.to_vec() }
+        AuthConfig {
+            auth_type: ty,
+            key_id: 7,
+            secret: secret.to_vec(),
+        }
     }
 
     #[test]
@@ -459,7 +466,10 @@ mod tests {
             let p1 = tx.append(&mand());
             assert!(rx.verify(&p1), "{ty:?} first packet verifies");
             let p2 = tx.append(&mand());
-            assert!(rx.verify(&p2), "{ty:?} second packet verifies (seq advanced)");
+            assert!(
+                rx.verify(&p2),
+                "{ty:?} second packet verifies (seq advanced)"
+            );
             // A flipped digest byte must fail.
             let mut tampered = p2.clone();
             let last = tampered.len() - 1;
@@ -526,7 +536,10 @@ mod tests {
                 rx.verify(&forge(&c, 0)),
                 "{ty:?} refused the packet after the sequence wrapped to 0"
             );
-            assert!(rx.verify(&forge(&c, 1)), "{ty:?} refused the one after that");
+            assert!(
+                rx.verify(&forge(&c, 1)),
+                "{ty:?} refused the one after that"
+            );
         }
     }
 
@@ -536,12 +549,29 @@ mod tests {
         // 3 × Detect Mult = 9 either side of the wrap.
         for meticulous in [false, true] {
             let floor = u32::from(meticulous);
-            assert!(within_replay_window(u32::MAX, u32::MAX.wrapping_add(1), 3, meticulous));
-            assert!(within_replay_window(u32::MAX, 8, 3, meticulous), "the far edge, wrapped");
-            assert!(!within_replay_window(u32::MAX, 9, 3, meticulous), "one past the far edge");
+            assert!(within_replay_window(
+                u32::MAX,
+                u32::MAX.wrapping_add(1),
+                3,
+                meticulous
+            ));
+            assert!(
+                within_replay_window(u32::MAX, 8, 3, meticulous),
+                "the far edge, wrapped"
+            );
+            assert!(
+                !within_replay_window(u32::MAX, 9, 3, meticulous),
+                "one past the far edge"
+            );
             // A replay from behind is a huge forward delta, so it is outside.
-            assert!(!within_replay_window(0, u32::MAX, 3, meticulous), "a replay was admitted");
-            assert!(!within_replay_window(100, 99, 3, meticulous), "an older number was admitted");
+            assert!(
+                !within_replay_window(0, u32::MAX, 3, meticulous),
+                "a replay was admitted"
+            );
+            assert!(
+                !within_replay_window(100, 99, 3, meticulous),
+                "an older number was admitted"
+            );
             // The same number again: keyed permits it, meticulous does not.
             assert_eq!(within_replay_window(100, 100, 3, meticulous), floor == 0);
         }
@@ -568,10 +598,22 @@ mod tests {
     fn the_simple_password_section_matches_the_rfc_field_order() {
         let mut tx = cfg(AuthType::SimplePassword, b"hunter2").new_state(3);
         let b = tx.append(&mand());
-        assert_eq!(b[1] & 0x04, 0x04, "the A bit is set in byte 1 of the header");
-        assert_eq!(b[3] as usize, b.len(), "the header Length now covers the section");
+        assert_eq!(
+            b[1] & 0x04,
+            0x04,
+            "the A bit is set in byte 1 of the header"
+        );
+        assert_eq!(
+            b[3] as usize,
+            b.len(),
+            "the header Length now covers the section"
+        );
         assert_eq!(b[24], 1, "Auth Type is byte 24; Simple Password is 1");
-        assert_eq!(b[25], 3 + 7, "Auth Len is byte 26 and counts its own 3 octets");
+        assert_eq!(
+            b[25],
+            3 + 7,
+            "Auth Len is byte 26 and counts its own 3 octets"
+        );
         assert_eq!(b[26], 7, "Auth Key ID is byte 26");
         assert_eq!(&b[27..], b"hunter2", "the password starts at byte 27");
         assert_eq!(b.len(), 24 + 3 + 7);
@@ -599,9 +641,17 @@ mod tests {
             let b = tx.append(&mand());
             assert_eq!(ty.code(), code, "{ty:?} is auth type code {code}");
             assert_eq!(b[1] & 0x04, 0x04, "the A bit is set");
-            assert_eq!(b[3] as usize, b.len(), "the header Length covers the section");
+            assert_eq!(
+                b[3] as usize,
+                b.len(),
+                "the header Length covers the section"
+            );
             assert_eq!(b[24], code, "Auth Type is byte 24");
-            assert_eq!(b[25] as usize, 8 + dlen, "Auth Len is byte 25 = 8 + digest len");
+            assert_eq!(
+                b[25] as usize,
+                8 + dlen,
+                "Auth Len is byte 25 = 8 + digest len"
+            );
             assert_eq!(b[26], 7, "Auth Key ID is byte 26");
             assert_eq!(b[27], 0, "byte 27 is Reserved and must be zero");
             assert_eq!(
@@ -609,12 +659,20 @@ mod tests {
                 &[0x01, 0x02, 0x03, 0x04],
                 "the Sequence Number is bytes 28..32, big-endian, incremented on send"
             );
-            assert_eq!(b.len(), 24 + 8 + dlen, "the digest occupies the last {dlen} octets");
+            assert_eq!(
+                b.len(),
+                24 + 8 + dlen,
+                "the digest occupies the last {dlen} octets"
+            );
             // The digest field is not the raw key: the key is only the seed
             // written into that field before hashing (§4.3).
             let mut key = b"sharedsecret".to_vec();
             key.resize(dlen, 0);
-            assert_ne!(&b[32..], &key[..], "byte 32 onward is the digest, not the key");
+            assert_ne!(
+                &b[32..],
+                &key[..],
+                "byte 32 onward is the digest, not the key"
+            );
         }
     }
 
@@ -637,7 +695,11 @@ mod tests {
         key.resize(16, 0);
         image.extend_from_slice(&key);
         assert_eq!(image.len(), b.len());
-        assert_eq!(&b[32..], &md5(&image)[..], "the digest must match §4.3's construction");
+        assert_eq!(
+            &b[32..],
+            &md5(&image)[..],
+            "the digest must match §4.3's construction"
+        );
         // And it really covers the mandatory section: flipping My Discriminator
         // changes the digest.
         let mut other = image.clone();

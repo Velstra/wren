@@ -362,7 +362,11 @@ mod tests {
         let p = ControlPacket::decode(&b).expect("auth-present packets still decode");
         assert!(p.auth_present);
         // A plain (unauthenticated) packet records the bit as clear.
-        assert!(!ControlPacket::decode(&sample().encode()).unwrap().auth_present);
+        assert!(
+            !ControlPacket::decode(&sample().encode())
+                .unwrap()
+                .auth_present
+        );
     }
 
     #[test]
@@ -388,7 +392,10 @@ mod tests {
         b[1] |= 1 << 2;
         b[3] = MIN_AUTHENTICATED_LEN as u8;
         b.extend_from_slice(&[0, 0]);
-        assert!(ControlPacket::decode(&b).is_some(), "the shortest legal authenticated packet was refused");
+        assert!(
+            ControlPacket::decode(&b).is_some(),
+            "the shortest legal authenticated packet was refused"
+        );
         // And with the A bit clear, 24 is still legal — the floor moved only for
         // the authenticated case.
         assert!(ControlPacket::decode(&sample().encode()).is_some());
@@ -430,8 +437,8 @@ mod tests {
             detect_mult: 5,
             my_discr: 0x0a0b_0c0d,
             your_discr: 0x1122_3344,
-            desired_min_tx: 0x0004_93e0,     // 300000
-            required_min_rx: 0x000f_4240,    // 1000000
+            desired_min_tx: 0x0004_93e0,       // 300000
+            required_min_rx: 0x000f_4240,      // 1000000
             required_min_echo_rx: 0x0000_03e8, // 1000
             ..sample()
         };
@@ -439,11 +446,31 @@ mod tests {
         assert_eq!(b.len(), 24, "the mandatory section is 24 octets");
         assert_eq!(b[2], 5, "Detect Mult is byte 2");
         assert_eq!(b[3], 24, "Length is byte 3");
-        assert_eq!(&b[4..8], &[0x0a, 0x0b, 0x0c, 0x0d], "My Discriminator is 4..8");
-        assert_eq!(&b[8..12], &[0x11, 0x22, 0x33, 0x44], "Your Discriminator is 8..12");
-        assert_eq!(&b[12..16], &[0x00, 0x04, 0x93, 0xe0], "Desired Min TX is 12..16");
-        assert_eq!(&b[16..20], &[0x00, 0x0f, 0x42, 0x40], "Required Min RX is 16..20");
-        assert_eq!(&b[20..24], &[0x00, 0x00, 0x03, 0xe8], "Required Min Echo RX is 20..24");
+        assert_eq!(
+            &b[4..8],
+            &[0x0a, 0x0b, 0x0c, 0x0d],
+            "My Discriminator is 4..8"
+        );
+        assert_eq!(
+            &b[8..12],
+            &[0x11, 0x22, 0x33, 0x44],
+            "Your Discriminator is 8..12"
+        );
+        assert_eq!(
+            &b[12..16],
+            &[0x00, 0x04, 0x93, 0xe0],
+            "Desired Min TX is 12..16"
+        );
+        assert_eq!(
+            &b[16..20],
+            &[0x00, 0x0f, 0x42, 0x40],
+            "Required Min RX is 16..20"
+        );
+        assert_eq!(
+            &b[20..24],
+            &[0x00, 0x00, 0x03, 0xe8],
+            "Required Min Echo RX is 20..24"
+        );
     }
 
     /// RFC 5880 §4.1 assigns each flag its own bit of byte 1, below the 2-bit
@@ -482,8 +509,16 @@ mod tests {
             demand: true,
             ..base
         };
-        assert_eq!(all.encode()[1] & 0x04, 0, "the A bit is never set by encode");
-        assert_eq!(all.encode()[1] & 0x01, 0, "the M bit is never set by encode");
+        assert_eq!(
+            all.encode()[1] & 0x04,
+            0,
+            "the A bit is never set by encode"
+        );
+        assert_eq!(
+            all.encode()[1] & 0x01,
+            0,
+            "the M bit is never set by encode"
+        );
         assert_eq!(all.encode()[1], 0x3a, "P|F|C|D with State AdminDown");
     }
 
@@ -515,7 +550,11 @@ mod tests {
                 your_discr: 1, // non-zero so Init/Up are legal to encode
                 ..sample()
             };
-            assert_eq!(p.encode()[1] >> 6, bits, "State is the top 2 bits of byte 1");
+            assert_eq!(
+                p.encode()[1] >> 6,
+                bits,
+                "State is the top 2 bits of byte 1"
+            );
         }
     }
 

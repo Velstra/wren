@@ -43,6 +43,37 @@ const ETH_P_ARP: u16 = 0x0806;
 /// The IPv6 all-nodes multicast group, the destination for an unsolicited NA.
 const ALL_NODES_V6: Ipv6Addr = Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 1);
 
+/// Retry startup announcements, then refresh neighbor learning while master.
+/// A successful send only means the local kernel accepted the frame; a switch
+/// recovering at the same time may still miss it.
+#[derive(Default)]
+struct AnnouncementTimer {
+    deadline: Option<Instant>,
+    retries: u8,
+}
+
+impl AnnouncementTimer {
+    fn arm(&mut self, now: Instant) {
+        self.retries = 2;
+        self.deadline = Some(now + Duration::from_secs(1));
+    }
+
+    fn cancel(&mut self) {
+        self.deadline = None;
+        self.retries = 0;
+    }
+
+    fn due(&mut self, now: Instant) -> bool {
+        if !self.deadline.is_some_and(|deadline| now >= deadline) {
+            return false;
+        }
+        self.retries = self.retries.saturating_sub(1);
+        let delay = if self.retries > 0 { 1 } else { 30 };
+        self.deadline = Some(now + Duration::from_secs(delay));
+        true
+    }
+}
+
 /// One virtual router as resolved by `main.rs` from `[[vrrp]]`.
 pub struct InstanceConfig {
     /// The interface the virtual router runs on.
@@ -117,6 +148,7 @@ struct Instance {
     adver_deadline: Option<Instant>,
     /// When the master is declared down (Backup only).
     master_down_deadline: Option<Instant>,
+    announcements: AnnouncementTimer,
 }
 
 /// Run every configured virtual router until cancelled. `queries` answers
@@ -134,7 +166,7 @@ pub async fn run(
         let (ifindex, std_sock) = open_vrrp_socket(&cfg.interface, ipv6)
             .with_context(|| format!("opening VRRP socket on {:?}", cfg.interface))?;
         let sock = Arc::new(UdpSocket::from_std(std_sock).context("registering VRRP socket")?);
-        let primary = iface_primary(&cfg.interface, ipv6).unwrap_or(if ipv6 {
+        let primary = iface_primary(&cfg.interface, ipv6, &cfg.addresses).unwrap_or(if ipv6 {
             IpAddr::V6(Ipv6Addr::UNSPECIFIED)
         } else {
             IpAddr::V4(Ipv4Addr::UNSPECIFIED)
@@ -179,7 +211,11 @@ pub async fn run(
             fsm,
             ifname: cfg.interface.clone(),
             ifindex,
-            addr_ifname: if addr_ifindex == ifindex { cfg.interface.clone() } else { addr_ifname },
+            addr_ifname: if addr_ifindex == ifindex {
+                cfg.interface.clone()
+            } else {
+                addr_ifname
+            },
             addr_ifindex,
             addr_mac,
             primary,
@@ -193,6 +229,7 @@ pub async fn run(
             tracked_down: false,
             adver_deadline: None,
             master_down_deadline: None,
+            announcements: AnnouncementTimer::default(),
         };
         info!(
             vrid = inst.fsm.vrid(),
@@ -201,8 +238,10 @@ pub async fn run(
             family = if ipv6 { "ipv6" } else { "ipv4" },
             "VRRP virtual router starting",
         );
-        let actions = inst.fsm.on_startup();
-        apply_actions(&mut inst, actions).await;
+        if !primary.is_unspecified() {
+            let actions = inst.fsm.on_startup();
+            apply_actions(&mut inst, actions).await;
+        }
         instances.push(inst);
     }
     drop(adv_tx); // the reader tasks hold their own clones
@@ -232,6 +271,7 @@ pub async fn run(
             }
             _ = track_poll.tick() => {
                 for inst in instances.iter_mut() {
+                    poll_primary(inst).await;
                     poll_tracking(inst).await;
                 }
             }
@@ -256,6 +296,9 @@ pub async fn run(
                         let actions = inst.fsm.on_master_down_timer();
                         apply_actions(inst, actions).await;
                     }
+                    if inst.announcements.due(now) {
+                        announce_vips(inst);
+                    }
                 }
             }
             Some(req) = queries.recv() => {
@@ -269,7 +312,13 @@ pub async fn run(
 fn next_deadline(instances: &[Instance]) -> Option<Instant> {
     instances
         .iter()
-        .flat_map(|i| [i.adver_deadline, i.master_down_deadline])
+        .flat_map(|i| {
+            [
+                i.adver_deadline,
+                i.master_down_deadline,
+                i.announcements.deadline,
+            ]
+        })
         .flatten()
         .min()
 }
@@ -280,8 +329,14 @@ async fn apply_actions(inst: &mut Instance, actions: Vec<Action>) {
         match action {
             Action::SendAdvert => send_advert(inst, inst.fsm.priority()).await,
             Action::SendAdvertZero => send_advert(inst, 0).await,
-            Action::AssumeVip => assume_vip(inst),
-            Action::ReleaseVip => release_vip(inst),
+            Action::AssumeVip => {
+                assume_vip(inst);
+                inst.announcements.arm(Instant::now());
+            }
+            Action::ReleaseVip => {
+                inst.announcements.cancel();
+                release_vip(inst);
+            }
             Action::ArmAdverTimer(cs) => {
                 inst.adver_deadline = Some(Instant::now() + cs_to_dur(cs));
                 inst.master_down_deadline = None; // mutually exclusive with backup
@@ -293,6 +348,29 @@ async fn apply_actions(inst: &mut Instance, actions: Vec<Action>) {
             Action::CancelAdverTimer => inst.adver_deadline = None,
             Action::CancelMasterDownTimer => inst.master_down_deadline = None,
         }
+    }
+}
+
+/// DHCP and address changes can occur after the daemon starts. Never elect
+/// ourselves using an unspecified address or a VIP left by an earlier election.
+async fn poll_primary(inst: &mut Instance) {
+    let next = iface_primary(&inst.ifname, inst.ipv6, &inst.addresses);
+    if next == Some(inst.primary) || (next.is_none() && inst.primary.is_unspecified()) {
+        return;
+    }
+    info!(vrid = inst.fsm.vrid(), interface = %inst.ifname, primary = ?next,
+        "VRRP interface address changed; restarting election");
+    let actions = inst.fsm.on_shutdown();
+    apply_actions(inst, actions).await;
+    inst.primary = next.unwrap_or(if inst.ipv6 {
+        IpAddr::V6(Ipv6Addr::UNSPECIFIED)
+    } else {
+        IpAddr::V4(Ipv4Addr::UNSPECIFIED)
+    });
+    inst.fsm.set_local_primary(inst.primary);
+    if next.is_some() {
+        let actions = inst.fsm.on_startup();
+        apply_actions(inst, actions).await;
     }
 }
 
@@ -315,7 +393,9 @@ async fn poll_tracking(inst: &mut Instance) {
         );
     }
     let effective = if any_down {
-        inst.base_priority.saturating_sub(inst.priority_decrement).max(1)
+        inst.base_priority
+            .saturating_sub(inst.priority_decrement)
+            .max(1)
     } else {
         inst.base_priority
     };
@@ -365,6 +445,12 @@ fn assume_vip(inst: &Instance) {
             Ok(()) => debug!(%vip, "virtual IP assigned"),
             Err(e) => warn!(%vip, error = %e, "assigning virtual IP"),
         }
+    }
+    announce_vips(inst);
+}
+
+fn announce_vips(inst: &Instance) {
+    for vip in &inst.addresses {
         // Announced where it is reachable, with that link's own MAC: a host on
         // the served segment must learn the address against a MAC it can send
         // to, which is not the election link's.
@@ -437,7 +523,13 @@ fn render_instances(instances: &[Instance]) -> String {
 }
 
 /// Read, validate and forward advertisements for one instance to the central loop.
-async fn read_loop(idx: usize, sock: Arc<UdpSocket>, vrid: u8, ipv6: bool, tx: mpsc::Sender<AdvIn>) {
+async fn read_loop(
+    idx: usize,
+    sock: Arc<UdpSocket>,
+    vrid: u8,
+    ipv6: bool,
+    tx: mpsc::Sender<AdvIn>,
+) {
     let mut buf = [0u8; 1500];
     let dst = mcast(ipv6);
     loop {
@@ -541,8 +633,13 @@ fn open_vrrp_socket(ifname: &str, ipv6: bool) -> Result<(u32, std::net::UdpSocke
         mreq.ipv6mr_interface = ifindex;
         setsockopt_struct(fd, libc::IPPROTO_IPV6, libc::IPV6_ADD_MEMBERSHIP, &mreq)
             .context("IPV6_ADD_MEMBERSHIP ff02::12")?;
-        setsockopt_int(fd, libc::IPPROTO_IPV6, libc::IPV6_MULTICAST_IF, ifindex as i32)
-            .context("IPV6_MULTICAST_IF")?;
+        setsockopt_int(
+            fd,
+            libc::IPPROTO_IPV6,
+            libc::IPV6_MULTICAST_IF,
+            ifindex as i32,
+        )
+        .context("IPV6_MULTICAST_IF")?;
         setsockopt_int(fd, libc::IPPROTO_IPV6, libc::IPV6_MULTICAST_LOOP, 0)?;
         setsockopt_int(fd, libc::IPPROTO_IPV6, libc::IPV6_MULTICAST_HOPS, VRRP_TTL)?;
         setsockopt_int(fd, libc::IPPROTO_IPV6, libc::IPV6_UNICAST_HOPS, VRRP_TTL)?;
@@ -556,7 +653,8 @@ fn open_vrrp_socket(ifname: &str, ipv6: bool) -> Result<(u32, std::net::UdpSocke
         // SAFETY: ip_mreqn is plain POD; only the interface index matters here.
         let mut ifreq: libc::ip_mreqn = unsafe { mem::zeroed() };
         ifreq.imr_ifindex = ifindex as libc::c_int;
-        setsockopt_struct(fd, libc::IPPROTO_IP, libc::IP_MULTICAST_IF, &ifreq).context("IP_MULTICAST_IF")?;
+        setsockopt_struct(fd, libc::IPPROTO_IP, libc::IP_MULTICAST_IF, &ifreq)
+            .context("IP_MULTICAST_IF")?;
         setsockopt_int(fd, libc::IPPROTO_IP, libc::IP_MULTICAST_LOOP, 0)?;
         setsockopt_int(fd, libc::IPPROTO_IP, libc::IP_MULTICAST_TTL, VRRP_TTL)?;
         setsockopt_int(fd, libc::IPPROTO_IP, libc::IP_TTL, VRRP_TTL)?;
@@ -578,14 +676,15 @@ fn bind_to_device(fd: i32, ifname: &str) -> Result<()> {
         )
     };
     if rc < 0 {
-        return Err(io::Error::last_os_error()).with_context(|| format!("SO_BINDTODEVICE {ifname:?}"));
+        return Err(io::Error::last_os_error())
+            .with_context(|| format!("SO_BINDTODEVICE {ifname:?}"));
     }
     Ok(())
 }
 
 /// The primary address of `ifname` for the family: the first global IPv4, or the
 /// interface's IPv6 link-local (the source VRRPv3 uses for IPv6 advertisements).
-fn iface_primary(ifname: &str, ipv6: bool) -> Option<IpAddr> {
+fn iface_primary(ifname: &str, ipv6: bool, virtual_addresses: &[IpAddr]) -> Option<IpAddr> {
     let mut head: *mut libc::ifaddrs = std::ptr::null_mut();
     // SAFETY: getifaddrs allocates a list into `head`, freed below.
     if unsafe { libc::getifaddrs(&mut head) } != 0 {
@@ -605,7 +704,7 @@ fn iface_primary(ifname: &str, ipv6: bool) -> Option<IpAddr> {
                     // SAFETY: AF_INET sockaddr is a sockaddr_in.
                     let sin = unsafe { &*(node.ifa_addr as *const libc::sockaddr_in) };
                     let ip = Ipv4Addr::from(u32::from_be(sin.sin_addr.s_addr));
-                    if !ip.is_loopback() && !ip.is_unspecified() {
+                    if eligible_primary(IpAddr::V4(ip), ipv6, virtual_addresses) {
                         result = Some(IpAddr::V4(ip));
                         break;
                     }
@@ -614,7 +713,7 @@ fn iface_primary(ifname: &str, ipv6: bool) -> Option<IpAddr> {
                     let sin6 = unsafe { &*(node.ifa_addr as *const libc::sockaddr_in6) };
                     let ip = Ipv6Addr::from(sin6.sin6_addr.s6_addr);
                     // VRRPv3 IPv6 advertisements are sourced from the link-local.
-                    if (ip.segments()[0] & 0xffc0) == 0xfe80 {
+                    if eligible_primary(IpAddr::V6(ip), ipv6, virtual_addresses) {
                         result = Some(IpAddr::V6(ip));
                         break;
                     }
@@ -626,6 +725,23 @@ fn iface_primary(ifname: &str, ipv6: bool) -> Option<IpAddr> {
     // SAFETY: `head` came from getifaddrs and is freed exactly once.
     unsafe { libc::freeifaddrs(head) };
     result
+}
+
+/// Only a real interface address can identify this router in an election.
+fn eligible_primary(ip: IpAddr, ipv6: bool, virtual_addresses: &[IpAddr]) -> bool {
+    if virtual_addresses.contains(&ip) {
+        return false;
+    }
+    match ip {
+        IpAddr::V4(ip) => {
+            !ipv6
+                && !ip.is_loopback()
+                && !ip.is_unspecified()
+                && !ip.is_multicast()
+                && !ip.is_broadcast()
+        }
+        IpAddr::V6(ip) => ipv6 && (ip.segments()[0] & 0xffc0) == 0xfe80,
+    }
 }
 
 /// Read the MAC of `ifname` via the namespace-aware `SIOCGIFHWADDR` ioctl.
@@ -711,7 +827,7 @@ fn send_gratuitous_arp(ifindex: u32, mac: [u8; 6], vip: Ipv4Addr) -> io::Result<
     arp[6..8].copy_from_slice(&1u16.to_be_bytes()); // oper: request
     arp[8..14].copy_from_slice(&mac); // sender hardware address
     arp[14..18].copy_from_slice(&vip.octets()); // sender protocol address
-    // target hardware address left zero; target protocol address = our VIP.
+                                                // target hardware address left zero; target protocol address = our VIP.
     arp[24..28].copy_from_slice(&vip.octets());
 
     // Destination: the broadcast MAC, via sockaddr_ll.
@@ -722,7 +838,12 @@ fn send_gratuitous_arp(ifindex: u32, mac: [u8; 6], vip: Ipv4Addr) -> io::Result<
     sll.sll_halen = 6;
     sll.sll_addr[..6].copy_from_slice(&[0xff; 6]);
 
-    let rc = sendto_sockaddr(fd, &arp, &sll as *const _ as *const libc::sockaddr, mem::size_of::<libc::sockaddr_ll>());
+    let rc = sendto_sockaddr(
+        fd,
+        &arp,
+        &sll as *const _ as *const libc::sockaddr,
+        mem::size_of::<libc::sockaddr_ll>(),
+    );
     // SAFETY: closing the fd we opened.
     unsafe { libc::close(fd) };
     rc
@@ -745,7 +866,12 @@ fn send_unsolicited_na(ifindex: u32, mac: [u8; 6], vip: Ipv6Addr) -> io::Result<
     }
     // NDP requires a hop limit of 255; pin egress to the interface.
     let _ = setsockopt_int(fd, libc::IPPROTO_IPV6, libc::IPV6_MULTICAST_HOPS, VRRP_TTL);
-    let _ = setsockopt_int(fd, libc::IPPROTO_IPV6, libc::IPV6_MULTICAST_IF, ifindex as i32);
+    let _ = setsockopt_int(
+        fd,
+        libc::IPPROTO_IPV6,
+        libc::IPV6_MULTICAST_IF,
+        ifindex as i32,
+    );
 
     // Neighbor Advertisement (RFC 4861 §4.4): override flag set, target = the VIP,
     // with a Target Link-Layer Address option carrying our MAC.
@@ -764,14 +890,24 @@ fn send_unsolicited_na(ifindex: u32, mac: [u8; 6], vip: Ipv6Addr) -> io::Result<
     sa.sin6_addr.s6_addr = ALL_NODES_V6.octets();
     sa.sin6_scope_id = ifindex;
 
-    let rc = sendto_sockaddr(fd, &na, &sa as *const _ as *const libc::sockaddr, mem::size_of::<libc::sockaddr_in6>());
+    let rc = sendto_sockaddr(
+        fd,
+        &na,
+        &sa as *const _ as *const libc::sockaddr,
+        mem::size_of::<libc::sockaddr_in6>(),
+    );
     // SAFETY: closing the fd we opened.
     unsafe { libc::close(fd) };
     rc
 }
 
 /// `sendto(fd, buf, 0, addr, addrlen)`, mapping a negative return to an error.
-fn sendto_sockaddr(fd: i32, buf: &[u8], addr: *const libc::sockaddr, addrlen: usize) -> io::Result<()> {
+fn sendto_sockaddr(
+    fd: i32,
+    buf: &[u8],
+    addr: *const libc::sockaddr,
+    addrlen: usize,
+) -> io::Result<()> {
     // SAFETY: `buf` and `addr` are valid for the call; `addrlen` matches the struct.
     let sent = unsafe {
         libc::sendto(
@@ -809,7 +945,49 @@ pub fn parse_vrrp_query(line: &str) -> Option<VrrpQuery> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn neighbor_announcements_retry_refresh_and_stop_on_release() {
+        let start = std::time::Instant::now();
+        let mut timer = super::AnnouncementTimer::default();
+        assert!(!timer.due(start));
+        timer.arm(start);
+        assert!(!timer.due(start + std::time::Duration::from_millis(999)));
+        assert!(timer.due(start + std::time::Duration::from_secs(1)));
+        assert!(timer.due(start + std::time::Duration::from_secs(2)));
+        assert!(!timer.due(start + std::time::Duration::from_secs(31)));
+        assert!(timer.due(start + std::time::Duration::from_secs(32)));
+        // Release must cancel both retries and periodic refresh. A backup must
+        // never overwrite the newly elected master's neighbor entry.
+        timer.cancel();
+        assert!(!timer.due(start + std::time::Duration::from_secs(100)));
+        timer.arm(start);
+        timer.cancel();
+        assert!(!timer.due(start + std::time::Duration::from_secs(1)));
+        timer.arm(start);
+        assert!(timer.due(start + std::time::Duration::from_secs(1)));
+    }
     use super::*;
+
+    #[test]
+    fn election_source_excludes_vips_and_unusable_addresses() {
+        let vip = "192.0.2.254".parse().unwrap();
+        assert!(!eligible_primary(vip, false, &[vip]));
+        for ip in ["0.0.0.0", "127.0.0.1", "224.0.0.18", "255.255.255.255"] {
+            assert!(!eligible_primary(ip.parse().unwrap(), false, &[]));
+        }
+        assert!(eligible_primary(
+            "192.0.2.10".parse().unwrap(),
+            false,
+            &[vip]
+        ));
+        assert!(eligible_primary("fe80::1".parse().unwrap(), true, &[]));
+        assert!(!eligible_primary("2001:db8::1".parse().unwrap(), true, &[]));
+        assert!(!eligible_primary(
+            "fe80::1".parse().unwrap(),
+            true,
+            &["fe80::1".parse().unwrap()]
+        ));
+    }
 
     #[test]
     fn ipv4_payload_skips_the_header_by_ihl() {
@@ -826,7 +1004,10 @@ mod tests {
 
     #[test]
     fn parse_vrrp_query_understands_show_vrrp() {
-        assert!(matches!(parse_vrrp_query("show vrrp"), Some(VrrpQuery::Instances)));
+        assert!(matches!(
+            parse_vrrp_query("show vrrp"),
+            Some(VrrpQuery::Instances)
+        ));
         assert!(matches!(
             parse_vrrp_query("show vrrp instances"),
             Some(VrrpQuery::Instances)

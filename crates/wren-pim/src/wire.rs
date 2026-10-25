@@ -445,11 +445,7 @@ impl Message {
                     g.encode_into(&mut out);
                 }
             }
-            Message::Register {
-                border,
-                null,
-                data,
-            } => {
+            Message::Register { border, null, data } => {
                 let mut flags = 0u32;
                 if *border {
                     flags |= REG_FLAG_BORDER;
@@ -724,9 +720,9 @@ mod tests {
         };
         let bytes = msg.encode();
         assert_eq!(bytes[0], 0x21); // version 2, type 1
-        // RFC 7761 §4.9: the Register checksum covers only the first 8 octets
-        // (header + flags), so *that* prefix sums to zero (not the whole message,
-        // which includes the encapsulated data).
+                                    // RFC 7761 §4.9: the Register checksum covers only the first 8 octets
+                                    // (header + flags), so *that* prefix sums to zero (not the whole message,
+                                    // which includes the encapsulated data).
         assert_eq!(checksum(&bytes[..8]), 0);
         assert_eq!(Message::decode(&bytes).unwrap(), msg);
     }
@@ -763,7 +759,7 @@ mod tests {
     fn rejects_bad_version() {
         let mut bytes = Message::Hello { options: vec![] }.encode();
         bytes[0] = 0x10; // version 1
-        // Re-fix the checksum so the version check (not the checksum) is what fires.
+                         // Re-fix the checksum so the version check (not the checksum) is what fires.
         bytes[2..4].copy_from_slice(&[0, 0]);
         let sum = checksum(&bytes);
         bytes[2..4].copy_from_slice(&sum.to_be_bytes());
@@ -799,7 +795,12 @@ mod tests {
             let _ = Message::decode(&buf);
         }
         // Valid header + a truncated Join/Prune / Register / Register-Stop body.
-        for typ in [TYPE_JOIN_PRUNE, TYPE_REGISTER, TYPE_REGISTER_STOP, TYPE_HELLO] {
+        for typ in [
+            TYPE_JOIN_PRUNE,
+            TYPE_REGISTER,
+            TYPE_REGISTER_STOP,
+            TYPE_HELLO,
+        ] {
             for len in 0..40usize {
                 let mut buf = vec![0u8; 4 + len];
                 buf[0] = (PIM_VERSION << 4) | typ;
@@ -892,12 +893,21 @@ mod tests {
         // The B and Z flag bits, asserted individually.
         let flags = |bidir, admin_scope| {
             Message::RegisterStop {
-                group: EncodedGroup { group: ip("239.0.0.1"), mask_len: 32, bidir, admin_scope },
+                group: EncodedGroup {
+                    group: ip("239.0.0.1"),
+                    mask_len: 32,
+                    bidir,
+                    admin_scope,
+                },
                 source: EncodedUnicast(ip("10.0.0.1")),
             }
             .encode()[6]
         };
-        assert_eq!(flags(true, false), 0x80, "B is the top bit of the flags octet");
+        assert_eq!(
+            flags(true, false),
+            0x80,
+            "B is the top bit of the flags octet"
+        );
         assert_eq!(flags(false, true), 0x01, "Z is the low bit");
         assert_eq!(flags(true, true), 0x81);
     }
@@ -935,12 +945,20 @@ mod tests {
         }
         .encode();
         assert_eq!(b[0], 0x23, "a Join/Prune is version 2, type 3");
-        assert_eq!(&b[4..10], &[1, 0, 10, 0, 0, 254], "the Upstream Neighbor is 4..10");
+        assert_eq!(
+            &b[4..10],
+            &[1, 0, 10, 0, 0, 254],
+            "the Upstream Neighbor is 4..10"
+        );
         assert_eq!(b[10], 0, "byte 10 is Reserved");
         assert_eq!(b[11], 1, "Number of Groups is byte 11");
         assert_eq!(&b[12..14], &[0x00, 0xd2], "Holdtime is bytes 12..14");
         let grp = &b[14..];
-        assert_eq!(&grp[0..8], &[1, 0, 0, 32, 239, 1, 2, 3], "the Encoded-Group");
+        assert_eq!(
+            &grp[0..8],
+            &[1, 0, 0, 32, 239, 1, 2, 3],
+            "the Encoded-Group"
+        );
         assert_eq!(&grp[8..10], &[0, 1], "Number of Joined Sources is 8..10");
         assert_eq!(&grp[10..12], &[0, 0], "Number of Pruned Sources is 10..12");
         assert_eq!(
@@ -968,16 +986,32 @@ mod tests {
             &[0x80, 0, 0, 0],
             "B is the top bit of the 32-bit flags word"
         );
-        assert_eq!(&mk(false, true, vec![])[4..8], &[0x40, 0, 0, 0], "N is the next bit");
+        assert_eq!(
+            &mk(false, true, vec![])[4..8],
+            &[0x40, 0, 0, 0],
+            "N is the next bit"
+        );
         assert_eq!(&mk(false, false, vec![])[4..8], &[0, 0, 0, 0]);
 
         // The checksum covers the first 8 octets only, so appending payload
         // leaves it unchanged — and the header still verifies at 0..8.
         let with_data = mk(false, false, vec![0x45, 0x00, 0xde, 0xad]);
         let bare = mk(false, false, vec![]);
-        assert_eq!(&with_data[2..4], &bare[2..4], "the payload is outside the checksum");
-        assert_eq!(checksum(&with_data[..8]), 0, "the 8-octet header checksums to zero");
-        assert_eq!(&with_data[8..], &[0x45, 0x00, 0xde, 0xad], "the datagram follows at 8");
+        assert_eq!(
+            &with_data[2..4],
+            &bare[2..4],
+            "the payload is outside the checksum"
+        );
+        assert_eq!(
+            checksum(&with_data[..8]),
+            0,
+            "the 8-octet header checksums to zero"
+        );
+        assert_eq!(
+            &with_data[8..],
+            &[0x45, 0x00, 0xde, 0xad],
+            "the datagram follows at 8"
+        );
     }
 
     /// RFC 7761 §4.9.2 makes each Hello option a `Type(2) · Length(2) · Value`
@@ -1000,14 +1034,25 @@ mod tests {
         assert_eq!(&h[4..6], &[0, 105], "then the value");
         assert_eq!(h.len(), 6);
 
-        assert_eq!(&one(HelloOption::DrPriority(7))[0..4], &[0, 19, 0, 4], "DR Priority is 19");
+        assert_eq!(
+            &one(HelloOption::DrPriority(7))[0..4],
+            &[0, 19, 0, 4],
+            "DR Priority is 19"
+        );
         assert_eq!(
             &one(HelloOption::GenerationId(9))[0..4],
             &[0, 20, 0, 4],
             "Generation ID is 20"
         );
-        let l = one(HelloOption::LanPruneDelay { value: 500, override_interval: 2500 });
-        assert_eq!(&l[0..4], &[0, 2, 0, 4], "LAN Prune Delay is option 2, 4 octets");
+        let l = one(HelloOption::LanPruneDelay {
+            value: 500,
+            override_interval: 2500,
+        });
+        assert_eq!(
+            &l[0..4],
+            &[0, 2, 0, 4],
+            "LAN Prune Delay is option 2, 4 octets"
+        );
         assert_eq!(&l[4..6], &[0x01, 0xf4], "Propagation_Delay first");
         assert_eq!(&l[6..8], &[0x09, 0xc4], "then Override_Interval");
     }

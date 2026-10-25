@@ -253,10 +253,7 @@ fn read_ip(buf: &[u8], bits: u8) -> Option<(Option<IpAddr>, usize)> {
         0 => Some((None, 0)),
         32 => {
             let b = buf.get(..4)?;
-            Some((
-                Some(IpAddr::V4(Ipv4Addr::new(b[0], b[1], b[2], b[3]))),
-                4,
-            ))
+            Some((Some(IpAddr::V4(Ipv4Addr::new(b[0], b[1], b[2], b[3]))), 4))
         }
         128 => {
             let b = buf.get(..16)?;
@@ -485,7 +482,11 @@ impl fmt::Display for EvpnNlri {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             EvpnNlri::MacIp {
-                rd, mac, ip, label1, ..
+                rd,
+                mac,
+                ip,
+                label1,
+                ..
             } => {
                 write!(
                     f,

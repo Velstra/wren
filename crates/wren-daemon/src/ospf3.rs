@@ -25,9 +25,9 @@
 //! other runners grants it.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::fmt::Write as _;
 use std::io;
 use std::mem;
-use std::fmt::Write as _;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV6};
 use std::os::raw::c_void;
 use std::os::unix::io::FromRawFd;
@@ -62,8 +62,8 @@ use wren_ospfv3::{
     OPT_E, OPT_R, OPT_V6,
 };
 
-use crate::sockopt::{setsockopt_int, setsockopt_struct};
 use crate::router::RouteUpdate;
+use crate::sockopt::{setsockopt_int, setsockopt_struct};
 
 /// How often (seconds) the housekeeping timer advances dead/wait timers.
 const HOUSEKEEPING_SECS: u64 = 1;
@@ -921,8 +921,7 @@ impl Ospf {
         let recv_master = dd.flags & DD_FLAG_MASTER != 0;
         let recv_init = dd.flags & DD_FLAG_INIT != 0;
         if crate::ospf::dd_seqnum_mismatch(recv_init, recv_master, master) {
-            let acts = self
-                .ifaces[idx]
+            let acts = self.ifaces[idx]
                 .neighbors
                 .get_mut(&nbr_id)
                 .unwrap()
@@ -1151,10 +1150,13 @@ impl Ospf {
                                     .or_insert(INITIAL_SEQUENCE_NUMBER);
                                 *slot = lsa.header.ls_seq.wrapping_add(1);
                                 if let Some(retired) = retired_self_external(
-                                    self_id, self.originated_externals.contains(&key), &lsa,
+                                    self_id,
+                                    self.originated_externals.contains(&key),
+                                    &lsa,
                                 ) {
                                     self.external_lsdb.install(retired.clone());
-                                    self.flood_external_except(&retired, Ipv6Addr::UNSPECIFIED).await;
+                                    self.flood_external_except(&retired, Ipv6Addr::UNSPECIFIED)
+                                        .await;
                                     installed = true;
                                     continue;
                                 }
@@ -1198,8 +1200,7 @@ impl Ospf {
         }
 
         if bad_ls_req {
-            let acts = self
-                .ifaces[idx]
+            let acts = self.ifaces[idx]
                 .neighbors
                 .get_mut(&nbr_id)
                 .unwrap()
@@ -1655,11 +1656,15 @@ impl Ospf {
     async fn on_adjacency_full(&mut self, idx: usize, nbr_id: Ipv4Addr) {
         info!(interface = %self.ifaces[idx].name, neighbor = %nbr_id, "OSPFv3 adjacency Full");
         self.originate_externals();
-        let externals: Vec<Lsa> = self.external_lsdb.iter()
+        let externals: Vec<Lsa> = self
+            .external_lsdb
+            .iter()
             .filter(|lsa| lsa.header.advertising_router == self.cfg.router_id)
-            .cloned().collect();
+            .cloned()
+            .collect();
         for lsa in externals {
-            self.flood_external_except(&lsa, Ipv6Addr::UNSPECIFIED).await;
+            self.flood_external_except(&lsa, Ipv6Addr::UNSPECIFIED)
+                .await;
         }
         self.reoriginate_and_flood().await;
         self.run_spf_and_announce().await;
@@ -1673,20 +1678,31 @@ impl Ospf {
                 neighbor.retransmit_list.clear();
             }
         }
-        let areas: Vec<_> = self.areas.iter().map(|(id, area)| {
-            (*id, shutdown_lsas(self.cfg.router_id, area.lsdb.iter()))
-        }).collect();
+        let areas: Vec<_> = self
+            .areas
+            .iter()
+            .map(|(id, area)| (*id, shutdown_lsas(self.cfg.router_id, area.lsdb.iter())))
+            .collect();
         for (area, lsas) in areas {
             for lsa in lsas {
                 self.flood_lsa(area, &lsa).await;
             }
         }
         for lsa in shutdown_lsas(self.cfg.router_id, self.external_lsdb.iter()) {
-            self.flood_external_except(&lsa, Ipv6Addr::UNSPECIFIED).await;
+            self.flood_external_except(&lsa, Ipv6Addr::UNSPECIFIED)
+                .await;
         }
-        let links: Vec<_> = self.ifaces.iter().enumerate().map(|(idx, iface)| {
-            (idx, shutdown_lsas(self.cfg.router_id, iface.link_lsdb.iter()))
-        }).collect();
+        let links: Vec<_> = self
+            .ifaces
+            .iter()
+            .enumerate()
+            .map(|(idx, iface)| {
+                (
+                    idx,
+                    shutdown_lsas(self.cfg.router_id, iface.link_lsdb.iter()),
+                )
+            })
+            .collect();
         for (idx, lsas) in links {
             for lsa in lsas {
                 self.flood_link_lsa(idx, &lsa).await;
@@ -1947,8 +1963,7 @@ impl Ospf {
                 }
             }
         }
-        let added: Vec<(Ipv6Addr, u32)> =
-            full.difference(&self.bfd_registered).copied().collect();
+        let added: Vec<(Ipv6Addr, u32)> = full.difference(&self.bfd_registered).copied().collect();
         for (addr, scope) in added {
             let _ = self
                 .bfd_register
@@ -2474,11 +2489,15 @@ fn shutdown_lsas<'a>(router_id: Ipv4Addr, lsas: impl Iterator<Item = &'a Lsa>) -
             let mut withdrawn = lsa.clone();
             withdrawn.header.ls_age = MAX_AGE;
             withdrawn
-        }).collect()
+        })
+        .collect()
 }
 
 fn retired_self_external(router_id: Ipv4Addr, originated: bool, lsa: &Lsa) -> Option<Lsa> {
-    if originated || lsa.header.advertising_router != router_id || lsa.header.ls_type != LsType::AsExternal {
+    if originated
+        || lsa.header.advertising_router != router_id
+        || lsa.header.ls_type != LsType::AsExternal
+    {
         return None;
     }
     let mut retired = lsa.clone();
@@ -2495,10 +2514,13 @@ mod tests {
         let mut lsa = router_lsa([0; 4], [1; 4], 9);
         lsa.header.ls_type = LsType::AsExternal;
         lsa.body = LsaBody::AsExternal(AsExternalLsa {
-            external_type2: true, metric: 20,
+            external_type2: true,
+            metric: 20,
             prefix: to_v3_prefix("2001:db8:9::/64".parse().unwrap()).unwrap(),
-            forwarding_address: None, route_tag: None,
-            referenced_ls_type: 0, referenced_link_state_id: None,
+            forwarding_address: None,
+            route_tag: None,
+            referenced_ls_type: 0,
+            referenced_link_state_id: None,
         });
         let lsa = Lsa::decode(&lsa.encode()).unwrap().0;
         let own_id = lsa.header.advertising_router;
@@ -2539,7 +2561,11 @@ mod tests {
                 ls_checksum: 0,
                 length: 0,
             },
-            body: LsaBody::Router(RouterLsa { flags: 0, options: 0, links: vec![] }),
+            body: LsaBody::Router(RouterLsa {
+                flags: 0,
+                options: 0,
+                links: vec![],
+            }),
         }
     }
 

@@ -1,7 +1,29 @@
 # Roadmap
 
-Wren is `0.0.x`. This page tracks what exists and what is planned. Each protocol is
-implemented to its RFC.
+Wren is `0.4.0` — the workspace version and the latest tag. This page tracks what
+exists and what is planned. Each protocol is implemented to its RFC.
+
+## Still open
+
+The short list, so nobody plans work that is already in tree:
+
+- **BGP/MPLS L3VPN** — the VPNv4 AFI/SAFI, RD on the wire and RT import/export
+  over the `[[vrf]]` tables that already exist. Control plane first; the MPLS
+  data plane can wait, the same split EVPN took.
+- **EVPN type 1 / type 4** — Ethernet A-D and Ethernet Segment routes, ESI and
+  multi-homing. Types 2/3/5, the SRv6 service-SID TLVs and `monitor evpn` are
+  done; a workload alive on *two* VTEPs is still undefined.
+- **FlowSpec → kernel** — SAFI 133, the FlowSpec RIB, `show bgp flowspec` and
+  `monitor flowspec` are done. Applying the rules through nftables on the Wren
+  side is open, and may stay so: the fabric consumes the monitor feed and
+  enforces in its own data plane.
+- **gNMI / OpenConfig, NETCONF, YANG** — the management plane beyond the control
+  socket and `SIGHUP`.
+- **OSPFv2 MD5 anti-replay sequencing** — the one gap left in OSPF authentication.
+- Further out, unscheduled: BGPsec (RFC 8205), long-lived graceful restart
+  (RFC 9494), RTC (RFC 4684), OSPFv3 NSSA and address families (RFC 5838), the
+  IS-IS three-way p2p TLV and L1↔L2 leaking, BFD demand mode, MPLS / SR-MPLS,
+  MLAG, RIFT, EIGRP.
 
 ## Protocols
 
@@ -262,15 +284,17 @@ Wren's ambition is to be a full BIRD/FRR-class routing stack. The following are
 tracked but not yet scheduled, grouped by area:
 
 - **IGPs & link-state:** OSPFv3 NSSA + address families (RFC 5838), IS-IS
-  refinements (the RFC 5303 p2p three-way TLV, L1↔L2 route leaking), RIFT, EIGRP;
-  IGMP/MLD for multicast group membership.
-- **BGP breadth:** EVPN (RFC 7432), long-lived graceful restart (RFC 9494),
-  RTC (RFC 4684). (**FlowSpec** (RFC 8955) is **in progress** — the flow-specification
-  NLRI codec (the §4.2 components with their numeric/bitmask operators, the §4 length
-  prefix) and the §7 traffic-filtering action extended communities (rate-limit /
-  discard, marking) are **done** and unit-tested in `wren-bgp::flowspec`; the MP-BGP
-  SAFI 133 exchange, a FlowSpec RIB, `show bgp flowspec` and kernel application via
-  nftables are the next steps.) (**BMP** (RFC 7854) — streaming BGP state
+  refinements (the RFC 5303 p2p three-way TLV, L1↔L2 route leaking), RIFT, EIGRP.
+  (**IGMPv3/MLDv2** querier + proxy and **PIM-SM** are **done** — see the
+  multicast section under Protocols.)
+- **BGP breadth:** long-lived graceful restart (RFC 9494), RTC (RFC 4684).
+  (**EVPN** (RFC 7432 / RFC 8365) is **done** for route types 2, 3 and 5, with the
+  RFC 9252 SRv6 service-SID TLVs, a per-EVI MAC-VRF, `monitor evpn` and the
+  `evpn advertise|withdraw` control API; types 1 and 4 are open — see above.
+  **FlowSpec** (RFC 8955) is **done** on the wire: the NLRI codec and the §7
+  action communities in `wren-bgp::flowspec`, the MP-BGP SAFI 133 exchange, a
+  FlowSpec RIB, `show bgp flowspec` and `monitor flowspec`; only kernel
+  application via nftables is open.) (**BMP** (RFC 7854) — streaming BGP state
   (Initiation, Peer Up, Route Monitoring, Peer Down) to a monitoring station via
   `[bgp.bmp]` — is **done**; see [Monitoring](monitoring.md).)
   (**Extended Next Hop / IPv4-over-IPv6** (RFC 5549 / RFC 8950) — advertising IPv4

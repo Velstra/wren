@@ -912,7 +912,10 @@ mod tests {
 
     fn assert_lsa_roundtrips(l: &Lsa) {
         let bytes = l.encode();
-        assert_eq!(bytes.len() as u16, u16::from_be_bytes([bytes[18], bytes[19]]));
+        assert_eq!(
+            bytes.len() as u16,
+            u16::from_be_bytes([bytes[18], bytes[19]])
+        );
         assert!(checksum_valid(&bytes));
         let (decoded, consumed) = Lsa::decode(&bytes).expect("decodes");
         assert_eq!(consumed, bytes.len());
@@ -974,7 +977,10 @@ mod tests {
             PREFIX_LA,
         );
         assert_eq!(p.address.len(), 8); // /48 -> 2 words
-        assert_eq!(p.ipv6(), Ipv6Addr::new(0x2001, 0xdb8, 0xabcd, 0, 0, 0, 0, 0));
+        assert_eq!(
+            p.ipv6(),
+            Ipv6Addr::new(0x2001, 0xdb8, 0xabcd, 0, 0, 0, 0, 0)
+        );
         // A round-trip through encode/decode with a metric mid-field.
         let mut buf = Vec::new();
         p.encode(7, &mut buf);
@@ -1142,7 +1148,11 @@ mod tests {
     fn unknown_lsa_floods_verbatim() {
         // A link-local-scoped unknown type: body bytes must survive a round-trip.
         let raw = vec![0xde, 0xad, 0xbe, 0xef, 0x01, 0x02];
-        let l = lsa(LsType::Unknown(0x000b), [0, 0, 0, 1], LsaBody::Unknown(raw.clone()));
+        let l = lsa(
+            LsType::Unknown(0x000b),
+            [0, 0, 0, 1],
+            LsaBody::Unknown(raw.clone()),
+        );
         let bytes = l.encode();
         assert!(checksum_valid(&bytes));
         let (decoded, _) = Lsa::decode(&bytes).unwrap();
@@ -1199,7 +1209,11 @@ mod tests {
             lsa(
                 LsType::Router,
                 [0, 0, 0, 0],
-                LsaBody::Router(RouterLsa { flags, options: OPT_V6 | OPT_R | OPT_E, links: vec![] }),
+                LsaBody::Router(RouterLsa {
+                    flags,
+                    options: OPT_V6 | OPT_R | OPT_E,
+                    links: vec![],
+                }),
             )
             .encode()
         };
@@ -1207,11 +1221,16 @@ mod tests {
         assert_eq!(RTR_FLAG_E, 0x02, "E is bit 1");
         assert_eq!(RTR_FLAG_V, 0x04, "V is bit 2");
         assert_eq!(RTR_FLAG_NT, 0x10, "Nt is bit 4");
-        for flags in [RTR_FLAG_B, RTR_FLAG_E, RTR_FLAG_V, RTR_FLAG_NT, RTR_FLAG_B | RTR_FLAG_E] {
+        for flags in [
+            RTR_FLAG_B,
+            RTR_FLAG_E,
+            RTR_FLAG_V,
+            RTR_FLAG_NT,
+            RTR_FLAG_B | RTR_FLAG_E,
+        ] {
             let b = mk(flags);
             assert_eq!(
-                b[LSA_HEADER_LEN],
-                flags,
+                b[LSA_HEADER_LEN], flags,
                 "the flags belong in byte 20 — the first octet of the body"
             );
             assert_eq!(
@@ -1252,13 +1271,21 @@ mod tests {
         assert_eq!(link[0], 2, "link Type is byte 0 of the entry; Transit is 2");
         assert_eq!(link[1], 0, "byte 1 is reserved and must be zero");
         assert_eq!(&link[2..4], &[0x00, 0x64], "Metric is bytes 2..4");
-        assert_eq!(&link[4..8], &[0x11, 0x12, 0x13, 0x14], "Interface ID is bytes 4..8");
+        assert_eq!(
+            &link[4..8],
+            &[0x11, 0x12, 0x13, 0x14],
+            "Interface ID is bytes 4..8"
+        );
         assert_eq!(
             &link[8..12],
             &[0x21, 0x22, 0x23, 0x24],
             "Neighbor Interface ID is bytes 8..12"
         );
-        assert_eq!(&link[12..16], &[10, 0, 0, 2], "Neighbor Router ID is bytes 12..16");
+        assert_eq!(
+            &link[12..16],
+            &[10, 0, 0, 2],
+            "Neighbor Router ID is bytes 12..16"
+        );
         assert_eq!(b.len(), LSA_HEADER_LEN + 4 + 16, "one link is 16 octets");
     }
 
@@ -1281,10 +1308,22 @@ mod tests {
         h.encode(&mut b);
         assert_eq!(b.len(), LSA_HEADER_LEN);
         assert_eq!(&b[0..2], &[0x01, 0x02], "LS Age is bytes 0..2");
-        assert_eq!(&b[2..4], &[0x20, 0x09], "LS Type is a 16-bit field at bytes 2..4");
+        assert_eq!(
+            &b[2..4],
+            &[0x20, 0x09],
+            "LS Type is a 16-bit field at bytes 2..4"
+        );
         assert_eq!(&b[4..8], &[11, 12, 13, 14], "Link State ID is bytes 4..8");
-        assert_eq!(&b[8..12], &[21, 22, 23, 24], "Advertising Router is bytes 8..12");
-        assert_eq!(&b[12..16], &[0x31, 0x32, 0x33, 0x34], "LS Sequence is bytes 12..16");
+        assert_eq!(
+            &b[8..12],
+            &[21, 22, 23, 24],
+            "Advertising Router is bytes 8..12"
+        );
+        assert_eq!(
+            &b[12..16],
+            &[0x31, 0x32, 0x33, 0x34],
+            "LS Sequence is bytes 12..16"
+        );
         assert_eq!(&b[16..18], &[0x41, 0x42], "LS Checksum is bytes 16..18");
         assert_eq!(&b[18..20], &[0x00, 0x34], "Length is bytes 18..20");
     }
@@ -1313,9 +1352,21 @@ mod tests {
             assert_eq!(LsType::from_u16(code), t);
         }
         // The scope is bits 14..13 of the type word: 0 link-local, 1 area, 2 AS.
-        assert_eq!(LsType::Link.as_u16() & 0x6000, 0x0000, "link-local scope is 0b00");
-        assert_eq!(LsType::Router.as_u16() & 0x6000, 0x2000, "area scope is 0b01");
-        assert_eq!(LsType::AsExternal.as_u16() & 0x6000, 0x4000, "AS scope is 0b10");
+        assert_eq!(
+            LsType::Link.as_u16() & 0x6000,
+            0x0000,
+            "link-local scope is 0b00"
+        );
+        assert_eq!(
+            LsType::Router.as_u16() & 0x6000,
+            0x2000,
+            "area scope is 0b01"
+        );
+        assert_eq!(
+            LsType::AsExternal.as_u16() & 0x6000,
+            0x4000,
+            "AS scope is 0b10"
+        );
         // The U bit is clear on every type wren originates: an unrecognised LSA
         // with U=0 must not be flooded on by a receiver that does not know it.
         for t in [
@@ -1352,7 +1403,11 @@ mod tests {
         p.encode(0x0007, &mut b);
         assert_eq!(b[0], 48, "PrefixLength is byte 0");
         assert_eq!(b[1], PREFIX_LA, "PrefixOptions is byte 1");
-        assert_eq!(&b[2..4], &[0x00, 0x07], "the two-octet mid field is bytes 2..4");
+        assert_eq!(
+            &b[2..4],
+            &[0x00, 0x07],
+            "the two-octet mid field is bytes 2..4"
+        );
         assert_eq!(
             &b[4..12],
             &[0x20, 0x01, 0x0d, 0xb8, 0xab, 0xcd, 0x00, 0x00],
@@ -1363,7 +1418,11 @@ mod tests {
         let dflt = Prefix::from_ipv6(Ipv6Addr::UNSPECIFIED, 0, 0);
         let mut d = Vec::new();
         dflt.encode(0, &mut d);
-        assert_eq!(d.len(), 4, "a default prefix is just the 4-octet fixed part");
+        assert_eq!(
+            d.len(),
+            4,
+            "a default prefix is just the 4-octet fixed part"
+        );
     }
 
     /// RFC 5340 §A.4.7 puts the AS-external-LSA's E, F and T bits in the first
@@ -1387,11 +1446,7 @@ mod tests {
             LsaBody::AsExternal(AsExternalLsa {
                 external_type2: true,
                 metric: 0x0000_1420,
-                prefix: Prefix::from_ipv6(
-                    Ipv6Addr::new(0x2001, 0xdb8, 0xc, 0, 0, 0, 0, 0),
-                    48,
-                    0,
-                ),
+                prefix: Prefix::from_ipv6(Ipv6Addr::new(0x2001, 0xdb8, 0xc, 0, 0, 0, 0, 0), 48, 0),
                 referenced_ls_type: 0,
                 forwarding_address: Some(Ipv6Addr::new(0x2001, 0xdb8, 0xa, 0, 0, 0, 0, 1)),
                 route_tag: Some(0xdead_beef),
@@ -1405,7 +1460,11 @@ mod tests {
             EXT_FLAG_E | EXT_FLAG_F | EXT_FLAG_T,
             "a type-2 external with a forwarding address and a tag sets E|F|T"
         );
-        assert_eq!(&body[1..4], &[0x00, 0x14, 0x20], "the 24-bit metric is bytes 1..4");
+        assert_eq!(
+            &body[1..4],
+            &[0x00, 0x14, 0x20],
+            "the 24-bit metric is bytes 1..4"
+        );
 
         // A minimal external — type-1 metric, no forwarding address, no tag —
         // leaves the flag octet entirely zero.
@@ -1422,6 +1481,10 @@ mod tests {
                 referenced_link_state_id: None,
             }),
         );
-        assert_eq!(bare.encode()[LSA_HEADER_LEN], 0, "no flags set for a bare type-1");
+        assert_eq!(
+            bare.encode()[LSA_HEADER_LEN],
+            0,
+            "no flags set for a bare type-1"
+        );
     }
 }

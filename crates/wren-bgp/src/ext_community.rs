@@ -166,7 +166,12 @@ mod tests {
 
     #[test]
     fn formats_round_trip() {
-        for s in ["rt:65001:100", "ro:65001:0", "rt:65536:1", "ro:192.0.2.1:42"] {
+        for s in [
+            "rt:65001:100",
+            "ro:65001:0",
+            "rt:65536:1",
+            "ro:192.0.2.1:42",
+        ] {
             let c = parse_ext_community(s).unwrap();
             assert_eq!(parse_ext_community(&format_ext_community(c)), Some(c));
         }

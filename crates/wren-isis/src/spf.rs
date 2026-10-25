@@ -600,7 +600,10 @@ mod tests {
         assert_eq!(find(&res, "192.168.1.0/24").cost, 1);
         // R2 is not reachable over the drained link: no node entry, no route.
         assert_eq!(res.nodes.get(&nid(2, 0)), None);
-        assert!(!res.routes.iter().any(|r| r.prefix.to_string() == "192.168.2.0/24"));
+        assert!(!res
+            .routes
+            .iter()
+            .any(|r| r.prefix.to_string() == "192.168.2.0/24"));
     }
 
     #[test]

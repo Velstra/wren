@@ -15,7 +15,7 @@ It is being built both as a **standalone daemon** and as a control plane that
 can be embedded into the [Velstra **Sentinel**](https://github.com/velstra)
 appliance, whose eBPF/XDP data plane can consume Wren's chosen routes.
 
-> **Status: 0.3.0 — a full multi-protocol routing daemon.** Wren runs **BGP-4**
+> **Status: 0.4.0 — a full multi-protocol routing daemon.** Wren runs **BGP-4**
 > (MP-BGP for IPv4/IPv6, route reflection, confederations, communities, add-path,
 > RPKI/RTR, BMP, and the EVPN, SRv6 service-SID, BGP-LS and FlowSpec address
 > families), **OSPFv2** and **OSPFv3**, **IS-IS**, **RIPv2/RIPng**, **Babel**,

@@ -119,7 +119,11 @@ mod tests {
         s.parse().unwrap()
     }
     fn roa(prefix: &str, max_length: u8, origin_as: u32) -> Roa {
-        Roa { prefix: pfx(prefix), max_length, origin_as }
+        Roa {
+            prefix: pfx(prefix),
+            max_length,
+            origin_as,
+        }
     }
 
     #[test]
@@ -128,7 +132,10 @@ mod tests {
         // A prefix outside any ROA's range.
         assert_eq!(t.validate(&pfx("192.0.2.0/24"), 65001), Validity::NotFound);
         // The empty table never covers anything.
-        assert_eq!(RoaTable::default().validate(&pfx("10.0.0.0/24"), 65001), Validity::NotFound);
+        assert_eq!(
+            RoaTable::default().validate(&pfx("10.0.0.0/24"), 65001),
+            Validity::NotFound
+        );
     }
 
     #[test]
@@ -152,7 +159,10 @@ mod tests {
     #[test]
     fn a_matching_roa_outweighs_a_covering_non_matching_one() {
         // Two ROAs cover 10.1.2.0/24: one wrong-AS, one right. A single match → Valid.
-        let t = RoaTable::new(vec![roa("10.0.0.0/8", 16, 65002), roa("10.1.0.0/16", 24, 65001)]);
+        let t = RoaTable::new(vec![
+            roa("10.0.0.0/8", 16, 65002),
+            roa("10.1.0.0/16", 24, 65001),
+        ]);
         assert_eq!(t.validate(&pfx("10.1.2.0/24"), 65001), Validity::Valid);
         // For 10.1.2.0/24 with AS 65003: 10.1.0.0/16 covers (within /24) but wrong AS,
         // 10.0.0.0/8 covers but /24 > its /16 max_length → no match → Invalid.
@@ -163,7 +173,10 @@ mod tests {
     fn families_do_not_cross() {
         let t = RoaTable::new(vec![roa("2001:db8::/32", 48, 65001)]);
         assert_eq!(t.validate(&pfx("2001:db8:1::/48"), 65001), Validity::Valid);
-        assert_eq!(t.validate(&pfx("2001:db8:1::/48"), 65002), Validity::Invalid);
+        assert_eq!(
+            t.validate(&pfx("2001:db8:1::/48"), 65002),
+            Validity::Invalid
+        );
         // An IPv4 route is never covered by an IPv6 ROA.
         assert_eq!(t.validate(&pfx("10.0.0.0/24"), 65001), Validity::NotFound);
     }

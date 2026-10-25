@@ -27,8 +27,8 @@ use wren_rip::{ng, Advert, Command, RipEvent, RipTable, METRIC_INFINITY, UPDATE_
 
 use crate::connected;
 use crate::rip::{render_rip_routes, RipQuery, RipQueryRequest};
-use crate::sockopt::{setsockopt_int, setsockopt_struct};
 use crate::router::{Redistribution, RouteUpdate};
+use crate::sockopt::{setsockopt_int, setsockopt_struct};
 
 /// Advance timers / flush triggered updates this often (seconds).
 const HOUSEKEEPING_SECS: u64 = 1;

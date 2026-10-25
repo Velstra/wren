@@ -72,7 +72,10 @@ impl LsType {
 
     /// Whether this is an opaque LSA type (RFC 5250, type 9/10/11).
     pub fn is_opaque(self) -> bool {
-        matches!(self, LsType::OpaqueLink | LsType::OpaqueArea | LsType::OpaqueAs)
+        matches!(
+            self,
+            LsType::OpaqueLink | LsType::OpaqueArea | LsType::OpaqueAs
+        )
     }
 }
 
@@ -433,12 +436,12 @@ impl Lsa {
                 LsaBody::Summary(decode_summary(body_bytes)?)
             }
             // A type-7 NSSA-external uses the very same body as a type-5 (RFC 3101).
-            LsType::AsExternal | LsType::Nssa => {
-                LsaBody::AsExternal(decode_external(body_bytes)?)
-            }
+            LsType::AsExternal | LsType::Nssa => LsaBody::AsExternal(decode_external(body_bytes)?),
             // Opaque LSAs (type 9/10/11) carry an uninterpreted TLV payload.
             LsType::OpaqueLink | LsType::OpaqueArea | LsType::OpaqueAs => {
-                LsaBody::Opaque(OpaqueLsa { data: body_bytes.to_vec() })
+                LsaBody::Opaque(OpaqueLsa {
+                    data: body_bytes.to_vec(),
+                })
             }
         };
         Some((Lsa { header, body }, len))
@@ -631,7 +634,10 @@ mod tests {
         assert_eq!(lsid, Ipv4Addr::new(3, 0, 1, 2));
         assert_eq!(opaque_type_of(lsid), 3);
         // The id is masked to 24 bits — a stray top byte does not leak in.
-        assert_eq!(opaque_link_state_id(3, 0xff00_0102), Ipv4Addr::new(3, 0, 1, 2));
+        assert_eq!(
+            opaque_link_state_id(3, 0xff00_0102),
+            Ipv4Addr::new(3, 0, 1, 2)
+        );
     }
 
     #[test]
@@ -648,7 +654,9 @@ mod tests {
                     ls_checksum: 0,
                     length: 0,
                 },
-                body: LsaBody::Opaque(OpaqueLsa { data: vec![0, 3, 0, 4, 0, 0, 0, 90] }),
+                body: LsaBody::Opaque(OpaqueLsa {
+                    data: vec![0, 3, 0, 4, 0, 0, 0, 90],
+                }),
             };
             let bytes = l.encode();
             assert!(checksum_valid(&bytes));
@@ -689,7 +697,10 @@ mod tests {
     #[test]
     fn recency_then_checksum_then_age() {
         // Equal seq -> higher checksum wins.
-        assert_eq!(hdr(7, 0x20, 1).compare_recency(&hdr(7, 0x10, 1)), Ordering::Greater);
+        assert_eq!(
+            hdr(7, 0x20, 1).compare_recency(&hdr(7, 0x10, 1)),
+            Ordering::Greater
+        );
         // Equal seq+checksum -> MaxAge wins.
         assert_eq!(
             hdr(7, 0x10, MAX_AGE).compare_recency(&hdr(7, 0x10, 1)),
@@ -701,7 +712,10 @@ mod tests {
             Ordering::Greater
         );
         // Small age gap -> same instance.
-        assert_eq!(hdr(7, 0x10, 100).compare_recency(&hdr(7, 0x10, 120)), Ordering::Equal);
+        assert_eq!(
+            hdr(7, 0x10, 100).compare_recency(&hdr(7, 0x10, 120)),
+            Ordering::Equal
+        );
     }
 
     #[test]
@@ -744,7 +758,10 @@ mod tests {
     fn assert_lsa_roundtrips(l: &Lsa) {
         let bytes = l.encode();
         // Encode must fix up length and a valid checksum.
-        assert_eq!(bytes.len() as u16, u16::from_be_bytes([bytes[18], bytes[19]]));
+        assert_eq!(
+            bytes.len() as u16,
+            u16::from_be_bytes([bytes[18], bytes[19]])
+        );
         assert!(checksum_valid(&bytes));
         let (decoded, consumed) = Lsa::decode(&bytes).expect("decodes");
         assert_eq!(consumed, bytes.len());
@@ -941,8 +958,16 @@ mod tests {
         assert_eq!(b[2], 0x22, "Options is byte 2");
         assert_eq!(b[3], 4, "LS type is byte 3 (SummaryAsbr = 4)");
         assert_eq!(&b[4..8], &[11, 12, 13, 14], "Link State ID is bytes 4..8");
-        assert_eq!(&b[8..12], &[21, 22, 23, 24], "Advertising Router is bytes 8..12");
-        assert_eq!(&b[12..16], &[0x31, 0x32, 0x33, 0x34], "LS sequence is bytes 12..16");
+        assert_eq!(
+            &b[8..12],
+            &[21, 22, 23, 24],
+            "Advertising Router is bytes 8..12"
+        );
+        assert_eq!(
+            &b[12..16],
+            &[0x31, 0x32, 0x33, 0x34],
+            "LS sequence is bytes 12..16"
+        );
         assert_eq!(&b[16..18], &[0x41, 0x42], "LS checksum is bytes 16..18");
         assert_eq!(&b[18..20], &[0x00, 0x24], "length is bytes 18..20");
     }
@@ -999,12 +1024,23 @@ mod tests {
         let body = &bytes[LSA_HEADER_LEN..];
         assert_eq!(body[0], RTR_FLAG_B, "V/E/B flags in byte 0");
         assert_eq!(body[1], 0, "byte 1 is reserved zero");
-        assert_eq!(u16::from_be_bytes([body[2], body[3]]), 1, "# links in bytes 2..4");
+        assert_eq!(
+            u16::from_be_bytes([body[2], body[3]]),
+            1,
+            "# links in bytes 2..4"
+        );
         let link = &body[4..16];
-        assert_eq!(&link[0..4], &[10, 0, 0, 2], "Link ID is bytes 0..4 of the entry");
+        assert_eq!(
+            &link[0..4],
+            &[10, 0, 0, 2],
+            "Link ID is bytes 0..4 of the entry"
+        );
         assert_eq!(&link[4..8], &[192, 168, 1, 1], "Link Data is bytes 4..8");
         assert_eq!(link[8], 2, "link Type is byte 8 (Transit = 2)");
-        assert_eq!(link[9], 0, "#TOS is byte 9 and wren always originates TOS 0 only");
+        assert_eq!(
+            link[9], 0,
+            "#TOS is byte 9 and wren always originates TOS 0 only"
+        );
         assert_eq!(&link[10..12], &[0x00, 0x64], "TOS 0 metric is bytes 10..12");
         assert_eq!(body.len(), 16, "no trailing TOS entries");
     }
@@ -1029,9 +1065,20 @@ mod tests {
         );
         let body = &l.encode()[LSA_HEADER_LEN..];
         assert_eq!(&body[0..4], &[255, 255, 0, 0], "Network Mask is bytes 0..4");
-        assert_eq!(body[4], 0, "byte 4 is reserved and must be zero, not metric bits");
-        assert_eq!(&body[5..8], &[0xab, 0xcd, 0xef], "the 24-bit metric is bytes 5..8");
-        assert_eq!(body.len(), 8, "a TOS-0-only summary body is exactly 8 bytes");
+        assert_eq!(
+            body[4], 0,
+            "byte 4 is reserved and must be zero, not metric bits"
+        );
+        assert_eq!(
+            &body[5..8],
+            &[0xab, 0xcd, 0xef],
+            "the 24-bit metric is bytes 5..8"
+        );
+        assert_eq!(
+            body.len(),
+            8,
+            "a TOS-0-only summary body is exactly 8 bytes"
+        );
     }
 
     /// RFC 2328 §A.4.5: an AS-external-LSA body is Network Mask 0..4, then a
@@ -1063,12 +1110,35 @@ mod tests {
         };
         let t2 = mk(true);
         let body = &t2[LSA_HEADER_LEN..];
-        assert_eq!(&body[0..4], &[255, 255, 255, 0], "Network Mask is bytes 0..4");
-        assert_eq!(body[4], 0x80, "a type-2 external sets only the high bit of byte 4");
-        assert_eq!(&body[5..8], &[0x00, 0x14, 0x20], "the 24-bit metric is bytes 5..8");
-        assert_eq!(&body[8..12], &[192, 168, 1, 254], "Forwarding address is 8..12");
-        assert_eq!(&body[12..16], &[0xde, 0xad, 0xbe, 0xef], "Route Tag is 12..16");
-        assert_eq!(body.len(), 16, "a TOS-0-only external body is exactly 16 bytes");
+        assert_eq!(
+            &body[0..4],
+            &[255, 255, 255, 0],
+            "Network Mask is bytes 0..4"
+        );
+        assert_eq!(
+            body[4], 0x80,
+            "a type-2 external sets only the high bit of byte 4"
+        );
+        assert_eq!(
+            &body[5..8],
+            &[0x00, 0x14, 0x20],
+            "the 24-bit metric is bytes 5..8"
+        );
+        assert_eq!(
+            &body[8..12],
+            &[192, 168, 1, 254],
+            "Forwarding address is 8..12"
+        );
+        assert_eq!(
+            &body[12..16],
+            &[0xde, 0xad, 0xbe, 0xef],
+            "Route Tag is 12..16"
+        );
+        assert_eq!(
+            body.len(),
+            16,
+            "a TOS-0-only external body is exactly 16 bytes"
+        );
 
         let t1 = mk(false);
         assert_eq!(
@@ -1091,9 +1161,17 @@ mod tests {
             }),
         );
         let body = &l.encode()[LSA_HEADER_LEN..];
-        assert_eq!(&body[0..4], &[255, 255, 255, 0], "Network Mask is bytes 0..4");
+        assert_eq!(
+            &body[0..4],
+            &[255, 255, 255, 0],
+            "Network Mask is bytes 0..4"
+        );
         assert_eq!(&body[4..8], &[10, 0, 0, 1], "first Attached Router at 4..8");
-        assert_eq!(&body[8..12], &[10, 0, 0, 2], "second Attached Router at 8..12");
+        assert_eq!(
+            &body[8..12],
+            &[10, 0, 0, 2],
+            "second Attached Router at 8..12"
+        );
         assert_eq!(body.len(), 12);
     }
 
@@ -1111,12 +1189,18 @@ mod tests {
         let l = lsa(
             LsType::Router,
             [10, 0, 0, 1],
-            LsaBody::Router(RouterLsa { flags: RTR_FLAG_E, links: vec![] }),
+            LsaBody::Router(RouterLsa {
+                flags: RTR_FLAG_E,
+                links: vec![],
+            }),
         );
         let bytes = l.encode();
         let stamped = u16::from_be_bytes([bytes[16], bytes[17]]);
         assert_ne!(stamped, 0, "a real LSA gets a non-zero checksum");
-        assert_eq!(LSA_CSUM_OFFSET, 14, "offset 14 within the age-stripped region");
+        assert_eq!(
+            LSA_CSUM_OFFSET, 14,
+            "offset 14 within the age-stripped region"
+        );
         // Independent recomputation: zero the field, fold the region by hand per
         // RFC 1008 and confirm the stored value makes the sums vanish.
         let (mut c0, mut c1) = (0i32, 0i32);
@@ -1124,6 +1208,10 @@ mod tests {
             c0 = (c0 + *b as i32) % 255;
             c1 = (c1 + c0) % 255;
         }
-        assert_eq!((c0, c1), (0, 0), "the stored checksum must fold the region to zero");
+        assert_eq!(
+            (c0, c1),
+            (0, 0),
+            "the stored checksum must fold the region to zero"
+        );
     }
 }

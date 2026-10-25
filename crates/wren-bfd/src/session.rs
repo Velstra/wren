@@ -177,7 +177,10 @@ impl Session {
             self.state = State::Down;
             self.remote_state = State::Down;
             self.remote_discr = 0;
-            Some(Transition { from, to: State::Down })
+            Some(Transition {
+                from,
+                to: State::Down,
+            })
         } else {
             None
         }
@@ -194,7 +197,10 @@ impl Session {
             self.state = State::Down;
             self.remote_state = State::Down;
             self.remote_discr = 0;
-            Some(Transition { from, to: State::Down })
+            Some(Transition {
+                from,
+                to: State::Down,
+            })
         } else {
             None
         }
@@ -254,8 +260,7 @@ impl Session {
     /// receive interval (the greater of our Required Min RX and the neighbour's
     /// Desired Min TX).
     pub fn detection_time_us(&self) -> u64 {
-        let interval =
-            (self.cfg.required_min_rx_us as u64).max(self.remote_desired_tx_us as u64);
+        let interval = (self.cfg.required_min_rx_us as u64).max(self.remote_desired_tx_us as u64);
         self.remote_detect_mult as u64 * interval
     }
 }
@@ -265,7 +270,11 @@ mod tests {
     use super::*;
 
     fn cfg() -> SessionConfig {
-        SessionConfig { desired_min_tx_us: 300_000, required_min_rx_us: 300_000, detect_mult: 3 }
+        SessionConfig {
+            desired_min_tx_us: 300_000,
+            required_min_rx_us: 300_000,
+            detect_mult: 3,
+        }
     }
 
     /// Run `rounds` of a full bidirectional exchange between two sessions, feeding
@@ -297,7 +306,13 @@ mod tests {
         let (mut a, _b) = exchange(3);
         assert_eq!(a.state(), State::Up);
         let t = a.on_detect_timeout().expect("transition");
-        assert_eq!(t, Transition { from: State::Up, to: State::Down });
+        assert_eq!(
+            t,
+            Transition {
+                from: State::Up,
+                to: State::Down
+            }
+        );
         assert_eq!(a.state(), State::Down);
         assert_eq!(a.remote_discr(), 0);
         // The packet we now build carries the detection-expired diagnostic.
@@ -328,7 +343,13 @@ mod tests {
             auth_present: false,
         };
         let t = a.on_packet(&down).expect("transition");
-        assert_eq!(t, Transition { from: State::Up, to: State::Down });
+        assert_eq!(
+            t,
+            Transition {
+                from: State::Up,
+                to: State::Down
+            }
+        );
         assert_eq!(a.build_control().diag, Diag::NeighborSignaledDown);
     }
 
@@ -358,7 +379,10 @@ mod tests {
         poll.my_discr = 9;
         poll.state = State::Down;
         a.on_packet(&poll);
-        assert!(a.build_control().final_, "first packet after a poll sets Final");
+        assert!(
+            a.build_control().final_,
+            "first packet after a poll sets Final"
+        );
         assert!(!a.build_control().final_, "and only that one packet");
     }
 

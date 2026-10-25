@@ -39,9 +39,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use wren_core::{NextHop, Prefix, Protocol, Route};
 
-use crate::lsa::{
-    LsType, LsaBody, NetworkLsa, RouterLink, RouterLinkType, PREFIX_NU,
-};
+use crate::lsa::{LsType, LsaBody, NetworkLsa, RouterLink, RouterLinkType, PREFIX_NU};
 use crate::lsdb::Lsdb;
 use crate::{LS_INFINITY, MAX_AGE};
 
@@ -236,7 +234,11 @@ pub fn external_routes(area: &Lsdb, intra: &SpfResult, self_id: Ipv4Addr) -> Vec
         let Some(prefix) = to_core_prefix(&ext.prefix) else {
             continue;
         };
-        let gateways = intra.router_nexthops.get(&asbr).cloned().unwrap_or_default();
+        let gateways = intra
+            .router_nexthops
+            .get(&asbr)
+            .cloned()
+            .unwrap_or_default();
         add_route(&mut by_prefix, prefix, total, &gateways);
     }
     by_prefix.into_values().collect()
@@ -494,9 +496,9 @@ impl Spf<'_> {
 
     /// Whether a router has any present, non-MaxAge Router-LSA.
     fn router_alive(&self, rid: Ipv4Addr) -> bool {
-        self.area.iter_type(LsType::Router).any(|lsa| {
-            lsa.header.advertising_router == rid && lsa.header.ls_age < MAX_AGE
-        })
+        self.area
+            .iter_type(LsType::Router)
+            .any(|lsa| lsa.header.advertising_router == rid && lsa.header.ls_age < MAX_AGE)
     }
 
     /// Whether a transit network's Network-LSA is present and not MaxAge.
@@ -589,7 +591,12 @@ fn to_core_prefix(p: &crate::lsa::Prefix) -> Option<Prefix> {
 
 /// Insert or fold a route into the by-prefix table: a strictly lower cost
 /// replaces, an equal cost merges next hops (ECMP), a higher cost is dropped.
-fn add_route(map: &mut BTreeMap<Prefix, SpfRoute>, prefix: Prefix, cost: u32, gateways: &[SpfNextHop]) {
+fn add_route(
+    map: &mut BTreeMap<Prefix, SpfRoute>,
+    prefix: Prefix,
+    cost: u32,
+    gateways: &[SpfNextHop],
+) {
     match map.get_mut(&prefix) {
         None => {
             map.insert(
@@ -760,15 +767,33 @@ mod tests {
         let mut area = Lsdb::new();
         let mut links = Lsdb::new();
         // R1 <--cost10--> R2 (R1 if 1, R2 if 2), each with its own /64.
-        area.install(router_lsa([1, 1, 1, 1], 0, vec![p2p([2, 2, 2, 2], 1, 2, 10)], 1));
-        area.install(router_lsa([2, 2, 2, 2], 0, vec![p2p([1, 1, 1, 1], 2, 1, 10)], 1));
+        area.install(router_lsa(
+            [1, 1, 1, 1],
+            0,
+            vec![p2p([2, 2, 2, 2], 1, 2, 10)],
+            1,
+        ));
+        area.install(router_lsa(
+            [2, 2, 2, 2],
+            0,
+            vec![p2p([1, 1, 1, 1], 2, 1, 10)],
+            1,
+        ));
         area.install(intra_router(
             [1, 1, 1, 1],
-            vec![prefix(Ipv6Addr::new(0x2001, 0xdb8, 1, 0, 0, 0, 0, 0), 64, 0)],
+            vec![prefix(
+                Ipv6Addr::new(0x2001, 0xdb8, 1, 0, 0, 0, 0, 0),
+                64,
+                0,
+            )],
         ));
         area.install(intra_router(
             [2, 2, 2, 2],
-            vec![prefix(Ipv6Addr::new(0x2001, 0xdb8, 2, 0, 0, 0, 0, 0), 64, 0)],
+            vec![prefix(
+                Ipv6Addr::new(0x2001, 0xdb8, 2, 0, 0, 0, 0, 0),
+                64,
+                0,
+            )],
         ));
         // R2's link-local address on its interface 2 (the shared link).
         links.install(link_lsa([2, 2, 2, 2], 2, ll(2)));
@@ -806,17 +831,29 @@ mod tests {
             vec![transit([1, 1, 1, 1], 1, 2, 1)],
             1,
         ));
-        area.install(network_lsa([1, 1, 1, 1], 1, vec![[1, 1, 1, 1], [2, 2, 2, 2]]));
+        area.install(network_lsa(
+            [1, 1, 1, 1],
+            1,
+            vec![[1, 1, 1, 1], [2, 2, 2, 2]],
+        ));
         // The LAN's prefix hangs off the DR's Network-LSA (metric 0).
         area.install(intra_network(
             [1, 1, 1, 1],
             1,
-            vec![prefix(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0), 64, 0)],
+            vec![prefix(
+                Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0),
+                64,
+                0,
+            )],
         ));
         // R2's own /64 behind it.
         area.install(intra_router(
             [2, 2, 2, 2],
-            vec![prefix(Ipv6Addr::new(0x2001, 0xdb8, 2, 0, 0, 0, 0, 0), 64, 5)],
+            vec![prefix(
+                Ipv6Addr::new(0x2001, 0xdb8, 2, 0, 0, 0, 0, 0),
+                64,
+                5,
+            )],
         ));
         // R2's link-local address on its interface 2.
         links.install(link_lsa([2, 2, 2, 2], 2, ll(2)));
@@ -840,11 +877,20 @@ mod tests {
         let mut area = Lsdb::new();
         let links = Lsdb::new();
         // R1 claims a link to R2, but R2 never claims one back.
-        area.install(router_lsa([1, 1, 1, 1], 0, vec![p2p([2, 2, 2, 2], 1, 2, 10)], 1));
+        area.install(router_lsa(
+            [1, 1, 1, 1],
+            0,
+            vec![p2p([2, 2, 2, 2], 1, 2, 10)],
+            1,
+        ));
         area.install(router_lsa([2, 2, 2, 2], 0, vec![], 1));
         area.install(intra_router(
             [2, 2, 2, 2],
-            vec![prefix(Ipv6Addr::new(0x2001, 0xdb8, 2, 0, 0, 0, 0, 0), 64, 0)],
+            vec![prefix(
+                Ipv6Addr::new(0x2001, 0xdb8, 2, 0, 0, 0, 0, 0),
+                64,
+                0,
+            )],
         ));
 
         let res = compute(&area, &links, rid([1, 1, 1, 1]));
@@ -856,7 +902,12 @@ mod tests {
     fn maxage_router_is_excluded() {
         let mut area = Lsdb::new();
         let links = Lsdb::new();
-        area.install(router_lsa([1, 1, 1, 1], 0, vec![p2p([2, 2, 2, 2], 1, 2, 10)], 1));
+        area.install(router_lsa(
+            [1, 1, 1, 1],
+            0,
+            vec![p2p([2, 2, 2, 2], 1, 2, 10)],
+            1,
+        ));
         // R2's Router-LSA has aged out.
         area.install(router_lsa(
             [2, 2, 2, 2],
@@ -866,7 +917,11 @@ mod tests {
         ));
         area.install(intra_router(
             [2, 2, 2, 2],
-            vec![prefix(Ipv6Addr::new(0x2001, 0xdb8, 2, 0, 0, 0, 0, 0), 64, 0)],
+            vec![prefix(
+                Ipv6Addr::new(0x2001, 0xdb8, 2, 0, 0, 0, 0, 0),
+                64,
+                0,
+            )],
         ));
 
         let res = compute(&area, &links, rid([1, 1, 1, 1]));
@@ -925,7 +980,11 @@ mod tests {
         ));
         area.install(intra_router(
             [3, 3, 3, 3],
-            vec![prefix(Ipv6Addr::new(0x2001, 0xdb8, 3, 0, 0, 0, 0, 0), 64, 1)],
+            vec![prefix(
+                Ipv6Addr::new(0x2001, 0xdb8, 3, 0, 0, 0, 0, 0),
+                64,
+                1,
+            )],
         ));
         // R2's and R4's link-local addresses on their interfaces facing R1.
         links.install(link_lsa([2, 2, 2, 2], 21, ll(2)));
@@ -945,19 +1004,39 @@ mod tests {
     fn to_route_maps_protocol_and_nexthops() {
         let mut area = Lsdb::new();
         let mut links = Lsdb::new();
-        area.install(router_lsa([1, 1, 1, 1], 0, vec![p2p([2, 2, 2, 2], 1, 2, 10)], 1));
-        area.install(router_lsa([2, 2, 2, 2], 0, vec![p2p([1, 1, 1, 1], 2, 1, 10)], 1));
+        area.install(router_lsa(
+            [1, 1, 1, 1],
+            0,
+            vec![p2p([2, 2, 2, 2], 1, 2, 10)],
+            1,
+        ));
+        area.install(router_lsa(
+            [2, 2, 2, 2],
+            0,
+            vec![p2p([1, 1, 1, 1], 2, 1, 10)],
+            1,
+        ));
         area.install(intra_router(
             [1, 1, 1, 1],
-            vec![prefix(Ipv6Addr::new(0x2001, 0xdb8, 1, 0, 0, 0, 0, 0), 64, 0)],
+            vec![prefix(
+                Ipv6Addr::new(0x2001, 0xdb8, 1, 0, 0, 0, 0, 0),
+                64,
+                0,
+            )],
         ));
         area.install(intra_router(
             [2, 2, 2, 2],
-            vec![prefix(Ipv6Addr::new(0x2001, 0xdb8, 2, 0, 0, 0, 0, 0), 64, 0)],
+            vec![prefix(
+                Ipv6Addr::new(0x2001, 0xdb8, 2, 0, 0, 0, 0, 0),
+                64,
+                0,
+            )],
         ));
         links.install(link_lsa([2, 2, 2, 2], 2, ll(2)));
 
-        let rts = routes(&area, &links, rid([1, 1, 1, 1]), |_| Some("if1".to_string()));
+        let rts = routes(&area, &links, rid([1, 1, 1, 1]), |_| {
+            Some("if1".to_string())
+        });
         let far = rts
             .iter()
             .find(|r| r.prefix == p("2001:db8:2::/64"))
@@ -988,7 +1067,12 @@ mod tests {
     /// A two-router area where R2 is an ABR injecting an inter-area prefix.
     fn area_with_abr() -> Lsdb {
         let mut area = Lsdb::new();
-        area.install(router_lsa([1, 1, 1, 1], 0, vec![p2p([2, 2, 2, 2], 1, 2, 10)], 1));
+        area.install(router_lsa(
+            [1, 1, 1, 1],
+            0,
+            vec![p2p([2, 2, 2, 2], 1, 2, 10)],
+            1,
+        ));
         area.install(router_lsa(
             [2, 2, 2, 2],
             crate::lsa::RTR_FLAG_B,
@@ -997,7 +1081,12 @@ mod tests {
         ));
         // The ABR summarises 2001:db8:99::/64 (another area) at cost 5.
         area.install(Lsa {
-            header: hdr(LsType::InterAreaPrefix, rid([0, 0, 0, 1]), rid([2, 2, 2, 2]), 1),
+            header: hdr(
+                LsType::InterAreaPrefix,
+                rid([0, 0, 0, 1]),
+                rid([2, 2, 2, 2]),
+                1,
+            ),
             body: LsaBody::InterAreaPrefix(InterAreaPrefixLsa {
                 metric: 5,
                 prefix: crate::lsa::Prefix::from_ipv6(
@@ -1030,7 +1119,12 @@ mod tests {
         let mut area = area_with_abr();
         // A summary from an ABR not on the SPF tree → unreachable, skipped.
         area.install(Lsa {
-            header: hdr(LsType::InterAreaPrefix, rid([0, 0, 0, 2]), rid([9, 9, 9, 9]), 1),
+            header: hdr(
+                LsType::InterAreaPrefix,
+                rid([0, 0, 0, 2]),
+                rid([9, 9, 9, 9]),
+                1,
+            ),
             body: LsaBody::InterAreaPrefix(InterAreaPrefixLsa {
                 metric: 1,
                 prefix: crate::lsa::Prefix::from_ipv6(
@@ -1042,7 +1136,12 @@ mod tests {
         });
         // A summary at LSInfinity → skipped.
         area.install(Lsa {
-            header: hdr(LsType::InterAreaPrefix, rid([0, 0, 0, 3]), rid([2, 2, 2, 2]), 1),
+            header: hdr(
+                LsType::InterAreaPrefix,
+                rid([0, 0, 0, 3]),
+                rid([2, 2, 2, 2]),
+                1,
+            ),
             body: LsaBody::InterAreaPrefix(InterAreaPrefixLsa {
                 metric: LS_INFINITY,
                 prefix: crate::lsa::Prefix::from_ipv6(
@@ -1057,8 +1156,14 @@ mod tests {
         let inter = inter_area_routes(&area, &intra, rid([1, 1, 1, 1]));
         let dests: Vec<Prefix> = inter.iter().map(|r| r.prefix).collect();
         assert!(dests.contains(&p("2001:db8:99::/64")));
-        assert!(!dests.contains(&p("2001:db8:77::/64")), "unreachable ABR skipped");
-        assert!(!dests.contains(&p("2001:db8:66::/64")), "LSInfinity skipped");
+        assert!(
+            !dests.contains(&p("2001:db8:77::/64")),
+            "unreachable ABR skipped"
+        );
+        assert!(
+            !dests.contains(&p("2001:db8:66::/64")),
+            "LSInfinity skipped"
+        );
 
         // A summary we originated ourselves is skipped (self_id = the ABR).
         let self_intra = compute(&area, &links, rid([2, 2, 2, 2]));
@@ -1069,7 +1174,12 @@ mod tests {
     /// A two-router area where R2 is an ASBR.
     fn area_with_asbr() -> Lsdb {
         let mut area = Lsdb::new();
-        area.install(router_lsa([1, 1, 1, 1], 0, vec![p2p([2, 2, 2, 2], 1, 2, 10)], 1));
+        area.install(router_lsa(
+            [1, 1, 1, 1],
+            0,
+            vec![p2p([2, 2, 2, 2], 1, 2, 10)],
+            1,
+        ));
         area.install(router_lsa(
             [2, 2, 2, 2],
             crate::lsa::RTR_FLAG_E,
@@ -1133,7 +1243,10 @@ mod tests {
             false,
         ));
         let rts = external_routes(&ext, &intra, rid([1, 1, 1, 1]));
-        let r = rts.iter().find(|r| r.prefix == p("2001:db8:aa::/64")).unwrap();
+        let r = rts
+            .iter()
+            .find(|r| r.prefix == p("2001:db8:aa::/64"))
+            .unwrap();
         assert_eq!(r.cost, 30); // E1: 10 (to ASBR) + 20
     }
 

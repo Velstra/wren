@@ -21,7 +21,7 @@ use std::net::IpAddr;
 
 use wren_core::Prefix;
 
-use crate::decision::{Path, is_better};
+use crate::decision::{is_better, Path};
 use crate::evpn::EvpnNlri;
 
 /// Build the auto-derived Route Target of an EVI (RFC 7432 §7.10.1, adapted to
@@ -860,24 +860,22 @@ mod tests {
         assert_eq!(evi.lookup_mac(0, mac).unwrap().vtep, ip([10, 0, 0, 1]));
 
         // It moves to VTEP .2, announced with a higher sequence — the move wins.
-        assert!(
-            evi.apply(&EvpnRibEvent::Best {
+        assert!(evi
+            .apply(&EvpnRibEvent::Best {
                 nlri: b,
                 path: mob_path([10, 0, 0, 2], 1, false)
             })
-            .is_some()
-        );
+            .is_some());
         assert_eq!(evi.lookup_mac(0, mac).unwrap().vtep, ip([10, 0, 0, 2]));
 
         // A stale re-advertisement of the pre-move route (lower sequence) is ignored
         // rather than re-pinning the MAC to the old VTEP.
-        assert!(
-            evi.apply(&EvpnRibEvent::Best {
+        assert!(evi
+            .apply(&EvpnRibEvent::Best {
                 nlri: a,
                 path: mob_path([10, 0, 0, 1], 0, false)
             })
-            .is_none()
-        );
+            .is_none());
         assert_eq!(evi.lookup_mac(0, mac).unwrap().vtep, ip([10, 0, 0, 2]));
     }
 
@@ -891,13 +889,12 @@ mod tests {
             path: mob_path([10, 0, 0, 1], 0, true),
         });
         // A dynamic route with a higher sequence from another VTEP must NOT take it.
-        assert!(
-            evi.apply(&EvpnRibEvent::Best {
+        assert!(evi
+            .apply(&EvpnRibEvent::Best {
                 nlri: mac_route(2, 0x01, 10100),
                 path: mob_path([10, 0, 0, 2], 5, false),
             })
-            .is_none()
-        );
+            .is_none());
         assert_eq!(evi.lookup_mac(0, mac).unwrap().vtep, ip([10, 0, 0, 1]));
     }
 
