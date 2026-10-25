@@ -116,6 +116,67 @@ pub enum VrrpQuery {
 /// A [`VrrpQuery`] paired with the channel to answer it on.
 pub type VrrpQueryRequest = crate::query::QueryRequest<VrrpQuery>;
 
+/// The control socket keeps one sender while the supervisor replaces actors.
+pub type QuerySender = mpsc::Sender<VrrpQueryRequest>;
+pub type QueryRoute = tokio::sync::watch::Sender<Option<QuerySender>>;
+pub fn query_broker(capacity: usize) -> (QuerySender, QueryRoute) {
+    let (sender, mut input) = mpsc::channel::<VrrpQueryRequest>(capacity);
+    let (route, current) = tokio::sync::watch::channel::<Option<QuerySender>>(None);
+    tokio::spawn(async move {
+        while let Some(query) = input.recv().await {
+            let target = current.borrow().clone();
+            if let Some(target) = target {
+                if let Err(error) = target.send(query).await {
+                    let _ = error.0.respond.send("VRRP is reloading\n".into());
+                }
+            } else {
+                let _ = query.respond.send("VRRP is not configured\n".into());
+            }
+        }
+    });
+    (sender, route)
+}
+
+/// A reload signals the old actor asynchronously. Wait for its exclusive lock
+/// before touching VIPs or role files, rather than losing the replacement actor.
+async fn coordinator_lock(
+    path: &std::path::Path,
+    stop: &mut tokio::sync::watch::Receiver<bool>,
+) -> Result<Option<std::fs::File>> {
+    use std::{
+        fs::OpenOptions,
+        os::{fd::AsRawFd, unix::fs::OpenOptionsExt},
+    };
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)?;
+    let until = Instant::now() + Duration::from_secs(2);
+    loop {
+        if *stop.borrow() {
+            return Ok(None);
+        }
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+            return Ok(Some(file));
+        }
+        let error = std::io::Error::last_os_error();
+        anyhow::ensure!(
+            error.kind() == std::io::ErrorKind::WouldBlock
+                || error.raw_os_error() == Some(libc::EINTR),
+            "HA coordinator lock failed: {error}"
+        );
+        anyhow::ensure!(
+            Instant::now() < until,
+            "HA coordinator lock remains held by another actor/process"
+        );
+        tokio::select! {_=tokio::time::sleep(Duration::from_millis(5))=>{},_=stop.changed()=>{return Ok(None);}}
+    }
+}
+
 /// A validated advertisement forwarded from a reader task to the central loop.
 struct AdvIn {
     idx: usize,
@@ -323,27 +384,16 @@ pub async fn run_ha(
     mut queries: mpsc::Receiver<VrrpQueryRequest>,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) -> Result<()> {
-    use std::{
-        fs::OpenOptions,
-        os::{fd::AsRawFd, unix::fs::OpenOptionsExt},
-        path::Path,
-    };
+    use std::path::Path;
     use wren_ha::{Agent, Authority, Request, Role, AGENT_PATH, ROLE_PATH};
     config.validate()?;
     anyhow::ensure!(!configs.is_empty(), "HA requires virtual addresses");
     std::fs::create_dir_all("/run/velstra/ha")?;
-    let lock = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-        .open("/run/velstra/ha/coordinator.lock")?;
-    anyhow::ensure!(
-        unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0,
-        "HA coordinator is already running"
-    );
+    let Some(_lock) =
+        coordinator_lock(Path::new("/run/velstra/ha/coordinator.lock"), &mut shutdown).await?
+    else {
+        return Ok(());
+    };
     let mut binding = LeaseBindings {
         configs,
         owns: false,
@@ -407,7 +457,7 @@ pub async fn run_ha(
                         && (config.wireguard.contains(&c.address_interface) || read_mac(&c.address_interface).is_some())
                         && c.track_interfaces.iter().all(|i| iface_running(i)));
                 let request = Request { cluster: config.cluster.clone(), node: config.node,
-                    boot, priority: config.priority, preempt: config.preempt,
+                    boot, agent_boot: agent.as_ref().map_or([0;16],|a|a.agent_boot), priority: config.priority, preempt: config.preempt,
                     ready_term: agent.as_ref().map_or(0, |a| a.ready_term),
                     policy: agent.as_ref().map_or(role.authority.policy, |a| a.policy),
                     eligible: healthy && agent.is_some() && now>=vpn_failed_until };
@@ -416,10 +466,10 @@ pub async fn run_ha(
                         let same = role.authority == reply.authority;
                         role.authority = reply.authority;
                         if reply.granted || !same { role.deadline_ns = deadline; }
-                        if !same {role.vpn_ready=false;rekey.cancel();rekey_term=0;}
+                        if !same {debug!(authority=?role.authority,ready_term=request.ready_term,granted=reply.granted,"HA witness generation changed");role.vpn_ready=false;rekey.cancel();rekey_term=0;}
                         if reply.granted { role.claimed_ready_term = request.ready_term; role.claimed_agent_boot = agent.as_ref().map_or([0;16], |a|a.agent_boot); }
                     }
-                    Err(error) => { debug!(%error, "HA witness unavailable; existing lease cannot be extended"); }
+                    Err(error) => { debug!(error = format_args!("{error:#}"), "HA witness unavailable; existing lease cannot be extended"); }
                 }
                 let now = wren_ha::now_ns();
                 let active = healthy && agent.is_some() && now>=vpn_failed_until && role.authority.owner == config.node
@@ -1327,6 +1377,70 @@ mod tests {
             .unwrap()
             .unwrap();
             assert!(bytes[..length].ends_with(b"link local advertisement"));
+        }
+    }
+    #[tokio::test]
+    async fn ha_reload_waits_for_old_actor_and_honors_cancellation() {
+        let path = std::env::temp_dir().join(format!("wren-ha-reload-{}.lock", std::process::id()));
+        let (stop, mut receive) = tokio::sync::watch::channel(false);
+        let first = coordinator_lock(&path, &mut receive)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut next_stop = receive.clone();
+        let next_path = path.clone();
+        let next = tokio::spawn(async move { coordinator_lock(&next_path, &mut next_stop).await });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(
+            !next.is_finished(),
+            "replacement must wait without touching the old actor"
+        );
+        drop(first);
+        let second = tokio::time::timeout(Duration::from_secs(2), next)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        stop.send(true).unwrap();
+        assert!(coordinator_lock(&path, &mut receive)
+            .await
+            .unwrap()
+            .is_none());
+        drop(second);
+        std::fs::remove_file(path).unwrap();
+    }
+    #[tokio::test]
+    async fn show_queries_follow_replaced_or_newly_enabled_ha_actors() {
+        let (queries, route) = query_broker(4);
+        let (respond, answer) = tokio::sync::oneshot::channel();
+        queries
+            .send(VrrpQueryRequest {
+                query: VrrpQuery::Instances,
+                respond,
+            })
+            .await
+            .unwrap();
+        assert!(answer.await.unwrap().contains("not configured"));
+        for generation in [1, 2] {
+            let (actor, mut requests) = mpsc::channel::<VrrpQueryRequest>(4);
+            route.send_replace(Some(actor));
+            let (respond, answer) = tokio::sync::oneshot::channel();
+            queries
+                .send(VrrpQueryRequest {
+                    query: VrrpQuery::Instances,
+                    respond,
+                })
+                .await
+                .unwrap();
+            requests
+                .recv()
+                .await
+                .unwrap()
+                .respond
+                .send(generation.to_string())
+                .unwrap();
+            assert_eq!(answer.await.unwrap(), generation.to_string());
         }
     }
     #[test]

@@ -588,11 +588,17 @@ async fn main() -> Result<()> {
     #[cfg(feature = "rip")]
     let ripng_enabled = cfg.ripng.as_ref().is_some_and(|r| r.enabled);
     #[cfg(feature = "vrrp")]
-    let (vrrp_queries_tx, vrrp_queries_rx) = mpsc::channel(QUERY_QUEUE);
+    let (vrrp_queries_tx, vrrp_routes) = vrrp::query_broker(QUERY_QUEUE);
+    #[cfg(feature = "vrrp")]
+    let (vrrp_actor_tx, vrrp_queries_rx) = mpsc::channel(QUERY_QUEUE);
     #[cfg(feature = "vrrp")]
     let mut vrrp_queries_rx = Some(vrrp_queries_rx);
     #[cfg(feature = "vrrp")]
     let vrrp_enabled = !cfg.vrrp.is_empty();
+    #[cfg(feature = "vrrp")]
+    {
+        vrrp_routes.send_replace(vrrp_enabled.then_some(vrrp_actor_tx));
+    }
     // PIM-SM (`show pim …`) query channel, and the IGMP→PIM membership feed. Both
     // exist only when PIM is enabled in `[multicast.pim]`.
     #[cfg(feature = "pim")]
@@ -634,7 +640,7 @@ async fn main() -> Result<()> {
             #[cfg(feature = "rip")]
             ripng: ripng_enabled.then(|| ripng_queries_tx.clone()),
             #[cfg(feature = "vrrp")]
-            vrrp: vrrp_enabled.then(|| vrrp_queries_tx.clone()),
+            vrrp: Some(vrrp_queries_tx.clone()),
             #[cfg(feature = "pim")]
             pim: pim_enabled.then(|| pim_queries_tx.clone()),
         };
@@ -1404,10 +1410,12 @@ async fn main() -> Result<()> {
     }
     #[cfg(feature = "vrrp")]
     {
+        let routes = vrrp_routes.clone();
         supervisor.register(
             "vrrp",
             Box::new(vrrp_sig),
             Box::new(move |cfg, stop| {
+                routes.send_replace(None);
                 if cfg.vrrp.is_empty() {
                     return None;
                 }
@@ -1419,6 +1427,7 @@ async fn main() -> Result<()> {
                     }
                 };
                 let (qtx, qrx) = mpsc::channel(QUERY_QUEUE);
+                routes.send_replace(Some(qtx.clone()));
                 let ha = cfg.ha.clone();
                 let join = tokio::spawn(async move {
                     let result = if let Some(ha) = ha {

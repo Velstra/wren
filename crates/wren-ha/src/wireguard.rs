@@ -30,6 +30,22 @@ struct Cache {
     authority: Authority,
     endpoints: Vec<Endpoint>,
 }
+impl Cache {
+    fn validate(&self, config: &Config, role: &Role) -> Result<()> {
+        // Roaming metadata belongs to the desired VPN identity. Unrelated
+        // firewall changes advance the HA policy without invalidating it.
+        ensure!(
+            self.cluster == config.cluster
+                && self.node == config.node
+                && self.policy == config.wireguard_policy
+                && self.authority.term <= role.authority.term
+                && self.endpoints.len() <= 4096,
+            "incompatible WireGuard HA snapshot"
+        );
+        Ok(())
+    }
+}
+
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct Recovery {
@@ -143,15 +159,7 @@ pub async fn promote(config: Config, role: Role) -> Result<()> {
     }
     let cache = match read_private::<Cache>(Path::new("/run/velstra/ha/wireguard.json")) {
         Ok(cache) => {
-            ensure!(
-                cache.cluster == config.cluster
-                    && cache.node == config.node
-                    && cache.policy == config.wireguard_policy
-                    && cache.authority.policy == role.authority.policy
-                    && cache.authority.term <= role.authority.term
-                    && cache.endpoints.len() <= 4096,
-                "incompatible WireGuard HA snapshot"
-            );
+            cache.validate(&config, &role)?;
             Some(cache)
         }
         Err(error) => {
@@ -233,6 +241,50 @@ fn restore_keepalive(original: &str, promoted: &str) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn roaming_cache_survives_filter_change_but_cannot_cross_vpn_identity() {
+        let mut config = Config {
+            cluster: "cluster".into(),
+            node: 1,
+            witness: "127.0.0.1:5440".parse().unwrap(),
+            secret: "unused".into(),
+            priority: 200,
+            preempt: true,
+            wireguard: vec!["wg0".into()],
+            wireguard_policy: "vpn-digest".into(),
+        };
+        let role = Role {
+            authority: Authority {
+                term: 5,
+                policy: [9; 32],
+                ..Authority::default()
+            },
+            ..Role::default()
+        };
+        let mut cache = Cache {
+            cluster: config.cluster.clone(),
+            node: 1,
+            policy: config.wireguard_policy.clone(),
+            authority: Authority {
+                term: 4,
+                policy: [8; 32],
+                ..Authority::default()
+            },
+            endpoints: vec![],
+        };
+        cache.validate(&config, &role).unwrap();
+        config.wireguard_policy = "changed-identity".into();
+        assert!(cache.validate(&config, &role).is_err());
+        config.wireguard_policy = cache.policy.clone();
+        cache.authority.term = 6;
+        assert!(cache.validate(&config, &role).is_err());
+        cache.authority.term = 4;
+        cache.node = 2;
+        assert!(cache.validate(&config, &role).is_err());
+        cache.node = 1;
+        cache.cluster = "another-cluster".into();
+        assert!(cache.validate(&config, &role).is_err());
+    }
     #[test]
     fn promotion_reuses_identity_updates_only_known_peer_and_restores_keepalive() {
         let key = STANDARD.encode([1; 32]);

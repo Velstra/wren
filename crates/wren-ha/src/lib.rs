@@ -109,6 +109,7 @@ pub struct Request {
     pub cluster: String,
     pub node: u8,
     pub boot: [u8; 16],
+    pub agent_boot: [u8; 16],
     pub priority: u8,
     pub preempt: bool,
     pub ready_term: u64,
@@ -248,6 +249,7 @@ struct Engine {
     owner_priority: u8,
     preferred: Option<(u8, u8, u64)>,
     cold: [Option<ColdVote>; 2],
+    bootstrap_agent: Option<[u8; 16]>,
 }
 impl Engine {
     fn new(cluster: String, previous: Authority, now: u64) -> Self {
@@ -259,6 +261,7 @@ impl Engine {
             owner_priority: 0,
             preferred: None,
             cold: [None, None],
+            bootstrap_agent: None,
         }
     }
     /// Pure transition: the caller persists a changed authority before sending
@@ -267,7 +270,8 @@ impl Engine {
         ensure!(
             request.cluster == self.cluster
                 && (1..=2).contains(&request.node)
-                && request.priority > 0,
+                && request.priority > 0
+                && (!request.eligible || request.agent_boot != [0; 16]),
             "unknown cluster/member"
         );
         if self.preferred.is_some_and(|(_, _, until)| now >= until) {
@@ -296,7 +300,13 @@ impl Engine {
             && request.ready_term > 0
             && request.ready_term <= self.authority.term;
         let initial = self.authority.term == 0 && request.node == 1 && request.ready_term == 0;
-        let eligible = request.eligible && (ready || initial || cold_quorum && request.node == 1);
+        // A lost bootstrap ACK must not strand a new cluster with its second
+        // member offline. Retry only the same empty agent incarnation, and stop
+        // allowing this as soon as it reports a completed active generation.
+        let bootstrap =
+            ours && request.ready_term == 0 && self.bootstrap_agent == Some(request.agent_boot);
+        let eligible =
+            request.eligible && (ready || initial || bootstrap || cold_quorum && request.node == 1);
         if current
             && !ours
             && exact
@@ -318,7 +328,7 @@ impl Engine {
         if now >= self.quarantine && request.eligible {
             if current
                 && ours
-                && request.ready_term == self.authority.term
+                && (request.ready_term == self.authority.term || bootstrap)
                 && (preferred_us || request.policy != self.authority.policy)
             {
                 if request.policy != self.authority.policy {
@@ -329,6 +339,9 @@ impl Engine {
                         .context("HA term exhausted")?;
                     self.authority.policy = request.policy;
                     self.preferred = None;
+                }
+                if request.ready_term > 0 {
+                    self.bootstrap_agent = None;
                 }
                 // A policy change requires a fully reconciled local table and
                 // becomes visible with a fresh authority generation below.
@@ -350,6 +363,7 @@ impl Engine {
                 self.owner_priority = request.priority;
                 self.preferred = None;
                 self.cold = [None, None];
+                self.bootstrap_agent = (request.ready_term == 0).then_some(request.agent_boot);
                 granted = true;
             }
         }
@@ -597,6 +611,7 @@ mod tests {
             cluster: "ha-test-cluster-01".into(),
             node,
             boot: [node; 16],
+            agent_boot: [node + 2; 16],
             priority: if node == 1 { 200 } else { 100 },
             preempt: true,
             ready_term: term,
@@ -656,6 +671,47 @@ mod tests {
         assert!(
             engine
                 .request(&request(1, 2), active + TTL_MS * 1_000_000)
+                .unwrap()
+                .granted
+        );
+    }
+    #[test]
+    fn lost_cold_grant_ack_can_retry_only_until_the_same_agent_reports_warm_state() {
+        let mut engine = Engine::new("ha-test-cluster-01".into(), Authority::default(), 0);
+        let now = 1_000_000_000;
+        assert!(engine.request(&request(1, 0), now).unwrap().granted);
+        let mut restarted = request(1, 0);
+        restarted.agent_boot = [9; 16];
+        assert!(!engine.request(&restarted, now + 1).unwrap().granted);
+        assert!(
+            engine
+                .request(&request(1, 0), now + TTL_MS * 1_000_000 + 1)
+                .unwrap()
+                .granted,
+            "lost ACK after expiry must recover without an offline peer"
+        );
+        assert!(
+            engine
+                .request(&request(1, 0), now + TTL_MS * 1_000_000 + 2)
+                .unwrap()
+                .granted
+        );
+        assert!(
+            engine
+                .request(&request(1, 2), now + TTL_MS * 1_000_000 + 3)
+                .unwrap()
+                .granted
+        );
+        assert!(
+            !engine
+                .request(&request(1, 0), now + TTL_MS * 1_000_000 + 4)
+                .unwrap()
+                .granted,
+            "an acknowledged warm owner cannot regress to a cold claim"
+        );
+        assert!(
+            !engine
+                .request(&restarted, now + 2 * TTL_MS * 1_000_000 + 4)
                 .unwrap()
                 .granted
         );
