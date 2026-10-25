@@ -8,6 +8,12 @@ follows [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **OSPFv2/v3 withdraw their own LSAs on a normal shutdown.** Configuration
+  restarts now flood MaxAge instances at the original link, area and AS scopes,
+  then accept acknowledgments and retry within a bounded shutdown window.
+  Removing a redistributed static route no longer leaves a stale route on
+  neighbours until MaxAge. Foreign advertisements remain untouched; an enabled
+  OSPFv2 graceful restart keeps its existing Grace-LSA behavior.
 - **OSPF ignores a Hello from off its own subnet (RFC 2328 §8.2).** A router
   with two subnets on one LAN runs an OSPF interface per address and sends a
   Hello from each, both with its Router ID. The one from the other subnet was
