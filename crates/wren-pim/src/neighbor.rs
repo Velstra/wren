@@ -200,7 +200,11 @@ mod tests {
         let mut t = NeighborTable::new();
         let t0 = Instant::now();
         t.on_hello(t0, ip("10.0.2.1"), &hello(105, 1, Some(7)));
-        let ev = t.on_hello(t0 + Duration::from_secs(30), ip("10.0.2.1"), &hello(105, 1, Some(7)));
+        let ev = t.on_hello(
+            t0 + Duration::from_secs(30),
+            ip("10.0.2.1"),
+            &hello(105, 1, Some(7)),
+        );
         assert_eq!(ev, None);
         assert_eq!(t.len(), 1);
     }

@@ -15,7 +15,7 @@
 use std::collections::BTreeMap;
 use std::net::Ipv4Addr;
 
-use crate::lsa::{Lsa, LsType, LsaHeader};
+use crate::lsa::{LsType, Lsa, LsaHeader};
 use crate::MAX_AGE;
 
 /// The identity that names an LSA across its instances: type, Link State ID and
@@ -191,7 +191,10 @@ mod tests {
             stored.encode().len(),
             "the stored length must be the length of the encoded LSA"
         );
-        assert_ne!(stored.header.ls_checksum, 0, "and the checksum is filled in");
+        assert_ne!(
+            stored.header.ls_checksum, 0,
+            "and the checksum is filled in"
+        );
     }
 
     fn summary(lsid: [u8; 4], metric: u32) -> Lsa {
@@ -223,7 +226,10 @@ mod tests {
         // The same instance is a no-op.
         assert_eq!(db.install(router_lsa([10, 0, 0, 1], 6, 1)), Install::Same);
         // An older instance is rejected, database copy unchanged.
-        assert_eq!(db.install(router_lsa([10, 0, 0, 1], 5, 1)), Install::HaveNewer);
+        assert_eq!(
+            db.install(router_lsa([10, 0, 0, 1], 5, 1)),
+            Install::HaveNewer
+        );
         let k = (LsType::Router, [10, 0, 0, 1].into(), [10, 0, 0, 1].into());
         assert_eq!(db.get(&k).unwrap().header.ls_seq, 6);
     }

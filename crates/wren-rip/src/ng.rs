@@ -202,7 +202,12 @@ fn push_rte(buf: &mut Vec<u8>, addr: &Ipv6Addr, tag: u16, prefix_len: u8, metric
 
 impl fmt::Display for Message {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "RIPng {:?} ({} entries)", self.command, self.entries.len())
+        write!(
+            f,
+            "RIPng {:?} ({} entries)",
+            self.command,
+            self.entries.len()
+        )
     }
 }
 
@@ -261,9 +266,18 @@ mod tests {
     #[test]
     fn from_adverts_skips_ipv4_and_caps_metric() {
         let adverts = vec![
-            Advert { prefix: p("2001:db8::/32"), metric: 3 },
-            Advert { prefix: p("10.0.0.0/24"), metric: 1 }, // IPv4 → skipped
-            Advert { prefix: p("fd00::/8"), metric: 99 },   // capped to 16
+            Advert {
+                prefix: p("2001:db8::/32"),
+                metric: 3,
+            },
+            Advert {
+                prefix: p("10.0.0.0/24"),
+                metric: 1,
+            }, // IPv4 → skipped
+            Advert {
+                prefix: p("fd00::/8"),
+                metric: 99,
+            }, // capped to 16
         ];
         let msg = Message::from_adverts(&adverts);
         assert_eq!(msg.entries.len(), 2);
@@ -274,7 +288,13 @@ mod tests {
     #[test]
     fn decode_rejects_short_and_misaligned_and_bad_command() {
         assert_eq!(Message::decode(&[2, 1, 0]), Err(RipError::TooShort));
-        assert_eq!(Message::decode(&[2, 1, 0, 0, 1, 2, 3]), Err(RipError::BadLength(3)));
-        assert_eq!(Message::decode(&[9, 1, 0, 0]), Err(RipError::UnknownCommand(9)));
+        assert_eq!(
+            Message::decode(&[2, 1, 0, 0, 1, 2, 3]),
+            Err(RipError::BadLength(3))
+        );
+        assert_eq!(
+            Message::decode(&[9, 1, 0, 0]),
+            Err(RipError::UnknownCommand(9))
+        );
     }
 }

@@ -108,13 +108,25 @@ fn encode_event(ev: &BmpEvent) -> Vec<u8> {
             received_open,
         } => {
             let pph = PerPeerHeader::global(*peer, *asn, *bgp_id, secs, micros);
-            bmp::peer_up(&pph, *local_addr, *local_port, *remote_port, sent_open, received_open)
+            bmp::peer_up(
+                &pph,
+                *local_addr,
+                *local_port,
+                *remote_port,
+                sent_open,
+                received_open,
+            )
         }
         BmpEvent::PeerDown { peer, asn, bgp_id } => {
             let pph = PerPeerHeader::global(*peer, *asn, *bgp_id, secs, micros);
             bmp::peer_down(&pph, bmp::peer_down_reason::REMOTE_NO_NOTIFICATION, &[])
         }
-        BmpEvent::RouteMonitor { peer, asn, bgp_id, update } => {
+        BmpEvent::RouteMonitor {
+            peer,
+            asn,
+            bgp_id,
+            update,
+        } => {
             let pph = PerPeerHeader::global(*peer, *asn, *bgp_id, secs, micros);
             bmp::route_monitoring(&pph, update)
         }
@@ -138,9 +150,13 @@ pub async fn run(cfg: BmpConfig, mut rx: mpsc::Receiver<BmpEvent>) {
 async fn session(cfg: &BmpConfig, rx: &mut mpsc::Receiver<BmpEvent>) -> std::io::Result<()> {
     let mut stream = timeout(CONNECT_TIMEOUT, TcpStream::connect(cfg.station))
         .await
-        .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "BMP connect timed out"))??;
+        .map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::TimedOut, "BMP connect timed out")
+        })??;
     info!(station = %cfg.station, "BMP connected to monitoring station");
-    stream.write_all(&bmp::initiation(&cfg.sys_name, &cfg.sys_descr)).await?;
+    stream
+        .write_all(&bmp::initiation(&cfg.sys_name, &cfg.sys_descr))
+        .await?;
 
     while let Some(ev) = rx.recv().await {
         stream.write_all(&encode_event(&ev)).await?;

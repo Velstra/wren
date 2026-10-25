@@ -421,12 +421,7 @@ mod set_next_hop_tests {
     use super::*;
 
     fn route(nexthops: Vec<NextHop>) -> Route {
-        Route::new(
-            "10.0.0.0/8".parse().unwrap(),
-            Protocol::Bgp,
-            nexthops,
-            0,
-        )
+        Route::new("10.0.0.0/8".parse().unwrap(), Protocol::Bgp, nexthops, 0)
     }
 
     /// Naming one gateway means one gateway. A multipath route that keeps its
@@ -443,9 +438,17 @@ mod set_next_hop_tests {
             NextHop::via("198.51.100.2".parse().unwrap()),
         ]);
         m.apply(&mut r);
-        assert_eq!(r.nexthops.len(), 1, "the other paths survived: {:?}", r.nexthops);
+        assert_eq!(
+            r.nexthops.len(),
+            1,
+            "the other paths survived: {:?}",
+            r.nexthops
+        );
         assert_eq!(r.nexthops[0].gateway, Some("192.0.2.1".parse().unwrap()));
-        assert_eq!(r.nexthops[0].iface, None, "a named gateway is not pinned to a link");
+        assert_eq!(
+            r.nexthops[0].iface, None,
+            "a named gateway is not pinned to a link"
+        );
     }
 
     /// A route with no next hop is a discard route. Giving it one from a filter

@@ -298,7 +298,10 @@ mod tests {
         assert_eq!(n.state, Init);
         assert_eq!(n.handle(TwoWayReceived, adj()), vec![StartDdExchange]);
         assert_eq!(n.state, ExStart);
-        assert_eq!(n.handle(NegotiationDone, adj()), vec![StartDatabaseExchange]);
+        assert_eq!(
+            n.handle(NegotiationDone, adj()),
+            vec![StartDatabaseExchange]
+        );
         assert_eq!(n.state, Exchange);
         // Request list empty → straight to Full.
         assert_eq!(n.handle(ExchangeDone, adj()), vec![AdjacencyUp]);

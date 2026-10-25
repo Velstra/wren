@@ -180,7 +180,7 @@ pub fn flood_scope(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::lsa::{Lsa, LsType, LsaBody, LsaHeader, RouterLsa};
+    use crate::lsa::{LsType, Lsa, LsaBody, LsaHeader, RouterLsa};
     use crate::{INITIAL_SEQUENCE_NUMBER, OPT_R, OPT_V6};
 
     fn ip(o: [u8; 4]) -> Ipv4Addr {
@@ -225,7 +225,9 @@ mod tests {
         let lsa = router_lsa([1, 1, 1, 1], 5, 1);
         assert_eq!(
             decide_flood(&input(&db, &lsa)),
-            FloodDecision::Install { self_originated: false }
+            FloodDecision::Install {
+                self_originated: false
+            }
         );
     }
 
@@ -237,7 +239,12 @@ mod tests {
         let newer = router_lsa([1, 1, 1, 1], 6, 1);
         let mut inp = input(&db, &newer);
         inp.db_copy_age_since_install = Some(10); // well past MinLSArrival
-        assert_eq!(decide_flood(&inp), FloodDecision::Install { self_originated: false });
+        assert_eq!(
+            decide_flood(&inp),
+            FloodDecision::Install {
+                self_originated: false
+            }
+        );
 
         let older = router_lsa([1, 1, 1, 1], 4, 1);
         assert_eq!(decide_flood(&input(&db, &older)), FloodDecision::SendBack);
@@ -289,7 +296,12 @@ mod tests {
         // But if a neighbour is mid-exchange, install it so it floods through.
         let mut inp = input(&db, &flush);
         inp.any_neighbor_exchanging = true;
-        assert_eq!(decide_flood(&inp), FloodDecision::Install { self_originated: false });
+        assert_eq!(
+            decide_flood(&inp),
+            FloodDecision::Install {
+                self_originated: false
+            }
+        );
     }
 
     #[test]
@@ -309,14 +321,21 @@ mod tests {
         let mine = router_lsa([9, 9, 9, 9], 7, 1); // advertising_router == self
         assert_eq!(
             decide_flood(&input(&db, &mine)),
-            FloodDecision::Install { self_originated: true }
+            FloodDecision::Install {
+                self_originated: true
+            }
         );
     }
 
     #[test]
     fn flood_scope_dr_other_only_reaches_the_d_routers() {
         assert_eq!(
-            flood_scope(InterfaceType::Broadcast, InterfaceState::DrOther, false, false),
+            flood_scope(
+                InterfaceType::Broadcast,
+                InterfaceState::DrOther,
+                false,
+                false
+            ),
             Some(FloodScope::AllDRouters)
         );
         assert_eq!(
@@ -328,11 +347,21 @@ mod tests {
     #[test]
     fn flood_scope_skips_when_received_from_dr_or_as_backup() {
         assert_eq!(
-            flood_scope(InterfaceType::Broadcast, InterfaceState::DrOther, true, true),
+            flood_scope(
+                InterfaceType::Broadcast,
+                InterfaceState::DrOther,
+                true,
+                true
+            ),
             None
         );
         assert_eq!(
-            flood_scope(InterfaceType::Broadcast, InterfaceState::Backup, true, false),
+            flood_scope(
+                InterfaceType::Broadcast,
+                InterfaceState::Backup,
+                true,
+                false
+            ),
             None
         );
     }
@@ -340,7 +369,12 @@ mod tests {
     #[test]
     fn flood_scope_point_to_point_always_all_spf() {
         assert_eq!(
-            flood_scope(InterfaceType::PointToPoint, InterfaceState::PointToPoint, true, false),
+            flood_scope(
+                InterfaceType::PointToPoint,
+                InterfaceState::PointToPoint,
+                true,
+                false
+            ),
             Some(FloodScope::AllSpfRouters)
         );
     }

@@ -566,9 +566,11 @@ mod tests {
 
     #[test]
     fn sg_and_star_g_oifs_union_for_forwarding() {
-        let rpf = MockRpf::new()
-            .via("10.0.9.9", 2, Some("10.0.2.1"))
-            .via("10.1.1.1", 2, Some("10.0.2.1"));
+        let rpf = MockRpf::new().via("10.0.9.9", 2, Some("10.0.2.1")).via(
+            "10.1.1.1",
+            2,
+            Some("10.0.2.1"),
+        );
         let mut t = table("10.0.9.9");
         // A (*,G) receiver on 5 and an (S,G) receiver on 6.
         t.on_membership(5, ip("239.1.1.1"), None, true, &rpf);
@@ -582,11 +584,18 @@ mod tests {
     fn second_receiver_does_not_rejoin() {
         let rpf = MockRpf::new().via("10.0.9.9", 2, Some("10.0.2.1"));
         let mut t = table("10.0.9.9");
-        assert_eq!(t.on_membership(5, ip("239.1.1.1"), None, true, &rpf).len(), 1);
+        assert_eq!(
+            t.on_membership(5, ip("239.1.1.1"), None, true, &rpf).len(),
+            1
+        );
         // A second receiver for the same group: OIF grows, but no new upstream Join.
-        assert!(t.on_membership(6, ip("239.1.1.1"), None, true, &rpf).is_empty());
+        assert!(t
+            .on_membership(6, ip("239.1.1.1"), None, true, &rpf)
+            .is_empty());
         // The first leaving still leaves one OIF ⇒ no prune yet.
-        assert!(t.on_membership(5, ip("239.1.1.1"), None, false, &rpf).is_empty());
+        assert!(t
+            .on_membership(5, ip("239.1.1.1"), None, false, &rpf)
+            .is_empty());
         // The last leaving prunes.
         assert_eq!(
             t.on_membership(6, ip("239.1.1.1"), None, false, &rpf).len(),

@@ -257,7 +257,7 @@ pub fn build_echo_v6(our: Ipv6Addr, discr: u32, seq: u64) -> Vec<u8> {
     pkt.push(255); // hop limit — survive the one forwarding hop
     pkt.extend_from_slice(&our.octets()); // source
     pkt.extend_from_slice(&our.octets()); // destination
-    // UDP header + payload.
+                                          // UDP header + payload.
     let udp_off = pkt.len();
     pkt.extend_from_slice(&ECHO_PORT.to_be_bytes()); // source port
     pkt.extend_from_slice(&ECHO_PORT.to_be_bytes()); // destination port
@@ -407,10 +407,16 @@ pub fn egress_for(peer: Ipv4Addr) -> Option<Egress> {
             continue;
         }
         // SAFETY: `ifa_name` is a valid NUL-terminated C string.
-        let name = unsafe { CStr::from_ptr(ifa.ifa_name) }.to_string_lossy().into_owned();
+        let name = unsafe { CStr::from_ptr(ifa.ifa_name) }
+            .to_string_lossy()
+            .into_owned();
         let ifindex = name_to_index(&name);
         if ifindex != 0 {
-            found = Some(Egress { ifindex, ifname: name, our_ip: Ipv4Addr::from(ip) });
+            found = Some(Egress {
+                ifindex,
+                ifname: name,
+                our_ip: Ipv4Addr::from(ip),
+            });
             break;
         }
     }
@@ -461,7 +467,9 @@ pub fn egress_for_v6(peer: Ipv6Addr, scope: u32) -> Option<EgressV6> {
         let ip = Ipv6Addr::from(addr.sin6_addr.s6_addr);
         let addr_ll = is_link_local_v6(&ip);
         // SAFETY: `ifa_name` is a valid NUL-terminated C string.
-        let name = unsafe { CStr::from_ptr(ifa.ifa_name) }.to_string_lossy().into_owned();
+        let name = unsafe { CStr::from_ptr(ifa.ifa_name) }
+            .to_string_lossy()
+            .into_owned();
         let ifindex = name_to_index(&name);
         if ifindex == 0 {
             continue;
@@ -475,7 +483,11 @@ pub fn egress_for_v6(peer: Ipv6Addr, scope: u32) -> Option<EgressV6> {
             !addr_ll && m != 0 && (u128::from(ip) & m) == (target & m)
         };
         if matches {
-            found = Some(EgressV6 { ifindex, ifname: name, our_ip: ip });
+            found = Some(EgressV6 {
+                ifindex,
+                ifname: name,
+                our_ip: ip,
+            });
             break;
         }
     }
@@ -492,7 +504,9 @@ fn is_link_local_v6(ip: &Ipv6Addr) -> bool {
 
 /// `if_nametoindex`, or 0 if the name is invalid or unknown.
 fn name_to_index(name: &str) -> u32 {
-    let Ok(cname) = CString::new(name) else { return 0 };
+    let Ok(cname) = CString::new(name) else {
+        return 0;
+    };
     // SAFETY: `cname` is a valid NUL-terminated string for the call's duration.
     unsafe { libc::if_nametoindex(cname.as_ptr()) }
 }
@@ -560,7 +574,11 @@ const NDMSG_LEN: usize = 12;
 pub fn neighbor_mac_v6(ifindex: u32, peer: Ipv6Addr) -> Option<[u8; 6]> {
     // SAFETY: a plain netlink socket; the fd is owned by `RawSock` and closed on drop.
     let fd = unsafe {
-        libc::socket(libc::AF_NETLINK, libc::SOCK_RAW | libc::SOCK_CLOEXEC, libc::NETLINK_ROUTE)
+        libc::socket(
+            libc::AF_NETLINK,
+            libc::SOCK_RAW | libc::SOCK_CLOEXEC,
+            libc::NETLINK_ROUTE,
+        )
     };
     if fd < 0 {
         return None;
@@ -688,7 +706,11 @@ mod tests {
 
     #[test]
     fn echo_roundtrips_through_build_and_parse() {
-        let pkt = build_echo(Ipv4Addr::new(10, 9, 0, 1), 0xdead_beef, 0x0102_0304_0506_0708);
+        let pkt = build_echo(
+            Ipv4Addr::new(10, 9, 0, 1),
+            0xdead_beef,
+            0x0102_0304_0506_0708,
+        );
         let (discr, seq) = parse_echo(&pkt).expect("our own packet must parse");
         assert_eq!(discr, 0xdead_beef);
         assert_eq!(seq, 0x0102_0304_0506_0708);
@@ -720,7 +742,8 @@ mod tests {
         // the IPv6 pseudo-header is folded in (a v4-style checksum would ignore them).
         let a = build_echo_v6("2001:db8::1".parse().unwrap(), 1, 1);
         let b = build_echo_v6("2001:db8::2".parse().unwrap(), 1, 1);
-        let udp_csum = |p: &[u8]| u16::from_be_bytes([p[IPV6_HEADER_LEN + 6], p[IPV6_HEADER_LEN + 7]]);
+        let udp_csum =
+            |p: &[u8]| u16::from_be_bytes([p[IPV6_HEADER_LEN + 6], p[IPV6_HEADER_LEN + 7]]);
         assert_ne!(udp_csum(&a), udp_csum(&b));
     }
 
@@ -758,7 +781,10 @@ mod tests {
 
     #[test]
     fn parses_arp_mac() {
-        assert_eq!(parse_mac("aa:bb:cc:dd:ee:ff"), Some([0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff]));
+        assert_eq!(
+            parse_mac("aa:bb:cc:dd:ee:ff"),
+            Some([0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff])
+        );
         assert_eq!(parse_mac("aa:bb:cc:dd:ee"), None);
         assert_eq!(parse_mac("aa:bb:cc:dd:ee:ff:00"), None);
     }

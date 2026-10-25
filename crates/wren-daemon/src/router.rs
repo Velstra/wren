@@ -382,7 +382,12 @@ async fn subscribe_routes(
     // backpressure to the router, but a new subscription is a rare operator
     // action.
     for route in exported.values() {
-        if sub.events.send(RouteEvent::Update(route.clone())).await.is_err() {
+        if sub
+            .events
+            .send(RouteEvent::Update(route.clone()))
+            .await
+            .is_err()
+        {
             return;
         }
     }
@@ -530,7 +535,11 @@ pub fn render_vrfs(rib: &Rib, vrfs: &[VrfInfo]) -> String {
         return "no vrfs configured\n".to_string();
     }
     let mut out = String::new();
-    let _ = writeln!(out, "{:<16} {:>8} {:<20} {:>6}", "vrf", "table", "rd", "routes");
+    let _ = writeln!(
+        out,
+        "{:<16} {:>8} {:<20} {:>6}",
+        "vrf", "table", "rd", "routes"
+    );
     for v in vrfs {
         let count = rib.iter_best().filter(|r| r.table == v.table).count();
         let _ = writeln!(
@@ -714,7 +723,10 @@ async fn program_fib(
                             remove_from_fib(fib, route.table, route.prefix, failed).await;
                             fanout(
                                 subscribers,
-                                RouteEvent::Withdraw { table: route.table, prefix: route.prefix },
+                                RouteEvent::Withdraw {
+                                    table: route.table,
+                                    prefix: route.prefix,
+                                },
                             );
                         }
                         return;
@@ -816,7 +828,13 @@ pub async fn reconcile_owned(
         if keep.contains(&(route.table, route.prefix)) {
             continue;
         }
-        match fib.apply(FibChange::Remove { table: route.table, prefix: route.prefix }).await {
+        match fib
+            .apply(FibChange::Remove {
+                table: route.table,
+                prefix: route.prefix,
+            })
+            .await
+        {
             Ok(()) => {
                 info!(
                     prefix = %route.prefix,
@@ -945,7 +963,10 @@ mod tests {
         );
         h.announce(connected.clone()).await;
         // Tracked in the RIB, never programmed: the kernel made it.
-        assert!(h.is_empty().await, "a connected route must not be programmed");
+        assert!(
+            h.is_empty().await,
+            "a connected route must not be programmed"
+        );
 
         h.feed(RouteUpdate::Withdraw {
             prefix: "10.0.0.0/24".parse().unwrap(),
@@ -956,7 +977,8 @@ mod tests {
         .await;
         // And the withdrawal must not have issued a delete for it either.
         assert!(
-            !h.failed.contains(&(wren_core::RT_TABLE_MAIN, "10.0.0.0/24".parse().unwrap())),
+            !h.failed
+                .contains(&(wren_core::RT_TABLE_MAIN, "10.0.0.0/24".parse().unwrap())),
             "removing a route we never installed must not even be attempted"
         );
         assert!(h.is_empty().await);
@@ -1095,14 +1117,19 @@ mod tests {
         .unwrap();
 
         let owned = fib.owned_routes().await.unwrap();
-        let keep: HashSet<(u32, Prefix)> =
-            [(wren_core::RT_TABLE_MAIN, still_wanted)].into_iter().collect();
+        let keep: HashSet<(u32, Prefix)> = [(wren_core::RT_TABLE_MAIN, still_wanted)]
+            .into_iter()
+            .collect();
         let removed = reconcile_owned(&fib, owned, &keep).await;
 
         assert_eq!(removed, 1);
         let remaining = fib.owned_routes().await.unwrap();
-        assert!(remaining.iter().any(|r| r.table == wren_core::RT_TABLE_MAIN && r.prefix == still_wanted));
-        assert!(!remaining.iter().any(|r| r.table == wren_core::RT_TABLE_MAIN && r.prefix == stale));
+        assert!(remaining
+            .iter()
+            .any(|r| r.table == wren_core::RT_TABLE_MAIN && r.prefix == still_wanted));
+        assert!(!remaining
+            .iter()
+            .any(|r| r.table == wren_core::RT_TABLE_MAIN && r.prefix == stale));
     }
 
     fn static_route(prefix: &str) -> Route {
@@ -1133,7 +1160,9 @@ mod tests {
     #[tokio::test]
     async fn redistribution_announces_sources_and_withdraws_others() {
         let (tx, mut rx) = mpsc::channel(16);
-        let sources: HashSet<Protocol> = [Protocol::Static, Protocol::Connected].into_iter().collect();
+        let sources: HashSet<Protocol> = [Protocol::Static, Protocol::Connected]
+            .into_iter()
+            .collect();
         let targets = vec![RedistTarget {
             protocol: Protocol::Bgp,
             sources,
@@ -1151,11 +1180,17 @@ mod tests {
         // A BGP route — the target's own protocol — is never re-announced; the
         // target is told to withdraw instead (loop prevention).
         redistribute(&targets, &RedistEvent::Changed(bgp_route("10.1.0.0/24", 0))).await;
-        assert!(matches!(rx.try_recv().unwrap(), Redistribution::Withdraw(_)));
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            Redistribution::Withdraw(_)
+        ));
 
         // A prefix going away withdraws everywhere.
         redistribute(&targets, &RedistEvent::Gone("10.0.0.0/24".parse().unwrap())).await;
-        assert!(matches!(rx.try_recv().unwrap(), Redistribution::Withdraw(_)));
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            Redistribution::Withdraw(_)
+        ));
     }
 
     #[tokio::test]
@@ -1179,10 +1214,16 @@ mod tests {
         }];
 
         redistribute(&targets, &RedistEvent::Changed(static_route("10.9.0.0/16"))).await;
-        assert!(matches!(rx.try_recv().unwrap(), Redistribution::Withdraw(_)));
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            Redistribution::Withdraw(_)
+        ));
 
         redistribute(&targets, &RedistEvent::Changed(static_route("8.8.8.0/24"))).await;
-        assert!(matches!(rx.try_recv().unwrap(), Redistribution::Announce(_)));
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            Redistribution::Announce(_)
+        ));
     }
 
     #[tokio::test]
@@ -1232,7 +1273,21 @@ mod tests {
             let mut rib = Rib::new();
             let fib = crate::fib::spawn(Box::new(MemoryFib::default()));
             let imports = ImportFilters::new();
-            run(&mut rib, &fib, urx, &imports, None, &[], &[], qrx, srx, &[], rrx, frrx).await;
+            run(
+                &mut rib,
+                &fib,
+                urx,
+                &imports,
+                None,
+                &[],
+                &[],
+                qrx,
+                srx,
+                &[],
+                rrx,
+                frrx,
+            )
+            .await;
         };
 
         let driver = async move {
@@ -1315,11 +1370,15 @@ mod tests {
         // the state a running daemon holds before a SIGHUP.
         let learned = bgp_route("203.0.113.0/24", 10);
         rib.update(learned.clone());
-        fib.apply(FibChange::Install(learned.clone())).await.unwrap();
+        fib.apply(FibChange::Install(learned.clone()))
+            .await
+            .unwrap();
         exported.insert((learned.table, learned.prefix), learned.clone());
         let old_static = static_route("10.0.0.0/24");
         rib.update(old_static.clone());
-        fib.apply(FibChange::Install(old_static.clone())).await.unwrap();
+        fib.apply(FibChange::Install(old_static.clone()))
+            .await
+            .unwrap();
         exported.insert((old_static.table, old_static.prefix), old_static.clone());
 
         let mut current: BTreeMap<(u32, Prefix), Route> = BTreeMap::new();
@@ -1434,14 +1493,24 @@ mod tests {
         )
         .await;
         let key = (wren_core::RT_TABLE_MAIN, "198.51.100.0/24".parse().unwrap());
-        assert!(fib.owned_routes().await.unwrap().is_empty(), "install should have failed");
-        assert!(failed.contains(&key), "failed prefix must be queued for retry");
+        assert!(
+            fib.owned_routes().await.unwrap().is_empty(),
+            "install should have failed"
+        );
+        assert!(
+            failed.contains(&key),
+            "failed prefix must be queued for retry"
+        );
 
         // The reconcile tick re-derives the desired state from the RIB and, now that
         // the kernel error has cleared, installs the route and clears the queue.
         retry_failed(&rib, &fib, None, &mut exported, &mut subs, &mut failed).await;
         assert!(
-            fib.owned_routes().await.unwrap().iter().any(|r| (r.table, r.prefix) == key),
+            fib.owned_routes()
+                .await
+                .unwrap()
+                .iter()
+                .any(|r| (r.table, r.prefix) == key),
             "route should self-heal"
         );
         assert!(failed.is_empty(), "queue must clear once the write lands");
@@ -1462,7 +1531,10 @@ mod tests {
         // RIB has no best path for the prefix → reconcile issues a remove and clears
         // the queue (MemoryFib remove of an absent key is a no-op success).
         retry_failed(&rib, &fib, None, &mut exported, &mut subs, &mut failed).await;
-        assert!(failed.is_empty(), "vanished prefix must leave the retry queue");
+        assert!(
+            failed.is_empty(),
+            "vanished prefix must leave the retry queue"
+        );
         assert!(fib.owned_routes().await.unwrap().is_empty());
     }
 
@@ -1478,7 +1550,8 @@ mod tests {
     impl Fib for CountingFib {
         fn apply(&mut self, change: &FibChange) -> Result<(), wren_core::FibError> {
             if matches!(change, FibChange::Install(_)) {
-                self.installs.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                self.installs
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
             self.inner.apply(change)
         }
@@ -1507,7 +1580,11 @@ mod tests {
         // Fold the whole burst into the RIB first, keeping the net change per prefix.
         let mut coalesced: BTreeMap<(u32, Prefix), FibChange> = BTreeMap::new();
         for metric in [30, 20, 10] {
-            if let Some(change) = ingest(&mut rib, RouteUpdate::Announce(bgp_route("203.0.113.0/24", metric)), &imports) {
+            if let Some(change) = ingest(
+                &mut rib,
+                RouteUpdate::Announce(bgp_route("203.0.113.0/24", metric)),
+                &imports,
+            ) {
                 coalesced.insert(fib_key(&change), change);
             }
         }
@@ -1525,7 +1602,11 @@ mod tests {
         let key = (wren_core::RT_TABLE_MAIN, "203.0.113.0/24".parse().unwrap());
         let installed = fib.owned_routes().await.unwrap();
         assert_eq!(
-            installed.iter().find(|r| (r.table, r.prefix) == key).unwrap().metric,
+            installed
+                .iter()
+                .find(|r| (r.table, r.prefix) == key)
+                .unwrap()
+                .metric,
             10,
             "final best path installed"
         );

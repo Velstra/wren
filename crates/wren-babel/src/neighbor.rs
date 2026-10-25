@@ -67,7 +67,11 @@ impl Neighbour {
                 // `gap` Hellos were missed before this one; shift them in as zeros,
                 // then mark this one received.
                 let shift = gap as u32 + 1;
-                self.history = if shift >= 16 { 1 } else { (self.history << shift) | 1 };
+                self.history = if shift >= 16 {
+                    1
+                } else {
+                    (self.history << shift) | 1
+                };
             } else {
                 // The seqno went backwards (reordering or a restart) — resync.
                 self.history = 1;

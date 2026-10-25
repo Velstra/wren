@@ -113,11 +113,11 @@ pub use evpn::{AFI_L2VPN, SAFI_EVPN};
 /// Subsequent Address Family Identifier: FlowSpec (RFC 8955) — re-exported from
 /// [`flowspec`]. Rides under AFI 1 (IPv4) and AFI 2 (IPv6).
 pub use flowspec::SAFI_FLOWSPEC;
+/// Address Family / SAFI for BGP-LS (RFC 7752) — re-exported from [`link_state`].
+pub use link_state::{AFI_LINK_STATE, SAFI_LINK_STATE};
 /// Subsequent Address Family Identifier: SR Policy (SAFI 73) — re-exported from
 /// [`sr_policy`]. Rides under AFI 1 (IPv4) and AFI 2 (IPv6) endpoints.
 pub use sr_policy::SAFI_SR_POLICY;
-/// Address Family / SAFI for BGP-LS (RFC 7752) — re-exported from [`link_state`].
-pub use link_state::{AFI_LINK_STATE, SAFI_LINK_STATE};
 
 /// The reserved 2-octet AS number that stands in for a 4-octet AS in any field a
 /// legacy (2-octet) speaker reads — the OPEN `my_as` and a 2-octet AS_PATH /
@@ -267,7 +267,13 @@ mod tests {
 
     #[test]
     fn prefix_roundtrips_at_byte_boundaries() {
-        for s in ["0.0.0.0/0", "10.0.0.0/8", "192.168.0.0/16", "203.0.113.0/24", "198.51.100.7/32"] {
+        for s in [
+            "0.0.0.0/0",
+            "10.0.0.0/8",
+            "192.168.0.0/16",
+            "203.0.113.0/24",
+            "198.51.100.7/32",
+        ] {
             let mut buf = Vec::new();
             encode_prefix(&mut buf, &p(s));
             let (decoded, used) = decode_prefix(&buf).expect("decodes");
@@ -301,7 +307,12 @@ mod tests {
 
     #[test]
     fn ipv6_prefix_roundtrips_via_any_codec() {
-        for s in ["::/0", "2001:db8::/32", "2001:db8:99::/64", "2001:db8::1/128"] {
+        for s in [
+            "::/0",
+            "2001:db8::/32",
+            "2001:db8:99::/64",
+            "2001:db8::1/128",
+        ] {
             let mut buf = Vec::new();
             encode_prefix_any(&mut buf, &p(s));
             let (decoded, used) = decode_prefix_v6(&buf).expect("decodes");
@@ -311,7 +322,10 @@ mod tests {
         // A /64 takes the length octet plus 8 address octets, no more.
         let mut buf = Vec::new();
         encode_prefix_any(&mut buf, &p("2001:db8:99::/64"));
-        assert_eq!(buf, vec![64, 0x20, 0x01, 0x0d, 0xb8, 0x00, 0x99, 0x00, 0x00]);
+        assert_eq!(
+            buf,
+            vec![64, 0x20, 0x01, 0x0d, 0xb8, 0x00, 0x99, 0x00, 0x00]
+        );
     }
 
     #[test]

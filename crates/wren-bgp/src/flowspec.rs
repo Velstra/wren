@@ -58,7 +58,13 @@ pub struct NumOp {
 impl NumOp {
     /// An `= value` term (the common case), OR-joined to any previous term.
     pub fn eq(value: u64) -> NumOp {
-        NumOp { and: false, lt: false, gt: false, eq: true, value }
+        NumOp {
+            and: false,
+            lt: false,
+            gt: false,
+            eq: true,
+            value,
+        }
     }
 }
 
@@ -534,10 +540,24 @@ mod tests {
     fn numeric_op_range_roundtrips() {
         // dport >= 1024 AND <= 2048 : two AND-joined terms.
         let ops = vec![
-            NumOp { and: false, lt: false, gt: true, eq: true, value: 1024 },
-            NumOp { and: true, lt: true, gt: false, eq: true, value: 2048 },
+            NumOp {
+                and: false,
+                lt: false,
+                gt: true,
+                eq: true,
+                value: 1024,
+            },
+            NumOp {
+                and: true,
+                lt: true,
+                gt: false,
+                eq: true,
+                value: 2048,
+            },
         ];
-        let fs = FlowSpec { components: vec![Component::DestPort(ops.clone())] };
+        let fs = FlowSpec {
+            components: vec![Component::DestPort(ops.clone())],
+        };
         let mut buf = Vec::new();
         fs.encode(&mut buf);
         let (back, _) = FlowSpec::decode(&buf).unwrap();
@@ -564,7 +584,9 @@ mod tests {
 
     #[test]
     fn two_octet_value_uses_two_byte_length() {
-        let fs = FlowSpec { components: vec![Component::DestPort(vec![NumOp::eq(8080)])] };
+        let fs = FlowSpec {
+            components: vec![Component::DestPort(vec![NumOp::eq(8080)])],
+        };
         let mut buf = Vec::new();
         fs.encode(&mut buf);
         // body: type(1) + op(1) + value(2) = 4 ; length prefix 1 ; total 5

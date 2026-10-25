@@ -63,14 +63,20 @@ pub async fn run(cfg: RtrConfig, roas_tx: mpsc::Sender<Vec<Roa>>) {
 async fn session(cfg: &RtrConfig, roas_tx: &mpsc::Sender<Vec<Roa>>) -> std::io::Result<()> {
     let stream = timeout(CONNECT_TIMEOUT, TcpStream::connect(cfg.server))
         .await
-        .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "RTR connect timed out"))??;
+        .map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::TimedOut, "RTR connect timed out")
+        })??;
     info!(server = %cfg.server, "RTR connected to validating cache");
     let (mut rd, mut wr) = stream.into_split();
 
     let mut roas: BTreeSet<Roa> = BTreeSet::new();
     let mut session_id: u16 = 0;
     let mut serial: u32 = 0;
-    let mut refresh = cfg.refresh.map(u64::from).unwrap_or(DEFAULT_REFRESH_SECS).max(1);
+    let mut refresh = cfg
+        .refresh
+        .map(u64::from)
+        .unwrap_or(DEFAULT_REFRESH_SECS)
+        .max(1);
 
     // Pull the entire current ROA set to start.
     wr.write_all(&Pdu::ResetQuery.encode()).await?;
@@ -98,7 +104,12 @@ async fn session(cfg: &RtrConfig, roas_tx: &mpsc::Sender<Vec<Roa>>) -> std::io::
                     }
                 }
             }
-            Pdu::EndOfData { session_id: sid, serial: s, refresh: rf, .. } => {
+            Pdu::EndOfData {
+                session_id: sid,
+                serial: s,
+                refresh: rf,
+                ..
+            } => {
                 session_id = sid;
                 serial = s;
                 if rf > 0 {
@@ -117,7 +128,8 @@ async fn session(cfg: &RtrConfig, roas_tx: &mpsc::Sender<Vec<Roa>>) -> std::io::
             }
             // A new serial is available: ask for the delta now.
             Pdu::SerialNotify { .. } => {
-                wr.write_all(&Pdu::SerialQuery { session_id, serial }.encode()).await?;
+                wr.write_all(&Pdu::SerialQuery { session_id, serial }.encode())
+                    .await?;
             }
             Pdu::ErrorReport { code } => {
                 warn!(server = %cfg.server, code, "RTR cache reported an error");
@@ -135,12 +147,16 @@ async fn read_pdu(rd: &mut OwnedReadHalf) -> std::io::Result<Pdu> {
     rd.read_exact(&mut hdr).await?;
     let len = pdu_length(&hdr).expect("8-byte header has a length") as usize;
     if !(HEADER_LEN..=MAX_PDU_LEN).contains(&len) {
-        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "bad RTR PDU length"));
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "bad RTR PDU length",
+        ));
     }
     let mut buf = vec![0u8; len];
     buf[..HEADER_LEN].copy_from_slice(&hdr);
     if len > HEADER_LEN {
         rd.read_exact(&mut buf[HEADER_LEN..]).await?;
     }
-    Pdu::decode(&buf).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))
+    Pdu::decode(&buf)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))
 }

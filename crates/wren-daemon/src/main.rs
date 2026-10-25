@@ -23,23 +23,23 @@ mod fib;
 mod igmp;
 #[cfg(feature = "isis")]
 mod isis;
+mod metrics;
 #[cfg(feature = "igmp")]
 mod mld;
-mod metrics;
 #[cfg(feature = "pim")]
 mod mroute;
-#[cfg(feature = "pim")]
-mod pim;
 #[cfg(feature = "ospf")]
 mod ospf;
 #[cfg(feature = "ospf3")]
 mod ospf3;
+#[cfg(feature = "pim")]
+mod pim;
 mod query;
+mod reload;
 #[cfg(feature = "rip")]
 mod rip;
 #[cfg(feature = "rip")]
 mod ripng;
-mod reload;
 mod router;
 mod rtr;
 #[cfg(feature = "vrrp")]
@@ -608,7 +608,8 @@ async fn main() -> Result<()> {
     #[cfg(feature = "pim")]
     let mut pim_queries_rx = Some(pim_queries_rx);
     #[cfg(feature = "pim")]
-    let (pim_membership_tx, pim_membership_rx) = mpsc::channel::<igmp::MembershipUpdate>(QUERY_QUEUE);
+    let (pim_membership_tx, pim_membership_rx) =
+        mpsc::channel::<igmp::MembershipUpdate>(QUERY_QUEUE);
     #[cfg(feature = "pim")]
     let mut pim_membership_rx = Some(pim_membership_rx);
     {
@@ -1045,7 +1046,9 @@ async fn main() -> Result<()> {
                 let bdrx = babel_bfd_rx.take().expect("babel bfd rx taken once");
                 let sd = supervisor.mark_started("babel", babel_sig(&cfg));
                 proto_handles.push(tokio::spawn(async move {
-                    if let Err(e) = babel::run(run_cfg, tx, redist_rx, qrx, breg, bnotify, bdrx, sd).await {
+                    if let Err(e) =
+                        babel::run(run_cfg, tx, redist_rx, qrx, breg, bnotify, bdrx, sd).await
+                    {
                         error!(error = %e, "Babel engine stopped");
                     }
                 }));
@@ -1101,7 +1104,9 @@ async fn main() -> Result<()> {
             match build_pim_config(mccfg) {
                 Ok(run_cfg) => {
                     let sd = shutdown_tx.subscribe();
-                    let mrx = pim_membership_rx.take().expect("pim membership rx taken once");
+                    let mrx = pim_membership_rx
+                        .take()
+                        .expect("pim membership rx taken once");
                     let qrx = pim_queries_rx.take().expect("pim queries rx taken once");
                     proto_handles.push(tokio::spawn(async move {
                         if let Err(e) = pim::run(run_cfg, mrx, qrx, sd).await {
@@ -1459,8 +1464,7 @@ async fn main() -> Result<()> {
     // (protocol goodbyes, and VRRP relinquishing mastership + releasing its VIP), so
     // a backup only takes over on the master-down timeout. Install it alongside
     // SIGINT; a failure just leaves SIGINT as the only graceful path.
-    let mut term = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-    {
+    let mut term = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
         Ok(s) => Some(s),
         Err(e) => {
             warn!(error = %e, "cannot install SIGTERM handler; only SIGINT/Ctrl-C will shut down");
@@ -1663,8 +1667,12 @@ fn build_ospf_config(
         iface_type,
         priority: ospf.router_priority.unwrap_or(1),
         cost: ospf.cost.unwrap_or(10),
-        hello_interval: ospf.hello_interval.unwrap_or(wren_ospf::DEFAULT_HELLO_INTERVAL),
-        dead_interval: ospf.dead_interval.unwrap_or(wren_ospf::DEFAULT_DEAD_INTERVAL),
+        hello_interval: ospf
+            .hello_interval
+            .unwrap_or(wren_ospf::DEFAULT_HELLO_INTERVAL),
+        dead_interval: ospf
+            .dead_interval
+            .unwrap_or(wren_ospf::DEFAULT_DEAD_INTERVAL),
         interfaces,
         passive_interfaces: ospf.passive_interfaces.iter().cloned().collect(),
         redistribute,
@@ -2035,8 +2043,8 @@ struct ReloadedConfig {
 /// one. Only neighbour add/remove is acted on by the caller; the rest of the BGP config
 /// is not live-reconfigured.
 fn reload_config(path: &std::path::Path) -> Result<ReloadedConfig> {
-    let cfg = wren_config::Config::load(path)
-        .with_context(|| format!("reading {}", path.display()))?;
+    let cfg =
+        wren_config::Config::load(path).with_context(|| format!("reading {}", path.display()))?;
     let by_name = compile_named_filters(&cfg).context("compiling filters")?;
     let imports = resolve_import_filters(&cfg, &by_name).context("resolving import filters")?;
     let fib_export = resolve_fib_export(&cfg, &by_name).context("resolving export filters")?;
@@ -2297,9 +2305,9 @@ fn build_bgp_config(
         };
         // BGP Role (RFC 9234 §4): the local speaker's role toward this neighbour.
         let role = match n.role.as_deref() {
-            Some(s) => Some(parse_bgp_role(s).with_context(|| {
-                format!("bgp neighbor {addr} role {s:?}")
-            })?),
+            Some(s) => {
+                Some(parse_bgp_role(s).with_context(|| format!("bgp neighbor {addr} role {s:?}"))?)
+            }
             None => None,
         };
         // ebgp-multihop (raised session TTL) and ttl-security (GTSM) drive the TTL in
@@ -2318,9 +2326,9 @@ fn build_bgp_config(
         // must match the neighbour's transport address (a v4 neighbour needs a v4 source).
         let update_source = match &n.update_source {
             Some(s) => {
-                let src: std::net::IpAddr = s
-                    .parse()
-                    .with_context(|| format!("bgp neighbor {addr} update-source {s:?} must be an IP address"))?;
+                let src: std::net::IpAddr = s.parse().with_context(|| {
+                    format!("bgp neighbor {addr} update-source {s:?} must be an IP address")
+                })?;
                 if src.is_ipv4() != addr.is_ipv4() {
                     anyhow::bail!(
                         "bgp neighbor {addr} update-source {s:?} address family must match the neighbour's"
@@ -2536,13 +2544,13 @@ fn build_srpolicy(
     wren_bgp::sr_policy::SrPolicyNlri,
     wren_bgp::sr_policy::SrPolicyEncoding,
 )> {
-    use wren_bgp::sr_policy::{
-        BindingSid, Segment, SegmentList, SrPolicyEncoding, SrPolicyNlri,
-    };
-    let endpoint: std::net::IpAddr = p
-        .endpoint
-        .parse()
-        .with_context(|| format!("bgp srpolicy endpoint {:?} must be an IP address", p.endpoint))?;
+    use wren_bgp::sr_policy::{BindingSid, Segment, SegmentList, SrPolicyEncoding, SrPolicyNlri};
+    let endpoint: std::net::IpAddr = p.endpoint.parse().with_context(|| {
+        format!(
+            "bgp srpolicy endpoint {:?} must be an IP address",
+            p.endpoint
+        )
+    })?;
     let nlri = SrPolicyNlri {
         color: p.color,
         endpoint,
@@ -2559,7 +2567,8 @@ fn build_srpolicy(
     };
     let mut segments = Vec::with_capacity(p.segment_list.len());
     for s in &p.segment_list {
-        segments.push(parse_sid_or_label(s).with_context(|| format!("bgp srpolicy segment {s:?}"))?);
+        segments
+            .push(parse_sid_or_label(s).with_context(|| format!("bgp srpolicy segment {s:?}"))?);
     }
     let encoding = SrPolicyEncoding {
         preference: p.preference,
@@ -2619,10 +2628,12 @@ fn build_link_state(
         "ospfv3" => 6,
         other => anyhow::bail!("bgp link-state protocol {other:?} is unknown"),
     };
-    let router_id: Ipv4Addr = o
-        .router_id
-        .parse()
-        .with_context(|| format!("bgp link-state router-id {:?} must be a dotted quad", o.router_id))?;
+    let router_id: Ipv4Addr = o.router_id.parse().with_context(|| {
+        format!(
+            "bgp link-state router-id {:?} must be a dotted quad",
+            o.router_id
+        )
+    })?;
     // Build a Node Descriptors TLV (256 local / 257 remote) from an IGP Router-ID and
     // optional AS.
     let node_descriptors = |rid: Ipv4Addr, as_num: Option<u32>, typ: u16| -> LsTlv {
@@ -2660,11 +2671,17 @@ fn build_link_state(
             // Link descriptors: IPv4 interface (259) / neighbor (260) addresses.
             if let Some(a) = &o.local_interface {
                 let ip: Ipv4Addr = a.parse().context("bgp link-state local-interface")?;
-                descriptors.push(LsTlv { typ: 259, value: ip.octets().to_vec() });
+                descriptors.push(LsTlv {
+                    typ: 259,
+                    value: ip.octets().to_vec(),
+                });
             }
             if let Some(a) = &o.remote_interface {
                 let ip: Ipv4Addr = a.parse().context("bgp link-state remote-interface")?;
-                descriptors.push(LsTlv { typ: 260, value: ip.octets().to_vec() });
+                descriptors.push(LsTlv {
+                    typ: 260,
+                    value: ip.octets().to_vec(),
+                });
             }
             LsObjectKind::Link
         }
@@ -2683,7 +2700,10 @@ fn build_link_state(
             };
             let mut value = vec![p.len()];
             value.extend_from_slice(&bytes);
-            descriptors.push(LsTlv { typ: TLV_IP_REACHABILITY, value });
+            descriptors.push(LsTlv {
+                typ: TLV_IP_REACHABILITY,
+                value,
+            });
             if p.addr().is_ipv6() {
                 LsObjectKind::Ipv6Prefix
             } else {
@@ -2852,8 +2872,7 @@ fn build_evpn_config(
         }
         let router_mac = match &v.router_mac {
             Some(s) => Some(
-                parse_mac(s)
-                    .with_context(|| format!("bgp evpn ip-vrf {} router-mac", v.name))?,
+                parse_mac(s).with_context(|| format!("bgp evpn ip-vrf {} router-mac", v.name))?,
             ),
             // RFC 9136 §4.4.1 requires the Router's MAC "if the route is associated
             // with an Ethernet NVO tunnel" — a VXLAN receiver has no other source
@@ -2924,7 +2943,9 @@ fn build_flowspec_config(f: &wren_config::BgpFlowSpec) -> Result<bgp::FlowSpecCo
                 .parse()
                 .with_context(|| format!("bgp flowspec rule {i} dest {d:?} must be addr/len"))?;
             if !p.is_ipv4() {
-                anyhow::bail!("bgp flowspec rule {i} dest {d:?}: only IPv4 flow rules are supported");
+                anyhow::bail!(
+                    "bgp flowspec rule {i} dest {d:?}: only IPv4 flow rules are supported"
+                );
             }
             components.push(Component::DestPrefix(p));
         }
@@ -3157,7 +3178,8 @@ fn build_pim_config(mc: &wren_config::Multicast) -> Result<pim::PimConfig> {
         interfaces,
         rp,
         hello_interval: std::time::Duration::from_secs(
-            p.hello_interval.unwrap_or(wren_pim::DEFAULT_HELLO_PERIOD_SECS) as u64,
+            p.hello_interval
+                .unwrap_or(wren_pim::DEFAULT_HELLO_PERIOD_SECS) as u64,
         ),
     })
 }
@@ -3595,7 +3617,10 @@ mod tests {
         .expect("resolves");
         let p = &resolved.peers[0];
         assert_eq!(p.local_as, Some(65099));
-        assert_eq!(p.update_source, Some(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 9))));
+        assert_eq!(
+            p.update_source,
+            Some(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 9)))
+        );
         assert_eq!(p.ebgp_multihop, Some(5));
         assert_eq!(p.description.as_deref(), Some("transit"));
         assert!(p.shutdown);
@@ -3618,7 +3643,8 @@ mod tests {
             ebgp-multihop = 4
             "#,
         )
-        .err().expect("must reject both");
+        .err()
+        .expect("must reject both");
         assert!(err.to_string().contains("ttl-security"));
         assert!(err.to_string().contains("ebgp-multihop"));
     }
@@ -3638,7 +3664,8 @@ mod tests {
             update-source = "2001:db8::9"
             "#,
         )
-        .err().expect("family mismatch rejected");
+        .err()
+        .expect("family mismatch rejected");
         assert!(err.to_string().contains("address family"));
     }
 
@@ -3656,7 +3683,8 @@ mod tests {
             local-as = 0
             "#,
         )
-        .err().expect("zero local-as rejected");
+        .err()
+        .expect("zero local-as rejected");
         assert!(err.to_string().contains("local-as"));
     }
 
@@ -3701,7 +3729,10 @@ mod tests {
             vec![wren_bgp::evpn_rib::auto_route_target(65001, 50100)]
         );
         assert_eq!(vrf.rt_export, vrf.rt_import);
-        assert_eq!(vrf.rd, wren_bgp::evpn::Rd::from_ip("10.0.0.1".parse().unwrap(), 50100));
+        assert_eq!(
+            vrf.rd,
+            wren_bgp::evpn::Rd::from_ip("10.0.0.1".parse().unwrap(), 50100)
+        );
         assert!(vrf.prefixes.is_empty());
         assert_eq!(vrf.router_mac, None);
     }

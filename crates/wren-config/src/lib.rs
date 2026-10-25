@@ -1479,21 +1479,21 @@ impl Config {
                 Vec::new()
             } else {
                 vec![match (&s.via, &s.dev) {
-                (Some(via), dev) => {
-                    let gw: IpAddr = via.parse().map_err(|_| {
-                        ConfigError::Invalid(format!("static via {via:?} is not an IP address"))
-                    })?;
-                    match dev {
-                        Some(d) => NextHop::via_dev(gw, d.clone()),
-                        None => NextHop::via(gw),
+                    (Some(via), dev) => {
+                        let gw: IpAddr = via.parse().map_err(|_| {
+                            ConfigError::Invalid(format!("static via {via:?} is not an IP address"))
+                        })?;
+                        match dev {
+                            Some(d) => NextHop::via_dev(gw, d.clone()),
+                            None => NextHop::via(gw),
+                        }
                     }
-                }
-                (None, Some(dev)) => NextHop::dev(dev.clone()),
-                (None, None) => {
-                    return Err(ConfigError::Invalid(format!(
-                        "static route {prefix} needs `via`, `dev` or `blackhole`"
-                    )))
-                }
+                    (None, Some(dev)) => NextHop::dev(dev.clone()),
+                    (None, None) => {
+                        return Err(ConfigError::Invalid(format!(
+                            "static route {prefix} needs `via`, `dev` or `blackhole`"
+                        )))
+                    }
                 }]
             };
             let mut route = Route::new(prefix, Protocol::Static, nexthops, s.metric);
@@ -1942,7 +1942,7 @@ mod tests {
         let bgp = cfg.bgp.expect("bgp present");
         assert!(bgp.neighbor[0].add_path);
         assert!(!bgp.neighbor[0].extended_nexthop); // unrelated, defaults false
-        // Defaults to false when unset.
+                                                    // Defaults to false when unset.
         let cfg2 = Config::from_toml(
             r#"
             router-id = "10.0.0.1"
@@ -2104,7 +2104,10 @@ distance = 254
             "[[static]]\nprefix = \"203.0.113.0/24\"\nblackhole = true\nvia = \"192.0.2.1\"\n",
         )
         .expect("parses");
-        assert!(both.static_routes().is_err(), "blackhole + via was accepted");
+        assert!(
+            both.static_routes().is_err(),
+            "blackhole + via was accepted"
+        );
     }
 
     #[test]
@@ -2418,7 +2421,11 @@ distance = 254
             "router-id = \"10.0.0.1\"\n[ospf]\nenabled = true\ninterfaces = [\"eth1\"]\n",
         )
         .expect("valid config");
-        assert!(cfg.ospf.expect("ospf present").passive_interfaces.is_empty());
+        assert!(cfg
+            .ospf
+            .expect("ospf present")
+            .passive_interfaces
+            .is_empty());
     }
 
     #[test]
@@ -2496,9 +2503,15 @@ distance = 254
         assert_eq!(cfg.vrf_table("nope"), None);
         let routes = cfg.static_routes().expect("static routes");
         // The VRF static lands in table 100; the plain one stays in the main table.
-        let in_vrf = routes.iter().find(|r| r.prefix.to_string() == "10.9.0.0/24").unwrap();
+        let in_vrf = routes
+            .iter()
+            .find(|r| r.prefix.to_string() == "10.9.0.0/24")
+            .unwrap();
         assert_eq!(in_vrf.table, 100);
-        let in_main = routes.iter().find(|r| r.prefix.to_string() == "10.8.0.0/24").unwrap();
+        let in_main = routes
+            .iter()
+            .find(|r| r.prefix.to_string() == "10.8.0.0/24")
+            .unwrap();
         assert_eq!(in_main.table, wren_core::RT_TABLE_MAIN);
     }
 

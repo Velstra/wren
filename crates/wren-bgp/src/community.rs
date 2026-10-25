@@ -61,7 +61,10 @@ mod tests {
     fn parses_well_known_names_case_insensitively() {
         assert_eq!(parse_community("no-export"), Some(NO_EXPORT));
         assert_eq!(parse_community("NO-ADVERTISE"), Some(NO_ADVERTISE));
-        assert_eq!(parse_community("No-Export-Subconfed"), Some(NO_EXPORT_SUBCONFED));
+        assert_eq!(
+            parse_community("No-Export-Subconfed"),
+            Some(NO_EXPORT_SUBCONFED)
+        );
     }
 
     #[test]
@@ -79,7 +82,13 @@ mod tests {
 
     #[test]
     fn formats_round_trip() {
-        for s in ["65001:100", "no-export", "no-advertise", "no-export-subconfed", "0:42"] {
+        for s in [
+            "65001:100",
+            "no-export",
+            "no-advertise",
+            "no-export-subconfed",
+            "0:42",
+        ] {
             let c = parse_community(s).unwrap();
             assert_eq!(parse_community(&format_community(c)), Some(c));
         }
