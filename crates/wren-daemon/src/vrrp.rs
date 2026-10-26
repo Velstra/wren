@@ -446,7 +446,11 @@ pub async fn run_ha(
                     match result {
                         Ok(Ok(())) if rekey_term==role.authority.term => role.vpn_ready=true,
                         Ok(Ok(())) => {},
-                        _ => {warn!("HA VPN reconstruction failed; relinquishing authority");vpn_failed_until=now.saturating_add(1_000_000_000);role.deadline_ns=0;role.vpn_ready=false;}
+                        failure => {
+                            if let Ok(Err(error)) = failure {warn!(error=format_args!("{error:#}"),"HA VPN reconstruction failed; relinquishing authority");}
+                            else {warn!("HA VPN reconstruction task failed; relinquishing authority");}
+                            vpn_failed_until=now.saturating_add(1_000_000_000);role.deadline_ns=0;role.vpn_ready=false;
+                        }
                     }
                 }
                 let agent = wren_ha::read_private::<Agent>(Path::new(AGENT_PATH)).ok()

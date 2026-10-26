@@ -185,7 +185,9 @@ pub async fn promote(config: Config, role: Role) -> Result<()> {
             {
                 saved.config
             }
-            _ => command(&["showconf", interface], None).await?,
+            _ => command(&["showconf", interface], None)
+                .await
+                .context("reading current WireGuard configuration")?,
         };
         let promoted = promotion_config(&original, interface, cache.as_ref())?;
         // Store the endpoint-adjusted policy with its original keepalive intent.
@@ -204,9 +206,15 @@ pub async fn promote(config: Config, role: Role) -> Result<()> {
             .split("[Peer]")
             .next()
             .context("missing WireGuard interface")?;
-        command(&["setconf", interface, "/dev/stdin"], Some(interface_only)).await?;
-        command(&["setconf", interface, "/dev/stdin"], Some(&promoted)).await?;
-        command(&["syncconf", interface, "/dev/stdin"], Some(&restored)).await?;
+        command(&["setconf", interface, "/dev/stdin"], Some(interface_only))
+            .await
+            .context("clearing prior WireGuard sessions")?;
+        command(&["setconf", interface, "/dev/stdin"], Some(&promoted))
+            .await
+            .context("installing promotion WireGuard configuration")?;
+        command(&["syncconf", interface, "/dev/stdin"], Some(&restored))
+            .await
+            .context("restoring WireGuard keepalive intent")?;
         std::fs::remove_file(recovery_path)?;
     }
     Ok(())
