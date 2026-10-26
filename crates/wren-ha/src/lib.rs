@@ -1,6 +1,16 @@
 //! A single durable witness serializes forwarding authority. Leases expire on
 //! CLOCK_BOOTTIME, including suspend; dataplanes must enforce the corresponding
 //! absolute local deadline in the kernel. Authentication does not encrypt metadata.
+//!
+//! Timing is a budget, not a set of independent knobs. A member's lease is
+//! valid locally from the instant it *started* connecting, minus a margin, so
+//! the round trips to the witness are spent out of the lease itself. One
+//! exchange costs roughly three round trips (connect, nonce/tag, request/reply)
+//! and is abandoned after `io_ms`; the lease must survive one abandoned exchange
+//! plus the coordinator's poll before the next one: `2·io + poll + margin ≤
+//! lease`. The defaults (250 ms lease, 80 ms I/O) therefore need a witness
+//! round trip below roughly 25 ms; a distant witness needs a longer lease and
+//! I/O budget, configured identically on both members and the witness.
 pub mod wireguard;
 use anyhow::{ensure, Context, Result};
 use ring::{
@@ -11,7 +21,7 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::{
     fs::{File, OpenOptions},
     io::Write,
-    net::SocketAddr,
+    net::{IpAddr, SocketAddr},
     os::{
         fd::AsRawFd,
         unix::fs::{MetadataExt, OpenOptionsExt},
@@ -23,17 +33,59 @@ use std::{
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
-    sync::{Mutex, Semaphore},
+    sync::{Mutex, OwnedSemaphorePermit, Semaphore},
     time::timeout,
 };
 
 pub const ROLE_PATH: &str = "/run/velstra/ha/role.json";
 pub const AGENT_PATH: &str = "/run/velstra/ha/agent.json";
+/// Default lease. Configurable, see [`check_budget`].
 pub const TTL_MS: u64 = 250;
 pub const MARGIN_MS: u64 = 20;
 pub const FRESH_NS: u64 = 100_000_000;
+/// Default bound on one complete witness exchange.
+pub const IO_MS: u64 = 80;
+/// The coordinator's renewal cadence; part of the lease budget.
+pub const POLL_MS: u64 = 25;
+/// No configuration can make a lost member keep its authority for longer.
+pub const MAX_LEASE_MS: u64 = 10_000;
+/// How long the witness must have heard nothing from one member before it
+/// lets the other, cold member open a new empty epoch alone.
+pub const PEER_SILENCE_MS: u64 = 10_000;
+/// Concurrent sessions each configured member may hold. The coordinator runs
+/// one exchange at a time; the rest absorbs exchanges it abandoned that the
+/// witness has not yet timed out.
+const MEMBER_PERMITS: usize = 8;
+/// Unrestricted (legacy) witnesses share one pool across every source.
+const SHARED_PERMITS: usize = 64;
 const LIMIT: usize = 4096;
-const IO: Duration = Duration::from_millis(80);
+fn default_lease_ms() -> u64 {
+    TTL_MS
+}
+fn default_io_ms() -> u64 {
+    IO_MS
+}
+fn default_peer_silence_ms() -> u64 {
+    PEER_SILENCE_MS
+}
+
+/// A lease that cannot outlive one abandoned exchange plus the next poll
+/// would expire between two healthy renewals: the owner would flap, or never
+/// hold authority at all behind a slow witness link.
+pub fn check_budget(lease_ms: u64, io_ms: u64) -> Result<()> {
+    ensure!(
+        (1..=MAX_LEASE_MS).contains(&lease_ms) && io_ms > 0,
+        "HA lease must be 1..={MAX_LEASE_MS} ms and the witness I/O budget nonzero"
+    );
+    ensure!(
+        2 * io_ms + POLL_MS + MARGIN_MS <= lease_ms,
+        "HA witness I/O budget {io_ms} ms does not fit a {lease_ms} ms lease: \
+         2 x I/O + {POLL_MS} ms poll + {MARGIN_MS} ms margin must not exceed the lease \
+         (an I/O budget of {io_ms} ms needs a lease of at least {} ms)",
+        2 * io_ms + POLL_MS + MARGIN_MS
+    );
+    Ok(())
+}
 
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -49,9 +101,17 @@ pub struct Config {
     pub wireguard: Vec<String>,
     #[serde(default)]
     pub wireguard_policy: String,
+    /// The longest local lease this member honours; a longer witness grant is
+    /// cut to it. Set it equal to the witness's lease.
+    #[serde(default = "default_lease_ms")]
+    pub lease_ms: u64,
+    /// Bound on one complete witness exchange, round trips included.
+    #[serde(default = "default_io_ms")]
+    pub io_ms: u64,
 }
 impl Config {
     pub fn validate(&self) -> Result<()> {
+        check_budget(self.lease_ms, self.io_ms)?;
         ensure!((1..=2).contains(&self.node), "HA node must be 1 or 2");
         ensure!(
             (16..=128).contains(&self.cluster.len())
@@ -90,9 +150,42 @@ impl Config {
 #[serde(deny_unknown_fields)]
 pub struct WitnessConfig {
     pub cluster: String,
+    /// The derived witness key, never the members' enrollment credential.
     pub secret: String,
     pub listen: SocketAddr,
     pub state: PathBuf,
+    /// The two members' source addresses. Any other source is closed before
+    /// it can occupy a session; empty keeps the legacy unrestricted listener.
+    #[serde(default)]
+    pub members: Vec<IpAddr>,
+    #[serde(default = "default_lease_ms")]
+    pub lease_ms: u64,
+    #[serde(default = "default_peer_silence_ms")]
+    pub peer_silence_ms: u64,
+}
+impl WitnessConfig {
+    pub fn validate(&self) -> Result<()> {
+        ensure!(
+            (1..=MAX_LEASE_MS).contains(&self.lease_ms) && self.lease_ms > MARGIN_MS,
+            "witness lease must be {}..={MAX_LEASE_MS} ms",
+            MARGIN_MS + 1
+        );
+        // Silence only decides when warm state is presumed lost, never who
+        // may forward (lease expiry does that), but it must be long enough
+        // that a member which merely missed a few renewals is not presumed dead.
+        ensure!(
+            self.peer_silence_ms >= 1_000 && self.peer_silence_ms >= 4 * self.lease_ms,
+            "witness peer silence must be at least 1000 ms and four leases"
+        );
+        ensure!(
+            self.members.is_empty()
+                || self.members.len() == 2
+                    && canonical(self.members[0]) != canonical(self.members[1])
+                    && self.members.iter().all(|m| !m.is_unspecified()),
+            "witness members must be the two distinct member addresses"
+        );
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
@@ -248,6 +341,11 @@ struct Durable {
     authority: Authority,
     #[serde(default)]
     claim: Claim,
+    /// The lease length this witness grants. A restarted witness quarantines
+    /// for the longer of this and its new setting, so shortening the lease
+    /// across a restart cannot cut an outstanding grant short.
+    #[serde(default = "default_lease_ms")]
+    lease_ms: u64,
 }
 type ColdVote = ([u8; 16], [u8; 32], u64);
 struct Engine {
@@ -259,18 +357,38 @@ struct Engine {
     preferred: Option<(u8, u8, u64)>,
     cold: [Option<ColdVote>; 2],
     claim: Claim,
+    lease_ns: u64,
+    silence_ns: u64,
+    /// The last authenticated request from each member, or this witness's own
+    /// start: silence it did not observe is never presumed.
+    heard: [u64; 2],
 }
 impl Engine {
+    #[cfg(test)]
     fn new(cluster: String, previous: Authority, now: u64) -> Self {
+        Self::configured(cluster, previous, TTL_MS, TTL_MS, PEER_SILENCE_MS, now)
+    }
+    fn configured(
+        cluster: String,
+        previous: Authority,
+        recorded_lease_ms: u64,
+        lease_ms: u64,
+        silence_ms: u64,
+        now: u64,
+    ) -> Self {
+        let outstanding = recorded_lease_ms.max(lease_ms);
         Self {
             cluster,
             authority: previous,
             expiry: 0,
-            quarantine: now.saturating_add((TTL_MS + MARGIN_MS) * 1_000_000),
+            quarantine: now.saturating_add((outstanding + MARGIN_MS) * 1_000_000),
             owner_priority: 0,
             preferred: None,
             cold: [None, None],
             claim: Claim::default(),
+            lease_ns: lease_ms * 1_000_000,
+            silence_ns: silence_ms * 1_000_000,
+            heard: [now, now],
         }
     }
     /// Pure transition: the caller persists a changed authority before sending
@@ -288,6 +406,7 @@ impl Engine {
         }
         ensure!(now != u64::MAX, "witness clock unavailable");
         let slot = usize::from(request.node - 1);
+        self.heard[slot] = now;
         self.cold[slot] = if request.eligible && request.ready_term == 0 {
             Some((request.boot, request.policy, now))
         } else {
@@ -295,7 +414,7 @@ impl Engine {
         };
         let cold_quorum = self.cold.iter().all(|vote| {
             vote.is_some_and(|(_, policy, at)| {
-                policy == request.policy && now.saturating_sub(at) < 2 * TTL_MS * 1_000_000
+                policy == request.policy && now.saturating_sub(at) < 2 * self.lease_ns
             })
         });
         let current = self.expiry > now;
@@ -315,8 +434,22 @@ impl Engine {
             && request.policy == self.authority.policy
             && request.ready_term == self.claim.ready_term
             && request.agent_boot == self.claim.agent_boot;
-        let eligible =
-            request.eligible && (ready || initial || retry || cold_quorum && request.node == 1);
+        // A lone survivor. The other member has sent nothing this witness could
+        // authenticate for the whole silence interval (counted from this
+        // witness's own start, never from before it), so its warm state is
+        // presumed lost and a cold vote cannot be outvoted. This rule never
+        // decides *whether* authority may move: that is still `!current`
+        // below, the witness's own lease expiry, which the silent member's
+        // kernel deadline (started before it connected) precedes. A member
+        // that is merely slow keeps talking and is never silent; one that
+        // returns after this grant holds a superseded generation and must
+        // import the survivor's snapshot before it is eligible again. The
+        // survivor's policy is taken as is: its table is empty, so nothing is
+        // interpreted under a fingerprint it does not hold.
+        let lone =
+            request.ready_term == 0 && now.saturating_sub(self.heard[1 - slot]) >= self.silence_ns;
+        let eligible = request.eligible
+            && (ready || initial || retry || cold_quorum && request.node == 1 || lone);
         if current
             && !ours
             && exact
@@ -328,7 +461,7 @@ impl Engine {
             self.preferred = Some((
                 request.node,
                 request.priority,
-                now.saturating_add(2 * TTL_MS * 1_000_000),
+                now.saturating_add(2 * self.lease_ns),
             ));
         }
         let preferred_us = self
@@ -352,7 +485,7 @@ impl Engine {
                 }
                 // A policy change requires a fully reconciled local table and
                 // becomes visible with a fresh authority generation below.
-                self.expiry = now.saturating_add(TTL_MS * 1_000_000);
+                self.expiry = now.saturating_add(self.lease_ns);
                 self.owner_priority = request.priority;
                 granted = true;
             } else if !current && eligible && preferred_us {
@@ -366,7 +499,7 @@ impl Engine {
                     boot: request.boot,
                     policy: request.policy,
                 };
-                self.expiry = now.saturating_add(TTL_MS * 1_000_000);
+                self.expiry = now.saturating_add(self.lease_ns);
                 self.owner_priority = request.priority;
                 self.preferred = None;
                 self.cold = [None, None];
@@ -476,17 +609,23 @@ async fn receive<T: DeserializeOwned>(
 }
 /// Returns an absolute conservative local lease deadline. Starting the clock
 /// before connect excludes both transit time and server processing from validity.
+/// A grant longer than this member's own lease is cut to it: ending a lease
+/// early is always safe, the witness still waits out its own expiry.
 pub async fn exchange(config: &Config, request: &Request) -> Result<(Reply, u64)> {
     let start = now_ns();
-    timeout(IO, async {
+    timeout(Duration::from_millis(config.io_ms), async {
         let mut socket = TcpStream::connect(config.witness).await?;
         socket.set_nodelay(true)?;
         let key = handshake(&mut socket, config.secret.as_bytes(), true).await?;
         send(&mut socket, &key, 0, request).await?;
         let reply: Reply = receive(&mut socket, &key, 1).await?;
-        ensure!(reply.remaining_ms <= TTL_MS, "invalid witness duration");
+        ensure!(
+            reply.remaining_ms <= MAX_LEASE_MS,
+            "invalid witness duration"
+        );
         let deadline = if reply.granted {
-            start.saturating_add(reply.remaining_ms.saturating_sub(MARGIN_MS) * 1_000_000)
+            let valid = reply.remaining_ms.min(config.lease_ms);
+            start.saturating_add(valid.saturating_sub(MARGIN_MS) * 1_000_000)
         } else {
             0
         };
@@ -496,7 +635,47 @@ pub async fn exchange(config: &Config, request: &Request) -> Result<(Reply, u64)
     .context("witness request deadline")?
 }
 
+/// An IPv4 member reaching a dual-stack listener arrives v4-mapped.
+fn canonical(address: IpAddr) -> IpAddr {
+    match address {
+        IpAddr::V6(v6) => v6.to_ipv4_mapped().map_or(address, IpAddr::V4),
+        v4 => v4,
+    }
+}
+/// Sessions are admitted per source before any work is done for them. With
+/// members configured, a stranger is closed at once and each member draws on
+/// its own pool, so neither a third party nor one member's leftovers can hold
+/// the sessions the other member needs to renew within its lease.
+struct Admission {
+    members: Vec<IpAddr>,
+    pools: Vec<Arc<Semaphore>>,
+}
+impl Admission {
+    fn new(members: &[IpAddr]) -> Self {
+        let members: Vec<_> = members.iter().copied().map(canonical).collect();
+        let pools = if members.is_empty() {
+            vec![Arc::new(Semaphore::new(SHARED_PERMITS))]
+        } else {
+            members
+                .iter()
+                .map(|_| Arc::new(Semaphore::new(MEMBER_PERMITS)))
+                .collect()
+        };
+        Self { members, pools }
+    }
+    fn admit(&self, source: IpAddr) -> Option<OwnedSemaphorePermit> {
+        let pool = if self.members.is_empty() {
+            0
+        } else {
+            let source = canonical(source);
+            self.members.iter().position(|m| *m == source)?
+        };
+        self.pools[pool].clone().try_acquire_owned().ok()
+    }
+}
+
 pub async fn serve(config: WitnessConfig) -> Result<()> {
+    config.validate()?;
     Config {
         cluster: config.cluster.clone(),
         node: 1,
@@ -509,6 +688,8 @@ pub async fn serve(config: WitnessConfig) -> Result<()> {
         preempt: false,
         wireguard: Vec::new(),
         wireguard_policy: String::new(),
+        lease_ms: TTL_MS,
+        io_ms: IO_MS,
     }
     .validate()?;
     let parent = config.state.parent().context("witness state parent")?;
@@ -531,31 +712,40 @@ pub async fn serve(config: WitnessConfig) -> Result<()> {
                 saved.cluster == config.cluster,
                 "witness cluster differs from durable state"
             );
-            (saved.authority, saved.claim)
+            (saved.authority, saved.claim, saved.lease_ms)
         }
         Err(error) => {
             if std::fs::symlink_metadata(&config.state).is_ok() {
                 return Err(error);
             }
-            (Authority::default(), Claim::default())
+            (Authority::default(), Claim::default(), TTL_MS)
         }
     };
-    let mut restored = Engine::new(config.cluster.clone(), previous.0, now_ns());
+    let mut restored = Engine::configured(
+        config.cluster.clone(),
+        previous.0,
+        previous.2,
+        config.lease_ms,
+        config.peer_silence_ms,
+        now_ns(),
+    );
     restored.claim = previous.1;
     let engine = Arc::new(Mutex::new(restored));
-    let permits = Arc::new(Semaphore::new(64));
+    let admission = Admission::new(&config.members);
+    // A member abandons an exchange after its I/O budget, which is shorter
+    // than the lease; holding a session longer than one lease serves nobody.
+    let session = Duration::from_millis(config.lease_ms);
     let listener = TcpListener::bind(config.listen).await?;
     loop {
-        let (mut socket, _) = listener.accept().await?;
-        let permit = match permits.clone().try_acquire_owned() {
-            Ok(p) => p,
-            Err(_) => continue,
+        let (mut socket, source) = listener.accept().await?;
+        let Some(permit) = admission.admit(source.ip()) else {
+            continue;
         };
         let engine = engine.clone();
         let config = config.clone();
         tokio::spawn(async move {
             let _permit = permit;
-            let _ = timeout(Duration::from_secs(1), async {
+            let _ = timeout(session, async {
                 socket.set_nodelay(true)?;
                 let key = handshake(&mut socket, config.secret.as_bytes(), false).await?;
                 let request: Request = receive(&mut socket, &key, 0).await?;
@@ -570,6 +760,11 @@ pub async fn serve(config: WitnessConfig) -> Result<()> {
                                 cluster: config.cluster.clone(),
                                 authority: engine.authority.clone(),
                                 claim: engine.claim.clone(),
+                                // Every grant after a restart follows the
+                                // quarantine and changes the authority, so the
+                                // first one records this run's lease before
+                                // any reply carries it.
+                                lease_ms: config.lease_ms,
                             },
                             true,
                         ) {
@@ -765,6 +960,7 @@ mod tests {
             cluster: engine.cluster.clone(),
             authority: engine.authority.clone(),
             claim: engine.claim.clone(),
+            lease_ms: TTL_MS,
         };
         let saved: Durable = serde_json::from_slice(&serde_json::to_vec(&saved).unwrap()).unwrap();
         let mut restored =
@@ -841,6 +1037,352 @@ mod tests {
                 .unwrap()
                 .granted
         );
+    }
+    const SILENCE: u64 = PEER_SILENCE_MS * 1_000_000;
+    #[test]
+    fn lone_cold_survivor_is_granted_only_after_the_peer_was_silent_for_the_full_interval() {
+        // Node 1 owned term 10 and then died for good; node 2's agent restarts
+        // cold. Before this rule nothing could ever grant node 2 again.
+        let previous = Authority {
+            term: 10,
+            owner: 1,
+            boot: [1; 16],
+            policy: [7; 32],
+        };
+        let start = 1_000_000_000;
+        let mut engine = Engine::new("ha-test-cluster-01".into(), previous, start);
+        // The witness hears node 1 one last time, then never again.
+        let mut last = request(1, 10);
+        last.eligible = false;
+        engine.request(&last, start + 1).unwrap();
+        let cold = request(2, 0);
+        assert!(!engine.request(&cold, start + 2).unwrap().granted);
+        assert!(
+            !engine.request(&cold, start + SILENCE).unwrap().granted,
+            "granted before the peer had been silent for the full interval"
+        );
+        let reply = engine.request(&cold, start + 1 + SILENCE).unwrap();
+        assert!(reply.granted, "a lone cold survivor must forward again");
+        assert_eq!(reply.authority.term, 11);
+        assert_eq!(reply.authority.owner, 2);
+        assert_eq!(
+            reply.claim.ready_term, 0,
+            "the grant names an empty baseline"
+        );
+    }
+    #[test]
+    fn lone_cold_survivor_with_a_newer_policy_is_granted_its_own_policy() {
+        // The survivor missed (or alone received) the last commit. Its table is
+        // empty, so no state is interpreted under the old fingerprint.
+        let previous = Authority {
+            term: 3,
+            owner: 1,
+            boot: [1; 16],
+            policy: [7; 32],
+        };
+        let mut engine = Engine::new("ha-test-cluster-01".into(), previous, 0);
+        let mut cold = request(2, 0);
+        cold.policy = [9; 32];
+        let reply = engine.request(&cold, SILENCE).unwrap();
+        assert!(reply.granted);
+        assert_eq!(reply.authority.policy, [9; 32]);
+    }
+    #[test]
+    fn a_renewing_peer_is_never_silent_and_never_displaced_by_a_lone_cold_member() {
+        let mut engine = Engine::new("ha-test-cluster-01".into(), Authority::default(), 0);
+        let mut now = (TTL_MS + MARGIN_MS) * 1_000_000;
+        assert!(engine.request(&request(1, 0), now).unwrap().granted);
+        let term = engine.authority.term;
+        let mut restarted = request(2, 0);
+        restarted.agent_boot = [9; 16];
+        let until = now + 3 * SILENCE;
+        while now < until {
+            now += 50_000_000;
+            assert!(engine.request(&request(1, term), now).unwrap().granted);
+            assert!(
+                !engine.request(&restarted, now + 1).unwrap().granted,
+                "a lone cold member displaced a live owner"
+            );
+        }
+        // An ineligible but talking peer is not silent either.
+        let mut idle = request(1, term);
+        idle.eligible = false;
+        now += TTL_MS * 1_000_000;
+        while now < until + 3 * SILENCE {
+            now += 50_000_000;
+            engine.request(&idle, now).unwrap();
+            assert!(!engine.request(&restarted, now + 1).unwrap().granted);
+        }
+    }
+    #[test]
+    fn both_cold_members_alive_still_use_the_two_vote_rule() {
+        let previous = Authority {
+            term: 10,
+            owner: 2,
+            boot: [2; 16],
+            policy: [7; 32],
+        };
+        let mut engine = Engine::new("ha-test-cluster-01".into(), previous, 0);
+        let mut now = 1_000_000_000;
+        // Both members keep voting cold; only node 1 may win, by quorum, and
+        // node 2 never by the lone rule while node 1 is audible.
+        assert!(!engine.request(&request(2, 0), now).unwrap().granted);
+        now += 1;
+        let reply = engine.request(&request(1, 0), now).unwrap();
+        assert!(reply.granted);
+        assert_eq!(reply.authority.owner, 1);
+        for _ in 0..400 {
+            now += 50_000_000;
+            assert!(engine.request(&request(1, 0), now).unwrap().granted);
+            assert!(!engine.request(&request(2, 0), now + 1).unwrap().granted);
+        }
+    }
+    #[test]
+    fn restarted_witness_waits_the_full_silence_interval_from_its_own_start() {
+        // After a restart the witness has observed no silence at all: the
+        // peer may have been renewing until the moment it stopped.
+        let previous = Authority {
+            term: 10,
+            owner: 1,
+            boot: [1; 16],
+            policy: [7; 32],
+        };
+        let start = 50 * SILENCE;
+        let mut engine = Engine::new("ha-test-cluster-01".into(), previous, start);
+        assert!(
+            !engine
+                .request(&request(2, 0), start + SILENCE - 1)
+                .unwrap()
+                .granted
+        );
+        assert!(
+            engine
+                .request(&request(2, 0), start + SILENCE)
+                .unwrap()
+                .granted
+        );
+    }
+    fn witness_fixture(name: &str) -> (WitnessConfig, Config) {
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let directory = std::env::temp_dir().join(format!(
+            "wren-ha-{name}-{}-{}",
+            std::process::id(),
+            random::<8>()
+                .unwrap()
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>()
+        ));
+        let key = "a-derived-witness-key-of-at-least-32-bytes".to_string();
+        let witness = WitnessConfig {
+            cluster: "ha-test-cluster-01".into(),
+            secret: key.clone(),
+            listen: format!("127.0.0.1:{port}").parse().unwrap(),
+            state: directory.join("state.json"),
+            members: vec!["127.0.0.1".parse().unwrap(), "127.0.0.2".parse().unwrap()],
+            lease_ms: TTL_MS,
+            peer_silence_ms: PEER_SILENCE_MS,
+        };
+        let member = Config {
+            cluster: "ha-test-cluster-01".into(),
+            node: 2,
+            witness: witness.listen,
+            secret: key,
+            priority: 100,
+            preempt: false,
+            wireguard: Vec::new(),
+            wireguard_policy: String::new(),
+            lease_ms: TTL_MS,
+            io_ms: IO_MS,
+        };
+        (witness, member)
+    }
+    async fn wait_listening(address: SocketAddr) {
+        for _ in 0..200 {
+            if TcpStream::connect(address).await.is_ok() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        panic!("witness never listened");
+    }
+    async fn connect_from(source: &str, address: SocketAddr) -> TcpStream {
+        let socket = tokio::net::TcpSocket::new_v4().unwrap();
+        socket.bind(format!("{source}:0").parse().unwrap()).unwrap();
+        socket.connect(address).await.unwrap()
+    }
+    #[tokio::test]
+    async fn idle_connections_from_one_source_cannot_starve_a_member() {
+        let (witness, member) = witness_fixture("flood");
+        let address = witness.listen;
+        let state = witness.state.clone();
+        let server = tokio::spawn(serve(witness));
+        wait_listening(address).await;
+        // An attacker (or a misbehaving member) holds more idle sessions than
+        // the witness has ever had permits for; none sends its nonce.
+        let mut flood = Vec::new();
+        for _ in 0..80 {
+            flood.push(connect_from("127.0.0.2", address).await);
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let request = Request {
+            cluster: member.cluster.clone(),
+            node: 2,
+            boot: [2; 16],
+            agent_boot: [4; 16],
+            priority: 100,
+            preempt: false,
+            ready_term: 0,
+            policy: [7; 32],
+            eligible: false,
+        };
+        let answered = exchange(&member, &request).await;
+        server.abort();
+        drop(flood);
+        let _ = std::fs::remove_dir_all(state.parent().unwrap());
+        assert!(
+            answered.is_ok(),
+            "a flood from one source starved a member's renewal: {:#}",
+            answered.err().unwrap()
+        );
+    }
+    #[tokio::test]
+    async fn a_connection_from_a_non_member_is_closed_at_once() {
+        let (witness, _) = witness_fixture("stranger");
+        let address = witness.listen;
+        let state = witness.state.clone();
+        let server = tokio::spawn(serve(witness));
+        wait_listening(address).await;
+        let mut stranger = connect_from("127.0.0.3", address).await;
+        let mut byte = [0; 1];
+        let closed = timeout(Duration::from_millis(200), stranger.read(&mut byte)).await;
+        server.abort();
+        let _ = std::fs::remove_dir_all(state.parent().unwrap());
+        assert!(
+            matches!(closed, Ok(Ok(0)) | Ok(Err(_))),
+            "a non-member held a witness session open"
+        );
+    }
+    #[test]
+    fn strangers_consume_no_permits_and_members_draw_on_separate_pools() {
+        let a: IpAddr = "10.3.0.1".parse().unwrap();
+        let b: IpAddr = "10.3.0.2".parse().unwrap();
+        let admission = Admission::new(&[a, b]);
+        for _ in 0..1000 {
+            assert!(admission.admit("10.3.0.9".parse().unwrap()).is_none());
+        }
+        let held: Vec<_> = (0..MEMBER_PERMITS)
+            .map(|_| admission.admit(a).expect("member A permit"))
+            .collect();
+        assert!(admission.admit(a).is_none(), "member A is bounded");
+        let b_permits: Vec<_> = (0..MEMBER_PERMITS)
+            .map(|_| admission.admit(b).expect("member A cannot starve member B"))
+            .collect();
+        assert_eq!(b_permits.len(), MEMBER_PERMITS);
+        // An IPv4 member reaching a dual-stack listener arrives v4-mapped.
+        drop(held);
+        assert!(admission
+            .admit("::ffff:10.3.0.1".parse().unwrap())
+            .is_some());
+        // Legacy: no members configured keeps the old shared listener.
+        assert!(Admission::new(&[])
+            .admit("192.0.2.1".parse().unwrap())
+            .is_some());
+    }
+    #[test]
+    fn timing_budget_requires_one_abandoned_exchange_to_fit_the_lease() {
+        check_budget(TTL_MS, IO_MS).unwrap();
+        // A 50 ms round-trip witness: ~150 ms per exchange.
+        let error = check_budget(250, 150).unwrap_err().to_string();
+        assert!(error.contains("at least 345 ms"), "{error}");
+        check_budget(400, 150).unwrap();
+        assert!(check_budget(MAX_LEASE_MS + 1, 80).is_err());
+        assert!(check_budget(250, 0).is_err());
+        // Configurations written before the budget existed keep its defaults.
+        let old: Config = serde_json::from_str(
+            r#"{"cluster":"ha-test-cluster-01","node":1,"witness":"10.3.0.3:5440",
+                "secret":"a-derived-witness-key-of-at-least-32-bytes","priority":200}"#,
+        )
+        .unwrap();
+        assert_eq!((old.lease_ms, old.io_ms), (TTL_MS, IO_MS));
+        old.validate().unwrap();
+        let mut slow = old.clone();
+        slow.io_ms = 150;
+        assert!(slow.validate().is_err());
+    }
+    #[test]
+    fn witness_configuration_bounds_members_lease_and_silence() {
+        let (mut witness, _) = witness_fixture("validate");
+        witness.validate().unwrap();
+        witness.members.pop();
+        assert!(witness.validate().is_err(), "one member is not a pair");
+        witness.members = vec![
+            "10.3.0.1".parse().unwrap(),
+            "::ffff:10.3.0.1".parse().unwrap(),
+        ];
+        assert!(witness.validate().is_err(), "the same member twice");
+        witness.members.clear();
+        witness.validate().unwrap();
+        witness.peer_silence_ms = 3 * witness.lease_ms;
+        assert!(witness.validate().is_err());
+        let old: WitnessConfig = serde_json::from_str(
+            r#"{"cluster":"ha-test-cluster-01","secret":"k","listen":"10.3.0.3:5440","state":"/s"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            (old.members.len(), old.lease_ms, old.peer_silence_ms),
+            (0, TTL_MS, PEER_SILENCE_MS)
+        );
+    }
+    #[test]
+    fn a_witness_restarted_with_a_shorter_lease_waits_out_the_longer_recorded_one() {
+        let mut engine = Engine::configured(
+            "ha-test-cluster-01".into(),
+            Authority::default(),
+            2_000,
+            250,
+            10_000,
+            0,
+        );
+        assert!(
+            !engine
+                .request(&request(1, 0), 2_019_999_999)
+                .unwrap()
+                .granted
+        );
+        let reply = engine.request(&request(1, 0), 2_020_000_000).unwrap();
+        assert!(reply.granted);
+        assert_eq!(reply.remaining_ms, 250);
+    }
+    #[tokio::test]
+    async fn a_member_cuts_a_longer_witness_grant_to_its_own_lease() {
+        let (mut witness, mut member) = witness_fixture("cut");
+        witness.lease_ms = 1_000;
+        witness.peer_silence_ms = 4_000;
+        member.node = 1;
+        member.priority = 200;
+        let address = witness.listen;
+        let state = witness.state.clone();
+        let server = tokio::spawn(serve(witness));
+        wait_listening(address).await;
+        tokio::time::sleep(Duration::from_millis(1_100)).await;
+        let mut cold = request(1, 0);
+        cold.cluster = member.cluster.clone();
+        let before = now_ns();
+        let result = exchange(&member, &cold).await;
+        server.abort();
+        let _ = std::fs::remove_dir_all(state.parent().unwrap());
+        let (reply, deadline) = result.unwrap();
+        assert!(reply.granted);
+        assert!(
+            reply.remaining_ms > TTL_MS,
+            "the witness granted its own lease"
+        );
+        assert!(deadline <= before + (TTL_MS - MARGIN_MS) * 1_000_000 + 5_000_000);
     }
     #[tokio::test]
     async fn fresh_mutual_handshake_rejects_wrong_credentials_and_reflection() {
