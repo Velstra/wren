@@ -24,6 +24,7 @@ authors = ["The Wren authors"]
 
 [workspace.dependencies]
 # Internal crates.
+wren-ha = { path = "crates/wren-ha", version = "0.4.0" }
 wren-core = { path = "crates/wren-core", version = "0.4.0" }
 wren-rip = { path = "crates/wren-rip", version = "0.4.0" }
 wren-ospf = { path = "crates/wren-ospf", version = "0.4.0" }
