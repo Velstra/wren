@@ -260,6 +260,8 @@ mod tests {
             preempt: true,
             wireguard: vec!["wg0".into()],
             wireguard_policy: "vpn-digest".into(),
+            lease_ms: crate::TTL_MS,
+            io_ms: crate::IO_MS,
         };
         let role = Role {
             authority: Authority {
