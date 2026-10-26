@@ -116,10 +116,17 @@ pub struct Request {
     pub policy: [u8; 32],
     pub eligible: bool,
 }
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct Claim {
+    pub ready_term: u64,
+    pub agent_boot: [u8; 16],
+}
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Reply {
     pub authority: Authority,
+    pub claim: Claim,
     pub remaining_ms: u64,
     pub granted: bool,
 }
@@ -239,6 +246,8 @@ pub fn read_private<T: DeserializeOwned>(path: &Path) -> Result<T> {
 struct Durable {
     cluster: String,
     authority: Authority,
+    #[serde(default)]
+    claim: Claim,
 }
 type ColdVote = ([u8; 16], [u8; 32], u64);
 struct Engine {
@@ -249,7 +258,7 @@ struct Engine {
     owner_priority: u8,
     preferred: Option<(u8, u8, u64)>,
     cold: [Option<ColdVote>; 2],
-    bootstrap_agent: Option<[u8; 16]>,
+    claim: Claim,
 }
 impl Engine {
     fn new(cluster: String, previous: Authority, now: u64) -> Self {
@@ -261,7 +270,7 @@ impl Engine {
             owner_priority: 0,
             preferred: None,
             cold: [None, None],
-            bootstrap_agent: None,
+            claim: Claim::default(),
         }
     }
     /// Pure transition: the caller persists a changed authority before sending
@@ -300,13 +309,14 @@ impl Engine {
             && request.ready_term > 0
             && request.ready_term <= self.authority.term;
         let initial = self.authority.term == 0 && request.node == 1 && request.ready_term == 0;
-        // A lost bootstrap ACK must not strand a new cluster with its second
-        // member offline. Retry only the same empty agent incarnation, and stop
-        // allowing this as soon as it reports a completed active generation.
-        let bootstrap =
-            ours && request.ready_term == 0 && self.bootstrap_agent == Some(request.agent_boot);
+        // Every reply repeats the durable grant's exact baseline and agent.
+        // A lost warm or cold ACK cannot strand its still-complete baseline.
+        let retry = ours
+            && request.policy == self.authority.policy
+            && request.ready_term == self.claim.ready_term
+            && request.agent_boot == self.claim.agent_boot;
         let eligible =
-            request.eligible && (ready || initial || bootstrap || cold_quorum && request.node == 1);
+            request.eligible && (ready || initial || retry || cold_quorum && request.node == 1);
         if current
             && !ours
             && exact
@@ -328,7 +338,7 @@ impl Engine {
         if now >= self.quarantine && request.eligible {
             if current
                 && ours
-                && (request.ready_term == self.authority.term || bootstrap)
+                && (request.ready_term == self.authority.term || retry)
                 && (preferred_us || request.policy != self.authority.policy)
             {
                 if request.policy != self.authority.policy {
@@ -339,9 +349,6 @@ impl Engine {
                         .context("HA term exhausted")?;
                     self.authority.policy = request.policy;
                     self.preferred = None;
-                }
-                if request.ready_term > 0 {
-                    self.bootstrap_agent = None;
                 }
                 // A policy change requires a fully reconciled local table and
                 // becomes visible with a fresh authority generation below.
@@ -363,12 +370,18 @@ impl Engine {
                 self.owner_priority = request.priority;
                 self.preferred = None;
                 self.cold = [None, None];
-                self.bootstrap_agent = (request.ready_term == 0).then_some(request.agent_boot);
                 granted = true;
             }
         }
+        if granted {
+            self.claim = Claim {
+                ready_term: request.ready_term,
+                agent_boot: request.agent_boot,
+            };
+        }
         Ok(Reply {
             authority: self.authority.clone(),
+            claim: self.claim.clone(),
             remaining_ms: self.expiry.saturating_sub(now) / 1_000_000,
             granted,
         })
@@ -518,20 +531,18 @@ pub async fn serve(config: WitnessConfig) -> Result<()> {
                 saved.cluster == config.cluster,
                 "witness cluster differs from durable state"
             );
-            saved.authority
+            (saved.authority, saved.claim)
         }
         Err(error) => {
             if std::fs::symlink_metadata(&config.state).is_ok() {
                 return Err(error);
             }
-            Authority::default()
+            (Authority::default(), Claim::default())
         }
     };
-    let engine = Arc::new(Mutex::new(Engine::new(
-        config.cluster.clone(),
-        previous,
-        now_ns(),
-    )));
+    let mut restored = Engine::new(config.cluster.clone(), previous.0, now_ns());
+    restored.claim = previous.1;
+    let engine = Arc::new(Mutex::new(restored));
     let permits = Arc::new(Semaphore::new(64));
     let listener = TcpListener::bind(config.listen).await?;
     loop {
@@ -550,14 +561,15 @@ pub async fn serve(config: WitnessConfig) -> Result<()> {
                 let request: Request = receive(&mut socket, &key, 0).await?;
                 let reply = {
                     let mut engine = engine.lock().await;
-                    let previous = engine.authority.clone();
+                    let previous = (engine.authority.clone(), engine.claim.clone());
                     let reply = engine.request(&request, now_ns())?;
-                    if previous != engine.authority {
+                    if previous != (engine.authority.clone(), engine.claim.clone()) {
                         if let Err(error) = write_private(
                             &config.state,
                             &Durable {
                                 cluster: config.cluster.clone(),
                                 authority: engine.authority.clone(),
+                                claim: engine.claim.clone(),
                             },
                             true,
                         ) {
@@ -715,6 +727,62 @@ mod tests {
                 .unwrap()
                 .granted
         );
+    }
+    #[test]
+    fn lost_warm_ack_retains_exact_claim_across_retries_and_witness_restart() {
+        let mut engine = Engine::new("ha-test-cluster-01".into(), Authority::default(), 0);
+        let now = 1_000_000_000;
+        engine.request(&request(1, 0), now).unwrap();
+        engine.request(&request(1, 1), now + 1).unwrap();
+        let grant = engine
+            .request(&request(2, 1), now + TTL_MS * 1_000_000 + 2)
+            .unwrap();
+        assert!(grant.granted);
+        assert_eq!(grant.claim.ready_term, 1);
+        let mut denied = request(2, 1);
+        denied.eligible = false;
+        let observed = engine
+            .request(&denied, now + TTL_MS * 1_000_000 + 3)
+            .unwrap();
+        assert!(!observed.granted);
+        assert_eq!(observed.claim, grant.claim);
+        assert!(
+            engine
+                .request(&request(2, 1), now + TTL_MS * 1_000_000 + 4)
+                .unwrap()
+                .granted
+        );
+        let mut wrong_live = request(2, 1);
+        wrong_live.agent_boot = [9; 16];
+        assert!(
+            !engine
+                .request(&wrong_live, now + TTL_MS * 1_000_000 + 5)
+                .unwrap()
+                .granted,
+            "a different agent cannot retry the live grant's predecessor baseline"
+        );
+        let saved = Durable {
+            cluster: engine.cluster.clone(),
+            authority: engine.authority.clone(),
+            claim: engine.claim.clone(),
+        };
+        let saved: Durable = serde_json::from_slice(&serde_json::to_vec(&saved).unwrap()).unwrap();
+        let mut restored =
+            Engine::new(saved.cluster, saved.authority, now + 2 * TTL_MS * 1_000_000);
+        restored.claim = saved.claim;
+        let later = now + 2 * TTL_MS * 1_000_000 + (TTL_MS + MARGIN_MS) * 1_000_000;
+        let mut wrong = request(2, 0);
+        wrong.agent_boot = [9; 16];
+        assert!(!restored.request(&wrong, later).unwrap().granted);
+        assert!(restored.request(&request(2, 1), later + 1).unwrap().granted);
+        let term = restored.authority.term;
+        assert!(
+            restored
+                .request(&request(2, term), later + 2)
+                .unwrap()
+                .granted
+        );
+        assert!(!restored.request(&request(2, 1), later + 3).unwrap().granted);
     }
     #[test]
     fn restarted_witness_quarantines_before_reissuing_any_lease() {

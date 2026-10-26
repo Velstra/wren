@@ -467,7 +467,7 @@ pub async fn run_ha(
                         role.authority = reply.authority;
                         if reply.granted || !same { role.deadline_ns = deadline; }
                         if !same {debug!(authority=?role.authority,ready_term=request.ready_term,granted=reply.granted,"HA witness generation changed");role.vpn_ready=false;rekey.cancel();rekey_term=0;}
-                        if reply.granted { role.claimed_ready_term = request.ready_term; role.claimed_agent_boot = agent.as_ref().map_or([0;16], |a|a.agent_boot); }
+                        role.claimed_ready_term=reply.claim.ready_term;role.claimed_agent_boot=reply.claim.agent_boot;
                     }
                     Err(error) => { debug!(error = format_args!("{error:#}"), "HA witness unavailable; existing lease cannot be extended"); }
                 }
