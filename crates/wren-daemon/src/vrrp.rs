@@ -415,8 +415,13 @@ pub async fn run_ha(
         claimed_agent_boot: [0; 16],
     };
     wren_ha::write_private(Path::new(ROLE_PATH), &role, false)?;
-    let mut poll = tokio::time::interval(Duration::from_millis(25));
+    let mut poll = tokio::time::interval(Duration::from_millis(wren_ha::POLL_MS));
     poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // The lease budget assumes an exchange well inside `io_ms`. A witness
+    // that answers, but too slowly, looks healthy until the first lost reply
+    // fences the pair, so say so while it still works.
+    let mut slow_warned: Option<Instant> = None;
+    let mut agent_seen: Option<Agent> = None;
     let mut announcements = AnnouncementTimer::default();
     let mut announced_term = 0;
     let mut rekey = RekeyTask::default();
@@ -432,7 +437,12 @@ pub async fn run_ha(
             }
             Some(query) = queries.recv() => {
                 let active = role.deadline_ns > wren_ha::now_ns() && binding.owns;
-                let state = if active { "Master" } else { "Backup" };
+                let state = if active { "Master".to_string() } else {
+                    match standby_unready(agent_seen.as_ref(), &role, wren_ha::now_ns()) {
+                        Some(reason) => format!("Backup (not ready: {reason})"),
+                        None => "Backup".to_string(),
+                    }
+                };
                 let mut text = format!("HA {state} node={} term={} owner={} lease-ms={}\n",
                     config.node, role.authority.term, role.authority.owner,
                     role.deadline_ns.saturating_sub(wren_ha::now_ns()) / 1_000_000);
@@ -453,9 +463,11 @@ pub async fn run_ha(
                         }
                     }
                 }
-                let agent = wren_ha::read_private::<Agent>(Path::new(AGENT_PATH)).ok()
+                let reported = wren_ha::read_private::<Agent>(Path::new(AGENT_PATH)).ok()
                     .filter(|a| a.cluster == config.cluster && a.node == config.node
-                        && a.coordinator_boot == boot && a.eligible && wren_ha::fresh(a.updated_ns, now));
+                        && a.coordinator_boot == boot);
+                let agent = reported.clone().filter(|a| a.eligible && wren_ha::fresh(a.updated_ns, now));
+                agent_seen = reported;
                 let healthy = binding.configs.iter().all(|c|
                     iface_running(&c.address_interface) && iface_index(&c.address_interface).is_some()
                         && (config.wireguard.contains(&c.address_interface) || read_mac(&c.address_interface).is_some())
@@ -465,7 +477,16 @@ pub async fn run_ha(
                     ready_term: agent.as_ref().map_or(0, |a| a.ready_term),
                     policy: agent.as_ref().map_or(role.authority.policy, |a| a.policy),
                     eligible: healthy && agent.is_some() && now>=vpn_failed_until };
-                match wren_ha::exchange(&config, &request).await {
+                let asked = Instant::now();
+                let answer = wren_ha::exchange(&config, &request).await;
+                let took = asked.elapsed();
+                if took > Duration::from_millis(config.io_ms * 3 / 4)
+                    && slow_warned.map_or(true, |at| at.elapsed() > Duration::from_secs(60)) {
+                    slow_warned = Some(Instant::now());
+                    warn!(elapsed_ms = took.as_millis() as u64, io_ms = config.io_ms, lease_ms = config.lease_ms,
+                        "HA witness exchange is close to or beyond its I/O budget; raise lease-ms and io-timeout-ms on both members and the witness, or move the witness closer");
+                }
+                match answer {
                     Ok((reply, deadline)) => {
                         let same = role.authority == reply.authority;
                         role.authority = reply.authority;
@@ -506,6 +527,33 @@ pub async fn run_ha(
             }
         }
     }
+}
+
+/// Why a standby could not take over now, as `show vrrp` reports it. The
+/// agent's own report is the evidence; the witness would refuse the same
+/// standby for the same reasons.
+fn standby_unready(
+    agent: Option<&wren_ha::Agent>,
+    role: &wren_ha::Role,
+    now: u64,
+) -> Option<&'static str> {
+    let Some(agent) = agent.filter(|a| wren_ha::fresh(a.updated_ns, now)) else {
+        return Some("data-plane agent is not reporting");
+    };
+    if role.authority.term > 0 && agent.policy != role.authority.policy {
+        return Some("policy differs from the owner's; awaiting configuration sync");
+    }
+    if !agent.eligible {
+        return Some(if agent.ready_term == 0 {
+            "no complete state snapshot from the owner"
+        } else {
+            "state snapshot is stale"
+        });
+    }
+    if agent.ready_term == 0 && role.authority.term > 0 {
+        return Some("fresh data-plane agent has no state snapshot yet");
+    }
+    None
 }
 
 #[derive(Default)]
@@ -1479,6 +1527,56 @@ mod tests {
         assert!(timer.due(start + std::time::Duration::from_millis(100)));
     }
     use super::*;
+
+    #[test]
+    fn show_vrrp_names_why_a_standby_cannot_take_over() {
+        let now = wren_ha::now_ns();
+        let role = wren_ha::Role {
+            authority: wren_ha::Authority {
+                term: 4,
+                owner: 1,
+                boot: [1; 16],
+                policy: [7; 32],
+            },
+            ..Default::default()
+        };
+        let ready = wren_ha::Agent {
+            node: 2,
+            policy: [7; 32],
+            ready_term: 4,
+            eligible: true,
+            updated_ns: now,
+            ..Default::default()
+        };
+        assert_eq!(standby_unready(Some(&ready), &role, now), None);
+        assert_eq!(
+            standby_unready(None, &role, now),
+            Some("data-plane agent is not reporting")
+        );
+        let mut committed = ready.clone();
+        committed.policy = [9; 32];
+        committed.eligible = false;
+        committed.ready_term = 0;
+        assert_eq!(
+            standby_unready(Some(&committed), &role, now),
+            Some("policy differs from the owner's; awaiting configuration sync")
+        );
+        let mut stale = ready.clone();
+        stale.eligible = false;
+        assert_eq!(
+            standby_unready(Some(&stale), &role, now),
+            Some("state snapshot is stale")
+        );
+        let mut cold = ready.clone();
+        cold.ready_term = 0;
+        assert_eq!(
+            standby_unready(Some(&cold), &role, now),
+            Some("fresh data-plane agent has no state snapshot yet")
+        );
+        let mut silent = ready;
+        silent.updated_ns = now.saturating_sub(2 * wren_ha::FRESH_NS);
+        assert!(standby_unready(Some(&silent), &role, now).is_some());
+    }
 
     #[test]
     fn election_source_excludes_vips_and_unusable_addresses() {
