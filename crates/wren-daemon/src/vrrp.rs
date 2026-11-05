@@ -415,6 +415,23 @@ pub async fn run_ha(
         claimed_agent_boot: [0; 16],
     };
     wren_ha::write_private(Path::new(ROLE_PATH), &role, false)?;
+    let mut peer_control = if config.mode == wren_ha::Mode::TwoNode {
+        warn!("two-node HA has no independent quorum: a total control-path partition can activate both members; use witness mode for partition-exclusive ownership");
+        // Sentinel intentionally holds links down until the new data-plane
+        // hooks are attached. Wren can start before networkd restores the
+        // control IPs. Retain the sole-writer lock and closed role while waiting;
+        // never bind a wildcard/freebind socket or begin the election early.
+        let Some(peers) = wait_for_peer_bind(&mut shutdown, || {
+            wren_ha::two_node::PeerCoordinator::start(config.clone(), boot)
+        })
+        .await?
+        else {
+            return Ok(());
+        };
+        Some(peers)
+    } else {
+        None
+    };
     let mut poll = tokio::time::interval(Duration::from_millis(wren_ha::POLL_MS));
     poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     // The lease budget assumes an exchange well inside `io_ms`. A witness
@@ -427,6 +444,7 @@ pub async fn run_ha(
     let mut rekey = RekeyTask::default();
     let mut rekey_term = 0;
     let mut vpn_failed_until = 0;
+    let mut vip_failed_until = 0;
     loop {
         tokio::select! {
             _ = shutdown.changed() => {
@@ -476,11 +494,13 @@ pub async fn run_ha(
                     boot, agent_boot: agent.as_ref().map_or([0;16],|a|a.agent_boot), priority: config.priority, preempt: config.preempt,
                     ready_term: agent.as_ref().map_or(0, |a| a.ready_term),
                     policy: agent.as_ref().map_or(role.authority.policy, |a| a.policy),
-                    eligible: healthy && agent.is_some() && now>=vpn_failed_until };
+                    eligible: healthy && agent.is_some() && now>=vpn_failed_until && now>=vip_failed_until };
                 let asked = Instant::now();
-                let answer = wren_ha::exchange(&config, &request).await;
+                let answer = if let Some(peers) = &mut peer_control {
+                    peers.step(&request, role.deadline_ns, role.vips_ready).await
+                } else { wren_ha::exchange(&config, &request).await };
                 let took = asked.elapsed();
-                if took > Duration::from_millis(config.io_ms * 3 / 4)
+                if config.mode == wren_ha::Mode::Witness && took > Duration::from_millis(config.io_ms * 3 / 4)
                     && slow_warned.map_or(true, |at| at.elapsed() > Duration::from_secs(60)) {
                     slow_warned = Some(Instant::now());
                     warn!(elapsed_ms = took.as_millis() as u64, io_ms = config.io_ms, lease_ms = config.lease_ms,
@@ -490,19 +510,19 @@ pub async fn run_ha(
                     Ok((reply, deadline)) => {
                         let same = role.authority == reply.authority;
                         role.authority = reply.authority;
-                        if reply.granted || !same { role.deadline_ns = deadline; }
-                        if !same {debug!(authority=?role.authority,ready_term=request.ready_term,granted=reply.granted,"HA witness generation changed");role.vpn_ready=false;rekey.cancel();rekey_term=0;}
+                        if config.mode == wren_ha::Mode::TwoNode || reply.granted || !same { role.deadline_ns = deadline; }
+                        if !same {debug!(authority=?role.authority,ready_term=request.ready_term,granted=reply.granted,"HA authority generation changed");role.vpn_ready=false;rekey.cancel();rekey_term=0;}
                         role.claimed_ready_term=reply.claim.ready_term;role.claimed_agent_boot=reply.claim.agent_boot;
                     }
-                    Err(error) => { debug!(error = format_args!("{error:#}"), "HA witness unavailable; existing lease cannot be extended"); }
+                    Err(error) => { debug!(error = format_args!("{error:#}"), "HA authority renewal unavailable; existing deadline cannot be extended"); }
                 }
                 let now = wren_ha::now_ns();
-                let active = healthy && agent.is_some() && now>=vpn_failed_until && role.authority.owner == config.node
+                let active = healthy && agent.is_some() && now>=vpn_failed_until && now>=vip_failed_until && role.authority.owner == config.node
                     && role.authority.boot == boot && role.deadline_ns > now;
                 if active {
                     match binding.assume() {
                         Ok(changed) => {role.vips_ready = true;if changed {announced_term=0;}},
-                        Err(error) => { warn!(%error, "HA VIP transaction failed; fencing"); role.deadline_ns = 0; role.vips_ready = false; binding.release(); }
+                        Err(error) => { warn!(%error, "HA VIP transaction failed; fencing"); role.deadline_ns = 0; role.vips_ready = false; vip_failed_until=now.saturating_add(1_000_000_000); binding.release(); }
                     }
                 } else {
                     role.deadline_ns = 0; role.vips_ready = false;
@@ -525,6 +545,57 @@ pub async fn run_ha(
                     } else if announcements.due(Instant::now()) { binding.announce(); }
                 }
             }
+        }
+    }
+}
+
+/// Retry only the transient missing-local-address condition. Port conflicts,
+/// permissions and malformed configuration must remain explicit hard failures.
+/// The caller must publish a closed role before entering this cancellable wait.
+async fn wait_for_peer_bind<T, F, Fut>(
+    shutdown: &mut tokio::sync::watch::Receiver<bool>,
+    mut attempt: F,
+) -> Result<Option<T>>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T>>,
+{
+    let mut waiting = false;
+    loop {
+        if *shutdown.borrow() || shutdown.has_changed().is_err() {
+            return Ok(None);
+        }
+        let result = tokio::select! {
+            biased;
+            _ = shutdown.changed() => return Ok(None),
+            result = attempt() => result,
+        };
+        match result {
+            Ok(value) => {
+                if waiting {
+                    info!("HA peer control addresses are available; starting fenced election quarantine");
+                }
+                return Ok(Some(value));
+            }
+            Err(error)
+                if error
+                    .downcast_ref::<io::Error>()
+                    .is_some_and(|error| error.raw_os_error() == Some(libc::EADDRNOTAVAIL)) =>
+            {
+                if !waiting {
+                    warn!(
+                        error = format_args!("{error:#}"),
+                        "HA peer control address unavailable; role remains fenced while waiting"
+                    );
+                    waiting = true;
+                }
+            }
+            Err(error) => return Err(error),
+        }
+        tokio::select! {
+            biased;
+            _ = shutdown.changed() => return Ok(None),
+            _ = tokio::time::sleep(Duration::from_millis(100)) => {}
         }
     }
 }
@@ -1384,6 +1455,99 @@ pub fn parse_vrrp_query(line: &str) -> Option<VrrpQuery> {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn ha_peer_bind_retries_only_unavailable_address_until_ready() {
+        let (_sender, mut shutdown) = tokio::sync::watch::channel(false);
+        let mut attempts = 0;
+        let started = Instant::now();
+        let result = wait_for_peer_bind(&mut shutdown, || {
+            attempts += 1;
+            std::future::ready(if attempts < 3 {
+                Err(
+                    anyhow::Error::new(io::Error::from_raw_os_error(libc::EADDRNOTAVAIL))
+                        .context("binding configured control address"),
+                )
+            } else {
+                Ok(42)
+            })
+        })
+        .await
+        .unwrap();
+        assert_eq!(result, Some(42));
+        assert_eq!(attempts, 3);
+        assert!(started.elapsed() >= Duration::from_millis(200));
+    }
+
+    #[tokio::test]
+    async fn ha_peer_bind_does_not_hide_port_permission_or_config_errors() {
+        for errno in [libc::EADDRINUSE, libc::EACCES, libc::EINVAL] {
+            let (_sender, mut shutdown) = tokio::sync::watch::channel(false);
+            let mut attempts = 0;
+            let error = wait_for_peer_bind::<(), _, _>(&mut shutdown, || {
+                attempts += 1;
+                std::future::ready(Err(anyhow::Error::new(io::Error::from_raw_os_error(errno))
+                    .context("binding configured control address")))
+            })
+            .await
+            .unwrap_err();
+            assert_eq!(attempts, 1);
+            assert_eq!(
+                error.downcast_ref::<io::Error>().unwrap().raw_os_error(),
+                Some(errno)
+            );
+            assert!(format!("{error:#}").contains("binding configured control address"));
+        }
+    }
+
+    #[tokio::test]
+    async fn ha_peer_bind_wait_is_cancelled_without_another_attempt() {
+        let (sender, mut shutdown) = tokio::sync::watch::channel(false);
+        let stop = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            sender.send(true).unwrap();
+        });
+        let mut attempts = 0;
+        let result = tokio::time::timeout(
+            Duration::from_millis(80),
+            wait_for_peer_bind::<(), _, _>(&mut shutdown, || {
+                attempts += 1;
+                std::future::ready(Err(io::Error::from_raw_os_error(libc::EADDRNOTAVAIL).into()))
+            }),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(result.is_none());
+        assert_eq!(attempts, 1);
+        stop.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn ha_peer_bind_cancels_inflight_attempt_and_honors_already_stopped() {
+        let (sender, mut shutdown) = tokio::sync::watch::channel(false);
+        let stop = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            sender.send(true).unwrap();
+        });
+        let result = tokio::time::timeout(
+            Duration::from_millis(80),
+            wait_for_peer_bind::<(), _, _>(&mut shutdown, std::future::pending),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(result.is_none());
+        stop.await.unwrap();
+        assert!(wait_for_peer_bind::<(), _, _>(&mut shutdown, || {
+            panic!("shutdown must be checked before attempting a bind");
+            #[allow(unreachable_code)]
+            std::future::ready(Ok(()))
+        })
+        .await
+        .unwrap()
+        .is_none());
+    }
+
     #[tokio::test]
     #[ignore = "requires CAP_NET_RAW and an isolated namespace with loopback up"]
     async fn raw_socket_rejects_routed_advertisements_in_both_families() {

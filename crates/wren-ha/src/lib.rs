@@ -1,4 +1,6 @@
-//! A single durable witness serializes forwarding authority. Leases expire on
+//! By default a single durable witness serializes forwarding authority. The
+//! explicit `two-node` mode instead elects over authenticated peer paths and
+//! trades partition exclusivity for availability; see [`two_node`]. Leases expire on
 //! CLOCK_BOOTTIME, including suspend; dataplanes must enforce the corresponding
 //! absolute local deadline in the kernel. Authentication does not encrypt metadata.
 //!
@@ -11,6 +13,7 @@
 //! lease`. The defaults (250 ms lease, 80 ms I/O) therefore need a witness
 //! round trip below roughly 25 ms; a distant witness needs a longer lease and
 //! I/O budget, configured identically on both members and the witness.
+pub mod two_node;
 pub mod wireguard;
 use anyhow::{ensure, Context, Result};
 use ring::{
@@ -74,7 +77,7 @@ fn default_peer_silence_ms() -> u64 {
 /// hold authority at all behind a slow witness link.
 pub fn check_budget(lease_ms: u64, io_ms: u64) -> Result<()> {
     ensure!(
-        (1..=MAX_LEASE_MS).contains(&lease_ms) && io_ms > 0,
+        (1..=MAX_LEASE_MS).contains(&lease_ms) && (1..=MAX_LEASE_MS).contains(&io_ms),
         "HA lease must be 1..={MAX_LEASE_MS} ms and the witness I/O budget nonzero"
     );
     ensure!(
@@ -92,7 +95,12 @@ pub fn check_budget(lease_ms: u64, io_ms: u64) -> Result<()> {
 pub struct Config {
     pub cluster: String,
     pub node: u8,
-    pub witness: SocketAddr,
+    #[serde(default)]
+    pub mode: Mode,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub witness: Option<SocketAddr>,
+    #[serde(default, alias = "two-node", skip_serializing_if = "Option::is_none")]
+    pub two_node: Option<two_node::PeerConfig>,
     pub secret: String,
     pub priority: u8,
     #[serde(default)]
@@ -108,6 +116,13 @@ pub struct Config {
     /// Bound on one complete witness exchange, round trips included.
     #[serde(default = "default_io_ms")]
     pub io_ms: u64,
+}
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum Mode {
+    #[default]
+    Witness,
+    TwoNode,
 }
 impl Config {
     pub fn validate(&self) -> Result<()> {
@@ -125,10 +140,32 @@ impl Config {
             self.secret.len() >= 32 && self.secret.len() <= 1024,
             "HA credential must contain 32..1024 bytes"
         );
-        ensure!(
-            self.priority > 0 && !self.witness.ip().is_unspecified() && self.witness.port() > 0,
-            "invalid HA priority/witness"
-        );
+        ensure!(self.priority > 0, "invalid HA priority");
+        match self.mode {
+            Mode::Witness => {
+                let witness = self
+                    .witness
+                    .context("witness mode requires a witness endpoint")?;
+                ensure!(
+                    !witness.ip().is_unspecified() && witness.port() > 0,
+                    "invalid HA witness"
+                );
+                ensure!(
+                    self.two_node.is_none(),
+                    "witness mode cannot enable two-node peers"
+                );
+            }
+            Mode::TwoNode => {
+                ensure!(
+                    self.witness.is_none(),
+                    "two-node mode must not configure a witness"
+                );
+                self.two_node
+                    .as_ref()
+                    .context("two-node mode requires peer paths")?
+                    .validate(self.lease_ms, self.io_ms)?;
+            }
+        }
         ensure!(
             self.wireguard.len() <= 128
                 && self.wireguard.iter().all(|n| !n.is_empty()
@@ -622,7 +659,8 @@ async fn receive<T: DeserializeOwned>(
 pub async fn exchange(config: &Config, request: &Request) -> Result<(Reply, u64)> {
     let start = now_ns();
     timeout(Duration::from_millis(config.io_ms), async {
-        let mut socket = TcpStream::connect(config.witness).await?;
+        let mut socket =
+            TcpStream::connect(config.witness.context("no witness configured")?).await?;
         socket.set_nodelay(true)?;
         let key = handshake(&mut socket, config.secret.as_bytes(), true).await?;
         send(&mut socket, &key, 0, request).await?;
@@ -687,10 +725,12 @@ pub async fn serve(config: WitnessConfig) -> Result<()> {
     Config {
         cluster: config.cluster.clone(),
         node: 1,
-        witness: std::net::SocketAddr::new(
+        mode: Mode::Witness,
+        two_node: None,
+        witness: Some(std::net::SocketAddr::new(
             std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
             config.listen.port(),
-        ),
+        )),
         secret: config.secret.clone(),
         priority: 200,
         preempt: false,
@@ -810,6 +850,8 @@ impl std::fmt::Debug for Config {
             .field("cluster", &self.cluster)
             .field("node", &self.node)
             .field("witness", &self.witness)
+            .field("mode", &self.mode)
+            .field("two_node", &self.two_node)
             .field("priority", &self.priority)
             .field("preempt", &self.preempt)
             .field("wireguard", &self.wireguard)
@@ -1215,7 +1257,9 @@ mod tests {
         let member = Config {
             cluster: "ha-test-cluster-01".into(),
             node: 2,
-            witness: witness.listen,
+            mode: Mode::Witness,
+            two_node: None,
+            witness: Some(witness.listen),
             secret: key,
             priority: 100,
             preempt: false,
