@@ -184,6 +184,9 @@ struct Slot {
     running: Option<Sig>,
     /// Stop signal for the running generation (flip to `true` to end it).
     stop: Option<watch::Sender<bool>>,
+    /// Owned cancellation handle; replacing/stopping the generation must not
+    /// leave its daemon-wide shutdown subscription behind.
+    relay: Option<JoinHandle<()>>,
     /// Task handle of a generation *this supervisor* spawned (a reload restart). The
     /// startup generation's handle lives in `main`'s `proto_handles` instead, so it is
     /// awaited within the graceful-shutdown window; a reload-spawned generation is
@@ -195,6 +198,12 @@ struct Slot {
     sig_of: SigOf,
     /// How to (re)spawn this engine from a config.
     respawn: Respawn,
+}
+
+impl Drop for Slot {
+    fn drop(&mut self) {
+        stop_slot(self);
+    }
 }
 
 /// Supervises the dynamic protocol engines across configuration hot-reloads. Holds a
@@ -237,6 +246,7 @@ impl Supervisor {
                 name,
                 running: None,
                 stop: None,
+                relay: None,
                 join: None,
                 parked: Vec::new(),
                 sig_of,
@@ -252,16 +262,19 @@ impl Supervisor {
     /// `main`'s `proto_handles` for the graceful-shutdown window.
     pub fn mark_started(&mut self, name: &'static str, sig: Sig) -> watch::Receiver<bool> {
         let (stop_tx, stop_rx) = watch::channel(false);
-        spawn_shutdown_relay(&self.global, stop_tx.clone());
+        let relay = spawn_shutdown_relay(&self.global, stop_tx.clone());
         if let Some(slot) = self.slot_mut(name) {
+            stop_slot(slot);
             slot.running = Some(sig);
             slot.stop = Some(stop_tx);
+            slot.relay = Some(relay);
         } else {
             // Registered later; park the state in a placeholder slot.
             self.slots.push(Slot {
                 name,
                 running: Some(sig),
                 stop: Some(stop_tx),
+                relay: Some(relay),
                 join: None,
                 parked: Vec::new(),
                 sig_of: Box::new(|_| Sig::new(false, Vec::<String>::new())),
@@ -323,6 +336,9 @@ fn stop_slot(slot: &mut Slot) {
     if let Some(stop) = slot.stop.take() {
         let _ = stop.send(true);
     }
+    if let Some(relay) = slot.relay.take() {
+        relay.abort();
+    }
     slot.join = None;
     slot.parked.clear();
     slot.running = None;
@@ -338,9 +354,9 @@ fn spawn_generation(
     cfg: &wren_config::Config,
 ) -> bool {
     let (stop_tx, stop_rx) = watch::channel(false);
-    spawn_shutdown_relay(global, stop_tx.clone());
     match (slot.respawn)(cfg, stop_rx) {
         Some(out) => {
+            slot.relay = Some(spawn_shutdown_relay(global, stop_tx.clone()));
             slot.stop = Some(stop_tx);
             slot.join = Some(out.join);
             slot.parked = out.parked;
@@ -355,23 +371,142 @@ fn spawn_generation(
 
 /// Spawn a tiny task that flips `engine_stop` to `true` when the daemon-wide shutdown
 /// signal fires, so an engine watching a per-engine stop still emits its protocol
-/// goodbye on Ctrl-C. Ends once shutdown fires (or the engine's stop is dropped).
-fn spawn_shutdown_relay(global: &watch::Sender<bool>, engine_stop: watch::Sender<bool>) {
+/// goodbye on Ctrl-C. The slot aborts this task on replacement/stop/drop; an
+/// engine that exits by itself also releases the subscription immediately.
+fn spawn_shutdown_relay(
+    global: &watch::Sender<bool>,
+    engine_stop: watch::Sender<bool>,
+) -> JoinHandle<()> {
     let mut g = global.subscribe();
     tokio::spawn(async move {
-        while g.changed().await.is_ok() {
+        loop {
+            // Shutdown may have happened before this task was first polled.
             if *g.borrow() {
                 let _ = engine_stop.send(true);
                 break;
             }
+            tokio::select! {
+                _ = engine_stop.closed() => break,
+                changed = g.changed() => {
+                    if changed.is_err() {
+                        let _ = engine_stop.send(true);
+                        break;
+                    }
+                }
+            }
         }
-    });
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::collections::BTreeMap;
+
+    async fn subscriptions(global: &watch::Sender<bool>, expected: usize) {
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while global.receiver_count() != expected {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("shutdown relay subscription leaked");
+    }
+
+    #[tokio::test]
+    async fn repeated_generations_release_their_shutdown_relays() {
+        let (global, _) = watch::channel(false);
+        let mut supervisor = Supervisor::new(global.clone());
+        supervisor.register(
+            "test-engine",
+            Box::new(|cfg| Sig::new(cfg.router_id.is_some(), cfg.router_id.iter().cloned())),
+            Box::new(|_, mut stop| {
+                Some(SpawnOut {
+                    join: tokio::spawn(async move {
+                        while !*stop.borrow_and_update() {
+                            if stop.changed().await.is_err() {
+                                break;
+                            }
+                        }
+                    }),
+                    parked: vec![],
+                })
+            }),
+        );
+        for cycle in 0..100 {
+            let mut cfg = wren_config::Config {
+                router_id: Some(format!("192.0.2.{}", cycle + 1)),
+                ..Default::default()
+            };
+            supervisor.apply(&cfg);
+            subscriptions(&global, 1).await;
+            cfg.router_id = Some(format!("198.51.100.{}", cycle + 1));
+            supervisor.apply(&cfg);
+            subscriptions(&global, 1).await;
+            cfg.router_id = None;
+            supervisor.apply(&cfg);
+            subscriptions(&global, 0).await;
+        }
+        supervisor.apply(&wren_config::Config {
+            router_id: Some("192.0.2.1".into()),
+            ..Default::default()
+        });
+        let mut engine = supervisor.slots[0].stop.as_ref().unwrap().subscribe();
+        global.send(true).unwrap();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            engine.wait_for(|stop| *stop),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        supervisor
+            .join_all(tokio::time::Instant::now() + std::time::Duration::from_secs(1))
+            .await;
+        subscriptions(&global, 0).await;
+    }
+
+    #[tokio::test]
+    async fn exited_startup_engine_and_failed_spawn_do_not_keep_subscriptions() {
+        let (global, _) = watch::channel(false);
+        let mut supervisor = Supervisor::new(global.clone());
+        let startup = supervisor.mark_started("test-engine", Sig::new(true, ["eth0"]));
+        assert_eq!(global.receiver_count(), 1);
+        drop(startup);
+        subscriptions(&global, 0).await;
+        supervisor.register(
+            "test-engine",
+            Box::new(|_| Sig::new(true, ["eth1"])),
+            Box::new(|_, _| None),
+        );
+        supervisor.apply(&wren_config::Config::default());
+        subscriptions(&global, 0).await;
+    }
+
+    #[tokio::test]
+    async fn dropping_supervisor_cancels_relays_and_stops_active_engine() {
+        let (global, _) = watch::channel(false);
+        let mut supervisor = Supervisor::new(global.clone());
+        let engine = supervisor.mark_started("test-engine", Sig::new(true, ["eth0"]));
+        drop(supervisor);
+        assert!(*engine.borrow());
+        subscriptions(&global, 0).await;
+    }
+
+    #[tokio::test]
+    async fn shutdown_already_set_before_relay_starts_is_delivered() {
+        let (global, _) = watch::channel(true);
+        let mut supervisor = Supervisor::new(global.clone());
+        let mut engine = supervisor.mark_started("test-engine", Sig::new(true, ["eth0"]));
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            engine.wait_for(|stop| *stop),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        subscriptions(&global, 0).await;
+    }
 
     // --- protocol enable/disable/restart planning -------------------------------
 

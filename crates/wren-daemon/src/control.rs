@@ -776,9 +776,7 @@ pub async fn run_client(path: &Path, command: &str) -> Result<()> {
 
 /// Serve a route-export subscription: register with the router, then stream each
 /// [`RouteEvent`] to the client as a line until the channel ends or the client
-/// disconnects. Long-lived, unlike the one-shot query path. A dropped client is
-/// noticed on the next write and the router prunes the (now-closed) sender on its
-/// next fan-out.
+/// disconnects. A closed peer is noticed even when the routing stream is quiet.
 async fn stream_routes(
     mut reader: BufReader<UnixStream>,
     subscribe: &mpsc::Sender<RouteSubscribe>,
@@ -795,16 +793,7 @@ async fn stream_routes(
         return Ok(());
     }
     let stream = reader.get_mut();
-    while let Some(event) = rx.recv().await {
-        if stream
-            .write_all(format_route_event(&event).as_bytes())
-            .await
-            .is_err()
-        {
-            break; // client gone
-        }
-    }
-    Ok(())
+    stream_monitor(stream, &mut rx, format_route_event).await
 }
 
 /// Render one FlowSpec monitor event as its wire line.
@@ -855,8 +844,7 @@ fn flowspec_action_token(action: &wren_bgp::flowspec::Action) -> String {
 
 /// Serve a FlowSpec monitor subscription (`wren monitor flowspec`): register with
 /// the BGP task, then stream each event to the client as a line. The mirror of
-/// [`stream_evpn`]; a dropped client is noticed on the next write and the BGP
-/// task prunes the closed sender on its next fan-out.
+/// [`stream_evpn`]; full client closure is noticed even without another event.
 async fn stream_flowspec(
     mut reader: BufReader<UnixStream>,
     subscribe: &Option<mpsc::Sender<FlowSpecSubscribe>>,
@@ -883,24 +871,14 @@ async fn stream_flowspec(
         return Ok(());
     }
     let stream = reader.get_mut();
-    while let Some(event) = rx.recv().await {
-        if stream
-            .write_all(format_flowspec_event(&event).as_bytes())
-            .await
-            .is_err()
-        {
-            break; // client gone
-        }
-    }
-    Ok(())
+    stream_monitor(stream, &mut rx, format_flowspec_event).await
 }
 
 /// Serve an EVPN monitor subscription (`wren monitor evpn`): register with the BGP
 /// task, then stream each [`EvpnEvent`] to the client as a line until the channel
 /// ends or the client disconnects. If BGP is not running there is nothing to
 /// subscribe to, so report that instead of hanging. Long-lived, like
-/// [`stream_routes`]; a dropped client is noticed on the next write and the BGP
-/// task prunes the closed sender on its next fan-out.
+/// [`stream_routes`]; full client closure releases the subscription while idle.
 async fn stream_evpn(
     mut reader: BufReader<UnixStream>,
     subscribe: &Option<mpsc::Sender<EvpnSubscribe>>,
@@ -925,13 +903,50 @@ async fn stream_evpn(
         return Ok(());
     }
     let stream = reader.get_mut();
-    while let Some(event) = rx.recv().await {
-        if stream
-            .write_all(format_evpn_event(&event).as_bytes())
-            .await
-            .is_err()
-        {
-            break; // client gone
+    stream_monitor(stream, &mut rx, format_evpn_event).await
+}
+
+/// Check full closure/errors, not POLLRDHUP: a monitor may legitimately close
+/// only its request half and keep consuming the response stream.
+fn fd_is_closed(fd: std::os::fd::RawFd) -> std::io::Result<bool> {
+    let mut descriptor = libc::pollfd {
+        fd,
+        events: 0,
+        revents: 0,
+    };
+    // SAFETY: descriptor is a live one-element pollfd buffer, timeout zero
+    // never blocks, and poll does not take ownership of the borrowed fd.
+    if unsafe { libc::poll(&mut descriptor, 1, 0) } < 0 {
+        let error = std::io::Error::last_os_error();
+        if error.kind() == std::io::ErrorKind::Interrupted {
+            return Ok(false);
+        }
+        return Err(error);
+    }
+    if descriptor.revents & libc::POLLNVAL != 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "monitor output descriptor is invalid",
+        ));
+    }
+    Ok(descriptor.revents & (libc::POLLERR | libc::POLLHUP) != 0)
+}
+
+async fn stream_monitor<E>(
+    stream: &mut UnixStream,
+    events: &mut mpsc::Receiver<E>,
+    render: impl Fn(&E) -> String,
+) -> Result<()> {
+    use std::os::fd::AsRawFd;
+    let mut closure = tokio::time::interval(std::time::Duration::from_millis(250));
+    loop {
+        tokio::select! {
+            _ = closure.tick() => if fd_is_closed(stream.as_raw_fd())? { break; },
+            event = events.recv() => {
+                let Some(event) = event else { break; };
+                let line = render(&event);
+                if !matches!(tokio::time::timeout(std::time::Duration::from_secs(5), stream.write_all(line.as_bytes())).await, Ok(Ok(()))) { break; }
+            }
         }
     }
     Ok(())
@@ -943,7 +958,6 @@ async fn stream_evpn(
 /// feed is usable live (and survives a `timeout`/SIGTERM in tests, which would
 /// otherwise lose block-buffered output).
 pub async fn run_monitor_client(path: &Path, command: &str) -> Result<()> {
-    use std::io::Write as _;
     let stream = UnixStream::connect(path).await.with_context(|| {
         format!("connecting to control socket {path:?} (is wren running with --socket {path:?}?)")
     })?;
@@ -951,17 +965,151 @@ pub async fn run_monitor_client(path: &Path, command: &str) -> Result<()> {
     write_half.write_all(command.as_bytes()).await?;
     write_half.write_all(b"\n").await?;
 
-    let mut lines = BufReader::new(read_half).lines();
     let mut out = std::io::stdout();
-    while let Some(line) = lines
-        .next_line()
-        .await
-        .context("reading route-export stream")?
-    {
-        writeln!(out, "{line}").ok();
-        out.flush().ok();
+    relay_monitor_output(read_half, &mut out).await
+}
+
+async fn relay_monitor_output<R, W>(reader: R, out: &mut W) -> Result<()>
+where
+    R: tokio::io::AsyncRead + Unpin,
+    W: std::io::Write + std::os::fd::AsRawFd,
+{
+    let mut lines = BufReader::new(reader).lines();
+    let mut closure = tokio::time::interval(std::time::Duration::from_millis(250));
+    loop {
+        tokio::select! {
+            _ = closure.tick() => if fd_is_closed(out.as_raw_fd())? { return Ok(()); },
+            line = lines.next_line() => {
+                let Some(line) = line.context("reading route-export stream")? else { return Ok(()); };
+                if let Err(error) = writeln!(out, "{line}").and_then(|()| out.flush()) {
+                    if error.kind() == std::io::ErrorKind::BrokenPipe { return Ok(()); }
+                    return Err(error).context("writing route-export output");
+                }
+            }
+        }
     }
-    Ok(())
+}
+
+#[cfg(test)]
+mod monitor_output_tests {
+    use super::*;
+    use std::io::{BufRead, Write};
+    use std::os::fd::{AsRawFd, FromRawFd};
+
+    #[tokio::test]
+    async fn one_line_pipe_consumer_releases_a_quiet_monitor_without_another_event() {
+        let mut fds = [-1; 2];
+        // SAFETY: pipe initializes two descriptors which are immediately and
+        // uniquely owned by Files; neither descriptor escapes those owners.
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        let reader = unsafe { std::fs::File::from_raw_fd(fds[0]) };
+        let mut writer = unsafe { std::fs::File::from_raw_fd(fds[1]) };
+        let consumer = std::thread::spawn(move || {
+            let mut line = String::new();
+            std::io::BufReader::new(reader)
+                .read_line(&mut line)
+                .unwrap();
+            assert_eq!(line, "% end-of-dump\n");
+        });
+        let (client, mut daemon) = UnixStream::pair().unwrap();
+        daemon.write_all(b"% end-of-dump\n").await.unwrap();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            relay_monitor_output(client, &mut writer),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        consumer.join().unwrap();
+        let mut byte = [0];
+        assert_eq!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), daemon.read(&mut byte))
+                .await
+                .unwrap()
+                .unwrap(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn output_errors_other_than_broken_pipe_propagate() {
+        struct Failing(std::fs::File);
+        impl AsRawFd for Failing {
+            fn as_raw_fd(&self) -> std::os::fd::RawFd {
+                self.0.as_raw_fd()
+            }
+        }
+        impl Write for Failing {
+            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "injected output failure",
+                ))
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let (client, mut daemon) = UnixStream::pair().unwrap();
+        daemon.write_all(b"event\n").await.unwrap();
+        let mut output = Failing(
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open("/dev/null")
+                .unwrap(),
+        );
+        let error = relay_monitor_output(client, &mut output).await.unwrap_err();
+        assert_eq!(
+            error
+                .root_cause()
+                .downcast_ref::<std::io::Error>()
+                .unwrap()
+                .kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+    }
+
+    #[tokio::test]
+    async fn server_releases_a_quiet_subscription_on_full_client_close() {
+        let (mut server, client) = UnixStream::pair().unwrap();
+        let (sender, mut events) = mpsc::channel::<RouteEvent>(1);
+        drop(client);
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            stream_monitor(&mut server, &mut events, format_route_event),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        drop(events);
+        assert!(sender.is_closed());
+    }
+
+    #[tokio::test]
+    async fn request_half_close_does_not_close_a_live_monitor_subscription() {
+        let (mut server, mut client) = UnixStream::pair().unwrap();
+        let (sender, mut events) = mpsc::channel::<RouteEvent>(1);
+        client.shutdown().await.unwrap();
+        let task = tokio::spawn(async move {
+            stream_monitor(&mut server, &mut events, format_route_event).await
+        });
+        sender.send(RouteEvent::EndOfDump).await.unwrap();
+        let mut line = String::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            BufReader::new(&mut client).read_line(&mut line),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(line, "% end-of-dump\n");
+        drop(client);
+        tokio::time::timeout(std::time::Duration::from_secs(1), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+    }
 }
 
 #[cfg(test)]

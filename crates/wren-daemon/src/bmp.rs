@@ -16,16 +16,18 @@
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tokio::time::{sleep, timeout};
-use tracing::{debug, info};
+use tracing::{info, warn};
 
 use wren_bgp::bmp::{self, PerPeerHeader};
 
 /// How long to wait for the TCP connection to the station before retrying.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// A connected, non-reading station must not wedge the exporter indefinitely.
+const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long to wait after a session ends before reconnecting.
 const RECONNECT_BACKOFF: Duration = Duration::from_secs(10);
 
@@ -139,7 +141,9 @@ pub async fn run(cfg: BmpConfig, mut rx: mpsc::Receiver<BmpEvent>) {
     loop {
         match session(&cfg, &mut rx).await {
             Ok(()) => return, // the channel closed — the BGP task is gone
-            Err(e) => debug!(station = %cfg.station, error = %e, "BMP session ended; reconnecting"),
+            Err(e) => {
+                warn!(station = %cfg.station, error = %e, "BMP session ended; observations may have been lost; reconnecting")
+            }
         }
         sleep(RECONNECT_BACKOFF).await;
     }
@@ -154,14 +158,57 @@ async fn session(cfg: &BmpConfig, rx: &mut mpsc::Receiver<BmpEvent>) -> std::io:
             std::io::Error::new(std::io::ErrorKind::TimedOut, "BMP connect timed out")
         })??;
     info!(station = %cfg.station, "BMP connected to monitoring station");
-    stream
-        .write_all(&bmp::initiation(&cfg.sys_name, &cfg.sys_descr))
-        .await?;
+    write_message(
+        &mut stream,
+        &bmp::initiation(&cfg.sys_name, &cfg.sys_descr),
+        WRITE_TIMEOUT,
+    )
+    .await?;
 
     while let Some(ev) = rx.recv().await {
-        stream.write_all(&encode_event(&ev)).await?;
+        write_message(&mut stream, &encode_event(&ev), WRITE_TIMEOUT).await?;
     }
     // The channel closed (daemon shutting down): say goodbye cleanly.
-    let _ = stream.write_all(&bmp::termination(0)).await;
+    let _ = write_message(&mut stream, &bmp::termination(0), WRITE_TIMEOUT).await;
     Ok(())
+}
+
+async fn write_message<W: AsyncWrite + Unpin>(
+    writer: &mut W,
+    message: &[u8],
+    deadline: Duration,
+) -> std::io::Result<()> {
+    timeout(deadline, writer.write_all(message))
+        .await
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "BMP write timed out"))?
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn non_reading_station_cannot_hold_a_bmp_write_forever() {
+        // A full duplex transport reproduces socket backpressure deterministically.
+        let (mut writer, _station) = tokio::io::duplex(64);
+        let error = write_message(&mut writer, &[0; 65536], Duration::from_millis(25))
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+    }
+
+    #[tokio::test]
+    async fn healthy_station_receives_the_complete_message() {
+        use tokio::io::AsyncReadExt;
+        let (mut writer, mut station) = tokio::io::duplex(64);
+        let reader = tokio::spawn(async move {
+            let mut body = vec![0; 512];
+            station.read_exact(&mut body).await.unwrap();
+            body
+        });
+        write_message(&mut writer, &[42; 512], Duration::from_secs(1))
+            .await
+            .unwrap();
+        assert_eq!(reader.await.unwrap(), vec![42; 512]);
+    }
 }
