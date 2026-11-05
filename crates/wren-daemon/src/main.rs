@@ -666,7 +666,7 @@ async fn main() -> Result<()> {
                         vrrp::run(instances, qrx, shutdown).await
                     };
                     if let Err(e) = result {
-                        error!(error = %e, "VRRP engine stopped");
+                        error!(error = format_args!("{e:#}"), "VRRP engine stopped");
                     }
                 }));
             }
@@ -1436,7 +1436,7 @@ async fn main() -> Result<()> {
                         vrrp::run(instances, qrx, stop).await
                     };
                     if let Err(e) = result {
-                        error!(error = %e, "VRRP engine stopped");
+                        error!(error = format_args!("{e:#}"), "VRRP engine stopped");
                     }
                 });
                 Some(reload::SpawnOut {
