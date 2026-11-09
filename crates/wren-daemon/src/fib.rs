@@ -23,6 +23,7 @@ use wren_core::{Fib, FibChange, FibError, Route};
 /// One unit of work for the FIB thread, carrying a one-shot channel for its reply.
 enum FibJob {
     Apply(FibChange, oneshot::Sender<Result<(), FibError>>),
+    RemoveOwned(Route, oneshot::Sender<Result<(), FibError>>),
     OwnedRoutes(oneshot::Sender<Result<Vec<Route>, FibError>>),
 }
 
@@ -40,6 +41,14 @@ fn worker_gone() -> FibError {
 }
 
 impl FibHandle {
+    /// Delete only the exact owned route, preserving colocated kernel routes.
+    pub async fn remove_owned(&self, route: Route) -> Result<(), FibError> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(FibJob::RemoveOwned(route, reply))
+            .map_err(|_| worker_gone())?;
+        rx.await.unwrap_or_else(|_| Err(worker_gone()))
+    }
     /// Apply one forwarding-plane change, awaiting the worker's result. Changes
     /// are applied in call order — the worker processes its queue sequentially —
     /// so an install and a later remove of the same prefix never reorder.
@@ -73,6 +82,9 @@ pub fn spawn(mut fib: Box<dyn Fib + Send>) -> FibHandle {
             // sender) is dropped.
             while let Ok(job) = rx.recv() {
                 match job {
+                    FibJob::RemoveOwned(route, reply) => {
+                        let _ = reply.send(fib.remove_owned(&route));
+                    }
                     FibJob::Apply(change, reply) => {
                         let _ = reply.send(fib.apply(&change));
                     }

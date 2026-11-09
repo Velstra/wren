@@ -719,8 +719,12 @@ async fn program_fib(
                         debug!(prefix = %route.prefix, "route rejected by FIB export filter");
                         // If we had programmed this (vrf, prefix), withdraw it now —
                         // from the FIB and from every route-export subscriber.
-                        if exported.remove(&(route.table, route.prefix)).is_some() {
-                            remove_from_fib(fib, route.table, route.prefix, failed).await;
+                        if let Some(previous) = exported.get(&(route.table, route.prefix)).cloned()
+                        {
+                            if !remove_from_fib(fib, previous, failed).await {
+                                return;
+                            }
+                            exported.remove(&(route.table, route.prefix));
                             fanout(
                                 subscribers,
                                 RouteEvent::Withdraw {
@@ -758,7 +762,7 @@ async fn program_fib(
             }
         }
         FibChange::Remove { table, prefix } => {
-            let was_exported = exported.remove(&(table, prefix)).is_some();
+            let previous = exported.get(&(table, prefix)).cloned();
             // Only ever unprogram what we programmed. `exported` records every
             // successful install, so a prefix missing from it is somebody
             // else's: an export-rejected route, another daemon's, or — the one
@@ -772,40 +776,44 @@ async fn program_fib(
             // to its own subnet: it stopped hearing its neighbour's hellos,
             // declared it dead, and the adjacency that had just come up went
             // down again — every time, a minute after reaching Full.
-            if !was_exported {
+            let Some(previous) = previous else {
                 failed.remove(&(table, prefix));
                 return;
+            };
+            if remove_from_fib(fib, previous, failed).await {
+                exported.remove(&(table, prefix));
+                fanout(subscribers, RouteEvent::Withdraw { table, prefix });
             }
-            remove_from_fib(fib, table, prefix, failed).await;
-            fanout(subscribers, RouteEvent::Withdraw { table, prefix });
         }
     }
 }
 
-/// Remove `(table, prefix)` from the forwarding plane, logging the outcome. A
+/// Remove an exact owned route from the forwarding plane, logging the outcome. A
 /// transient failure is queued in `failed` for the reconcile tick to retry; a
 /// success clears any prior queued failure for the prefix.
 async fn remove_from_fib(
     fib: &FibHandle,
-    table: u32,
-    prefix: Prefix,
+    route: Route,
     failed: &mut BTreeSet<(u32, Prefix)>,
-) {
-    match fib.apply(FibChange::Remove { table, prefix }).await {
+) -> bool {
+    let (table, prefix) = (route.table, route.prefix);
+    match fib.remove_owned(route).await {
         Ok(()) => {
             info!(%prefix, table, "route removed");
             failed.remove(&(table, prefix));
+            true
         }
         Err(e) => {
             warn!(error = %e, %prefix, table, "FIB remove failed; queued for retry");
             failed.insert((table, prefix));
+            false
         }
     }
 }
 
 /// Run `route` through its protocol's import filter, if one is configured. With no
 /// filter for the protocol the route is accepted unchanged.
-fn apply_import(imports: &ImportFilters, route: Route) -> Decision {
+pub(crate) fn apply_import(imports: &ImportFilters, route: Route) -> Decision {
     match imports.get(&route.protocol) {
         Some(filter) => filter.apply(&route),
         None => Decision::Accept(route),
@@ -828,13 +836,7 @@ pub async fn reconcile_owned(
         if keep.contains(&(route.table, route.prefix)) {
             continue;
         }
-        match fib
-            .apply(FibChange::Remove {
-                table: route.table,
-                prefix: route.prefix,
-            })
-            .await
-        {
+        match fib.remove_owned(route.clone()).await {
             Ok(()) => {
                 info!(
                     prefix = %route.prefix,
@@ -1452,9 +1454,17 @@ mod tests {
     struct FlakyFib {
         inner: MemoryFib,
         fail_installs: u32,
+        fail_removes: u32,
     }
 
     impl Fib for FlakyFib {
+        fn remove_owned(&mut self, route: &Route) -> Result<(), wren_core::FibError> {
+            if self.fail_removes > 0 {
+                self.fail_removes -= 1;
+                return Err(wren_core::FibError("transient ENOBUFS on remove".into()));
+            }
+            self.inner.remove_owned(route)
+        }
         fn apply(&mut self, change: &FibChange) -> Result<(), wren_core::FibError> {
             if matches!(change, FibChange::Install(_)) && self.fail_installs > 0 {
                 self.fail_installs -= 1;
@@ -1476,6 +1486,7 @@ mod tests {
         let fib = crate::fib::spawn(Box::new(FlakyFib {
             inner: MemoryFib::default(),
             fail_installs: 1,
+            fail_removes: 0,
         }));
         let mut exported = BTreeMap::new();
         let mut subs = Vec::new();
@@ -1538,6 +1549,60 @@ mod tests {
         assert!(fib.owned_routes().await.unwrap().is_empty());
     }
 
+    #[tokio::test]
+    async fn failed_exact_withdraw_keeps_identity_until_retry_succeeds() {
+        let route = bgp_route("203.0.113.0/24", 20);
+        let key = (route.table, route.prefix);
+        let mut inner = MemoryFib::default();
+        inner.apply(&FibChange::Install(route.clone())).unwrap();
+        let fib = crate::fib::spawn(Box::new(FlakyFib {
+            inner,
+            fail_installs: 0,
+            fail_removes: 1,
+        }));
+        let mut exported = BTreeMap::from([(key, route)]);
+        let mut failed = BTreeSet::new();
+        let (tx, mut rx) = mpsc::channel(2);
+        let mut subs = vec![tx];
+        program_fib(
+            &fib,
+            FibChange::Remove {
+                table: key.0,
+                prefix: key.1,
+            },
+            None,
+            &mut exported,
+            &mut subs,
+            &mut failed,
+        )
+        .await;
+        assert!(failed.contains(&key));
+        assert!(
+            exported.contains_key(&key),
+            "do not lose exact deletion identity on failure"
+        );
+        assert_eq!(fib.owned_routes().await.unwrap().len(), 1);
+        assert!(
+            rx.try_recv().is_err(),
+            "do not report a withdrawal that failed"
+        );
+        retry_failed(
+            &Rib::new(),
+            &fib,
+            None,
+            &mut exported,
+            &mut subs,
+            &mut failed,
+        )
+        .await;
+        assert!(exported.is_empty() && failed.is_empty());
+        assert!(fib.owned_routes().await.unwrap().is_empty());
+        assert!(
+            matches!(rx.try_recv().unwrap(), RouteEvent::Withdraw { table, prefix }
+            if (table, prefix) == key)
+        );
+    }
+
     /// A [`Fib`] that counts install writes — to prove a coalesced burst hits the
     /// forwarding plane once, not once per intermediate best-path change. The count
     /// lives behind a shared `Arc` so the test can read it after the FIB moves onto
@@ -1548,6 +1613,9 @@ mod tests {
     }
 
     impl Fib for CountingFib {
+        fn remove_owned(&mut self, route: &Route) -> Result<(), wren_core::FibError> {
+            self.inner.remove_owned(route)
+        }
         fn apply(&mut self, change: &FibChange) -> Result<(), wren_core::FibError> {
             if matches!(change, FibChange::Install(_)) {
                 self.installs

@@ -258,7 +258,7 @@ fn parse_route(msg: &[u8]) -> Option<Route> {
             }
         }
     };
-    if nexthops.is_empty() {
+    if nexthops.is_empty() && rtn_type != RTN_BLACKHOLE {
         return None;
     }
     Some(Route {
@@ -512,8 +512,9 @@ fn build_multipath(dst_family: u8, nexthops: &[NextHop]) -> Vec<u8> {
 /// Build an `RTM_NEWROUTE`/`RTM_DELROUTE` netlink message for `prefix`.
 ///
 /// When `route` is `Some`, the next-hop attributes (gateway / out-interface /
-/// metric) and origin protocol are added — that's an install. When `None`, only
-/// the destination is set — enough for the kernel to match and delete it.
+/// metric) and origin protocol are added — for an install or an exact owned
+/// removal. `None` requests a prefix-only wildcard delete; the daemon must never
+/// use it for reconciliation or withdrawal of a specific owned route.
 fn build_route_msg(
     nlmsg_type: u16,
     flags: u16,
@@ -536,17 +537,9 @@ fn build_route_msg(
     } else {
         RT_TABLE_UNSPEC
     };
-    // On a delete the kernel matches the stored route by these fields: any that
-    // we set non-wildcard must equal the *installed* route or the delete is a
-    // silent no-op. We install routes with their real origin protocol (bgp /
-    // ospf / rip / isis / babel) and — for gatewayed routes — universe scope, so
-    // a delete must NOT pin protocol or scope to a fixed value. Mirror
-    // `ip route del`: send the wildcards RTPROT_UNSPEC (matches any protocol) and
-    // RT_SCOPE_NOWHERE (matches any scope). (Previously this sent RTPROT_STATIC +
-    // RT_SCOPE_LINK, so every non-static or gatewayed route was undeletable —
-    // leaving a stale FIB entry / blackhole after the prefix was withdrawn.)
-    // A single best route exists per (table, prefix), so the (family, dst, table)
-    // key still identifies it uniquely.
+    // Preserve the actual origin and scope for exact deletion. The RIB chooses
+    // one best route per prefix, but Linux can retain several protocols/metrics
+    // at that prefix: wildcard deletion can remove a connected route instead.
     match route {
         Some(r) => {
             buf[21] = rtprot(r.protocol); // rtm_protocol
@@ -602,7 +595,7 @@ fn build_route_msg(
                 push_attr(&mut buf, RTA_MULTIPATH, &mp);
             }
         }
-        if r.metric > 0 {
+        if r.metric > 0 || nlmsg_type == RTM_DELROUTE {
             push_attr(&mut buf, RTA_PRIORITY, &r.metric.to_ne_bytes());
         }
     }
@@ -632,6 +625,28 @@ fn is_transient_errno(errno: i32) -> bool {
         errno,
         libc::EINTR | libc::EAGAIN | libc::ENOBUFS | libc::EBUSY
     )
+}
+
+/// Kernel identity, not RIB annotations (source, preference or communities).
+/// A gateway-only install acquires an output interface in the kernel dump.
+fn same_kernel_route(expected: &Route, observed: &Route) -> bool {
+    expected.prefix == observed.prefix
+        && expected.table == observed.table
+        && expected.protocol == observed.protocol
+        && expected.metric == observed.metric
+        && expected.nexthops.len() == observed.nexthops.len()
+        && expected
+            .nexthops
+            .iter()
+            .zip(&observed.nexthops)
+            .all(|(want, have)| {
+                want.gateway == have.gateway
+                    && want
+                        .iface
+                        .as_ref()
+                        .map_or(true, |iface| Some(iface) == have.iface.as_ref())
+                    && (expected.nexthops.len() == 1 || want.weight.clamp(1, 256) == have.weight)
+            })
 }
 
 /// A failed netlink round-trip: the [`FibError`] to surface, plus the raw errno (when
@@ -745,10 +760,35 @@ impl KernelFib {
     /// after the retries is surfaced to the router, which queues it for its own
     /// periodic reconciliation.
     fn request(&mut self, msg: &[u8]) -> Result<(), FibError> {
+        self.request_guarded(msg, None)
+    }
+
+    fn request_guarded(&mut self, msg: &[u8], expected: Option<&Route>) -> Result<(), FibError> {
         let mut attempt = 0u32;
         loop {
+            if let Some(expected) = expected {
+                // Linux IPv4 treats RTA_PRIORITY=0 as a wildcard even when
+                // the attribute is explicitly present. Check actual existence
+                // before EVERY send, including after a lost ACK/transient error.
+                // An absent zero-metric retry must not remove metric20 instead.
+                // This is not atomic exclusion against concurrent foreign FIB
+                // writers: rtnetlink provides no compare-and-delete for zero.
+                if !self
+                    .dump_owned()?
+                    .iter()
+                    .any(|route| same_kernel_route(expected, route))
+                {
+                    return Ok(());
+                }
+            }
             match self.request_once(msg) {
                 Ok(()) => return Ok(()),
+                Err(e)
+                    if e.errno == Some(libc::ESRCH)
+                        && u16::from_ne_bytes([msg[4], msg[5]]) == RTM_DELROUTE =>
+                {
+                    return Ok(())
+                }
                 Err(e) if e.errno.is_some_and(is_transient_errno) && attempt < FIB_MAX_RETRIES => {
                     attempt += 1;
                     // Linear backoff (20ms, 40ms, 60ms): brief, since these bursts
@@ -890,6 +930,22 @@ impl KernelFib {
 }
 
 impl Fib for KernelFib {
+    fn remove_owned(&mut self, route: &Route) -> Result<(), FibError> {
+        if owned_protocol(rtprot(route.protocol)).is_none() {
+            return Err(FibError("refusing to remove a kernel-owned route".into()));
+        }
+        let seq = self.next_seq();
+        let msg = build_route_msg(
+            RTM_DELROUTE,
+            NLM_F_REQUEST | NLM_F_ACK,
+            seq,
+            &route.prefix,
+            route.table,
+            Some(route),
+        );
+        let guard = (route.metric == 0 && route.prefix.addr().is_ipv4()).then_some(route);
+        self.request_guarded(&msg, guard)
+    }
     fn apply(&mut self, change: &FibChange) -> Result<(), FibError> {
         let seq = self.next_seq();
         let msg = match change {
@@ -932,6 +988,32 @@ pub const CREATE_ONLY_FLAGS: u16 = NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NL
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn kernel_identity_ignores_rib_annotations_but_not_owner_or_next_hop() {
+        let expected = Route::new(
+            p("198.18.254.0/24"),
+            Protocol::Ospf,
+            vec![NextHop::via("192.168.2.2".parse().unwrap())],
+            0,
+        );
+        let mut observed = expected.clone();
+        observed.source = 42;
+        observed.communities.push(123);
+        observed.nexthops[0].iface = Some("d1".into());
+        assert!(same_kernel_route(&expected, &observed));
+        observed.metric = 20;
+        assert!(!same_kernel_route(&expected, &observed));
+        observed.metric = 0;
+        observed.nexthops[0].gateway = Some("192.168.2.3".parse().unwrap());
+        assert!(!same_kernel_route(&expected, &observed));
+        observed.nexthops[0].gateway = expected.nexthops[0].gateway;
+        observed.protocol = Protocol::Bgp;
+        assert!(!same_kernel_route(&expected, &observed));
+        observed.protocol = expected.protocol;
+        observed.table += 1;
+        assert!(!same_kernel_route(&expected, &observed));
+    }
 
     #[test]
     #[ignore = "needs CAP_NET_ADMIN + d0; run scripts/netlink-kernel-smoke.sh"]
@@ -1021,6 +1103,155 @@ mod tests {
         assert_eq!(msg[22], RT_SCOPE_NOWHERE); // rtm_scope — wildcard
                                                // The destination key is still present so the kernel can find the route.
         assert!(has_attr(&msg, RTA_DST, &[10, 20, 0, 0]));
+    }
+
+    #[test]
+    fn exact_owned_delete_keeps_protocol_metric_gateway_and_table() {
+        for prefix in ["192.0.2.0/24", "2001:db8::/64"] {
+            for metric in [0, 20] {
+                let route = Route::new(
+                    p(prefix),
+                    Protocol::Ospf,
+                    vec![NextHop::via("192.168.1.2".parse().unwrap())],
+                    metric,
+                )
+                .with_table(1000);
+                let msg = build_route_msg(
+                    RTM_DELROUTE,
+                    NLM_F_REQUEST | NLM_F_ACK,
+                    1,
+                    &route.prefix,
+                    route.table,
+                    Some(&route),
+                );
+                assert_eq!(msg[21], RTPROT_OSPF);
+                assert_eq!(msg[22], RT_SCOPE_UNIVERSE);
+                assert!(has_attr(&msg, RTA_PRIORITY, &metric.to_ne_bytes()));
+                assert!(has_attr(&msg, RTA_TABLE, &1000u32.to_ne_bytes()));
+                assert!(has_attr(
+                    &msg,
+                    if route.prefix.is_ipv4() {
+                        RTA_GATEWAY
+                    } else {
+                        RTA_VIA
+                    },
+                    &[]
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn blackhole_routes_survive_owned_readback() {
+        let route = Route::new(p("198.19.244.0/24"), Protocol::Static, vec![], 60);
+        let msg = build_route_msg(RTM_NEWROUTE, 0, 1, &route.prefix, route.table, Some(&route));
+        assert_eq!(parse_route(&msg), Some(route));
+    }
+
+    #[test]
+    #[ignore = "needs CAP_NET_ADMIN + d0/d1; run scripts/netlink-kernel-smoke.sh"]
+    fn zero_metric_removal_retry_preserves_another_same_protocol_route() {
+        let mut fib = KernelFib::new().unwrap();
+        let prefix = p("198.18.254.0/24");
+        for metric in [0, 20] {
+            fib.apply(&FibChange::Install(Route::new(
+                prefix,
+                Protocol::Ospf,
+                vec![NextHop::via("192.168.2.2".parse().unwrap())],
+                metric,
+            )))
+            .unwrap();
+        }
+        let before = fib.owned_routes().unwrap();
+        let selected = before
+            .iter()
+            .find(|route| route.prefix == prefix && route.metric == 0)
+            .expect("the real kernel must actually have the metric-zero route");
+        assert!(before
+            .iter()
+            .any(|route| route.prefix == prefix && route.metric == 20));
+        fib.remove_owned(selected).unwrap();
+        fib.remove_owned(selected).unwrap();
+        let after = fib.owned_routes().unwrap();
+        assert!(!after
+            .iter()
+            .any(|route| route.prefix == prefix && route.metric == 0));
+        assert!(
+            after
+                .iter()
+                .any(|route| route.prefix == prefix && route.metric == 20),
+            "a retry for absent metric zero must not remove a different route"
+        );
+    }
+
+    #[test]
+    #[ignore = "needs CAP_NET_ADMIN + d0/d1; run scripts/netlink-kernel-smoke.sh"]
+    fn exact_owned_removal_preserves_connected_and_other_metrics() {
+        let mut fib = KernelFib::new().unwrap();
+        for (prefix, gateway) in [
+            ("192.168.1.0/24", "192.168.2.2"),
+            ("2001:db8::/64", "2001:db8:2::2"),
+        ] {
+            let connected = std::process::Command::new("ip")
+                .args([
+                    if prefix.contains(':') { "-6" } else { "-4" },
+                    "route",
+                    "show",
+                    "exact",
+                    prefix,
+                ])
+                .output()
+                .unwrap();
+            assert!(connected.status.success());
+            let connected = String::from_utf8(connected.stdout).unwrap();
+            assert!(
+                connected.contains("proto kernel"),
+                "namespace fixture missing: {connected}"
+            );
+            for metric in [20, 21] {
+                let route = Route::new(
+                    p(prefix),
+                    Protocol::Ospf,
+                    vec![NextHop::via(gateway.parse().unwrap())],
+                    metric,
+                );
+                fib.apply(&FibChange::Install(route))
+                    .unwrap_or_else(|e| panic!("install {prefix} metric {metric}: {e}"));
+            }
+            let owned = fib.owned_routes().unwrap();
+            let target = owned
+                .iter()
+                .find(|r| r.prefix == p(prefix) && r.metric == 20)
+                .unwrap();
+            // Exactly the route a restarting daemon received from owned_routes.
+            fib.remove_owned(target).unwrap();
+            fib.remove_owned(target).unwrap(); // absent is idempotent, not a broad retry
+            let remaining = fib.owned_routes().unwrap();
+            assert!(!remaining
+                .iter()
+                .any(|r| r.prefix == p(prefix) && r.metric == 20));
+            assert!(remaining
+                .iter()
+                .any(|r| r.prefix == p(prefix) && r.metric == 21));
+            let after = std::process::Command::new("ip")
+                .args([
+                    if prefix.contains(':') { "-6" } else { "-4" },
+                    "route",
+                    "show",
+                    "exact",
+                    prefix,
+                ])
+                .output()
+                .unwrap();
+            assert!(after.status.success());
+            let after = String::from_utf8(after.stdout).unwrap();
+            assert!(
+                after
+                    .lines()
+                    .any(|line| connected.lines().any(|original| original == line)),
+                "connected route changed: before={connected}; after={after}"
+            );
+        }
     }
 
     #[test]

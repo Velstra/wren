@@ -305,22 +305,6 @@ async fn main() -> Result<()> {
     // Resolve the static routes once: their prefixes are the set we keep when
     // reconciling away a previous instance's leftover forwarding-plane routes.
     let statics = cfg.static_routes().context("resolving static routes")?;
-    let keep: HashSet<_> = statics.iter().map(|r| (r.table, r.prefix)).collect();
-
-    // Reconcile at startup: drop routes a previous wren instance left in the
-    // forwarding plane that the current config no longer programs, so a restart
-    // doesn't leave stale routes behind. (A no-op on the dry-run in-memory plane;
-    // dynamic protocols re-install their routes as they reconverge.)
-    match fib.owned_routes().await {
-        Ok(owned) if !owned.is_empty() => {
-            let removed = router::reconcile_owned(&fib, owned, &keep).await;
-            if removed > 0 {
-                info!(removed, "reconciled stale routes from a previous instance");
-            }
-        }
-        Ok(_) => {}
-        Err(e) => warn!(error = %e, "reading existing routes for reconciliation failed"),
-    }
 
     // Compile the configured filters and resolve the import (per-protocol, into the
     // RIB) and export (RIB → FIB) attachments. A bad filter fails startup. Done before
@@ -331,6 +315,20 @@ async fn main() -> Result<()> {
     let (vrf_imports, vrf_exports) =
         build_vrf_routemaps(&cfg, &by_name).context("resolving vrf route-maps")?;
     let vrfs = build_vrf_infos(&cfg).context("resolving vrfs")?;
+    let statics = admit_static_routes(statics, &imports, &vrf_imports);
+    // Only admitted routes may preserve a previous process's FIB entries.
+    // Keeping every configured prefix would leave now-rejected statics behind.
+    let keep: HashSet<_> = statics.iter().map(|r| (r.table, r.prefix)).collect();
+    match fib.owned_routes().await {
+        Ok(owned) if !owned.is_empty() => {
+            let removed = router::reconcile_owned(&fib, owned, &keep).await;
+            if removed > 0 {
+                info!(removed, "reconciled stale routes from a previous instance");
+            }
+        }
+        Ok(_) => {}
+        Err(e) => warn!(error = %e, "reading existing routes for reconciliation failed"),
+    }
     if !imports.is_empty() {
         info!(protocols = imports.len(), "import filters active");
     }
@@ -351,10 +349,6 @@ async fn main() -> Result<()> {
     // route-map): the baseline the router diffs a SIGHUP reload against.
     let mut seeded_statics: Vec<wren_core::Route> = Vec::new();
     for route in statics {
-        let route = match vrf_routemap(&vrf_imports, route) {
-            Some(r) => r,
-            None => continue, // import route-map rejected it
-        };
         seeded_statics.push(route.clone());
         if let Some(change) = rib.update(route) {
             if let FibChange::Install(best) = &change {
@@ -1957,6 +1951,25 @@ fn vrf_routemap(
     }
 }
 
+/// Admit configured statics through the same import boundary as protocol updates.
+/// Startup and reload must share this path: an import-policy change can withdraw
+/// a static even when the configured prefix and next hop did not change. Apply
+/// each transformation once, before the route enters the RIB or reload baseline.
+fn admit_static_routes(
+    routes: Vec<wren_core::Route>,
+    imports: &router::ImportFilters,
+    vrf_imports: &std::collections::HashMap<u32, Filter>,
+) -> Vec<wren_core::Route> {
+    routes
+        .into_iter()
+        .filter_map(|route| vrf_routemap(vrf_imports, route))
+        .filter_map(|route| match router::apply_import(imports, route) {
+            Decision::Accept(route) => Some(route),
+            Decision::Reject => None,
+        })
+        .collect()
+}
+
 // --- Reload signatures (hot-reload) -----------------------------------------------
 //
 // Each dynamic protocol's [`reload::Sig`] captures the two things a SIGHUP acts on for
@@ -2046,8 +2059,8 @@ struct ReloadedConfig {
     /// The freshly-parsed configuration, handed to the protocol supervisor so it can
     /// diff each dynamic engine's signature and start/stop/restart the ones that changed.
     cfg: wren_config::Config,
-    /// Static routes, each already run through its VRF's import route-map — the same
-    /// baseline the router holds, so it can diff and apply only the delta.
+    /// Static routes, each already run through its VRF and global import filters
+    /// — the same baseline the router holds, so it can diff and apply only the delta.
     statics: Vec<wren_core::Route>,
     /// The recompiled per-protocol import filters (for the router's live filter swap).
     imports: router::ImportFilters,
@@ -2059,7 +2072,7 @@ struct ReloadedConfig {
 }
 
 /// Re-read the configuration file for a SIGHUP hot-reload: resolve its static routes
-/// (applying each VRF's import route-map exactly as startup does, so the result is the
+/// (applying VRF and global import filters exactly as startup does, so the result is the
 /// same baseline the router already holds) and, when BGP is enabled, build its neighbour
 /// set. Returns both, or an error — a missing/unparsable file, bad TOML, or an unknown
 /// filter — so the caller can keep the running configuration rather than apply a broken
@@ -2073,12 +2086,11 @@ fn reload_config(path: &std::path::Path) -> Result<ReloadedConfig> {
     let fib_export = resolve_fib_export(&cfg, &by_name).context("resolving export filters")?;
     let (vrf_imports, _vrf_exports) =
         build_vrf_routemaps(&cfg, &by_name).context("resolving vrf route-maps")?;
-    let mut statics = Vec::new();
-    for route in cfg.static_routes().context("resolving static routes")? {
-        if let Some(route) = vrf_routemap(&vrf_imports, route) {
-            statics.push(route);
-        }
-    }
+    let statics = admit_static_routes(
+        cfg.static_routes().context("resolving static routes")?,
+        &imports,
+        &vrf_imports,
+    );
     let bgp_peers = match cfg.bgp.as_ref().filter(|b| b.enabled) {
         Some(b) => Some(
             build_bgp_config(&cfg, b, &by_name)
@@ -3608,6 +3620,69 @@ fn build_vrrp_instances(cfg: &wren_config::Config) -> Result<Vec<vrrp::InstanceC
 mod tests {
     use super::*;
     use std::net::Ipv6Addr;
+
+    #[test]
+    fn static_admission_applies_vrf_then_global_import_exactly_once() {
+        let route = wren_core::Route::new(
+            "198.51.100.1/32".parse().unwrap(),
+            Protocol::Static,
+            vec![],
+            1,
+        )
+        .with_table(100);
+        let vrf = Filter {
+            rules: vec![Rule {
+                matcher: Match::default(),
+                modify: Modify {
+                    add_metric: Some(10),
+                    ..Default::default()
+                },
+                action: Action::Accept,
+            }],
+            default: Action::Reject,
+        };
+        let global = Filter {
+            rules: vec![Rule {
+                matcher: Match {
+                    metric_le: Some(11),
+                    metric_ge: Some(11),
+                    ..Default::default()
+                },
+                modify: Modify {
+                    add_metric: Some(100),
+                    ..Default::default()
+                },
+                action: Action::Accept,
+            }],
+            default: Action::Reject,
+        };
+        let vrfs = std::collections::HashMap::from([(100, vrf.clone())]);
+        let imports = router::ImportFilters::from([(Protocol::Static, global)]);
+        let admitted = admit_static_routes(vec![route.clone()], &imports, &vrfs);
+        assert_eq!(admitted.len(), 1);
+        assert_eq!(admitted[0].metric, 111);
+        // No VRF transformation means the global condition must reject it.
+        assert!(admit_static_routes(vec![route.clone()], &imports, &Default::default()).is_empty());
+        // A rejecting VRF must not be bypassed by a global accept policy.
+        let reject = Filter {
+            rules: vec![],
+            default: Action::Reject,
+        };
+        assert!(admit_static_routes(
+            vec![route.clone()],
+            &Default::default(),
+            &std::collections::HashMap::from([(100, reject)]),
+        )
+        .is_empty());
+        assert_eq!(
+            admit_static_routes(
+                vec![route.clone()],
+                &Default::default(),
+                &Default::default()
+            ),
+            vec![route]
+        );
+    }
 
     /// Resolve a `[bgp]` block from TOML through [`build_bgp_config`] with no named
     /// filters, returning the resolved config (or the resolution error).

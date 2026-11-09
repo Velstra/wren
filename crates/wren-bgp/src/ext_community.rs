@@ -39,7 +39,7 @@ pub fn parse_ext_community(s: &str) -> Option<ExtCommunity> {
     let s = s.trim();
     // Raw hex form: 0x + 16 hex digits.
     if let Some(hex) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
-        if hex.len() != 16 {
+        if hex.len() != 16 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
             return None;
         }
         let mut out = [0u8; 8];
@@ -162,6 +162,11 @@ mod tests {
         assert_eq!(parse_ext_community("rt:65536:99999"), None); // 4-octet form, value > u16
         assert_eq!(parse_ext_community("rt:192.0.2.1:99999"), None); // IPv4 form, value > u16
         assert_eq!(parse_ext_community("0x1234"), None); // wrong hex length
+        assert_eq!(parse_ext_community("0xgg00000000000001"), None);
+        // Sixteen bytes, but slicing hex pairs would split a Unicode character.
+        // User input must be rejected rather than panic in route-map compilation.
+        assert_eq!(parse_ext_community("0x1é0000000000000"), None);
+        assert_eq!(parse_ext_community("0x0000000000000é1"), None);
     }
 
     #[test]

@@ -18,6 +18,7 @@
 //! |---|---|
 //! | `10.0.0.0/8` | exactly `10.0.0.0/8` |
 //! | `10.0.0.0/8+` | `10.0.0.0/8` or any more-specific (length 8…max) |
+//! | `10.0.0.0/8-` | `10.0.0.0/8` or an enclosing less-specific prefix |
 //! | `10.0.0.0/8{16,24}` | within `10.0.0.0/8`, length 16…24 |
 //!
 //! ```
@@ -86,11 +87,24 @@ impl PrefixPattern {
         PrefixPattern::new(network, network.len(), max)
     }
 
+    /// Match the network or one of its enclosing prefixes. Unlike an ordinary
+    /// contained length window, this compares containment in the other direction.
+    pub fn orshorter(network: Prefix) -> Self {
+        Self {
+            network,
+            min_len: 0,
+            max_len: network.len(),
+        }
+    }
+
     /// Whether `prefix` matches this pattern.
     pub fn matches(&self, prefix: &Prefix) -> bool {
         self.network.is_ipv4() == prefix.is_ipv4()
-            && prefix.len() >= self.network.len()
-            && self.network.contains(prefix.addr())
+            && if self.min_len < self.network.len() {
+                prefix.contains(self.network.addr())
+            } else {
+                self.network.contains(prefix.addr())
+            }
             && prefix.len() >= self.min_len
             && prefix.len() <= self.max_len
     }
@@ -99,12 +113,15 @@ impl PrefixPattern {
 impl FromStr for PrefixPattern {
     type Err = ParseError;
 
-    /// Parse `addr/len`, `addr/len+`, or `addr/len{min,max}`.
+    /// Parse `addr/len`, `addr/len+`, `addr/len-`, or `addr/len{min,max}`.
     fn from_str(s: &str) -> Result<Self, ParseError> {
         let s = s.trim();
         if let Some(base) = s.strip_suffix('+') {
             let network = parse_prefix(base)?;
             return Ok(PrefixPattern::orlonger(network));
+        }
+        if let Some(base) = s.strip_suffix('-') {
+            return Ok(PrefixPattern::orshorter(parse_prefix(base)?));
         }
         if let Some(open) = s.find('{') {
             let base = &s[..open];
@@ -511,6 +528,44 @@ mod tests {
         assert!(p.matches(&pfx("10.0.0.0/8")));
         assert!(!p.matches(&pfx("10.1.0.0/16")));
         assert!(!p.matches(&pfx("11.0.0.0/8")));
+    }
+
+    #[test]
+    fn shorter_patterns_match_ancestors_not_siblings_or_descendants() {
+        for (pattern, yes, no) in [
+            (
+                "198.19.244.0/24-",
+                vec!["0.0.0.0/0", "198.19.0.0/16", "198.19.244.0/24"],
+                vec!["198.19.245.0/24", "198.19.244.0/25", "2001:db8::/32"],
+            ),
+            (
+                "2001:db8:244::/64-",
+                vec!["::/0", "2001:db8::/32", "2001:db8:244::/64"],
+                vec!["2001:db8:245::/64", "2001:db8:244::/65", "0.0.0.0/0"],
+            ),
+            ("0.0.0.0/0-", vec!["0.0.0.0/0"], vec!["198.19.0.0/16"]),
+        ] {
+            let p: PrefixPattern = pattern.parse().unwrap();
+            for prefix in yes {
+                assert!(
+                    p.matches(&prefix.parse().unwrap()),
+                    "{pattern} should match {prefix}"
+                );
+            }
+            for prefix in no {
+                assert!(
+                    !p.matches(&prefix.parse().unwrap()),
+                    "{pattern} must not match {prefix}"
+                );
+            }
+        }
+        for bad in [
+            "198.19.244.0/24--",
+            "198.19.244.0/24+-",
+            "198.19.244.0/24{bad,32}",
+        ] {
+            assert!(bad.parse::<PrefixPattern>().is_err());
+        }
     }
 
     #[test]

@@ -13,6 +13,13 @@ unshare -Urn bash -euo pipefail -c '
   ip link set d0 up
   ip link add d1 type dummy
   ip address add 192.168.2.1/24 dev d1
+  ip address add 2001:db8:2::1/64 dev d1
   ip link set d1 up
+  # Gateway validation needs usable addresses, not ones still undergoing DAD.
+  for attempt in $(seq 1 50); do
+    if ! ip -6 address show tentative | grep -q tentative; then break; fi
+    sleep 0.1
+  done
+  test -z "$(ip -6 address show tentative)"
   cargo test -p wren-netlink --locked --offline -- --ignored --nocapture
 '
