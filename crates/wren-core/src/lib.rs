@@ -550,6 +550,14 @@ pub trait Fib {
     /// Apply one change.
     fn apply(&mut self, change: &FibChange) -> Result<(), FibError>;
 
+    /// Remove this specific previously installed route, not an arbitrary route
+    /// sharing its prefix. Kernel FIBs can hold connected and learned routes at
+    /// the same destination; reconciliation must preserve their origin, metric,
+    /// next hops and table. Backends without exact removal fail closed.
+    fn remove_owned(&mut self, _route: &Route) -> Result<(), FibError> {
+        Err(FibError("exact owned-route removal is unsupported".into()))
+    }
+
     /// Apply many changes in order (default: one-by-one).
     fn apply_all(&mut self, changes: &[FibChange]) -> Result<(), FibError> {
         for c in changes {
@@ -592,6 +600,14 @@ impl Fib for MemoryFib {
 
     fn owned_routes(&mut self) -> Result<Vec<Route>, FibError> {
         Ok(self.installed.values().cloned().collect())
+    }
+
+    fn remove_owned(&mut self, route: &Route) -> Result<(), FibError> {
+        let key = (route.table, route.prefix);
+        if self.installed.get(&key) == Some(route) {
+            self.installed.remove(&key);
+        }
+        Ok(())
     }
 }
 
