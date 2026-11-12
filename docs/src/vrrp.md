@@ -113,6 +113,84 @@ vrid  interface  state       priority  master           virtual-ips
 `state` is `initialize`, `backup` or `master`; `master` is the address of the
 current master (this router itself when it is master).
 
+## Appliance HA: witness or explicit two-node mode
+
+An appliance `[ha]` configuration replaces the independent VRRP elections above
+with one forwarding authority for all configured VIPs. This requires the
+compatible data-plane HA agent and kernel guard: a running Wren process or a
+reachable peer alone is not permission to forward. Agent boot identity, policy
+digest, state readiness and bounded local kernel deadlines remain mandatory.
+
+`mode = "witness"` is the default and requires an independent authenticated
+witness. Existing configurations with `witness` and no `mode` retain this
+behavior. The alternative `mode = "two-node"` uses authenticated peer heartbeats
+without a witness. There is **no automatic fallback** between the two modes;
+configuring both a witness and two-node peers is rejected.
+
+**Two-node mode is availability-oriented, not quorum fencing. If every control
+path is partitioned, both healthy members can eventually become active.** On
+reconnection, deterministic priority/node ordering fences the losing member.
+Use witness mode when ownership must remain exclusive through a total member
+partition. Two VLANs sharing one NIC or switch do not provide independent
+physical failure paths.
+
+The following is the Wren runtime format for member 1. On a managed Sentinel
+appliance, use its HA configuration/enrollment workflow instead of editing the
+generated Wren file. Provision a real shared derived runtime key securely;
+the example key below is not a credential.
+
+```toml
+[ha]
+mode = "two-node"
+cluster = "example-cluster-0001"
+node = 1
+secret = "EXAMPLE-ONLY-never-use-this-runtime-key"
+priority = 200
+preempt = false
+lease_ms = 250
+io_ms = 80
+
+[ha.two_node]
+listen = ["10.3.0.1:5441"]
+peers = ["10.3.0.2:5441"]
+peer_timeout_ms = 1000
+startup_delay_ms = 3000
+
+[[vrrp]]
+interface = "lan0"
+vrid = 51
+virtual-address = ["10.0.0.254"]
+prefix-length = 24
+```
+
+Member 2 uses `node = 2`, its own priority (for example 100), and reciprocal
+`listen`/`peers` addresses. Both members need the same cluster and derived key,
+compatible policy, and configured state replication. Up to four matching
+local/peer paths are supported. Heartbeats use **TCP**, conventionally port
+5441, with expected-source-IP admission and mutually authenticated nonce-HMAC
+sessions; sequence/boot-epoch checks reject replay. Authentication does not
+encrypt metadata, so use private control links. Permit the selected TCP
+endpoints only between the intended members; state replication has its own
+transport and configuration.
+
+The default peer timeout is 1000 ms; accepted values are 750–1200 ms and must
+fit the configured lease/I/O budget and the data-plane replica freshness
+budget. Startup delay must be at least twice the peer timeout. An eligible
+cold bootstrap is distinct from warm takeover: a stale or incomplete warm
+snapshot is not silently promoted as an empty table. With preemption disabled,
+a healthy connected incumbent stays active. Explicit preemption requires the
+challenger's matching warm state; equal priorities favor member 1.
+
+During startup, Sentinel may temporarily remove control addresses while it
+reattaches the data plane. Wren publishes a closed role and retries only a
+missing-local-address bind error every 100 ms, honoring shutdown. The election
+startup quarantine begins only after every configured listener binds. Other
+errors (including port conflicts and permissions) fail explicitly; Wren never
+uses wildcard/freebind listeners to bypass address readiness. Unit tests cover
+delayed availability, cancellation, fatal errors and partial-bind cleanup.
+Actual appliance VM/hardware tests must additionally prove kernel/Agent
+readiness, VIP ownership, live-flow failover and total-path-partition recovery.
+
 ## Scope
 
 The runner is dual-stack (IPv4 and IPv6) with interface tracking. The remaining
