@@ -254,7 +254,9 @@ mod tests {
         let mut config = Config {
             cluster: "cluster".into(),
             node: 1,
-            witness: "127.0.0.1:5440".parse().unwrap(),
+            mode: crate::Mode::Witness,
+            two_node: None,
+            witness: Some("127.0.0.1:5440".parse().unwrap()),
             secret: "unused".into(),
             priority: 200,
             preempt: true,
