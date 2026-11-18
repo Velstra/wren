@@ -43,6 +43,320 @@ const ETH_P_ARP: u16 = 0x0806;
 /// The IPv6 all-nodes multicast group, the destination for an unsolicited NA.
 const ALL_NODES_V6: Ipv6Addr = Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 1);
 
+/// Timestamp the completed snapshot, not the beginning of the poll. The Agent
+/// can publish while its private file is being read; comparing that publication
+/// with an earlier clock value would falsely reject it as future-dated. Genuine
+/// future timestamps and snapshots that aged during the read remain invalid.
+fn read_then_timestamp_agent(
+    read: impl FnOnce() -> Option<wren_ha::Agent>,
+    clock: impl FnOnce() -> u64,
+) -> (Option<wren_ha::Agent>, u64) {
+    let agent = read();
+    let completed_ns = clock();
+    (agent, completed_ns)
+}
+
+struct HaDecisionObservation {
+    agent: Option<wren_ha::Agent>,
+    healthy: bool,
+    healthy_after: bool,
+    now: u64,
+}
+
+/// The exchange can outlive the Agent sample or a tracked link. Revalidate the
+/// SAME sample used in the request, never a new file/policy generation. Read the
+/// clock after the second health probe, so that probe's latency cannot hide age.
+fn revalidate_after_exchange(
+    agent: Option<wren_ha::Agent>,
+    healthy_before: bool,
+    health: impl FnOnce() -> bool,
+    clock: impl FnOnce() -> u64,
+) -> HaDecisionObservation {
+    let healthy_after = health();
+    let now = clock();
+    HaDecisionObservation {
+        agent: agent.filter(|agent| agent.eligible && wren_ha::fresh(agent.updated_ns, now)),
+        healthy: healthy_before && healthy_after,
+        healthy_after,
+        now,
+    }
+}
+
+/// Diagnostic-only snapshots. No value here participates in authority, freshness
+/// or fencing decisions. Formatting/logging is off the coordinator task; enqueue
+/// happens only after VIP release, so diagnostics never precede fencing.
+mod withdrawal_diagnostics {
+    use std::sync::mpsc::{sync_channel, SyncSender};
+
+    const CAPACITY: usize = 32;
+    const INTERVAL_NS: u64 = 1_000_000_000;
+
+    #[derive(Clone, Copy, Debug)]
+    pub(super) enum Event {
+        Inactive,
+        BindingAssumeFailure,
+        Shutdown,
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(super) enum AgentStatus {
+        MissingOrUnreadable,
+        IdentityMismatch,
+        Ineligible,
+        Future,
+        Stale,
+        Accepted,
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    pub(super) struct Observation {
+        pub(super) observed_ns: u64,
+        pub(super) updated_ns: Option<u64>,
+        pub(super) eligible: Option<bool>,
+        pub(super) identity_matches: bool,
+        pub(super) status: AgentStatus,
+    }
+
+    impl Observation {
+        pub(super) fn capture(
+            agent: Option<&wren_ha::Agent>,
+            config: &wren_ha::Config,
+            boot: [u8; 16],
+            now: u64,
+        ) -> Self {
+            let identity_matches = agent.is_some_and(|agent| {
+                agent.cluster == config.cluster
+                    && agent.node == config.node
+                    && agent.coordinator_boot == boot
+            });
+            Self {
+                observed_ns: now,
+                updated_ns: agent.map(|agent| agent.updated_ns),
+                eligible: agent.map(|agent| agent.eligible),
+                identity_matches,
+                status: classify_agent(
+                    agent.map(|agent| (agent.updated_ns, agent.eligible)),
+                    identity_matches,
+                    now,
+                ),
+            }
+        }
+    }
+
+    fn classify_agent(agent: Option<(u64, bool)>, identity_matches: bool, now: u64) -> AgentStatus {
+        let Some((updated, eligible)) = agent else {
+            return AgentStatus::MissingOrUnreadable;
+        };
+        // Match the existing identity -> eligible && fresh filter precedence.
+        // The separately captured accepted flag remains the authoritative result.
+        if !identity_matches {
+            AgentStatus::IdentityMismatch
+        } else if !eligible {
+            AgentStatus::Ineligible
+        } else if updated > now {
+            AgentStatus::Future
+        } else if !wren_ha::fresh(updated, now) {
+            AgentStatus::Stale
+        } else {
+            AgentStatus::Accepted
+        }
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    pub(super) struct Conditions {
+        pub(super) healthy: bool,
+        pub(super) healthy_before: bool,
+        pub(super) healthy_after: bool,
+        pub(super) agent_request_accepted: bool,
+        pub(super) agent_accepted: bool,
+        pub(super) vpn_cooldown: bool,
+        pub(super) vip_cooldown: bool,
+        pub(super) owner_matches: bool,
+        pub(super) authority_boot_matches: bool,
+        pub(super) authority_expired: bool,
+    }
+
+    impl Conditions {
+        pub(super) fn authority_expired(deadline: u64, now: u64) -> bool {
+            deadline <= now
+        }
+    }
+
+    // Every field is a fixed scalar/enum; no cluster IDs, policy hashes,
+    // credentials, interface names or free-form error text enter this record.
+    #[derive(Clone, Copy, Debug)]
+    pub(super) struct Report {
+        pub(super) event: Event,
+        pub(super) node: u8,
+        pub(super) decision_ns: u64,
+        pub(super) observation: Option<Observation>,
+        pub(super) pre_exchange_deadline_ns: u64,
+        pub(super) deadline_ns: u64,
+        pub(super) authority_term: u64,
+        pub(super) authority_owner: u8,
+        pub(super) conditions: Option<Conditions>,
+    }
+
+    #[derive(Default)]
+    struct Budget {
+        next_ns: u64,
+        suppressed: u64,
+    }
+
+    impl Budget {
+        fn admit(&mut self, now: u64) -> Option<u64> {
+            if now == u64::MAX || now < self.next_ns {
+                self.suppressed = self.suppressed.saturating_add(1);
+                return None;
+            }
+            self.next_ns = now.saturating_add(INTERVAL_NS);
+            Some(std::mem::take(&mut self.suppressed))
+        }
+    }
+
+    pub(super) struct Reporter {
+        sender: Option<SyncSender<(Report, u64, u64, u64)>>,
+        budgets: [Budget; 3],
+        dropped: u64,
+    }
+
+    impl Reporter {
+        pub(super) fn new() -> Self {
+            let (sender, receiver) = sync_channel::<(Report, u64, u64, u64)>(CAPACITY);
+            let started = std::thread::Builder::new()
+                .name("ha-withdraw-log".into())
+                .spawn(move || {
+                    // This coordinator owns the sole sender. Dropping it closes
+                    // the channel and exits this thread after the bounded tail;
+                    // never join a potentially blocked logging thread in HA.
+                    while let Ok((report, released_ns, suppressed, dropped)) = receiver.recv() {
+                        let observed = report.observation;
+                        let condition = report.conditions;
+                        tracing::info!(
+                            target: "wren::ha_withdrawal",
+                            event = ?report.event, node = report.node,
+                            decision_ns = report.decision_ns, released_ns,
+                            observation_ns = ?observed.map(|o| o.observed_ns),
+                            agent_updated_ns = ?observed.and_then(|o| o.updated_ns),
+                            agent_age_at_observation_ns = ?observed.and_then(|o| o.updated_ns.and_then(|at| o.observed_ns.checked_sub(at))),
+                            agent_age_at_decision_ns = ?observed.and_then(|o| o.updated_ns.and_then(|at| report.decision_ns.checked_sub(at))),
+                            agent_status = ?observed.map(|o| o.status),
+                            agent_eligible = ?observed.and_then(|o| o.eligible),
+                            agent_identity_matches = ?observed.map(|o| o.identity_matches),
+                            agent_gate_accepted = ?condition.map(|c| c.agent_accepted),
+                            agent_request_accepted = ?condition.map(|c| c.agent_request_accepted),
+                            healthy = ?condition.map(|c| c.healthy),
+                            healthy_before = ?condition.map(|c| c.healthy_before),
+                            healthy_after = ?condition.map(|c| c.healthy_after),
+                            vpn_cooldown = ?condition.map(|c| c.vpn_cooldown),
+                            vip_cooldown = ?condition.map(|c| c.vip_cooldown),
+                            owner_matches = ?condition.map(|c| c.owner_matches),
+                            authority_boot_matches = ?condition.map(|c| c.authority_boot_matches),
+                            authority_expired = ?condition.map(|c| c.authority_expired),
+                            pre_exchange_deadline_ns = report.pre_exchange_deadline_ns,
+                            deadline_ns = report.deadline_ns,
+                            remaining_ns = report.deadline_ns.saturating_sub(report.decision_ns),
+                            authority_term = report.authority_term,
+                            authority_owner = report.authority_owner,
+                            suppressed, queue_dropped = dropped,
+                            "HA VIP withdrawal decision"
+                        );
+                    }
+                })
+                .is_ok();
+            Self {
+                sender: started.then_some(sender),
+                budgets: std::array::from_fn(|_| Budget::default()),
+                dropped: 0,
+            }
+        }
+
+        pub(super) fn after_release(&mut self, report: Report) {
+            let Some(sender) = self.sender.as_ref() else {
+                return;
+            };
+            let released_ns = wren_ha::now_ns();
+            let Some(suppressed) = self.budgets[report.event as usize].admit(released_ns) else {
+                return;
+            };
+            if sender
+                .try_send((report, released_ns, suppressed, self.dropped))
+                .is_err()
+            {
+                self.dropped = self.dropped.saturating_add(1);
+            } else {
+                self.dropped = 0;
+            }
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn agent_reason_matches_existing_filter_order_and_freshness_boundary() {
+            let now = 2 * wren_ha::FRESH_NS;
+            assert_eq!(
+                classify_agent(None, false, now),
+                AgentStatus::MissingOrUnreadable
+            );
+            assert_eq!(
+                classify_agent(Some((now, true)), false, now),
+                AgentStatus::IdentityMismatch
+            );
+            assert_eq!(
+                classify_agent(Some((0, false)), true, now),
+                AgentStatus::Ineligible
+            );
+            assert_eq!(
+                classify_agent(Some((now + 1, true)), true, now),
+                AgentStatus::Future
+            );
+            assert_eq!(
+                classify_agent(Some((now - wren_ha::FRESH_NS - 1, true)), true, now),
+                AgentStatus::Stale
+            );
+            assert_eq!(
+                classify_agent(Some((now - wren_ha::FRESH_NS, true)), true, now),
+                AgentStatus::Accepted
+            );
+        }
+
+        #[test]
+        fn authority_expiration_matches_strict_live_deadline() {
+            assert!(!Conditions::authority_expired(101, 100));
+            assert!(Conditions::authority_expired(100, 100));
+            assert!(Conditions::authority_expired(99, 100));
+            assert!(Conditions::authority_expired(0, u64::MAX));
+        }
+
+        #[test]
+        fn bounded_queue_does_not_wait_and_closes_when_coordinator_drops_sender() {
+            let (sender, receiver) = sync_channel(CAPACITY);
+            for value in 0..CAPACITY {
+                sender.try_send(value).unwrap();
+            }
+            assert!(matches!(
+                sender.try_send(0),
+                Err(std::sync::mpsc::TrySendError::Full(_))
+            ));
+            drop(sender);
+            assert_eq!(receiver.into_iter().count(), CAPACITY);
+        }
+
+        #[test]
+        fn budget_suppression_does_not_slide_window_or_overflow_clock() {
+            let mut budget = Budget::default();
+            assert_eq!(budget.admit(5), Some(0));
+            assert_eq!(budget.admit(6), None);
+            assert_eq!(budget.admit(7), None);
+            assert_eq!(budget.admit(5 + INTERVAL_NS), Some(2));
+            assert_eq!(budget.admit(u64::MAX), None);
+        }
+    }
+}
+
 /// Retry startup announcements, then refresh neighbor learning while master.
 /// A successful send only means the local kernel accepted the frame; a switch
 /// recovering at the same time may still miss it.
@@ -104,6 +418,33 @@ pub struct InstanceConfig {
     pub track_interfaces: Vec<String>,
     /// How much to subtract from the base priority while a tracked interface is down.
     pub priority_decrement: u8,
+}
+
+fn ha_interfaces_healthy(configs: &[InstanceConfig], wireguard: &[String]) -> bool {
+    ha_interfaces_healthy_with(
+        configs,
+        wireguard,
+        iface_running,
+        |name| iface_index(name).is_some(),
+        |name| read_mac(name).is_some(),
+    )
+}
+
+/// Keep the exact existing address-link/index/MAC and tracked-link predicate in
+/// one place for both observations. WireGuard only exempts the address-link MAC.
+fn ha_interfaces_healthy_with(
+    configs: &[InstanceConfig],
+    wireguard: &[String],
+    mut running: impl FnMut(&str) -> bool,
+    mut indexed: impl FnMut(&str) -> bool,
+    mut mac: impl FnMut(&str) -> bool,
+) -> bool {
+    configs.iter().all(|config| {
+        running(&config.address_interface)
+            && indexed(&config.address_interface)
+            && (wireguard.contains(&config.address_interface) || mac(&config.address_interface))
+            && config.track_interfaces.iter().all(|name| running(name))
+    })
 }
 
 /// A read-only `show vrrp` query, answered from the instances the runner owns.
@@ -445,12 +786,23 @@ pub async fn run_ha(
     let mut rekey_term = 0;
     let mut vpn_failed_until = 0;
     let mut vip_failed_until = 0;
+    let mut withdrawal_reporter = withdrawal_diagnostics::Reporter::new();
+    let mut last_observation = None;
+    let mut pre_exchange_deadline_ns = 0;
     loop {
         tokio::select! {
             _ = shutdown.changed() => {
+                let withdrawal = binding.owns.then_some(withdrawal_diagnostics::Report {
+                    event: withdrawal_diagnostics::Event::Shutdown,
+                    node: config.node, decision_ns: wren_ha::now_ns(), observation: last_observation,
+                    pre_exchange_deadline_ns, deadline_ns: role.deadline_ns,
+                    authority_term: role.authority.term, authority_owner: role.authority.owner,
+                    conditions: None,
+                });
                 role.deadline_ns = 0; role.vips_ready = false;
                 wren_ha::write_private(Path::new(ROLE_PATH), &role, false)?;
                 binding.release();
+                if let Some(report) = withdrawal { withdrawal_reporter.after_release(report); }
                 return Ok(());
             }
             Some(query) = queries.recv() => {
@@ -469,6 +821,7 @@ pub async fn run_ha(
             }
             _ = poll.tick() => {
                 let now = wren_ha::now_ns();
+                pre_exchange_deadline_ns = role.deadline_ns;
                 if rekey.0.as_ref().is_some_and(|task|task.is_finished()) {
                     let result = rekey.0.take().expect("finished rekey").await;
                     match result {
@@ -481,20 +834,23 @@ pub async fn run_ha(
                         }
                     }
                 }
-                let reported = wren_ha::read_private::<Agent>(Path::new(AGENT_PATH)).ok()
+                let (raw_reported, observed_ns) = read_then_timestamp_agent(
+                    || wren_ha::read_private::<Agent>(Path::new(AGENT_PATH)).ok(),
+                    wren_ha::now_ns);
+                last_observation = Some(withdrawal_diagnostics::Observation::capture(
+                    raw_reported.as_ref(), &config, boot, observed_ns));
+                let reported = raw_reported
                     .filter(|a| a.cluster == config.cluster && a.node == config.node
                         && a.coordinator_boot == boot);
-                let agent = reported.clone().filter(|a| a.eligible && wren_ha::fresh(a.updated_ns, now));
+                let agent = reported.clone().filter(|a| a.eligible && wren_ha::fresh(a.updated_ns, observed_ns));
                 agent_seen = reported;
-                let healthy = binding.configs.iter().all(|c|
-                    iface_running(&c.address_interface) && iface_index(&c.address_interface).is_some()
-                        && (config.wireguard.contains(&c.address_interface) || read_mac(&c.address_interface).is_some())
-                        && c.track_interfaces.iter().all(|i| iface_running(i)));
+                let healthy_before = ha_interfaces_healthy(&binding.configs, &config.wireguard);
+                let agent_request_accepted = agent.is_some();
                 let request = Request { cluster: config.cluster.clone(), node: config.node,
                     boot, agent_boot: agent.as_ref().map_or([0;16],|a|a.agent_boot), priority: config.priority, preempt: config.preempt,
                     ready_term: agent.as_ref().map_or(0, |a| a.ready_term),
                     policy: agent.as_ref().map_or(role.authority.policy, |a| a.policy),
-                    eligible: healthy && agent.is_some() && now>=vpn_failed_until && now>=vip_failed_until };
+                    eligible: healthy_before && agent.is_some() && now>=vpn_failed_until && now>=vip_failed_until };
                 let asked = Instant::now();
                 let answer = if let Some(peers) = &mut peer_control {
                     peers.step(&request, role.deadline_ns, role.vips_ready).await
@@ -516,17 +872,40 @@ pub async fn run_ha(
                     }
                     Err(error) => { debug!(error = format_args!("{error:#}"), "HA authority renewal unavailable; existing deadline cannot be extended"); }
                 }
-                let now = wren_ha::now_ns();
+                let decision = revalidate_after_exchange(agent, healthy_before,
+                    || ha_interfaces_healthy(&binding.configs, &config.wireguard), wren_ha::now_ns);
+                let agent = decision.agent;
+                let healthy = decision.healthy;
+                let now = decision.now;
                 let active = healthy && agent.is_some() && now>=vpn_failed_until && now>=vip_failed_until && role.authority.owner == config.node
                     && role.authority.boot == boot && role.deadline_ns > now;
+                let withdrawal = withdrawal_diagnostics::Report {
+                    event: withdrawal_diagnostics::Event::Inactive,
+                    node: config.node, decision_ns: now, observation: last_observation,
+                    pre_exchange_deadline_ns, deadline_ns: role.deadline_ns,
+                    authority_term: role.authority.term, authority_owner: role.authority.owner,
+                    conditions: Some(withdrawal_diagnostics::Conditions {
+                        healthy, healthy_before, healthy_after: decision.healthy_after,
+                        agent_request_accepted, agent_accepted: agent.is_some(),
+                        vpn_cooldown: now < vpn_failed_until, vip_cooldown: now < vip_failed_until,
+                        owner_matches: role.authority.owner == config.node,
+                        authority_boot_matches: role.authority.boot == boot,
+                        authority_expired: withdrawal_diagnostics::Conditions::authority_expired(role.deadline_ns, now),
+                    }),
+                };
                 if active {
                     match binding.assume() {
                         Ok(changed) => {role.vips_ready = true;if changed {announced_term=0;}},
-                        Err(error) => { warn!(%error, "HA VIP transaction failed; fencing"); role.deadline_ns = 0; role.vips_ready = false; vip_failed_until=now.saturating_add(1_000_000_000); binding.release(); }
+                        Err(error) => {
+                            warn!(%error, "HA VIP transaction failed; fencing"); role.deadline_ns = 0; role.vips_ready = false; vip_failed_until=now.saturating_add(1_000_000_000); binding.release();
+                            withdrawal_reporter.after_release(withdrawal_diagnostics::Report {
+                                event: withdrawal_diagnostics::Event::BindingAssumeFailure, ..withdrawal
+                            });
+                        }
                     }
                 } else {
                     role.deadline_ns = 0; role.vips_ready = false;
-                    if binding.owns {binding.release();} announcements.cancel(); announced_term = 0;
+                    if binding.owns {binding.release(); withdrawal_reporter.after_release(withdrawal);} announcements.cancel(); announced_term = 0;
                     rekey.cancel();rekey_term=0;role.vpn_ready=false;
                 }
                 if active && role.vips_ready && agent.as_ref().is_some_and(|a| a.forwarding_term==role.authority.term) && rekey_term!=role.authority.term {
@@ -1455,6 +1834,200 @@ pub fn parse_vrrp_query(line: &str) -> Option<VrrpQuery> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn post_exchange_reuses_same_agent_and_enforces_exact_freshness_boundary() {
+        let updated_ns = 1_000_000_000;
+        let accepted = wren_ha::Agent {
+            eligible: true,
+            updated_ns,
+            agent_boot: [9; 16],
+            policy: [3; 32],
+            ready_term: 7,
+            forwarding_term: 7,
+            ..Default::default()
+        };
+        for (now, expected) in [
+            (updated_ns + wren_ha::FRESH_NS, true),
+            (updated_ns + wren_ha::FRESH_NS + 1, false),
+            (updated_ns - 1, false),
+        ] {
+            let decision = revalidate_after_exchange(Some(accepted.clone()), true, || true, || now);
+            assert_eq!(decision.agent.is_some(), expected);
+            if let Some(agent) = decision.agent {
+                assert_eq!(agent.updated_ns, updated_ns);
+                assert_eq!(agent.policy, accepted.policy);
+                assert_eq!(agent.agent_boot, accepted.agent_boot);
+                assert_eq!(agent.ready_term, 7);
+                assert_eq!(agent.forwarding_term, 7);
+            }
+        }
+        // No file read is accepted by this boundary: a missing/rejected request
+        // cannot acquire another generation just because the exchange completed.
+        assert!(
+            revalidate_after_exchange(None, true, || true, || updated_ns)
+                .agent
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn post_exchange_health_delay_counts_towards_agent_age() {
+        let updated_ns = 1_000_000_000;
+        let clock = std::cell::Cell::new(updated_ns);
+        let health_finished = std::cell::Cell::new(false);
+        let decision = revalidate_after_exchange(
+            Some(wren_ha::Agent {
+                eligible: true,
+                updated_ns,
+                ..Default::default()
+            }),
+            true,
+            || {
+                clock.set(updated_ns + wren_ha::FRESH_NS + 1);
+                health_finished.set(true);
+                true
+            },
+            || {
+                assert!(
+                    health_finished.get(),
+                    "clock sampled before the health probe finished"
+                );
+                clock.get()
+            },
+        );
+        assert!(decision.healthy);
+        assert!(
+            decision.agent.is_none(),
+            "slow health observation hid an expired Agent"
+        );
+    }
+
+    #[test]
+    fn post_exchange_requires_health_both_before_and_after() {
+        for (before, after) in [(true, true), (true, false), (false, true), (false, false)] {
+            let decision = revalidate_after_exchange(
+                Some(wren_ha::Agent {
+                    eligible: true,
+                    updated_ns: 1,
+                    ..Default::default()
+                }),
+                before,
+                || after,
+                || 1,
+            );
+            assert_eq!(decision.healthy, before && after);
+            assert_eq!(decision.healthy_after, after);
+            assert!(decision.agent.is_some());
+        }
+    }
+
+    #[test]
+    fn ha_health_preserves_wireguard_exemption_and_missing_link_fail_closed() {
+        let configs = [InstanceConfig {
+            interface: "control-only".into(),
+            vrid: 1,
+            priority: 100,
+            advert_int_cs: 100,
+            preempt: true,
+            addresses: vec!["192.0.2.1".parse().unwrap()],
+            address_interface: "eth1".into(),
+            prefix_len: 24,
+            track_interfaces: vec!["uplink".into(), "sync".into()],
+            priority_decrement: 20,
+        }];
+        for (running, indexed, mac, tracks, wg, expected) in [
+            (true, true, true, true, false, true),
+            (true, true, false, true, false, false),
+            (true, true, false, true, true, true),
+            (false, true, false, true, true, false),
+            (true, false, false, true, true, false),
+            (true, true, true, false, false, false),
+            (true, true, false, false, true, false),
+        ] {
+            let wireguard = if wg { vec!["eth1".into()] } else { vec![] };
+            assert_eq!(
+                ha_interfaces_healthy_with(
+                    &configs,
+                    &wireguard,
+                    |name| match name {
+                        "eth1" => running,
+                        "uplink" => true,
+                        "sync" => tracks,
+                        other => panic!("unexpected health probe: {other}"),
+                    },
+                    |name| {
+                        assert_eq!(name, "eth1");
+                        indexed
+                    },
+                    |name| {
+                        assert_eq!(name, "eth1");
+                        mac
+                    },
+                ),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn agent_published_during_read_is_checked_against_completion_clock() {
+        let read_started_ns = 286_243_938_949;
+        let published_ns = 286_245_574_911;
+        let read_completed_ns = 286_247_719_877;
+        let read_done = std::cell::Cell::new(false);
+        let (agent, observed_ns) = read_then_timestamp_agent(
+            || {
+                read_done.set(true);
+                Some(wren_ha::Agent {
+                    updated_ns: published_ns,
+                    eligible: true,
+                    ..Default::default()
+                })
+            },
+            || {
+                assert!(
+                    read_done.get(),
+                    "freshness clock sampled before read completed"
+                );
+                read_completed_ns
+            },
+        );
+        assert_eq!(observed_ns, read_completed_ns);
+        assert!(!wren_ha::fresh(published_ns, read_started_ns));
+        assert!(agent.is_some_and(|a| a.eligible && wren_ha::fresh(a.updated_ns, observed_ns)));
+    }
+
+    #[test]
+    fn completed_agent_read_preserves_future_stale_and_exact_boundary_checks() {
+        let read_started_ns = 1_000_000_000;
+        let read_completed_ns = read_started_ns + wren_ha::FRESH_NS + 1;
+        for (updated_ns, eligible, expected) in [
+            (read_completed_ns + 1, true, false),
+            (read_started_ns, true, false), // aged past the bound during read
+            (read_completed_ns - wren_ha::FRESH_NS, true, true),
+            (read_completed_ns, false, false),
+        ] {
+            let (agent, observed_ns) = read_then_timestamp_agent(
+                || {
+                    Some(wren_ha::Agent {
+                        updated_ns,
+                        eligible,
+                        ..Default::default()
+                    })
+                },
+                || read_completed_ns,
+            );
+            assert_eq!(
+                agent.is_some_and(|a| a.eligible && wren_ha::fresh(a.updated_ns, observed_ns)),
+                expected,
+                "updated={updated_ns}, completion={observed_ns}, eligible={eligible}"
+            );
+        }
+        let (missing, observed_ns) = read_then_timestamp_agent(|| None, || read_completed_ns);
+        assert!(missing.is_none());
+        assert_eq!(observed_ns, read_completed_ns);
+    }
+
     #[tokio::test]
     async fn ha_peer_bind_retries_only_unavailable_address_until_ready() {
         let (_sender, mut shutdown) = tokio::sync::watch::channel(false);

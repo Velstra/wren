@@ -11,7 +11,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt::Write as _;
 use std::time::Duration;
 
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tracing::{debug, info, warn};
 
 use wren_core::{FibChange, Prefix, Protocol, Rib, Route};
@@ -38,6 +38,110 @@ const MAX_COALESCE_BATCH: usize = 1024;
 /// Per-protocol import filters: applied to each route a protocol announces before
 /// it enters the RIB. A protocol with no entry imports everything unchanged.
 pub type ImportFilters = HashMap<Protocol, Filter>;
+
+/// Exact post-export routes successfully installed before the router starts.
+pub type ExportedRoutes = BTreeMap<(u32, Prefix), Route>;
+
+/// Completion refers only to routing policy/static FIB reconciliation, not to
+/// protocol adjacency establishment. A pending generation is never cancelled by
+/// a control client's timeout or disconnection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReloadStatus {
+    pub generation: u64,
+    pub state: &'static str,
+    pub pending_prefixes: usize,
+    pub detail: Option<String>,
+    /// Internal admission barrier; not part of the public receipt grammar.
+    pub in_flight: bool,
+}
+
+impl ReloadStatus {
+    pub fn startup() -> Self {
+        Self {
+            generation: 0,
+            state: "converged",
+            pending_prefixes: 0,
+            detail: None,
+            in_flight: false,
+        }
+    }
+
+    pub fn render(&self) -> String {
+        let mut text = format!(
+            "scope routing\ngeneration {}\nstate {}\npending-prefixes {}\n",
+            self.generation, self.state, self.pending_prefixes
+        );
+        if let Some(detail) = &self.detail {
+            // Details are fixed diagnostics, never configuration contents.
+            let _ = writeln!(text, "detail {}", detail.replace(['\n', '\r'], " "));
+        }
+        text
+    }
+}
+
+/// One admitted generation: policy and statics must never arrive independently.
+#[derive(Debug)]
+pub struct RouterReload {
+    pub generation: u64,
+    pub statics: Vec<Route>,
+    pub imports: ImportFilters,
+    pub fib_export: Option<Filter>,
+    pub vrf_exports: HashMap<u32, Filter>,
+}
+
+/// Seed admitted statics into the RIB, then program only its final best paths.
+/// Export decisions never remove candidates from the RIB. The returned cache is
+/// evidence of successful writes, not a reconstruction from configured routes.
+/// Startup callers must propagate errors before exposing a healthy daemon.
+pub async fn seed_startup_routes(
+    rib: &mut Rib,
+    fib: &FibHandle,
+    statics: &[Route],
+    vrf_exports: &HashMap<u32, Filter>,
+    fib_export: Option<&Filter>,
+) -> anyhow::Result<ExportedRoutes> {
+    for route in statics {
+        rib.update(route.clone());
+    }
+    let mut exported = ExportedRoutes::new();
+    for best in rib.iter_best() {
+        let Some(route) = export_route(best, vrf_exports.get(&best.table)) else {
+            continue;
+        };
+        let Some(route) = export_route(&route, fib_export) else {
+            continue;
+        };
+        fib.apply(FibChange::Install(route.clone()))
+            .await
+            .map_err(|error| anyhow::anyhow!(error))?;
+        exported.insert((route.table, route.prefix), route);
+    }
+    let observed = fib
+        .owned_routes()
+        .await
+        .map_err(|error| anyhow::anyhow!(error))?;
+    anyhow::ensure!(
+        observed.len() == exported.len()
+            && exported
+                .values()
+                .all(|want| observed.iter().any(|have| same_forwarding(want, have))),
+        "startup forwarding-plane readback does not match exported routes"
+    );
+    Ok(exported)
+}
+
+/// Connected routes belong to the kernel. Each export boundary transforms an
+/// accepted route exactly once; rejection is not an empty successful install.
+fn export_route(route: &Route, filter: Option<&Filter>) -> Option<Route> {
+    if route.protocol == Protocol::Connected {
+        return None;
+    }
+    match filter.map(|filter| filter.apply(route)) {
+        Some(Decision::Reject) => None,
+        Some(Decision::Accept(route)) => Some(route),
+        None => Some(route.clone()),
+    }
+}
 
 /// A route the router pushes *out* to a protocol engine for redistribution: the
 /// engine re-originates it in its own protocol (e.g. a connected or static route
@@ -171,36 +275,6 @@ pub struct RouteSubscribe {
     pub events: mpsc::Sender<RouteEvent>,
 }
 
-/// A request to reload the router's static routes from a freshly-read configuration
-/// (the SIGHUP hot-reload path). Carries the complete new desired static-route set;
-/// the router diffs it against the set it currently holds and applies only the delta
-/// — installing added routes, removing deleted ones, replacing changed ones —
-/// through the same RIB/FIB pipeline as a live protocol update (so a new route is
-/// programmed and streamed to `monitor routes` subscribers). Dynamically-learned
-/// routes are never touched, and no protocol engine is involved, so every session
-/// and adjacency stays up across a reload.
-#[derive(Debug)]
-pub struct ReloadRoutes {
-    /// The complete set of static routes the new configuration defines, already run
-    /// through any per-VRF import route-map by the caller (as at startup).
-    pub statics: Vec<Route>,
-}
-
-/// A request to swap the router's live filter set from a freshly-read configuration
-/// (the SIGHUP hot-reload path). Carries the complete new import filters (per-protocol,
-/// applied as a route enters the RIB) and FIB export filter (RIB → kernel). The router
-/// replaces its working set wholesale; the change takes effect on the next route update
-/// each affects — no session or adjacency is disturbed. Withdrawing an already-installed
-/// route when a stricter export filter now rejects it is handled the next time that
-/// prefix changes; the periodic reconcile does not re-run export policy on its own.
-#[derive(Debug)]
-pub struct FilterReload {
-    /// The new per-protocol import filters (replaces the running set wholesale).
-    pub imports: ImportFilters,
-    /// The new FIB export filter, or `None` to clear it.
-    pub fib_export: Option<Filter>,
-}
-
 /// Capacity of each route-export subscriber channel. Bounds the memory a single
 /// slow/stuck `monitor routes` client can cause the router to hold.
 pub(crate) const SUBSCRIBER_CAP: usize = 1024;
@@ -223,29 +297,25 @@ pub async fn run(
     mut queries: mpsc::Receiver<QueryRequest>,
     mut subscribes: mpsc::Receiver<RouteSubscribe>,
     statics: &[Route],
-    mut reloads: mpsc::Receiver<ReloadRoutes>,
-    mut filter_reloads: mpsc::Receiver<FilterReload>,
+    mut exported: ExportedRoutes,
+    mut reloads: mpsc::Receiver<RouterReload>,
+    status: watch::Sender<ReloadStatus>,
+    vrf_exports: &HashMap<u32, Filter>,
 ) {
-    // Own working copies of the filter set so a SIGHUP hot-reload can swap them live
-    // (`filter_reloads` arm below). Seeded from the startup filters the caller resolved.
+    // Policy and admitted statics change together in the reload arm.
     let mut imports = imports.clone();
     let mut fib_export = fib_export.cloned();
-    // The best-path routes we have actually programmed into the FIB, keyed by
-    // (vrf, prefix). Doubles as the route-export snapshot source, and lets the
-    // export filter's accept→reject transition withdraw a previously-installed
-    // route.
-    let mut exported: BTreeMap<(u32, Prefix), Route> = BTreeMap::new();
+    let mut vrf_exports = vrf_exports.clone();
+    let mut generation = 0;
+    let mut managed: BTreeSet<(u32, Prefix)> = exported.keys().copied().collect();
     // The static routes the running configuration defines, keyed by (vrf, prefix) —
-    // the baseline a SIGHUP reload diffs against. `main` seeds (installs) these into
-    // the FIB directly before this loop starts, so record them in `exported` too:
-    // they are in the forwarding plane, so a new `monitor routes` subscriber should
-    // see them in its snapshot, and a reload that removes one must be able to find
-    // and withdraw it.
+    // the pre-export baseline a SIGHUP reload diffs against. Keep it separate from
+    // the exact successful startup writes passed in `exported`: an export-denied
+    // static is still configured, but must never enter snapshots or FIB repair.
     let mut current_statics: BTreeMap<(u32, Prefix), Route> = BTreeMap::new();
     for route in statics {
         let key = (route.table, route.prefix);
         current_statics.insert(key, route.clone());
-        exported.entry(key).or_insert_with(|| route.clone());
     }
     // Prefixes whose last FIB write (install or remove) errored — retried on the
     // periodic reconcile tick below until they succeed (review finding M8).
@@ -253,6 +323,7 @@ pub async fn run(
     // Open route-export subscriptions (`wren monitor routes`); each receives live
     // RouteEvents. Closed ones are pruned lazily on the next fan-out.
     let mut subscribers: Vec<mpsc::Sender<RouteEvent>> = Vec::new();
+    let mut monitor_valid = true;
     // Periodic FIB reconciliation. The first `tick()` completes immediately, so
     // consume it up front — there is nothing to reconcile before the loop runs.
     let mut reconcile = tokio::time::interval(FIB_RECONCILE_INTERVAL);
@@ -260,7 +331,7 @@ pub async fn run(
     reconcile.tick().await;
     loop {
         tokio::select! {
-            update = updates.recv() => match update {
+            update = updates.recv(), if status.borrow().generation == generation => match update {
                 Some(first) => {
                     // Coalesce a burst: fold this update and every other one already
                     // waiting in the channel into the RIB, keeping only the net
@@ -285,11 +356,22 @@ pub async fn run(
                             Err(_) => break, // channel empty (or closed — recv() catches close)
                         }
                     }
-                    for (_key, change) in coalesced {
-                        let event = redist_event(&change);
-                        program_fib(fib, change, fib_export.as_ref(), &mut exported, &mut subscribers, &mut failed).await;
-                        redistribute(redist, &event).await;
+                    if coalesced.is_empty() { continue; }
+                    begin_attempt(&status, generation);
+                    managed.extend(coalesced.keys().copied());
+                    let changed: BTreeSet<_> = coalesced.keys().chain(failed.iter()).copied().collect();
+                    let desired: ExportedRoutes = changed.iter().filter_map(|(table, prefix)| {
+                        rib.best_in(*table, prefix).and_then(|route| export_route(route, vrf_exports.get(table)))
+                            .and_then(|route| export_route(&route, fib_export.as_ref()))
+                            .map(|route| ((route.table, route.prefix), route))
+                    }).collect();
+                    let converged = reconcile_selected(&desired, fib,
+                        &mut exported, &mut subscribers, &mut failed, &changed, &mut monitor_valid).await;
+                    for change in coalesced.values() {
+                        redistribute(redist, &redist_event(change)).await;
                     }
+                    publish_completion(&status, generation, &failed, converged);
+                    managed.retain(|key| failed.contains(key) || exported.contains_key(key));
                 }
                 None => break, // every protocol sender dropped — shut the router down
             },
@@ -297,43 +379,365 @@ pub async fn run(
                 let _ = req.respond.send(answer_query(rib, vrfs, &req.query));
             }
             Some(sub) = subscribes.recv() => {
-                subscribe_routes(&exported, &mut subscribers, sub).await;
+                if monitor_valid {
+                    subscribe_routes(&exported, &mut subscribers, sub).await;
+                }
+                // Unknown or ambiguous FIB state: drop without EndOfDump. A
+                // reconnect must not mistake uncertainty for a clean empty FIB.
             }
             Some(reload) = reloads.recv() => {
-                reload_statics(
-                    rib, fib, fib_export.as_ref(), &mut exported, &mut subscribers,
-                    &mut failed, &mut current_statics, reload.statics,
-                ).await;
-            }
-            Some(fr) = filter_reloads.recv() => {
-                // Swap the live filter set (SIGHUP hot-reload). Re-evaluated on the next
-                // route update each filter affects; running sessions are untouched. Report
-                // the per-protocol delta (added / removed / changed import filters) so an
-                // operator sees exactly what the reload changed.
-                let old_named: BTreeMap<&str, &Filter> =
-                    imports.iter().map(|(p, f)| (p.name(), f)).collect();
-                let new_named: BTreeMap<&str, &Filter> =
-                    fr.imports.iter().map(|(p, f)| (p.name(), f)).collect();
-                let delta = crate::reload::diff_keyed(&old_named, &new_named);
-                imports = fr.imports;
-                fib_export = fr.fib_export;
-                if delta.is_empty() {
-                    info!(fib_export = fib_export.is_some(), "route filters reloaded (import set unchanged)");
-                } else {
-                    info!(
-                        added = ?delta.added,
-                        removed = ?delta.removed,
-                        changed = ?delta.changed,
-                        fib_export = fib_export.is_some(),
-                        "route filters reloaded",
-                    );
+                // Stage all RIB changes before adopting the generation. Learned
+                // candidates remain intact; admission already rejected import
+                // changes which would require replaying their raw inputs.
+                let mut staged = rib.clone();
+                let next: BTreeMap<_, _> = reload.statics.into_iter()
+                    .map(|route| ((route.table, route.prefix), route)).collect();
+                managed.extend(current_statics.keys().copied());
+                managed.extend(next.keys().copied());
+                let mut changes = BTreeMap::new();
+                for (key, old) in &current_statics {
+                    if next.get(key) != Some(old) {
+                        if let Some(change) = staged.withdraw(key.0, key.1, Protocol::Static, old.source) {
+                            changes.insert(*key, change);
+                        }
+                    }
                 }
+                for (key, route) in &next {
+                    if current_statics.get(key) != Some(route) {
+                        if let Some(change) = staged.update(route.clone()) {
+                            changes.insert(*key, change);
+                        }
+                    }
+                }
+                *rib = staged;
+                current_statics = next;
+                imports = reload.imports;
+                fib_export = reload.fib_export;
+                vrf_exports = reload.vrf_exports;
+                generation = reload.generation;
+                let converged = reconcile_desired_checked(rib, fib, &vrf_exports, fib_export.as_ref(),
+                    &mut exported, &mut subscribers, &mut failed, &managed, &mut monitor_valid).await;
+                for change in changes.values() {
+                    redistribute(redist, &redist_event(change)).await;
+                }
+                publish_completion(&status, generation, &failed, converged);
+                managed.retain(|key| failed.contains(key) || exported.contains_key(key));
             }
-            _ = reconcile.tick() => {
-                retry_failed(rib, fib, fib_export.as_ref(), &mut exported, &mut subscribers, &mut failed).await;
+            _ = reconcile.tick(), if status.borrow().generation == generation => {
+                begin_attempt(&status, generation);
+                let converged = reconcile_desired_checked(rib, fib, &vrf_exports, fib_export.as_ref(),
+                    &mut exported, &mut subscribers, &mut failed, &managed, &mut monitor_valid).await;
+                publish_completion(&status, generation, &failed, converged);
+                managed.retain(|key| failed.contains(key) || exported.contains_key(key));
             }
         }
     }
+}
+
+fn begin_attempt(status: &watch::Sender<ReloadStatus>, generation: u64) {
+    status.send_modify(|current| {
+        if current.generation == generation {
+            current.in_flight = true;
+        }
+    });
+}
+
+fn publish_completion(
+    status: &watch::Sender<ReloadStatus>,
+    generation: u64,
+    failed: &BTreeSet<(u32, Prefix)>,
+    converged: bool,
+) {
+    status.send_modify(|current| {
+        // An older in-flight generation must not overwrite a newer admission.
+        if current.generation == generation && current.state != "rejected" {
+            current.in_flight = false;
+            current.state = if converged { "converged" } else { "pending" };
+            current.pending_prefixes = failed.len();
+            current.detail = (!converged)
+                .then(|| "forwarding-plane reconciliation incomplete; retry scheduled".into());
+        }
+    });
+}
+
+/// Kernel dumps canonicalize inferred interface and single-path weight. Do not
+/// compare RIB-only source/distance fields which the kernel cannot represent.
+fn same_forwarding(want: &Route, have: &Route) -> bool {
+    want.table == have.table
+        && want.prefix == have.prefix
+        && want.protocol == have.protocol
+        && want.metric == have.metric
+        && want.nexthops.len() == have.nexthops.len()
+        && want
+            .nexthops
+            .iter()
+            .zip(&have.nexthops)
+            .all(|(want_hop, have_hop)| {
+                want_hop.gateway == have_hop.gateway
+                    && want_hop
+                        .iface
+                        .as_ref()
+                        .map_or(true, |iface| Some(iface) == have_hop.iface.as_ref())
+                    && (want.nexthops.len() == 1
+                        || want_hop.weight.clamp(1, 256) == have_hop.weight)
+            })
+}
+
+fn inventory_index(observed: &[Route]) -> BTreeMap<(u32, Prefix), Vec<&Route>> {
+    let mut index = BTreeMap::<_, Vec<_>>::new();
+    for route in observed {
+        index
+            .entry((route.table, route.prefix))
+            .or_default()
+            .push(route);
+    }
+    index
+}
+
+fn observed_exports(
+    desired: &ExportedRoutes,
+    observed: &[Route],
+    keys: &BTreeSet<(u32, Prefix)>,
+    exported: &mut ExportedRoutes,
+    subscribers: &mut Vec<mpsc::Sender<RouteEvent>>,
+) -> bool {
+    let mut confirmed: ExportedRoutes = exported
+        .iter()
+        .filter(|(key, _)| !keys.contains(key))
+        .map(|(key, route)| (*key, route.clone()))
+        .collect();
+    let index = inventory_index(observed);
+    for key in keys {
+        if let Some(routes) = index.get(key) {
+            if routes.len() != 1 {
+                // This wire protocol has one route per prefix. Do not present
+                // an arbitrary sibling as the complete forwarding inventory.
+                subscribers.clear();
+                return false;
+            }
+            let observed = routes[0];
+            let route = desired
+                .get(key)
+                .filter(|want| same_forwarding(want, observed))
+                .or_else(|| {
+                    exported
+                        .get(key)
+                        .filter(|old| same_forwarding(old, observed))
+                })
+                .unwrap_or(observed);
+            confirmed.insert(*key, route.clone());
+        }
+    }
+    for key in exported.keys().filter(|key| !confirmed.contains_key(key)) {
+        fanout(
+            subscribers,
+            RouteEvent::Withdraw {
+                table: key.0,
+                prefix: key.1,
+            },
+        );
+    }
+    for (key, route) in &confirmed {
+        if exported.get(key) != Some(route) {
+            fanout(subscribers, RouteEvent::Update(route.clone()));
+        }
+    }
+    *exported = confirmed;
+    true
+}
+
+/// Reconcile against actual owned identities, not the success cache. An install
+/// may have reached the kernel even when its ACK failed. All restrictive removals
+/// and a complete readback precede expansions; no prefix-wide deletes are used.
+#[allow(clippy::too_many_arguments)]
+async fn reconcile_desired_checked(
+    rib: &Rib,
+    fib: &FibHandle,
+    vrf_exports: &HashMap<u32, Filter>,
+    fib_export: Option<&Filter>,
+    exported: &mut ExportedRoutes,
+    subscribers: &mut Vec<mpsc::Sender<RouteEvent>>,
+    failed: &mut BTreeSet<(u32, Prefix)>,
+    managed: &BTreeSet<(u32, Prefix)>,
+    monitor_valid: &mut bool,
+) -> bool {
+    let desired: ExportedRoutes = rib
+        .iter_best()
+        .filter_map(|route| {
+            export_route(route, vrf_exports.get(&route.table))
+                .and_then(|route| export_route(&route, fib_export))
+                .map(|route| ((route.table, route.prefix), route))
+        })
+        .collect();
+    let keys: BTreeSet<_> = managed
+        .iter()
+        .chain(desired.keys())
+        .chain(exported.keys())
+        .chain(failed.iter())
+        .copied()
+        .chain(rib.iter_best().map(|route| (route.table, route.prefix)))
+        .collect();
+    reconcile_selected(
+        &desired,
+        fib,
+        exported,
+        subscribers,
+        failed,
+        &keys,
+        monitor_valid,
+    )
+    .await
+}
+
+async fn reconcile_selected(
+    desired: &ExportedRoutes,
+    fib: &FibHandle,
+    exported: &mut ExportedRoutes,
+    subscribers: &mut Vec<mpsc::Sender<RouteEvent>>,
+    failed: &mut BTreeSet<(u32, Prefix)>,
+    keys: &BTreeSet<(u32, Prefix)>,
+    monitor_valid: &mut bool,
+) -> bool {
+    *monitor_valid = false;
+    failed.extend(keys.iter().copied());
+    let obsolete = |have: &Route| {
+        let key = (have.table, have.prefix);
+        keys.contains(&key)
+            && !desired
+                .get(&key)
+                .is_some_and(|want| same_forwarding(want, have))
+    };
+    let observed = match fib.owned_routes().await {
+        Ok(routes) => routes,
+        Err(error) => {
+            subscribers.clear();
+            warn!(%error, "routing reconciliation inventory failed");
+            return false;
+        }
+    };
+    let mut writes_ok = true;
+    let mut removed = false;
+    for route in observed.iter().filter(|route| obsolete(route)) {
+        removed = true;
+        if let Err(error) = fib.remove_owned(route.clone()).await {
+            writes_ok = false;
+            warn!(%error, prefix = %route.prefix, "exact route withdrawal pending");
+        }
+    }
+    let after_removals = if removed {
+        match fib.owned_routes().await {
+            Ok(routes) => routes,
+            Err(error) => {
+                subscribers.clear();
+                warn!(%error, "route withdrawal readback failed");
+                return false;
+            }
+        }
+    } else {
+        observed
+    };
+    *monitor_valid = observed_exports(desired, &after_removals, keys, exported, subscribers);
+    if !writes_ok || after_removals.iter().any(obsolete) {
+        return false;
+    }
+    let index = inventory_index(&after_removals);
+    let mut installed = false;
+    for (key, route) in desired {
+        if !index
+            .get(key)
+            .is_some_and(|routes| routes.iter().any(|have| same_forwarding(route, have)))
+        {
+            installed = true;
+            if let Err(error) = fib.apply(FibChange::Install(route.clone())).await {
+                writes_ok = false;
+                warn!(%error, prefix = %route.prefix, "route installation pending");
+            }
+        }
+    }
+    let final_routes = if installed {
+        match fib.owned_routes().await {
+            Ok(routes) => routes,
+            Err(error) => {
+                *monitor_valid = false;
+                subscribers.clear();
+                warn!(%error, "route installation readback failed");
+                return false;
+            }
+        }
+    } else {
+        after_removals
+    };
+    *monitor_valid = observed_exports(desired, &final_routes, keys, exported, subscribers);
+    let index = inventory_index(&final_routes);
+    failed.retain(|key| {
+        if !keys.contains(key) {
+            return true;
+        }
+        let actual = index.get(key).map_or(&[][..], Vec::as_slice);
+        match desired.get(key) {
+            Some(want) => actual.len() != 1 || !same_forwarding(want, actual[0]),
+            None => !actual.is_empty(),
+        }
+    });
+    writes_ok && failed.is_empty() && *monitor_valid
+}
+
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+async fn reconcile_desired(
+    rib: &Rib,
+    fib: &FibHandle,
+    vrf_exports: &HashMap<u32, Filter>,
+    fib_export: Option<&Filter>,
+    exported: &mut ExportedRoutes,
+    subscribers: &mut Vec<mpsc::Sender<RouteEvent>>,
+    failed: &mut BTreeSet<(u32, Prefix)>,
+    managed: &BTreeSet<(u32, Prefix)>,
+) -> bool {
+    reconcile_desired_checked(
+        rib,
+        fib,
+        vrf_exports,
+        fib_export,
+        exported,
+        subscribers,
+        failed,
+        managed,
+        &mut true,
+    )
+    .await
+}
+
+/// A successful install is not permanent: Linux removes gateway routes when a
+/// link goes down. Read back owned routes, not our cached RIB, and restore only
+/// successfully exported routes. Never flush another daemon's routes, refresh
+/// connected routes or resurrect a pending withdrawal/replacement.
+#[cfg(test)]
+async fn repair_missing_routes(
+    fib: &FibHandle,
+    exported: &BTreeMap<(u32, Prefix), Route>,
+    failed: &BTreeSet<(u32, Prefix)>,
+) {
+    let mut rib = Rib::new();
+    for (key, route) in exported {
+        if !failed.contains(key) {
+            rib.update(route.clone());
+        }
+    }
+    let mut confirmed = exported.clone();
+    let mut pending = failed.clone();
+    let keys = exported.keys().copied().collect();
+    reconcile_desired(
+        &rib,
+        fib,
+        &HashMap::new(),
+        None,
+        &mut confirmed,
+        &mut Vec::new(),
+        &mut pending,
+        &keys,
+    )
+    .await;
 }
 
 /// Re-apply the desired forwarding state for every prefix whose last FIB write
@@ -343,6 +747,7 @@ pub async fn run(
 /// prefix from `failed` (via [`program_fib`]); one that fails again stays queued for
 /// the next tick. Called only from the reconcile tick, so a healthy router with no
 /// outstanding failures does no work here.
+#[cfg(test)]
 async fn retry_failed(
     rib: &Rib,
     fib: &FibHandle,
@@ -351,19 +756,18 @@ async fn retry_failed(
     subscribers: &mut Vec<mpsc::Sender<RouteEvent>>,
     failed: &mut BTreeSet<(u32, Prefix)>,
 ) {
-    if failed.is_empty() {
-        return;
-    }
-    // Snapshot the queue: program_fib mutates `failed` as each retry resolves.
-    let pending: Vec<(u32, Prefix)> = failed.iter().copied().collect();
-    debug!(count = pending.len(), "retrying failed FIB writes");
-    for (table, prefix) in pending {
-        let change = match rib.best_in(table, &prefix) {
-            Some(route) => FibChange::Install(route.clone()),
-            None => FibChange::Remove { table, prefix },
-        };
-        program_fib(fib, change, fib_export, exported, subscribers, failed).await;
-    }
+    let managed = failed.clone();
+    reconcile_desired(
+        rib,
+        fib,
+        &HashMap::new(),
+        fib_export,
+        exported,
+        subscribers,
+        failed,
+        &managed,
+    )
+    .await;
 }
 
 /// Register a new route-export subscriber: replay the current forwarding table as
@@ -409,6 +813,7 @@ async fn subscribe_routes(
 /// and adjacency stays up across the reload. `current` is replaced with the new set so
 /// the next reload diffs against it.
 #[allow(clippy::too_many_arguments)] // one delta step: the RIB, the FIB, and every fan-out sink
+#[cfg(test)]
 async fn reload_statics(
     rib: &mut Rib,
     fib: &FibHandle,
@@ -419,51 +824,33 @@ async fn reload_statics(
     current: &mut BTreeMap<(u32, Prefix), Route>,
     new_statics: Vec<Route>,
 ) {
-    // Index the new desired set by (table, prefix). A duplicate prefix in the config
-    // keeps the last, matching how the RIB's single (Static, source=0) candidate per
-    // prefix behaves.
-    let mut next: BTreeMap<(u32, Prefix), Route> = BTreeMap::new();
-    for route in new_statics {
-        next.insert((route.table, route.prefix), route);
-    }
-
-    // Removed: present in the old set, absent from the new one — withdraw the static
-    // candidate. If another protocol still has a route to that prefix, the RIB's
-    // best-path simply changes to it (program_fib installs it); otherwise the prefix
-    // is removed from the FIB.
-    let removed: Vec<(u32, Prefix, u64)> = current
-        .iter()
-        .filter(|(key, _)| !next.contains_key(key))
-        .map(|((table, prefix), route)| (*table, *prefix, route.source))
+    let next: BTreeMap<_, _> = new_statics
+        .into_iter()
+        .map(|route| ((route.table, route.prefix), route))
         .collect();
-    let removed_count = removed.len();
-    for (table, prefix, source) in removed {
-        if let Some(change) = rib.withdraw(table, prefix, Protocol::Static, source) {
-            program_fib(fib, change, fib_export, exported, subscribers, failed).await;
+    let managed = current.keys().chain(next.keys()).copied().collect();
+    for (key, route) in current.iter() {
+        if next.get(key) != Some(route) {
+            rib.withdraw(key.0, key.1, Protocol::Static, route.source);
         }
     }
-
-    // Added or changed: absent from the old set, or defined differently — offer to
-    // the RIB. An unchanged route is skipped so its RIB entry (and any FIB state) is
-    // left exactly as it is.
-    let mut changed_count = 0usize;
     for (key, route) in &next {
-        if current.get(key) == Some(route) {
-            continue;
-        }
-        changed_count += 1;
-        if let Some(change) = rib.update(route.clone()) {
-            program_fib(fib, change, fib_export, exported, subscribers, failed).await;
+        if current.get(key) != Some(route) {
+            rib.update(route.clone());
         }
     }
-
     *current = next;
-    info!(
-        added_or_changed = changed_count,
-        removed = removed_count,
-        total = current.len(),
-        "static routes reloaded",
-    );
+    reconcile_desired(
+        rib,
+        fib,
+        &HashMap::new(),
+        fib_export,
+        exported,
+        subscribers,
+        failed,
+        &managed,
+    )
+    .await;
 }
 
 /// Fan a route-export event out to every open subscriber. Live events use
@@ -670,8 +1057,8 @@ fn redist_event(change: &FibChange) -> RedistEvent {
 
 /// Fold one protocol update into the RIB and, if the best path changed, program the
 /// forwarding plane and return the redistribution event. Retained for the unit tests
-/// (which drive one update at a time); [`run`] uses [`ingest`] + [`program_fib`]
-/// directly so it can coalesce a burst.
+/// (which drive one update at a time); both paths use the production readback
+/// reconciler, while [`run`] additionally coalesces bursts.
 #[cfg(test)]
 #[allow(clippy::too_many_arguments)] // the router threads every cross-cutting input through
 async fn apply(
@@ -686,13 +1073,24 @@ async fn apply(
 ) -> Option<RedistEvent> {
     let change = ingest(rib, update, imports)?;
     let event = redist_event(&change);
-    program_fib(fib, change, fib_export, exported, subscribers, failed).await;
+    reconcile_desired(
+        rib,
+        fib,
+        &HashMap::new(),
+        fib_export,
+        exported,
+        subscribers,
+        failed,
+        &BTreeSet::from([fib_key(&change)]),
+    )
+    .await;
     Some(event)
 }
 
 /// Carry the best-path change into the forwarding plane: program a new/changed
 /// best route (subject to the FIB export filter and the connected-route special
 /// case) or remove a withdrawn one.
+#[cfg(test)]
 async fn program_fib(
     fib: &FibHandle,
     change: FibChange,
@@ -701,114 +1099,29 @@ async fn program_fib(
     subscribers: &mut Vec<mpsc::Sender<RouteEvent>>,
     failed: &mut BTreeSet<(u32, Prefix)>,
 ) {
-    match change {
-        FibChange::Install(route) => {
-            // Directly-connected networks are created in the kernel FIB by the
-            // interface configuration itself; track them in the RIB but never
-            // reprogram them, which would fight the kernel. They are likewise not
-            // route-exported (the consumer owns its own interface routes).
-            if route.protocol == Protocol::Connected {
-                info!(prefix = %route.prefix, "connected route (kernel-owned; tracked, not reinstalled)");
-                return;
-            }
-            // Run the route through the FIB export filter, if one is configured.
-            let route = match fib_export {
-                Some(filter) => match filter.apply(&route) {
-                    Decision::Accept(r) => r,
-                    Decision::Reject => {
-                        debug!(prefix = %route.prefix, "route rejected by FIB export filter");
-                        // If we had programmed this (vrf, prefix), withdraw it now —
-                        // from the FIB and from every route-export subscriber.
-                        if let Some(previous) = exported.get(&(route.table, route.prefix)).cloned()
-                        {
-                            if !remove_from_fib(fib, previous, failed).await {
-                                return;
-                            }
-                            exported.remove(&(route.table, route.prefix));
-                            fanout(
-                                subscribers,
-                                RouteEvent::Withdraw {
-                                    table: route.table,
-                                    prefix: route.prefix,
-                                },
-                            );
-                        }
-                        return;
-                    }
-                },
-                None => route,
-            };
-            let key = (route.table, route.prefix);
-            match fib.apply(FibChange::Install(route.clone())).await {
-                Ok(()) => {
-                    exported.insert(key, route.clone());
-                    failed.remove(&key); // a retried write that finally landed
-                    info!(
-                        prefix = %route.prefix,
-                        table = route.table,
-                        protocol = route.protocol.name(),
-                        metric = route.metric,
-                        "route installed",
-                    );
-                    // Mirror the install to the route-export stream.
-                    fanout(subscribers, RouteEvent::Update(route));
-                }
-                Err(e) => {
-                    // A failed install (e.g. transient ENOBUFS) is queued for the
-                    // periodic reconcile tick to retry, rather than silently lost.
-                    warn!(error = %e, prefix = %route.prefix, "FIB install failed; queued for retry");
-                    failed.insert(key);
-                }
-            }
-        }
-        FibChange::Remove { table, prefix } => {
-            let previous = exported.get(&(table, prefix)).cloned();
-            // Only ever unprogram what we programmed. `exported` records every
-            // successful install, so a prefix missing from it is somebody
-            // else's: an export-rejected route, another daemon's, or — the one
-            // that mattered — the kernel's own connected route for the link.
-            //
-            // Install already refuses to touch a connected route; Remove did
-            // not, and only skipped unprogrammed prefixes when an export filter
-            // happened to be configured. So when OSPF withdrew its view of the
-            // segment it is speaking on, the kernel delete went through and took
-            // the interface's connected route with it. The box then had no route
-            // to its own subnet: it stopped hearing its neighbour's hellos,
-            // declared it dead, and the adjacency that had just come up went
-            // down again — every time, a minute after reaching Full.
-            let Some(previous) = previous else {
-                failed.remove(&(table, prefix));
-                return;
-            };
-            if remove_from_fib(fib, previous, failed).await {
-                exported.remove(&(table, prefix));
-                fanout(subscribers, RouteEvent::Withdraw { table, prefix });
-            }
+    let key = fib_key(&change);
+    let mut rib = Rib::new();
+    // Test adapter only: exercise the production reconciliation machinery.
+    // Other exported keys are included to avoid unrelated test fixture deletion.
+    for (previous_key, route) in exported.iter() {
+        if *previous_key != key {
+            rib.update(route.clone());
         }
     }
-}
-
-/// Remove an exact owned route from the forwarding plane, logging the outcome. A
-/// transient failure is queued in `failed` for the reconcile tick to retry; a
-/// success clears any prior queued failure for the prefix.
-async fn remove_from_fib(
-    fib: &FibHandle,
-    route: Route,
-    failed: &mut BTreeSet<(u32, Prefix)>,
-) -> bool {
-    let (table, prefix) = (route.table, route.prefix);
-    match fib.remove_owned(route).await {
-        Ok(()) => {
-            info!(%prefix, table, "route removed");
-            failed.remove(&(table, prefix));
-            true
-        }
-        Err(e) => {
-            warn!(error = %e, %prefix, table, "FIB remove failed; queued for retry");
-            failed.insert((table, prefix));
-            false
-        }
+    if let FibChange::Install(route) = change {
+        rib.update(route);
     }
+    reconcile_desired(
+        &rib,
+        fib,
+        &HashMap::new(),
+        fib_export,
+        exported,
+        subscribers,
+        failed,
+        &BTreeSet::from([key]),
+    )
+    .await;
 }
 
 /// Run `route` through its protocol's import filter, if one is configured. With no
@@ -820,35 +1133,44 @@ pub(crate) fn apply_import(imports: &ImportFilters, route: Route) -> Decision {
     }
 }
 
+/// Complete startup readback before any readiness/control endpoint is exposed.
+/// An unreadable inventory is unknown, not an empty set of stale routes.
+pub async fn reconcile_startup(fib: &FibHandle) -> anyhow::Result<usize> {
+    use anyhow::Context;
+    let owned = fib
+        .owned_routes()
+        .await
+        .context("reading existing owned routes for startup reconciliation")?;
+    reconcile_owned(fib, owned).await
+}
+
 /// Reconcile leftover routes at startup: remove every forwarding-plane route this
-/// daemon owns (read back via [`Fib::owned_routes`]) whose prefix the current
-/// configuration does **not** program, so a restarted daemon never leaves a stale
-/// route behind. `keep` is the set of prefixes the daemon installs up front (its
-/// static routes); dynamic protocols re-install theirs as they reconverge. Returns
-/// the number of routes removed.
-pub async fn reconcile_owned(
-    fib: &FibHandle,
-    owned: Vec<Route>,
-    keep: &HashSet<(u32, Prefix)>,
-) -> usize {
+/// daemon owns (read back via [`Fib::owned_routes`]), even when a new static uses
+/// the same prefix: metric/protocol siblings and export-denied routes must not
+/// survive by prefix coincidence. Exact owned removal preserves foreign routes.
+/// Static routes are synchronously reinstalled before readiness; dynamic routes
+/// return as protocols reconverge. Unchanged owned routes briefly withdraw on
+/// restart, a deliberate fail-closed tradeoff rather than stale preservation. Returns
+/// the number of routes removed. Any failed exact removal prevents startup;
+/// partially completed cleanup is retried from a fresh inventory next start.
+pub async fn reconcile_owned(fib: &FibHandle, owned: Vec<Route>) -> anyhow::Result<usize> {
+    use anyhow::Context;
     let mut removed = 0;
     for route in owned {
-        if keep.contains(&(route.table, route.prefix)) {
-            continue;
-        }
-        match fib.remove_owned(route.clone()).await {
-            Ok(()) => {
-                info!(
-                    prefix = %route.prefix,
-                    protocol = route.protocol.name(),
-                    "removed stale route left by a previous instance",
-                );
-                removed += 1;
-            }
-            Err(e) => warn!(error = %e, prefix = %route.prefix, "removing stale route"),
-        }
+        fib.remove_owned(route.clone()).await.with_context(|| {
+            format!(
+                "removing stale owned route {} in table {}",
+                route.prefix, route.table
+            )
+        })?;
+        info!(
+            prefix = %route.prefix,
+            protocol = route.protocol.name(),
+            "removed stale route left by a previous instance",
+        );
+        removed += 1;
     }
-    removed
+    Ok(removed)
 }
 
 #[cfg(test)]
@@ -922,6 +1244,30 @@ mod tests {
             vec![NextHop::via("192.0.2.1".parse().unwrap())],
             metric,
         )
+    }
+
+    #[tokio::test]
+    async fn lost_forwarding_routes_are_restored_without_a_protocol_restart() {
+        let mut h = Harness::new();
+        let expected = bgp_route("203.0.113.0/24", 42);
+        h.announce(expected.clone()).await;
+        // Simulate the kernel deleting a previously successful gateway route
+        // during a link bounce. The RIB and exported cache still hold it.
+        h.fib.remove_owned(expected.clone()).await.unwrap();
+        assert!(h.installed("203.0.113.0/24").await.is_none());
+        let unrelated = bgp_route("192.0.2.0/24", 77);
+        h.fib
+            .apply(FibChange::Install(unrelated.clone()))
+            .await
+            .unwrap();
+        repair_missing_routes(&h.fib, &h.exported, &h.failed).await;
+        assert_eq!(h.installed("203.0.113.0/24").await, Some(expected.clone()));
+        assert_eq!(h.installed("192.0.2.0/24").await, Some(unrelated));
+        // A failed replacement/withdrawal must not reinstall obsolete intent.
+        h.fib.remove_owned(expected.clone()).await.unwrap();
+        h.failed.insert((expected.table, expected.prefix));
+        repair_missing_routes(&h.fib, &h.exported, &h.failed).await;
+        assert!(h.installed("203.0.113.0/24").await.is_none());
     }
 
     /// A filter rejecting RFC 1918 BGP routes and bumping the metric of the rest.
@@ -1095,7 +1441,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reconcile_removes_stale_owned_routes_but_keeps_current_ones() {
+    async fn startup_removes_owned_routes_before_reinstalling_current_ones() {
         let fib = crate::fib::spawn(Box::new(MemoryFib::default()));
         // A previous instance left two routes: a static we still want, and a RIP
         // route the current config no longer covers.
@@ -1118,20 +1464,15 @@ mod tests {
         .await
         .unwrap();
 
-        let owned = fib.owned_routes().await.unwrap();
-        let keep: HashSet<(u32, Prefix)> = [(wren_core::RT_TABLE_MAIN, still_wanted)]
-            .into_iter()
-            .collect();
-        let removed = reconcile_owned(&fib, owned, &keep).await;
+        let removed = reconcile_startup(&fib).await.unwrap();
 
-        assert_eq!(removed, 1);
-        let remaining = fib.owned_routes().await.unwrap();
-        assert!(remaining
-            .iter()
-            .any(|r| r.table == wren_core::RT_TABLE_MAIN && r.prefix == still_wanted));
-        assert!(!remaining
-            .iter()
-            .any(|r| r.table == wren_core::RT_TABLE_MAIN && r.prefix == stale));
+        assert_eq!(removed, 2);
+        assert!(fib.owned_routes().await.unwrap().is_empty());
+        let desired = static_route("10.0.0.0/24");
+        fib.apply(FibChange::Install(desired.clone()))
+            .await
+            .unwrap();
+        assert_eq!(fib.owned_routes().await.unwrap(), vec![desired]);
     }
 
     fn static_route(prefix: &str) -> Route {
@@ -1141,6 +1482,370 @@ mod tests {
             vec![NextHop::via("192.0.2.1".parse().unwrap())],
             0,
         )
+    }
+
+    #[tokio::test]
+    async fn startup_export_rejections_never_reappear_in_repair_or_snapshots() {
+        for reject_at_vrf in [false, true] {
+            let mut route = static_route("198.51.100.0/24");
+            route.table = 100;
+            let mut rib = Rib::new();
+            let fib = crate::fib::spawn(Box::new(MemoryFib::default()));
+            let vrf_exports = if reject_at_vrf {
+                HashMap::from([(100, Filter::reject_all())])
+            } else {
+                HashMap::new()
+            };
+            let global = (!reject_at_vrf).then(Filter::reject_all);
+            let exported = seed_startup_routes(
+                &mut rib,
+                &fib,
+                std::slice::from_ref(&route),
+                &vrf_exports,
+                global.as_ref(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(rib.iter_best().cloned().collect::<Vec<_>>(), vec![route]);
+            assert!(exported.is_empty());
+            assert!(fib.owned_routes().await.unwrap().is_empty());
+            repair_missing_routes(&fib, &exported, &BTreeSet::new()).await;
+            assert!(fib.owned_routes().await.unwrap().is_empty());
+            let (tx, mut rx) = mpsc::channel(4);
+            subscribe_routes(&exported, &mut Vec::new(), RouteSubscribe { events: tx }).await;
+            assert!(matches!(rx.recv().await, Some(RouteEvent::EndOfDump)));
+            assert!(rx.recv().await.is_none());
+        }
+    }
+
+    fn rewriting_export(modify: Modify) -> Filter {
+        Filter {
+            rules: vec![Rule {
+                matcher: Match::any(),
+                modify,
+                action: Action::Accept,
+            }],
+            default: Action::Reject,
+        }
+    }
+
+    #[tokio::test]
+    async fn startup_export_rewrites_once_in_order_and_preserves_exact_repair_snapshot() {
+        let mut route = static_route("198.51.100.0/24");
+        route.table = 100;
+        let vrf_exports = HashMap::from([(
+            100,
+            rewriting_export(Modify {
+                set_metric: Some(30),
+                set_next_hop: Some("192.0.2.2".parse().unwrap()),
+                ..Modify::default()
+            }),
+        )]);
+        let global = rewriting_export(Modify {
+            add_metric: Some(7),
+            ..Modify::default()
+        });
+        let mut rib = Rib::new();
+        let fib = crate::fib::spawn(Box::new(MemoryFib::default()));
+        let exported = seed_startup_routes(
+            &mut rib,
+            &fib,
+            std::slice::from_ref(&route),
+            &vrf_exports,
+            Some(&global),
+        )
+        .await
+        .unwrap();
+        let mut expected = route.clone();
+        expected.metric = 37;
+        expected.nexthops = vec![NextHop::via("192.0.2.2".parse().unwrap())];
+        assert_eq!(rib.iter_best().cloned().collect::<Vec<_>>(), vec![route]);
+        assert_eq!(
+            exported.values().cloned().collect::<Vec<_>>(),
+            vec![expected.clone()]
+        );
+        assert_eq!(fib.owned_routes().await.unwrap(), vec![expected.clone()]);
+        fib.remove_owned(expected.clone()).await.unwrap();
+        repair_missing_routes(&fib, &exported, &BTreeSet::new()).await;
+        assert_eq!(fib.owned_routes().await.unwrap(), vec![expected.clone()]);
+        let (tx, mut rx) = mpsc::channel(4);
+        subscribe_routes(&exported, &mut Vec::new(), RouteSubscribe { events: tx }).await;
+        assert!(matches!(rx.recv().await, Some(RouteEvent::Update(route)) if route == expected));
+        assert!(matches!(rx.recv().await, Some(RouteEvent::EndOfDump)));
+    }
+
+    struct StartupInstallFib {
+        inner: MemoryFib,
+        attempts: std::sync::Arc<std::sync::Mutex<Vec<Route>>>,
+        fail: bool,
+    }
+
+    impl Fib for StartupInstallFib {
+        fn apply(&mut self, change: &FibChange) -> Result<(), wren_core::FibError> {
+            if let FibChange::Install(route) = change {
+                self.attempts.lock().unwrap().push(route.clone());
+                if self.fail {
+                    return Err(wren_core::FibError(
+                        "injected startup install failure".into(),
+                    ));
+                }
+            }
+            self.inner.apply(change)
+        }
+
+        fn owned_routes(&mut self) -> Result<Vec<Route>, wren_core::FibError> {
+            self.inner.owned_routes()
+        }
+    }
+
+    #[tokio::test]
+    async fn startup_exports_final_duplicate_best_only_and_never_connected_routes() {
+        let first = static_route("198.51.100.0/24");
+        let mut last = first.clone();
+        last.metric = 42;
+        last.nexthops = vec![NextHop::via("192.0.2.2".parse().unwrap())];
+        let mut connected = static_route("192.0.2.0/24");
+        connected.protocol = Protocol::Connected;
+        let attempts = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let fib = crate::fib::spawn(Box::new(StartupInstallFib {
+            inner: MemoryFib::default(),
+            attempts: attempts.clone(),
+            fail: false,
+        }));
+        let mut rib = Rib::new();
+        let exported = seed_startup_routes(
+            &mut rib,
+            &fib,
+            &[first, last.clone(), connected],
+            &HashMap::new(),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(*attempts.lock().unwrap(), vec![last.clone()]);
+        assert_eq!(
+            exported.values().cloned().collect::<Vec<_>>(),
+            vec![last.clone()]
+        );
+        assert_eq!(fib.owned_routes().await.unwrap(), vec![last]);
+        assert_eq!(rib.iter_best().count(), 2);
+    }
+
+    #[tokio::test]
+    async fn startup_install_failure_is_fatal_not_a_successful_export_cache() {
+        let attempts = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let fib = crate::fib::spawn(Box::new(StartupInstallFib {
+            inner: MemoryFib::default(),
+            attempts: attempts.clone(),
+            fail: true,
+        }));
+        let mut rib = Rib::new();
+        let route = static_route("198.51.100.0/24");
+        let error = seed_startup_routes(
+            &mut rib,
+            &fib,
+            std::slice::from_ref(&route),
+            &HashMap::new(),
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("injected startup install failure"));
+        assert_eq!(*attempts.lock().unwrap(), vec![route]);
+        assert!(fib.owned_routes().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn startup_router_loop_uses_successful_exports_not_static_intent() {
+        let accepted = static_route("198.51.100.0/24");
+        let denied = static_route("203.0.113.0/24");
+        let filter = Filter {
+            rules: vec![Rule {
+                matcher: Match::prefix("198.51.100.0/24".parse::<PrefixList>().unwrap()),
+                modify: Modify {
+                    add_metric: Some(9),
+                    ..Modify::default()
+                },
+                action: Action::Accept,
+            }],
+            default: Action::Reject,
+        };
+        let statics = vec![accepted.clone(), denied];
+        let mut rib = Rib::new();
+        let fib = crate::fib::spawn(Box::new(MemoryFib::default()));
+        let exported =
+            seed_startup_routes(&mut rib, &fib, &statics, &HashMap::new(), Some(&filter))
+                .await
+                .unwrap();
+        let (utx, urx) = mpsc::channel(4);
+        let (_qtx, qrx) = mpsc::channel(4);
+        let (stx, srx) = mpsc::channel(4);
+        let (_rtx, rrx) = mpsc::channel(4);
+        let (status, _status_rx) = watch::channel(ReloadStatus::startup());
+        let vrf_exports = HashMap::new();
+        let imports = ImportFilters::new();
+        let router = run(
+            &mut rib,
+            &fib,
+            urx,
+            &imports,
+            Some(&filter),
+            &[],
+            &[],
+            qrx,
+            srx,
+            &statics,
+            exported,
+            rrx,
+            status,
+            &vrf_exports,
+        );
+        let driver = async move {
+            let (tx, mut rx) = mpsc::channel(4);
+            stx.send(RouteSubscribe { events: tx }).await.unwrap();
+            let event = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+                .await
+                .unwrap();
+            let mut expected = accepted;
+            expected.metric = 9;
+            assert!(matches!(event, Some(RouteEvent::Update(route)) if route == expected));
+            assert!(matches!(
+                tokio::time::timeout(Duration::from_secs(1), rx.recv())
+                    .await
+                    .unwrap(),
+                Some(RouteEvent::EndOfDump)
+            ));
+            // Ending the update stream exits the real central loop.
+            drop(utx);
+        };
+        tokio::time::timeout(Duration::from_secs(2), async {
+            tokio::join!(router, driver);
+        })
+        .await
+        .unwrap();
+    }
+
+    struct StartupFaultFib {
+        inner: MemoryFib,
+        fail_inventory: bool,
+        fail_delete: bool,
+        removed: std::sync::Arc<std::sync::Mutex<Vec<Route>>>,
+    }
+
+    impl Fib for StartupFaultFib {
+        fn apply(&mut self, change: &FibChange) -> Result<(), wren_core::FibError> {
+            self.inner.apply(change)
+        }
+
+        fn owned_routes(&mut self) -> Result<Vec<Route>, wren_core::FibError> {
+            if std::mem::take(&mut self.fail_inventory) {
+                return Err(wren_core::FibError("injected inventory failure".into()));
+            }
+            self.inner.owned_routes()
+        }
+
+        fn remove_owned(&mut self, route: &Route) -> Result<(), wren_core::FibError> {
+            if std::mem::take(&mut self.fail_delete) {
+                return Err(wren_core::FibError("injected exact delete failure".into()));
+            }
+            self.removed.lock().unwrap().push(route.clone());
+            self.inner.remove_owned(route)
+        }
+    }
+
+    #[tokio::test]
+    async fn startup_inventory_failure_is_not_an_empty_healthy_inventory() {
+        let stale = static_route("10.8.0.0/16");
+        let mut inner = MemoryFib::default();
+        inner.apply(&FibChange::Install(stale.clone())).unwrap();
+        let removed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let fib = crate::fib::spawn(Box::new(StartupFaultFib {
+            inner,
+            fail_inventory: true,
+            fail_delete: false,
+            removed: removed.clone(),
+        }));
+        let error = reconcile_startup(&fib).await.unwrap_err();
+        assert!(format!("{error:#}").contains("injected inventory failure"));
+        assert!(removed.lock().unwrap().is_empty());
+        assert_eq!(fib.owned_routes().await.unwrap(), vec![stale.clone()]);
+        // A new start observes the real inventory and completes cleanup.
+        assert_eq!(reconcile_startup(&fib).await.unwrap(), 1);
+        assert_eq!(*removed.lock().unwrap(), vec![stale]);
+        assert!(fib.owned_routes().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn startup_delete_failure_blocks_readiness_until_complete_cleanup() {
+        let kept = static_route("10.0.0.0/24");
+        let stale = static_route("10.9.0.0/16");
+        let mut inner = MemoryFib::default();
+        for route in [&kept, &stale] {
+            inner.apply(&FibChange::Install(route.clone())).unwrap();
+        }
+        let removed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let fib = crate::fib::spawn(Box::new(StartupFaultFib {
+            inner,
+            fail_inventory: false,
+            fail_delete: true,
+            removed: removed.clone(),
+        }));
+        let error = reconcile_startup(&fib).await.unwrap_err();
+        assert!(format!("{error:#}").contains("injected exact delete failure"));
+        assert!(removed.lock().unwrap().is_empty());
+        assert_eq!(fib.owned_routes().await.unwrap().len(), 2);
+        assert_eq!(reconcile_startup(&fib).await.unwrap(), 2);
+        assert_eq!(*removed.lock().unwrap(), vec![kept, stale]);
+        assert!(fib.owned_routes().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn startup_cleans_metric_protocol_siblings_and_denied_routes_not_foreign_routes() {
+        // Model the kernel's multiple identities at one prefix; MemoryFib's
+        // one-route-per-prefix map cannot represent this important case.
+        struct ExactFib {
+            owned: Vec<Route>,
+            installed: std::sync::Arc<std::sync::Mutex<Vec<Route>>>,
+        }
+        impl Fib for ExactFib {
+            fn apply(&mut self, _: &FibChange) -> Result<(), wren_core::FibError> {
+                panic!("cleanup must use exact owned removal, never broad prefix mutation")
+            }
+            fn owned_routes(&mut self) -> Result<Vec<Route>, wren_core::FibError> {
+                Ok(self.owned.clone())
+            }
+            fn remove_owned(&mut self, route: &Route) -> Result<(), wren_core::FibError> {
+                assert!(
+                    self.owned.contains(route),
+                    "foreign identity offered for deletion"
+                );
+                self.installed
+                    .lock()
+                    .unwrap()
+                    .retain(|entry| entry != route);
+                self.owned.retain(|entry| entry != route);
+                Ok(())
+            }
+        }
+        let old_static = static_route("10.20.0.0/24");
+        let mut old_metric = old_static.clone();
+        old_metric.metric = 99;
+        let mut old_protocol = old_static.clone();
+        old_protocol.protocol = Protocol::Bgp;
+        let export_denied = static_route("10.30.0.0/24");
+        let mut foreign = old_static.clone();
+        foreign.metric = 77;
+        let owned = vec![old_static, old_metric, old_protocol, export_denied];
+        let mut all = owned.clone();
+        all.push(foreign.clone());
+        let installed = std::sync::Arc::new(std::sync::Mutex::new(all));
+        let fib = crate::fib::spawn(Box::new(ExactFib {
+            owned,
+            installed: installed.clone(),
+        }));
+        assert_eq!(reconcile_startup(&fib).await.unwrap(), 4);
+        assert_eq!(*installed.lock().unwrap(), vec![foreign]);
+        assert!(fib.owned_routes().await.unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -1263,8 +1968,8 @@ mod tests {
         let (utx, urx) = mpsc::channel(16);
         let (qtx, qrx) = mpsc::channel::<QueryRequest>(16);
         let (stx, srx) = mpsc::channel::<RouteSubscribe>(16);
-        let (_rtx, rrx) = mpsc::channel::<ReloadRoutes>(16);
-        let (_frtx, frrx) = mpsc::channel::<FilterReload>(16);
+        let (_rtx, rrx) = mpsc::channel::<RouterReload>(16);
+        let (status, _status_rx) = watch::channel(ReloadStatus::startup());
 
         // `run` borrows a `&mut Rib` for its whole lifetime, so it can't be
         // `tokio::spawn`ed (production runs it in `select!`, not spawned). Drive it
@@ -1286,8 +1991,10 @@ mod tests {
                 qrx,
                 srx,
                 &[],
+                ExportedRoutes::new(),
                 rrx,
-                frrx,
+                status,
+                &HashMap::new(),
             )
             .await;
         };
@@ -1601,6 +2308,562 @@ mod tests {
             matches!(rx.try_recv().unwrap(), RouteEvent::Withdraw { table, prefix }
             if (table, prefix) == key)
         );
+    }
+
+    #[derive(Default)]
+    struct LiveFaultFib {
+        routes: Vec<Route>,
+        fail_remove: bool,
+        error_after_install: bool,
+        fail_read_after_install: bool,
+        fail_next_read: bool,
+        operations: std::sync::Arc<std::sync::Mutex<Vec<&'static str>>>,
+    }
+
+    impl Fib for LiveFaultFib {
+        fn apply(&mut self, change: &FibChange) -> Result<(), wren_core::FibError> {
+            let FibChange::Install(route) = change else {
+                panic!("broad deletion forbidden")
+            };
+            self.operations.lock().unwrap().push("install");
+            self.routes.retain(|old| {
+                !(old.table == route.table
+                    && old.prefix == route.prefix
+                    && old.protocol == route.protocol
+                    && old.metric == route.metric)
+            });
+            self.routes.push(route.clone());
+            self.fail_next_read = std::mem::take(&mut self.fail_read_after_install);
+            if std::mem::take(&mut self.error_after_install) {
+                return Err(wren_core::FibError("injected lost ACK after effect".into()));
+            }
+            Ok(())
+        }
+        fn remove_owned(&mut self, route: &Route) -> Result<(), wren_core::FibError> {
+            self.operations.lock().unwrap().push("remove");
+            if std::mem::take(&mut self.fail_remove) {
+                return Err(wren_core::FibError("injected failed withdrawal".into()));
+            }
+            self.routes.retain(|old| old != route);
+            Ok(())
+        }
+        fn owned_routes(&mut self) -> Result<Vec<Route>, wren_core::FibError> {
+            self.operations.lock().unwrap().push("read");
+            if std::mem::take(&mut self.fail_next_read) {
+                return Err(wren_core::FibError("injected failed readback".into()));
+            }
+            Ok(self.routes.clone())
+        }
+    }
+
+    #[tokio::test]
+    async fn coherent_reload_removes_all_old_identities_before_expanding_and_reports_actual_monitor(
+    ) {
+        let original = static_route("198.51.100.0/24");
+        let key = (original.table, original.prefix);
+        let mut sibling = original.clone();
+        sibling.metric = 40;
+        let mut desired = original.clone();
+        desired.metric = 27;
+        let foreign_key = bgp_route("203.0.113.0/24", 99);
+        let operations = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let fib = crate::fib::spawn(Box::new(LiveFaultFib {
+            routes: vec![original.clone(), sibling, foreign_key.clone()],
+            fail_remove: true,
+            error_after_install: false,
+            operations: operations.clone(),
+            ..Default::default()
+        }));
+        let mut rib = Rib::new();
+        rib.update(desired.clone());
+        let mut exported = BTreeMap::from([(key, original.clone())]);
+        let mut failed = BTreeSet::new();
+        let managed = BTreeSet::from([key]);
+        let (tx, mut events) = mpsc::channel(10);
+        let mut subscribers = vec![tx];
+        assert!(
+            !reconcile_desired(
+                &rib,
+                &fib,
+                &HashMap::new(),
+                None,
+                &mut exported,
+                &mut subscribers,
+                &mut failed,
+                &managed
+            )
+            .await
+        );
+        assert!(
+            !operations.lock().unwrap().contains(&"install"),
+            "failed restrictive phase prohibits every expansion"
+        );
+        assert_eq!(exported.get(&key), Some(&original));
+        assert!(events.try_recv().is_err());
+        operations.lock().unwrap().clear();
+        assert!(
+            reconcile_desired(
+                &rib,
+                &fib,
+                &HashMap::new(),
+                None,
+                &mut exported,
+                &mut subscribers,
+                &mut failed,
+                &managed
+            )
+            .await
+        );
+        assert_eq!(
+            fib.owned_routes().await.unwrap(),
+            vec![foreign_key, desired.clone()]
+        );
+        assert_eq!(exported.get(&key), Some(&desired));
+        let ops = operations.lock().unwrap();
+        assert!(
+            ops.iter().position(|op| *op == "remove").unwrap()
+                < ops.iter().position(|op| *op == "install").unwrap()
+        );
+        assert!(ops.last() == Some(&"read"));
+        assert!(matches!(
+            events.try_recv().unwrap(),
+            RouteEvent::Withdraw { .. }
+        ));
+        assert!(
+            matches!(events.try_recv().unwrap(), RouteEvent::Update(route) if route == desired)
+        );
+    }
+
+    #[tokio::test]
+    async fn applied_despite_error_is_owned_and_withdrawn_by_subsequent_reject_or_connected_best() {
+        for connected in [false, true] {
+            let route = static_route("198.51.100.0/24");
+            let key = (route.table, route.prefix);
+            let fib = crate::fib::spawn(Box::new(LiveFaultFib {
+                routes: vec![],
+                fail_remove: false,
+                error_after_install: true,
+                operations: Default::default(),
+                ..Default::default()
+            }));
+            let mut rib = Rib::new();
+            rib.update(route.clone());
+            let mut exported = BTreeMap::new();
+            let mut failed = BTreeSet::new();
+            let managed = BTreeSet::from([key]);
+            let mut subscribers = vec![];
+            assert!(
+                !reconcile_desired(
+                    &rib,
+                    &fib,
+                    &HashMap::new(),
+                    None,
+                    &mut exported,
+                    &mut subscribers,
+                    &mut failed,
+                    &managed
+                )
+                .await
+            );
+            assert_eq!(fib.owned_routes().await.unwrap(), vec![route.clone()]);
+            let reject = Filter::reject_all();
+            if connected {
+                let mut local = route;
+                local.protocol = Protocol::Connected;
+                local.preference = Protocol::Connected.default_preference();
+                rib.update(local);
+                assert_eq!(
+                    rib.best_in(key.0, &key.1).unwrap().protocol,
+                    Protocol::Connected
+                );
+            }
+            assert!(
+                reconcile_desired(
+                    &rib,
+                    &fib,
+                    &HashMap::new(),
+                    (!connected).then_some(&reject),
+                    &mut exported,
+                    &mut subscribers,
+                    &mut failed,
+                    &managed
+                )
+                .await
+            );
+            assert!(fib.owned_routes().await.unwrap().is_empty());
+            assert!(exported.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn lost_ack_and_readback_then_failed_denial_never_produces_a_clean_empty_monitor() {
+        let route = static_route("198.51.100.0/24");
+        let key = (route.table, route.prefix);
+        let fib = crate::fib::spawn(Box::new(LiveFaultFib {
+            error_after_install: true,
+            fail_read_after_install: true,
+            fail_remove: true,
+            ..Default::default()
+        }));
+        let desired = BTreeMap::from([(key, route.clone())]);
+        let keys = BTreeSet::from([key]);
+        let mut exported = BTreeMap::new();
+        let mut failed = BTreeSet::new();
+        let (tx, mut rx) = mpsc::channel(10);
+        let mut subs = vec![tx];
+        let mut valid = true;
+        assert!(
+            !reconcile_selected(
+                &desired,
+                &fib,
+                &mut exported,
+                &mut subs,
+                &mut failed,
+                &keys,
+                &mut valid
+            )
+            .await
+        );
+        assert!(!valid && exported.is_empty());
+        assert!(
+            rx.recv().await.is_none(),
+            "unknown inventory closes rather than fabricating an empty dump"
+        );
+        assert_eq!(fib.owned_routes().await.unwrap(), vec![route.clone()]);
+        assert!(
+            !reconcile_selected(
+                &BTreeMap::new(),
+                &fib,
+                &mut exported,
+                &mut subs,
+                &mut failed,
+                &keys,
+                &mut valid
+            )
+            .await
+        );
+        assert!(
+            valid,
+            "sole observed old route is representable even when never cached"
+        );
+        assert_eq!(exported.get(&key), Some(&route));
+        assert!(
+            reconcile_selected(
+                &BTreeMap::new(),
+                &fib,
+                &mut exported,
+                &mut subs,
+                &mut failed,
+                &keys,
+                &mut valid
+            )
+            .await
+        );
+        assert!(valid && exported.is_empty());
+    }
+
+    #[tokio::test]
+    async fn ambiguous_sibling_inventory_drops_monitor_until_readback_proves_one_identity() {
+        let route = static_route("198.51.100.0/24");
+        let key = (route.table, route.prefix);
+        let mut sibling = route.clone();
+        sibling.metric = 99;
+        let fib = crate::fib::spawn(Box::new(LiveFaultFib {
+            routes: vec![route.clone(), sibling],
+            fail_remove: true,
+            ..Default::default()
+        }));
+        let desired = BTreeMap::from([(key, route.clone())]);
+        let keys = BTreeSet::from([key]);
+        let mut exported = desired.clone();
+        let mut failed = BTreeSet::new();
+        let (tx, mut rx) = mpsc::channel(10);
+        let mut subs = vec![tx];
+        let mut valid = true;
+        assert!(
+            !reconcile_selected(
+                &desired,
+                &fib,
+                &mut exported,
+                &mut subs,
+                &mut failed,
+                &keys,
+                &mut valid
+            )
+            .await
+        );
+        assert!(!valid);
+        assert!(rx.recv().await.is_none());
+        assert!(
+            reconcile_selected(
+                &desired,
+                &fib,
+                &mut exported,
+                &mut subs,
+                &mut failed,
+                &keys,
+                &mut valid
+            )
+            .await
+        );
+        assert!(valid);
+        assert_eq!(exported, desired);
+    }
+
+    #[tokio::test]
+    async fn runtime_vrf_then_global_exports_rewrite_once_in_repair_and_deny_unchanged_static() {
+        let mut route = static_route("198.51.100.0/24");
+        route.table = 100;
+        route.metric = 10;
+        let key = (route.table, route.prefix);
+        let increment = |amount| Filter {
+            rules: vec![Rule {
+                matcher: Match::default(),
+                modify: Modify {
+                    add_metric: Some(amount),
+                    ..Modify::default()
+                },
+                action: Action::Accept,
+            }],
+            default: Action::Accept,
+        };
+        let vrf = HashMap::from([(100, increment(7))]);
+        let global = increment(10);
+        let fib = crate::fib::spawn(Box::new(MemoryFib::default()));
+        let mut rib = Rib::new();
+        rib.update(route);
+        let mut exported = BTreeMap::new();
+        let mut failed = BTreeSet::new();
+        let mut subs = vec![];
+        for _ in 0..3 {
+            assert!(
+                reconcile_desired(
+                    &rib,
+                    &fib,
+                    &vrf,
+                    Some(&global),
+                    &mut exported,
+                    &mut subs,
+                    &mut failed,
+                    &BTreeSet::from([key])
+                )
+                .await
+            );
+            assert_eq!(exported[&key].metric, 27);
+            fib.remove_owned(exported[&key].clone()).await.unwrap();
+        }
+        // Restore once, then change only policy: static/RIB input is identical.
+        assert!(
+            reconcile_desired(
+                &rib,
+                &fib,
+                &vrf,
+                Some(&global),
+                &mut exported,
+                &mut subs,
+                &mut failed,
+                &BTreeSet::from([key])
+            )
+            .await
+        );
+        assert!(
+            reconcile_desired(
+                &rib,
+                &fib,
+                &HashMap::from([(100, Filter::reject_all())]),
+                Some(&global),
+                &mut exported,
+                &mut subs,
+                &mut failed,
+                &BTreeSet::from([key])
+            )
+            .await
+        );
+        assert!(exported.is_empty());
+        assert!(fib.owned_routes().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn full_reconcile_removes_drift_at_current_denied_rib_prefix_without_history() {
+        let route = static_route("198.51.100.0/24");
+        let mut rib = Rib::new();
+        rib.update(route.clone());
+        let fib = crate::fib::spawn(Box::new(MemoryFib::default()));
+        let reject = Filter::reject_all();
+        let mut exported = BTreeMap::new();
+        let mut failed = BTreeSet::new();
+        let mut subs = vec![];
+        assert!(
+            reconcile_desired(
+                &rib,
+                &fib,
+                &HashMap::new(),
+                Some(&reject),
+                &mut exported,
+                &mut subs,
+                &mut failed,
+                &BTreeSet::new()
+            )
+            .await
+        );
+        // Both cache and historical keys are empty after confirmed denial.
+        fib.apply(FibChange::Install(route)).await.unwrap();
+        assert!(
+            reconcile_desired(
+                &rib,
+                &fib,
+                &HashMap::new(),
+                Some(&reject),
+                &mut exported,
+                &mut subs,
+                &mut failed,
+                &BTreeSet::new()
+            )
+            .await
+        );
+        assert!(fib.owned_routes().await.unwrap().is_empty());
+    }
+
+    #[test]
+    fn old_completion_cannot_overwrite_new_generation_and_unknown_empty_inventory_is_not_converged()
+    {
+        let (status, _) = watch::channel(ReloadStatus {
+            generation: 2,
+            state: "pending",
+            pending_prefixes: 0,
+            detail: None,
+            in_flight: false,
+        });
+        publish_completion(&status, 1, &BTreeSet::new(), true);
+        assert_eq!(status.borrow().state, "pending");
+        publish_completion(&status, 2, &BTreeSet::new(), false);
+        assert_eq!(status.borrow().state, "pending");
+        publish_completion(&status, 2, &BTreeSet::new(), true);
+        assert_eq!(status.borrow().state, "converged");
+        assert_eq!(
+            ReloadStatus::startup().render(),
+            "scope routing\ngeneration 0\nstate converged\npending-prefixes 0\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn real_loop_skips_rejected_updates_commits_duplicate_last_and_forgets_verified_withdrawals(
+    ) {
+        let operations = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let fib = crate::fib::spawn(Box::new(LiveFaultFib {
+            operations: operations.clone(),
+            ..Default::default()
+        }));
+        let (updates, updates_rx) = mpsc::channel(16);
+        let (_queries, queries_rx) = mpsc::channel(4);
+        let (subscribe, subscribe_rx) = mpsc::channel(4);
+        let (reloads, reload_rx) = mpsc::channel(1);
+        let (status, progress) = watch::channel(ReloadStatus::startup());
+        let imports = HashMap::from([(Protocol::Bgp, Filter::reject_all())]);
+        let router = async {
+            run(
+                &mut Rib::new(),
+                &fib,
+                updates_rx,
+                &imports,
+                None,
+                &[],
+                &[],
+                queries_rx,
+                subscribe_rx,
+                &[],
+                ExportedRoutes::new(),
+                reload_rx,
+                status.clone(),
+                &HashMap::new(),
+            )
+            .await;
+        };
+        let driver = async {
+            for _ in 0..100 {
+                updates
+                    .send(RouteUpdate::Announce(bgp_route("203.0.113.0/24", 10)))
+                    .await
+                    .unwrap();
+            }
+            // Full capacity proves all updates were received; a rejected batch
+            // has no awaiting FIB work after its final recv.
+            while updates.capacity() != 16 {
+                tokio::task::yield_now().await;
+            }
+            assert!(
+                operations.lock().unwrap().is_empty(),
+                "no-op input must not dump or write FIB"
+            );
+            async fn commit(
+                tx: &mpsc::Sender<RouterReload>,
+                status: &watch::Sender<ReloadStatus>,
+                progress: &mut watch::Receiver<ReloadStatus>,
+                generation: u64,
+                routes: Vec<Route>,
+            ) {
+                let mut receipt = ReloadStatus::startup();
+                receipt.generation = generation;
+                receipt.state = "pending";
+                receipt.in_flight = true;
+                tx.try_send(RouterReload {
+                    generation,
+                    statics: routes,
+                    imports: HashMap::from([(Protocol::Bgp, Filter::reject_all())]),
+                    fib_export: None,
+                    vrf_exports: HashMap::new(),
+                })
+                .unwrap();
+                status.send_replace(receipt);
+                progress
+                    .wait_for(|value| value.generation == generation && value.state == "converged")
+                    .await
+                    .unwrap();
+                assert!(!status.borrow().in_flight);
+            }
+            let mut progress = progress;
+            let first = static_route("198.51.100.0/24");
+            let mut last = first.clone();
+            last.metric = 27;
+            commit(
+                &reloads,
+                &status,
+                &mut progress,
+                1,
+                vec![first, last.clone()],
+            )
+            .await;
+            assert_eq!(fib.owned_routes().await.unwrap(), vec![last.clone()]);
+            let (events, mut stream) = mpsc::channel(4);
+            subscribe.send(RouteSubscribe { events }).await.unwrap();
+            assert!(
+                matches!(stream.recv().await.unwrap(), RouteEvent::Update(route) if route == last)
+            );
+            assert!(matches!(
+                stream.recv().await.unwrap(),
+                RouteEvent::EndOfDump
+            ));
+            commit(&reloads, &status, &mut progress, 2, vec![]).await;
+            assert!(fib.owned_routes().await.unwrap().is_empty());
+            assert!(matches!(
+                stream.recv().await.unwrap(),
+                RouteEvent::Withdraw { .. }
+            ));
+            // A historical prefix no longer configured/failed/exported must not
+            // grant this router perpetual ownership over a later writer's route.
+            fib.apply(FibChange::Install(last.clone())).await.unwrap();
+            let next = static_route("192.0.2.128/25");
+            commit(&reloads, &status, &mut progress, 3, vec![next.clone()]).await;
+            let routes = fib.owned_routes().await.unwrap();
+            assert_eq!(routes.len(), 2);
+            assert!(routes.contains(&last) && routes.contains(&next));
+            drop(updates);
+        };
+        tokio::time::timeout(Duration::from_secs(3), async {
+            tokio::join!(router, driver);
+        })
+        .await
+        .unwrap();
     }
 
     /// A [`Fib`] that counts install writes — to prove a coalesced burst hits the
