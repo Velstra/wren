@@ -77,8 +77,18 @@ unshare -Urn bash -c '
   run_phase() {
     acfg="$1"; label="$2"
     nsenter -t $BPID -n "$WREN" --config "$WORK/b.toml" --backend kernel --socket "$WORK/b.sock" >"$WORK/b.log" 2>&1 &
+    bdaemon=$!
     "$WREN" --config "$acfg" --backend kernel --socket "$WORK/a.sock" >"$WORK/a.log" 2>&1 &
+    adaemon=$!
     sleep 12
+    # A missing route is only a valid negative assertion if both daemons are up.
+    # In particular, startup readback must accept the IPv6 default metric.
+    if ! kill -0 "$adaemon" "$bdaemon" 2>/dev/null; then
+      echo "FAIL: a daemon exited during phase $label"
+      cat "$WORK/a.log" "$WORK/b.log"
+      exit 1
+    fi
+    "$WREN" --socket "$WORK/a.sock" show routes static | grep -q "2001:db8:99::/64"
     echo "=== phase $label: wren show routes rip (on B) ==="
     nsenter -t $BPID -n "$WREN" --socket "$WORK/b.sock" show routes rip || true
     echo "=== phase $label: ip -6 route proto rip (on B) ==="

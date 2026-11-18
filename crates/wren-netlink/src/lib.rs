@@ -530,11 +530,16 @@ fn is_transient_errno(errno: i32) -> bool {
 
 /// Kernel identity, not RIB annotations (source, preference or communities).
 /// A gateway-only install acquires an output interface in the kernel dump.
-fn same_kernel_route(expected: &Route, observed: &Route) -> bool {
+/// Linux also replaces an IPv6 metric of zero with its default of 1024.
+/// Keep this comparison shared with the daemon's startup/reload readback gate.
+pub fn same_kernel_route(expected: &Route, observed: &Route) -> bool {
     expected.prefix == observed.prefix
         && expected.table == observed.table
         && expected.protocol == observed.protocol
-        && expected.metric == observed.metric
+        && (expected.metric == observed.metric
+            || (expected.prefix.addr().is_ipv6()
+                && expected.metric == 0
+                && observed.metric == 1024))
         && expected.nexthops.len() == observed.nexthops.len()
         && expected
             .nexthops
@@ -2089,6 +2094,52 @@ mod tests {
                 .count(),
             256
         );
+    }
+
+    #[test]
+    fn kernel_identity_accepts_only_the_ipv6_default_metric_normalization() {
+        for prefix in ["198.18.254.0/24", "2001:db8:99::/64"] {
+            for metric in [0, 1, 1024, 4096] {
+                let expected = Route::new(p(prefix), Protocol::Static, vec![], metric);
+                for observed_metric in [0, 1, 1024, 4096] {
+                    let mut observed = expected.clone();
+                    observed.metric = observed_metric;
+                    assert_eq!(
+                        same_kernel_route(&expected, &observed),
+                        metric == observed_metric
+                            || (expected.prefix.addr().is_ipv6()
+                                && metric == 0
+                                && observed_metric == 1024),
+                        "{prefix}: wanted {metric}, observed {observed_metric}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "needs CAP_NET_ADMIN + d0; run scripts/netlink-kernel-smoke.sh"]
+    fn ipv6_default_metric_readback_and_exact_removal() {
+        let mut fib = KernelFib::new().expect("open kernel fib");
+        for (index, metric) in [0, 1, 1024, 4096].into_iter().enumerate() {
+            let route = Route::new(
+                p(&format!("2001:db8:99:{index}::/64")),
+                Protocol::Static,
+                vec![NextHop::via("2001:db8::2".parse().unwrap())],
+                metric,
+            );
+            fib.apply(&FibChange::Install(route.clone())).unwrap();
+            let owned = fib.owned_routes().unwrap();
+            let observed = owned.iter().find(|r| r.prefix == route.prefix).unwrap();
+            assert_eq!(observed.metric, if metric == 0 { 1024 } else { metric });
+            assert!(same_kernel_route(&route, observed));
+            fib.remove_owned(observed).unwrap();
+            assert!(fib
+                .owned_routes()
+                .unwrap()
+                .iter()
+                .all(|r| r.prefix != route.prefix));
+        }
     }
 
     #[test]

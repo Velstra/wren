@@ -460,27 +460,10 @@ fn publish_completion(
     });
 }
 
-/// Kernel dumps canonicalize inferred interface and single-path weight. Do not
+/// Kernel dumps canonicalize inferred interface, IPv6 metric and single-path weight. Do not
 /// compare RIB-only source/distance fields which the kernel cannot represent.
 fn same_forwarding(want: &Route, have: &Route) -> bool {
-    want.table == have.table
-        && want.prefix == have.prefix
-        && want.protocol == have.protocol
-        && want.metric == have.metric
-        && want.nexthops.len() == have.nexthops.len()
-        && want
-            .nexthops
-            .iter()
-            .zip(&have.nexthops)
-            .all(|(want_hop, have_hop)| {
-                want_hop.gateway == have_hop.gateway
-                    && want_hop
-                        .iface
-                        .as_ref()
-                        .map_or(true, |iface| Some(iface) == have_hop.iface.as_ref())
-                    && (want.nexthops.len() == 1
-                        || want_hop.weight.clamp(1, 256) == have_hop.weight)
-            })
+    wren_netlink::same_kernel_route(want, have)
 }
 
 fn inventory_index(observed: &[Route]) -> BTreeMap<(u32, Prefix), Vec<&Route>> {
