@@ -1244,6 +1244,13 @@ mod tests {
                 .map(|b| format!("{b:02x}"))
                 .collect::<String>()
         ));
+        // Durable witness writes require a private parent independently of the
+        // test runner's umask; keep that production check intact.
+        use std::os::unix::fs::DirBuilderExt;
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&directory)
+            .unwrap();
         let key = "a-derived-witness-key-of-at-least-32-bytes".to_string();
         let witness = WitnessConfig {
             cluster: "ha-test-cluster-01".into(),
