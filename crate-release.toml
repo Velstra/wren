@@ -1,0 +1,8 @@
+# Deliberately one standalone library. New packages require an explicit review.
+package = "wren-core"
+manifest = "crates/wren-core/Cargo.toml"
+github = "Velstra/wren"
+repository = "https://github.com/Velstra/wren"
+license = "Apache-2.0"
+files = ["Cargo.toml", "Cargo.toml.orig", "Cargo.lock", ".cargo_vcs_info.json", "LICENSE"]
+required_files = ["Cargo.toml", ".cargo_vcs_info.json", "src/lib.rs", "LICENSE"]

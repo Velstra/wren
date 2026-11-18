@@ -1,5 +1,7 @@
 [package]
 name = "wren-core"
+publish = ["crates-io"]
+include = ["src/**", "LICENSE"]
 description = "Wren routing daemon — dependency-free control-plane core (RIB, routes, FIB abstraction)."
 keywords = ["routing", "rib", "fib", "networking"]
 categories = ["network-programming"]
