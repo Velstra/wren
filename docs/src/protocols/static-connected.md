@@ -1,51 +1,19 @@
-# Static & Connected Routes
+# Static and connected routes {#static--connected-routes}
 
-Before any dynamic protocol runs, Wren tracks two kinds of locally-known routes.
+## Declare a static route {#static-routes}
 
-## Static routes
-
-Static routes are declared in the config as a `[[static]]` array and seeded into
-the RIB at startup. Each becomes a `Route` with `Protocol::Static` (preference
-200), so a static route beats anything a dynamic protocol learns for the same
-prefix, but loses to a directly-connected network.
+Use `via` for a gateway, `dev` for an on-link destination, or both to pin a gateway to an interface. A blackhole route has no next hop. This example keeps a fallback route to the documentation prefix.
 
 ```toml
+router-id = "192.0.2.10"
 [[static]]
-prefix = "10.99.0.0/16"
-via    = "10.9.9.254"
-
-[[static]]
-prefix = "10.88.0.0/16"
-dev    = "dummy0"
-metric = 50
+prefix = "198.51.100.0/24"
+via = "192.0.2.1"
+distance = 250
 ```
 
-A next hop is `via` (a gateway), `dev` (an interface, for an on-link route), or
-both (a gateway pinned to an interface). With the kernel backend these install
-straight away:
+Save as `fallback.toml` and run `wren check -c fallback.toml`. With the kernel backend, the gateway must resolve through an interface. Check `wren show routes` for the selected path and `ip -4 route show exact 198.51.100.0/24` for the kernel result. A higher administrative distance makes the fallback less preferred.
 
-```text
-10.99.0.0/16 via 10.9.9.254 proto static
-10.88.0.0/16 dev dummy0 proto static metric 50
-```
+## Interpret connected networks {#connected-direct-networks}
 
-## Connected (direct) networks
-
-When an interface has an address, the kernel creates a directly-connected route
-for its subnet. Wren discovers these via `getifaddrs` and tracks them as
-`Protocol::Connected` (preference 240 — the most preferred source) for two
-reasons:
-
-1. **Best-path** — a connected network must win over any learned route to the same
-   subnet.
-2. **Redistribution** — connected networks are advertised into the running
-   protocols (for example, RIP advertises them to neighbours).
-
-Crucially, the router **never reprograms** a connected route into the kernel — the
-kernel already owns it. Reinstalling it would fight the kernel's own entry. So
-connected routes are tracked in the RIB and redistributed, but the FIB step is
-skipped for them; in `ip route` they stay `proto kernel`, while only learned
-routes appear as `proto rip` / `proto ospf` / `proto bgp`.
-
-Connected discovery covers both IPv4 (seeded into RIP) and IPv6 (seeded into
-RIPng, skipping link-local `fe80::/10`).
+Linux creates a route when it configures a local subnet. Wren can use connected networks for route selection and redistribution. Interface routes stay under kernel ownership; they are omitted from the [forwarding export stream](../monitoring.md#streaming-the-forwarding-table--wren-monitor-routes). Inspect `ip -4 route show proto kernel` to see routes installed by address configuration.

@@ -1,32 +1,32 @@
 # Summary
 
-[Introduction](introduction.md)
+[Wren operator handbook](introduction.md)
 
-# User Guide
+# Start here
 
-- [Getting Started](getting-started.md)
-- [Architecture](architecture.md)
-- [Configuration](configuration.md)
-- [Monitoring](monitoring.md)
+- [Build and check Wren](getting-started.md)
+- [Configure routes and policy](configuration.md)
+- [Inspect routes and reload peers](monitoring.md)
 
-# Protocols
+# Routing protocols
 
-- [Static & Connected Routes](protocols/static-connected.md)
-- [RIP & RIPng](protocols/rip.md)
+- [BGP and IPv6-only peering](protocols/bgp.md)
+- [EVPN for tenant networks](protocols/evpn.md)
 - [OSPFv2](protocols/ospf.md)
 - [OSPFv3](protocols/ospfv3.md)
-- [BGP-4](protocols/bgp.md)
-- [EVPN](protocols/evpn.md)
-- [Babel](protocols/babel.md)
 - [IS-IS](protocols/isis.md)
-- [BFD](protocols/bfd.md)
+- [Babel](protocols/babel.md)
+- [RIPv2 and RIPng](protocols/rip.md)
+- [Static and connected routes](protocols/static-connected.md)
 
-# Features
+# Isolation and availability
 
-- [VRFs & Route Distinguishers](vrf.md)
-- [VRRP — First-Hop Redundancy](vrrp.md)
+- [VRFs and Linux tables](vrf.md)
+- [BFD failure detection](protocols/bfd.md)
+- [VRRP gateway failover](vrrp.md)
 
-# Internals
+# Reference
 
-- [The Core: RIB, FIB & Embedding](core.md)
-- [Roadmap](roadmap.md)
+- [How Wren selects a route](architecture.md)
+- [Embed the routing core](core.md)
+- [Coverage and release status](roadmap.md)

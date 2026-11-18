@@ -1,5 +1,10 @@
 # Wren
 
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset=".github/brand/logo-on-dark.svg">
+  <img src=".github/brand/logo.svg" alt="Velstra Wren" height="72">
+</picture>
+
 Rust routing daemon for BGP, OSPFv2/v3, IS-IS, RIP/RIPng and Babel, with BFD,
 VRRP, VRFs and Linux kernel route installation.
 
@@ -52,13 +57,12 @@ bash scripts/run-all-tests.sh
 These need `iproute2` and enabled user/network namespaces.
 [Fuzzing](fuzz/README.md) is a separate nightly-toolchain workflow.
 
-## Documentation
+## Operator handbook
 
-[Getting started](docs/src/getting-started.md) ·
-[Configuration](docs/src/configuration.md) ·
-[Protocols](docs/src/SUMMARY.md) ·
-[Architecture](docs/src/architecture.md) ·
-[Monitoring](docs/src/monitoring.md)
+[Build and validate a configuration](https://velstra.github.io/wren/getting-started.html) ·
+[Route IPv4 over an IPv6-only link](https://velstra.github.io/wren/protocols/bgp.html#ipv6-transport-true-unnumbered) ·
+[Reload BGP peers](https://velstra.github.io/wren/monitoring.html#configuration-hot-reload--sighup) ·
+[Browse the handbook](https://velstra.github.io/wren/)
 
 ## License
 

@@ -1,138 +1,51 @@
-# RIP & RIPng
+# RIPv2 and RIPng {#rip--ripng}
 
-Wren implements **RIPv2** ([RFC 2453](https://www.rfc-editor.org/rfc/rfc2453),
-IPv4) and **RIPng** ([RFC 2080](https://www.rfc-editor.org/rfc/rfc2080), IPv6).
-Both share one distance-vector engine; only the wire codec and transport differ.
+Use `[rip]` for IPv4 and `[ripng]` for IPv6. Enable both on the same link when both families should advertise routes.
 
-| | RIPv2 | RIPng |
-|---|---|---|
-| Transport | UDP 520 | UDP 521 |
-| Multicast group | `224.0.0.9` | `ff02::9` |
-| Address family | IPv4 | IPv6 |
+<a id="redistribution-from-the-rib"></a>
 
-## What is implemented
+## Configure the first router {#configuration}
 
-- **The wire codec** — `Request`/`Response` messages and their route entries,
-  encode and decode, the full-table request (§3.9.1), and netmask ⇆ prefix-length
-  conversion. RIPng adds the IPv6 20-byte route-table entries and **next-hop
-  entries** (RFC 2080 §2.1.1).
-- **The distance-vector table** (`RipTable`) — the pure engine (RFC 2453 §3.9–10),
-  with time passed in as a value so it is fully unit-testable:
-  - metric accounting (add the interface cost, cap at metric 16 = unreachable);
-  - the update rules (a better metric, or any update from the current source,
-    replaces the route);
-  - the timers — a 180 s timeout poisons a stale route (metric 16) and starts a
-    120 s garbage timer, after which it is removed;
-  - **split horizon with poisoned reverse** — a route is advertised back out the
-    interface it was learned on with metric 16;
-  - periodic (30 s) and **triggered** updates.
-- **The socket runner** (in `wren-daemon`) — one multicast UDP socket per
-  interface, the startup full-table request, the periodic and housekeeping timers,
-  and answers to neighbours' full-table requests. RIP presents a single best route
-  per prefix to the central RIB.
-
-Each protocol presents exactly one best route per prefix to the RIB; the RIB then
-arbitrates across protocols by [preference](../core.md).
-
-## Configuration
+The lab originates two static routes. Each protocol exports the route in its own address family.
 
 ```toml
-[rip]
-enabled    = true
-interfaces = ["eth1", "eth2"]
-
-[ripng]                 # RIP for IPv6
-enabled    = true
-interfaces = ["eth1", "eth2"]
-```
-
-Connected networks on the listed interfaces are redistributed automatically (see
-[Static & Connected Routes](static-connected.md)).
-
-### Redistribution from the RIB
-
-Beyond its own connected networks, RIP can advertise the routes other protocols
-hold in the RIB — statics, or routes learned by an IGP or BGP — by naming their
-protocols under `redistribute`:
-
-```toml
+router-id = "10.0.0.1"
+[[static]]
+prefix = "10.99.0.0/24"
+via    = "10.0.0.2"
+[[static]]
+prefix = "2001:db8:99::/64"
+via    = "2001:db8::2"
 [rip]
 enabled      = true
-interfaces   = ["eth1"]
-redistribute = ["connected", "static", "ospf"]   # RIB source protocols
-redistribute-metric = 1                           # RIP metric for them (1..=15)
-```
-
-This is the same router → protocol push that feeds [BGP](bgp.md#redistribution)
-and [OSPF](ospf.md#redistribution-from-the-rib) redistribution: the [central
-router loop](../architecture.md) offers each best-path change to RIP, which holds
-it as one of its own routes (advertised at `redistribute-metric`, immune to a
-neighbour's advertisement) and **poisons** it (metric 16) when its best path goes
-away. Only IPv4 routes are redistributed; RIP never redistributes its own routes;
-and an optional `[export] rip = "name"` filter (the same `wren-filter` engine)
-gates and rewrites the routes first. `scripts/rip-redistribute-smoke.sh` exercises
-it live (rootless): a static is withheld from the peer without `redistribute`,
-then learned over RIP and installed `proto rip` once `redistribute = ["static"]`
-is set.
-
-**RIPng** redistributes the same way over IPv6 — the distance-vector engine is
-address-neutral, so `[ripng] redistribute` / `redistribute-metric` and an
-optional `[export] ripng` filter behave exactly as above, except **only IPv6
-routes** are carried (an IPv4 best-path change is offered but ignored, just as
-RIP ignores IPv6 ones):
-
-```toml
+interfaces   = ["veth0"]
+redistribute = ["static"]
 [ripng]
 enabled      = true
-interfaces   = ["eth1"]
-redistribute = ["connected", "static", "ospf3"]   # IPv6 RIB source protocols
-redistribute-metric = 1
+interfaces   = ["veth0"]
+redistribute = ["static"]
 ```
 
-`scripts/ripng-redistribute-smoke.sh` is the IPv6 counterpart: an IPv6 static is
-learned over RIPng and installed `proto rip` with a link-local next hop once
-`redistribute = ["static"]` is set.
+<a id="testing-it"></a>
 
-## Testing it
+## Observe the result {#inspecting-it}
 
-Using the two-namespace harness from [Getting Started](getting-started.md), run a
-`wren` with `[rip]` enabled on each side of a veth. The neighbour's multicast
-Response is learned and installed into the kernel:
-
-```text
-10.5.0.0/16 via 10.0.0.2 dev veth0 metric 2 proto rip
+```sh
+bash scripts/rip-show-smoke.sh
 ```
 
-> **Note.** Put the two veth ends in *separate* namespaces. If both ends live in
-> one namespace the kernel delivers locally and short-circuits the path before the
-> interface-bound RIP socket sees the packet — so nothing is learned.
+On a separate running instance, inspect the same state:
 
-For RIPng the same applies over IPv6 (link-local `fe80::` source, a learned
-route's link-local next hop pinned to the receiving interface so the kernel can
-install it).
-
-## Inspecting it
-
-The daemon answers `wren show rip` and `wren show ripng` over its
-[control socket](../configuration.md), each rendered by the owning engine out of
-its live distance-vector table — no shared access, like the other protocols'
-`show` commands. RIP keeps no adjacency state, so the only view is the table:
-
-```console
-$ wren show rip
-10.0.0.0/24 dev veth0 metric 1 (connected)
-10.99.0.0/24 metric 1 (redistributed)
-10.5.0.0/16 via 10.0.0.2 dev veth0 metric 2
-
-$ wren show ripng
-2001:db8::/64 dev veth0 metric 1 (connected)
-2001:db8:99::/64 via fe80::486c:d8ff:fed4:dda5 dev veth0 metric 2
+```sh
+wren show rip
+wren show ripng
 ```
 
-Each line is one route: the destination, the gateway (`via …`, omitted for a
-directly-connected or redistributed network), the interface, the metric (or
-`unreachable` for a route in garbage collection), and a `(connected)` /
-`(redistributed)` tag for the routes RIP originates itself.
-`scripts/rip-show-smoke.sh` exercises both live (rootless): two routers exchange
-Responses over a dual-stack veth and the queries report the learned and originated
-routes.
+Inspect `10.99.0.0/24` in the RIP table and `2001:db8:99::/64` in RIPng. With a kernel backend, inspect learned routes separately with `ip -4 route` and `ip -6 route`.
+
+[Lab source](https://github.com/Velstra/wren/blob/main/scripts/rip-show-smoke.sh).
+
+
+## Filter advertisements {#what-is-implemented}
+
+Run the [IPv4 redistribution lab](https://github.com/Velstra/wren/blob/main/scripts/rip-redistribute-smoke.sh) and the [IPv6 redistribution lab](https://github.com/Velstra/wren/blob/main/scripts/ripng-redistribute-smoke.sh) to compare an accepted and a rejected route across a live adjacency.
