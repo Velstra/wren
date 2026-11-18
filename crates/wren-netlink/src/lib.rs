@@ -22,7 +22,7 @@ use std::ffi::{CStr, CString};
 use std::io;
 use std::mem;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
-use std::os::raw::c_void;
+use std::time::{Duration, Instant};
 
 use wren_core::{Fib, FibChange, FibError, NextHop, Prefix, Protocol, Route};
 
@@ -160,176 +160,6 @@ fn ip_from_octets(family: u8, octets: Option<&[u8]>) -> Option<IpAddr> {
     }
 }
 
-/// Build a [`NextHop`] from a route's same-family gateway octets (`gw`, in `family`),
-/// an already-decoded cross-family gateway (`cross_gw`, from RTA_VIA, RFC 5549),
-/// and/or an out-interface; `None` if it has none of them.
-fn nexthop_from_gw(
-    family: u8,
-    gw: Option<&[u8]>,
-    cross_gw: Option<IpAddr>,
-    oif: Option<u32>,
-) -> Option<NextHop> {
-    let gateway = match (cross_gw, gw) {
-        (Some(g), _) => Some(g),
-        (None, Some(g)) => Some(ip_from_octets(family, Some(g))?),
-        (None, None) => None,
-    };
-    let iface = oif.and_then(if_name);
-    if gateway.is_none() && iface.is_none() {
-        return None;
-    }
-    Some(NextHop {
-        gateway,
-        iface,
-        weight: 1,
-    })
-}
-
-/// Parse one `RTM_NEWROUTE` message (header + rtmsg + rtattrs) into a [`Route`],
-/// keeping only **unicast** routes tagged with a protocol id Wren owns
-/// ([`owned_protocol`]) — in any table, so a VRF's routes are reconciled too. The
-/// route's table (VRF) is recorded in [`Route::table`]. Returns `None` for anything
-/// else — a foreign route, or one we cannot represent.
-fn parse_route(msg: &[u8]) -> Option<Route> {
-    if msg.len() < NLMSGHDR_LEN + RTMSG_LEN {
-        return None;
-    }
-    if u16::from_ne_bytes([msg[4], msg[5]]) != RTM_NEWROUTE {
-        return None;
-    }
-    let family = msg[16];
-    let dst_len = msg[17];
-    // The one-octet table id; a larger one (a VRF) overrides it from RTA_TABLE below.
-    let mut table = msg[20] as u32;
-    let protocol = owned_protocol(msg[21])?;
-    let rtn_type = msg[23];
-    if rtn_type != RTN_UNICAST && rtn_type != RTN_BLACKHOLE {
-        return None;
-    }
-
-    let total = u32::from_ne_bytes([msg[0], msg[1], msg[2], msg[3]]) as usize;
-    let end = total.min(msg.len());
-    let mut dst: Option<&[u8]> = None;
-    let mut gw: Option<&[u8]> = None;
-    let mut via: Option<&[u8]> = None;
-    let mut oif: Option<u32> = None;
-    let mut mp: Option<&[u8]> = None;
-    let mut metric: u32 = 0;
-    let mut off = NLMSGHDR_LEN + RTMSG_LEN;
-    while off + 4 <= end {
-        let len = u16::from_ne_bytes([msg[off], msg[off + 1]]) as usize;
-        let ty = u16::from_ne_bytes([msg[off + 2], msg[off + 3]]);
-        if len < 4 || off + len > end {
-            break;
-        }
-        let data = &msg[off + 4..off + len];
-        match ty {
-            RTA_DST => dst = Some(data),
-            RTA_GATEWAY => gw = Some(data),
-            RTA_VIA => via = Some(data),
-            RTA_MULTIPATH => mp = Some(data),
-            RTA_TABLE if data.len() == 4 => {
-                table = u32::from_ne_bytes([data[0], data[1], data[2], data[3]])
-            }
-            RTA_OIF if data.len() == 4 => {
-                oif = Some(u32::from_ne_bytes([data[0], data[1], data[2], data[3]]))
-            }
-            RTA_PRIORITY if data.len() == 4 => {
-                metric = u32::from_ne_bytes([data[0], data[1], data[2], data[3]])
-            }
-            _ => {}
-        }
-        off += align4(len);
-    }
-
-    let addr = ip_from_octets(family, dst)?;
-    let prefix = Prefix::new(addr, dst_len).ok()?;
-    // A multipath route carries its next-hops in RTA_MULTIPATH; otherwise it's the
-    // single top-level gateway/oif.
-    let nexthops = match mp {
-        Some(buf) => parse_multipath(family, buf),
-        None => {
-            // A cross-family gateway (RFC 5549) arrives in RTA_VIA, decoded by its own
-            // embedded family; an ordinary same-family gateway is in RTA_GATEWAY.
-            let cross_gw = via.and_then(via_addr);
-            match nexthop_from_gw(family, gw, cross_gw, oif) {
-                Some(nh) => vec![nh],
-                None => Vec::new(),
-            }
-        }
-    };
-    if nexthops.is_empty() && rtn_type != RTN_BLACKHOLE {
-        return None;
-    }
-    Some(Route {
-        prefix,
-        table,
-        nexthops,
-        protocol,
-        preference: protocol.default_preference(),
-        metric,
-        source: 0,
-        communities: Vec::new(),
-        large_communities: Vec::new(),
-        ext_communities: Vec::new(),
-    })
-}
-
-/// Parse an `RTA_MULTIPATH` payload back into next-hops — the inverse of
-/// [`build_multipath`]. Walks each `struct rtnexthop` (advancing by its 4-aligned
-/// `rtnh_len`) and reads its weight, out-interface and nested `RTA_GATEWAY`.
-fn parse_multipath(family: u8, mut buf: &[u8]) -> Vec<NextHop> {
-    let mut out = Vec::new();
-    while buf.len() >= RTNH_HDR_LEN {
-        let rtnh_len = u16::from_ne_bytes([buf[0], buf[1]]) as usize;
-        if rtnh_len < RTNH_HDR_LEN || rtnh_len > buf.len() {
-            break;
-        }
-        let hops = buf[3];
-        let ifindex = i32::from_ne_bytes([buf[4], buf[5], buf[6], buf[7]]);
-        // Nested attributes live between the header and rtnh_len.
-        let mut gw: Option<&[u8]> = None;
-        let mut via: Option<&[u8]> = None;
-        let mut off = RTNH_HDR_LEN;
-        while off + 4 <= rtnh_len {
-            let alen = u16::from_ne_bytes([buf[off], buf[off + 1]]) as usize;
-            let aty = u16::from_ne_bytes([buf[off + 2], buf[off + 3]]);
-            if alen < 4 || off + alen > rtnh_len {
-                break;
-            }
-            match aty {
-                RTA_GATEWAY => gw = Some(&buf[off + 4..off + alen]),
-                RTA_VIA => via = Some(&buf[off + 4..off + alen]),
-                _ => {}
-            }
-            off += align4(alen);
-        }
-        // A cross-family gateway (RFC 5549) is in RTA_VIA; else the same-family
-        // gateway octets in RTA_GATEWAY.
-        let gateway = via
-            .and_then(via_addr)
-            .or_else(|| gw.and_then(|g| ip_from_octets(family, Some(g))));
-        let iface = if ifindex > 0 {
-            if_name(ifindex as u32)
-        } else {
-            None
-        };
-        if gateway.is_some() || iface.is_some() {
-            out.push(NextHop {
-                gateway,
-                iface,
-                weight: hops as u16 + 1,
-            });
-        }
-        let advance = align4(rtnh_len);
-        if advance == 0 || advance > buf.len() {
-            break;
-        }
-        buf = &buf[advance..];
-    }
-    out
-}
-
 fn af(addr: &IpAddr) -> u8 {
     match addr {
         IpAddr::V4(_) => libc::AF_INET as u8,
@@ -358,16 +188,6 @@ fn push_gateway(buf: &mut Vec<u8>, dst_family: u8, gw: &IpAddr) {
         via.extend_from_slice(&addr_octets(gw));
         push_attr(buf, RTA_VIA, &via);
     }
-}
-
-/// Decode an `RTA_VIA` payload (`struct rtvia`: 2-octet family + gateway octets) into
-/// an [`IpAddr`] — the cross-family gateway of an RFC 5549 route.
-fn via_addr(data: &[u8]) -> Option<IpAddr> {
-    if data.len() < 2 {
-        return None;
-    }
-    let family = u16::from_ne_bytes([data[0], data[1]]) as u8;
-    ip_from_octets(family, Some(&data[2..]))
 }
 
 /// Round `n` up to the next multiple of 4 (netlink alignment).
@@ -487,14 +307,18 @@ fn address_op(
 /// next-hop, each carrying its weight (`rtnh_hops` = weight − 1) and out-interface,
 /// followed by a nested `RTA_GATEWAY` when it has a gateway. Each entry is padded
 /// to a 4-byte boundary, as the kernel's `RTNH_ALIGN` requires.
-fn build_multipath(dst_family: u8, nexthops: &[NextHop]) -> Vec<u8> {
+fn build_multipath(
+    dst_family: u8,
+    nexthops: &[NextHop],
+    interfaces: &InterfaceBindings,
+) -> Result<Vec<u8>, FibError> {
     let mut payload = Vec::new();
     for nh in nexthops {
         let start = payload.len();
         payload.extend_from_slice(&0u16.to_ne_bytes()); // rtnh_len — patched below
         payload.push(0); // rtnh_flags
         payload.push(nh.weight.saturating_sub(1).min(u8::MAX as u16) as u8); // rtnh_hops
-        let ifindex = nh.iface.as_deref().and_then(if_index).unwrap_or(0) as i32;
+        let ifindex = interfaces.index(nh.iface.as_deref())?.unwrap_or(0) as i32;
         payload.extend_from_slice(&ifindex.to_ne_bytes()); // rtnh_ifindex
         if let Some(gw) = nh.gateway {
             push_gateway(&mut payload, dst_family, &gw);
@@ -506,7 +330,63 @@ fn build_multipath(dst_family: u8, nexthops: &[NextHop]) -> Vec<u8> {
             payload.push(0);
         }
     }
-    payload
+    Ok(payload)
+}
+
+/// Keep the original name/index associations through every guarded retry.
+/// Resolution failure is never permission to broaden an install/delete to a
+/// gateway-only selector; a recreated name must not retarget an old request.
+#[derive(Default)]
+struct InterfaceBindings(std::collections::BTreeMap<String, u32>);
+
+impl InterfaceBindings {
+    fn resolve(
+        hops: &[NextHop],
+        lookup: &mut impl FnMut(&str) -> Option<u32>,
+    ) -> Result<Self, FibError> {
+        let mut bindings = Self::default();
+        for hop in hops {
+            if hop.gateway.is_none() && hop.iface.is_none() {
+                return Err(FibError(
+                    "route nexthop has neither gateway nor interface".into(),
+                ));
+            }
+            if let Some(name) = hop.iface.as_deref() {
+                if !bindings.0.contains_key(name) {
+                    let index = lookup(name)
+                        .filter(|index| *index > 0 && *index <= i32::MAX as u32)
+                        .ok_or_else(|| {
+                            FibError(format!("route interface {name:?} is absent or invalid"))
+                        })?;
+                    bindings.0.insert(name.to_owned(), index);
+                }
+            }
+        }
+        Ok(bindings)
+    }
+
+    fn index(&self, name: Option<&str>) -> Result<Option<u32>, FibError> {
+        name.map(|name| {
+            self.0.get(name).copied().ok_or_else(|| {
+                FibError(format!("route interface {name:?} has no validated binding"))
+            })
+        })
+        .transpose()
+    }
+
+    fn validate(&self, lookup: &mut impl FnMut(&str) -> Option<u32>) -> Result<(), FibError> {
+        for (name, expected) in &self.0 {
+            if lookup(name) != Some(*expected) {
+                return Err(FibError(format!("route interface {name:?} disappeared or changed identity; refusing stale request")));
+            }
+        }
+        Ok(())
+    }
+}
+
+struct EncodedRouteRequest {
+    bytes: Vec<u8>,
+    interfaces: InterfaceBindings,
 }
 
 /// Build an `RTM_NEWROUTE`/`RTM_DELROUTE` netlink message for `prefix`.
@@ -522,7 +402,23 @@ fn build_route_msg(
     prefix: &Prefix,
     table: u32,
     route: Option<&Route>,
-) -> Vec<u8> {
+) -> Result<EncodedRouteRequest, FibError> {
+    let interfaces = InterfaceBindings::resolve(
+        route.map_or(&[], |route| route.nexthops.as_slice()),
+        &mut if_index,
+    )?;
+    encode_route_msg(nlmsg_type, flags, seq, prefix, table, route, interfaces)
+}
+
+fn encode_route_msg(
+    nlmsg_type: u16,
+    flags: u16,
+    seq: u32,
+    prefix: &Prefix,
+    table: u32,
+    route: Option<&Route>,
+    interfaces: InterfaceBindings,
+) -> Result<EncodedRouteRequest, FibError> {
     let mut buf = vec![0u8; NLMSGHDR_LEN + RTMSG_LEN];
 
     // --- rtmsg (offset 16) ---
@@ -548,7 +444,9 @@ fn build_route_msg(
             let any_gateway = r.nexthops.iter().any(|n| n.gateway.is_some());
             // A discard route has no next-hop at all, so it is neither on-link
             // nor via anything: universe scope, like the kernel's own.
-            buf[22] = if any_gateway || r.nexthops.is_empty() {
+            // IPv6 rtnetlink canonicalizes even a dev-only route to universe
+            // scope. Use that same representation on writes and exact deletes.
+            buf[22] = if dst.is_ipv6() || any_gateway || r.nexthops.is_empty() {
                 RT_SCOPE_UNIVERSE
             } else {
                 RT_SCOPE_LINK
@@ -586,12 +484,12 @@ fn build_route_msg(
                 if let Some(gw) = nh.gateway {
                     push_gateway(&mut buf, af(&dst), &gw);
                 }
-                if let Some(idx) = nh.iface.as_deref().and_then(if_index) {
+                if let Some(idx) = interfaces.index(nh.iface.as_deref())? {
                     push_attr(&mut buf, RTA_OIF, &idx.to_ne_bytes());
                 }
             }
             nexthops => {
-                let mp = build_multipath(af(&dst), nexthops);
+                let mp = build_multipath(af(&dst), nexthops, &interfaces)?;
                 push_attr(&mut buf, RTA_MULTIPATH, &mp);
             }
         }
@@ -608,7 +506,10 @@ fn build_route_msg(
     buf[8..12].copy_from_slice(&seq.to_ne_bytes()); // nlmsg_seq
                                                     // 12..16 nlmsg_pid = 0 (kernel assigns on bind)
     debug_assert_eq!(buf.len(), align4(buf.len()));
-    buf
+    Ok(EncodedRouteRequest {
+        bytes: buf,
+        interfaces,
+    })
 }
 
 /// How many times a transient route write is retried before it is surfaced to the
@@ -629,11 +530,16 @@ fn is_transient_errno(errno: i32) -> bool {
 
 /// Kernel identity, not RIB annotations (source, preference or communities).
 /// A gateway-only install acquires an output interface in the kernel dump.
-fn same_kernel_route(expected: &Route, observed: &Route) -> bool {
+/// Linux also replaces an IPv6 metric of zero with its default of 1024.
+/// Keep this comparison shared with the daemon's startup/reload readback gate.
+pub fn same_kernel_route(expected: &Route, observed: &Route) -> bool {
     expected.prefix == observed.prefix
         && expected.table == observed.table
         && expected.protocol == observed.protocol
-        && expected.metric == observed.metric
+        && (expected.metric == observed.metric
+            || (expected.prefix.addr().is_ipv6()
+                && expected.metric == 0
+                && observed.metric == 1024))
         && expected.nexthops.len() == observed.nexthops.len()
         && expected
             .nexthops
@@ -651,6 +557,7 @@ fn same_kernel_route(expected: &Route, observed: &Route) -> bool {
 
 /// A failed netlink round-trip: the [`FibError`] to surface, plus the raw errno (when
 /// one was available) so the caller can classify it as transient or terminal.
+#[derive(Debug)]
 struct NetlinkFailure {
     fib: FibError,
     errno: Option<i32>,
@@ -660,16 +567,410 @@ struct NetlinkFailure {
 pub struct KernelFib {
     fd: i32,
     seq: u32,
+    port: u32,
+}
+
+const EXCHANGE_TIMEOUT: Duration = Duration::from_secs(5);
+const EXCHANGE_BYTES: usize = 8 * 1024 * 1024;
+const NLM_F_MULTI: u16 = 2;
+const NLM_F_DUMP_INTR: u16 = 0x10;
+const NLM_F_CAPPED: u16 = 0x100;
+const NLM_F_ACK_TLVS: u16 = 0x200;
+
+fn invalid(message: impl Into<String>) -> NetlinkFailure {
+    NetlinkFailure {
+        fib: FibError(message.into()),
+        errno: None,
+    }
+}
+
+fn syscall_error(context: &str, error: io::Error) -> NetlinkFailure {
+    NetlinkFailure {
+        fib: FibError(format!("{context}: {error}")),
+        errno: error.raw_os_error(),
+    }
+}
+
+struct ExchangeBudget {
+    deadline: Instant,
+    bytes: usize,
+}
+
+impl ExchangeBudget {
+    fn new() -> Self {
+        Self {
+            deadline: Instant::now() + EXCHANGE_TIMEOUT,
+            bytes: 0,
+        }
+    }
+
+    fn remaining(&self) -> Result<Duration, NetlinkFailure> {
+        self.deadline
+            .checked_duration_since(Instant::now())
+            .filter(|remaining| !remaining.is_zero())
+            .ok_or_else(|| invalid("netlink exchange exceeded its absolute deadline"))
+    }
+
+    fn charge(&mut self, bytes: usize) -> Result<(), NetlinkFailure> {
+        self.remaining()?;
+        if bytes == 0 || bytes > EXCHANGE_BYTES - self.bytes {
+            return Err(invalid("netlink exchange exceeded its wire-byte budget"));
+        }
+        self.bytes += bytes;
+        Ok(())
+    }
+}
+
+fn checked_attributes(mut bytes: &[u8]) -> Result<Vec<(u16, &[u8])>, NetlinkFailure> {
+    let mut attributes = Vec::new();
+    let mut kinds = std::collections::HashSet::new();
+    while !bytes.is_empty() {
+        if bytes.len() < 4 {
+            return Err(invalid("truncated netlink attribute header"));
+        }
+        let length = u16::from_ne_bytes([bytes[0], bytes[1]]) as usize;
+        let kind = u16::from_ne_bytes([bytes[2], bytes[3]]);
+        if length < 4 || length > bytes.len() || align4(length) > bytes.len() {
+            return Err(invalid("invalid netlink attribute length/alignment"));
+        }
+        if !kinds.insert(kind) {
+            return Err(invalid("duplicate netlink attribute"));
+        }
+        attributes.push((kind, &bytes[4..length]));
+        bytes = &bytes[align4(length)..];
+    }
+    Ok(attributes)
+}
+
+fn checked_messages(bytes: &[u8], sequence: u32, port: u32) -> Result<Vec<&[u8]>, NetlinkFailure> {
+    let mut rest = bytes;
+    let mut messages = Vec::new();
+    while !rest.is_empty() {
+        if rest.len() < NLMSGHDR_LEN {
+            return Err(invalid("truncated netlink message header"));
+        }
+        let length = u32::from_ne_bytes(rest[0..4].try_into().unwrap()) as usize;
+        if length < NLMSGHDR_LEN || length > rest.len() || align4(length) > rest.len() {
+            return Err(invalid("invalid netlink message length/alignment"));
+        }
+        let flags = u16::from_ne_bytes(rest[6..8].try_into().unwrap());
+        if flags & NLM_F_DUMP_INTR != 0 {
+            return Err(invalid(
+                "interrupted netlink dump; partial inventory rejected",
+            ));
+        }
+        if u32::from_ne_bytes(rest[8..12].try_into().unwrap()) != sequence
+            || u32::from_ne_bytes(rest[12..16].try_into().unwrap()) != port
+        {
+            return Err(invalid("netlink reply sequence/port mismatch"));
+        }
+        messages.push(&rest[..length]);
+        rest = &rest[align4(length)..];
+    }
+    if messages.is_empty() {
+        return Err(invalid("empty netlink datagram"));
+    }
+    Ok(messages)
+}
+
+fn checked_error(code: i32) -> Result<(), NetlinkFailure> {
+    if code > 0 || code == i32::MIN {
+        return Err(invalid("invalid positive/overflow netlink error code"));
+    }
+    if code < 0 {
+        return Err(syscall_error(
+            "netlink",
+            io::Error::from_raw_os_error(-code),
+        ));
+    }
+    Ok(())
+}
+
+fn checked_ack(message: &[u8], request: &[u8]) -> Result<(), NetlinkFailure> {
+    if request.len() < NLMSGHDR_LEN
+        || message.len() < NLMSGHDR_LEN + 4 + NLMSGHDR_LEN
+        || u16::from_ne_bytes(message[4..6].try_into().unwrap()) != NLMSG_ERROR
+    {
+        return Err(invalid("missing complete netlink ACK"));
+    }
+    let flags = u16::from_ne_bytes(message[6..8].try_into().unwrap());
+    if flags & !(NLM_F_CAPPED | NLM_F_ACK_TLVS) != 0 {
+        return Err(invalid("unexpected netlink ACK flags"));
+    }
+    let code = i32::from_ne_bytes(message[16..20].try_into().unwrap());
+    if message[20..36] != request[..NLMSGHDR_LEN] {
+        return Err(invalid(
+            "netlink ACK does not echo the issued request header",
+        ));
+    }
+    let echoed = if code == 0 || flags & NLM_F_CAPPED != 0 {
+        NLMSGHDR_LEN
+    } else {
+        request.len()
+    };
+    let end = 20 + align4(echoed);
+    if message.len() < end || message[20..20 + echoed] != request[..echoed] {
+        return Err(invalid(
+            "netlink ACK has a truncated or mismatched request echo",
+        ));
+    }
+    if flags & NLM_F_ACK_TLVS != 0 {
+        checked_attributes(&message[end..])?;
+    } else if message.len() != end {
+        return Err(invalid("unexpected trailing netlink ACK data"));
+    }
+    checked_error(code)
+}
+
+fn checked_done(message: &[u8]) -> Result<(), NetlinkFailure> {
+    if message.len() < NLMSGHDR_LEN + 4 {
+        return Err(invalid("missing netlink dump completion status"));
+    }
+    let flags = u16::from_ne_bytes(message[6..8].try_into().unwrap());
+    if flags & NLM_F_MULTI == 0 || flags & !(NLM_F_MULTI | NLM_F_ACK_TLVS) != 0 {
+        return Err(invalid("unexpected netlink dump completion flags"));
+    }
+    if flags & NLM_F_ACK_TLVS != 0 {
+        checked_attributes(&message[20..])?;
+    } else if message.len() != 20 {
+        return Err(invalid("unexpected trailing netlink dump completion data"));
+    }
+    checked_error(i32::from_ne_bytes(message[16..20].try_into().unwrap()))
+}
+
+fn validate_datagram(
+    received: usize,
+    expected: usize,
+    message: &libc::msghdr,
+    sender: &libc::sockaddr_nl,
+) -> Result<(), NetlinkFailure> {
+    if received == 0
+        || received != expected
+        || message.msg_flags & (libc::MSG_TRUNC | libc::MSG_CTRUNC) != 0
+    {
+        return Err(invalid("truncated or changed netlink datagram"));
+    }
+    if message.msg_namelen as usize != mem::size_of::<libc::sockaddr_nl>()
+        || sender.nl_family != libc::AF_NETLINK as u16
+        || sender.nl_pid != 0
+        || sender.nl_groups != 0
+    {
+        return Err(invalid(
+            "netlink reply did not originate from the kernel unicast peer",
+        ));
+    }
+    Ok(())
+}
+
+fn checked_gateway(family: u8, kind: u16, value: &[u8]) -> Result<IpAddr, NetlinkFailure> {
+    let address = if kind == RTA_VIA {
+        if value.len() < 2 {
+            return Err(invalid("truncated owned route cross-family gateway"));
+        }
+        let via_family = u16::from_ne_bytes(value[..2].try_into().unwrap());
+        if !matches!(via_family as i32, libc::AF_INET | libc::AF_INET6) {
+            return Err(invalid("unsupported owned route gateway family"));
+        }
+        ip_from_octets(via_family as u8, Some(&value[2..]))
+    } else {
+        ip_from_octets(family, Some(value))
+    };
+    address.ok_or_else(|| invalid("invalid owned route gateway address"))
+}
+
+fn checked_interface(
+    index: i32,
+    lookup: &mut impl FnMut(u32) -> Option<String>,
+) -> Result<String, NetlinkFailure> {
+    if index <= 0 {
+        return Err(invalid("owned route references an invalid interface"));
+    }
+    lookup(index as u32).ok_or_else(|| invalid("owned route references an absent interface"))
+}
+
+fn checked_multipath(
+    family: u8,
+    mut bytes: &[u8],
+    lookup: &mut impl FnMut(u32) -> Option<String>,
+) -> Result<Vec<NextHop>, NetlinkFailure> {
+    if bytes.is_empty() {
+        return Err(invalid("empty owned multipath route"));
+    }
+    let mut hops = Vec::new();
+    while !bytes.is_empty() {
+        if bytes.len() < RTNH_HDR_LEN {
+            return Err(invalid("truncated owned route nexthop"));
+        }
+        let length = u16::from_ne_bytes(bytes[..2].try_into().unwrap()) as usize;
+        if length < RTNH_HDR_LEN || length > bytes.len() || align4(length) > bytes.len() {
+            return Err(invalid("invalid owned route nexthop length"));
+        }
+        let index = i32::from_ne_bytes(bytes[4..8].try_into().unwrap());
+        // DEAD/OFFLOAD/LINKDOWN/TRAP report kernel state. ONLINK/PERVASIVE and
+        // unknown flags change forwarding semantics which Route cannot retain.
+        if bytes[2] & !(0x01 | 0x08 | 0x10 | 0x40) != 0 {
+            return Err(invalid("unsupported owned route nexthop flags"));
+        }
+        let iface = if index != 0 {
+            Some(checked_interface(index, lookup)?)
+        } else {
+            None
+        };
+        let mut gateway = None;
+        for (kind, value) in checked_attributes(&bytes[RTNH_HDR_LEN..length])? {
+            if !matches!(kind, RTA_GATEWAY | RTA_VIA) || gateway.is_some() {
+                return Err(invalid(
+                    "unsupported or ambiguous owned route nexthop attribute",
+                ));
+            }
+            gateway = Some(checked_gateway(family, kind, value)?);
+        }
+        if index == 0 && gateway.is_none() {
+            return Err(invalid("owned route nexthop has no destination"));
+        }
+        hops.push(NextHop {
+            gateway,
+            iface,
+            weight: bytes[3] as u16 + 1,
+        });
+        bytes = &bytes[align4(length)..];
+    }
+    Ok(hops)
+}
+
+/// Foreign protocols are explicitly outside our inventory. An owned route is
+/// different: malformed/unsupported identity must fail the whole dump, never
+/// turn into apparent absence and authorize a destructive reconciliation.
+fn parse_owned_route(message: &[u8]) -> Result<Option<Route>, NetlinkFailure> {
+    parse_owned_route_with(message, &mut if_name)
+}
+
+fn parse_owned_route_with(
+    message: &[u8],
+    lookup: &mut impl FnMut(u32) -> Option<String>,
+) -> Result<Option<Route>, NetlinkFailure> {
+    if message.len() < NLMSGHDR_LEN + RTMSG_LEN {
+        return Err(invalid("truncated route inventory record"));
+    }
+    let Some(protocol) = owned_protocol(message[21]) else {
+        return Ok(None);
+    };
+    let family = message[16];
+    if !matches!(family as i32, libc::AF_INET | libc::AF_INET6)
+        || message[18] != 0
+        || message[19] != 0
+        || !matches!(message[23], RTN_UNICAST | RTN_BLACKHOLE)
+    {
+        return Err(invalid("unrepresentable owned route family/source/type"));
+    }
+    // Only informational hardware-offload/trap state may be discarded. In
+    // particular, do not treat an ONLINK route as an ordinary gateway route.
+    let flags = u32::from_ne_bytes(message[24..28].try_into().unwrap());
+    if flags & !(0x4000 | 0x8000 | 0x2000_0000) != 0 {
+        return Err(invalid("unsupported owned route flags"));
+    }
+    let mut destination = None;
+    let mut gateway = None;
+    let mut interface = None;
+    let mut multipath = None;
+    let mut table = message[20] as u32;
+    let mut metric = 0;
+    for (kind, value) in checked_attributes(&message[NLMSGHDR_LEN + RTMSG_LEN..])? {
+        match kind {
+            RTA_DST => {
+                destination = Some(
+                    ip_from_octets(family, Some(value))
+                        .ok_or_else(|| invalid("invalid owned route destination"))?,
+                );
+            }
+            RTA_GATEWAY | RTA_VIA => {
+                if gateway.is_some() {
+                    return Err(invalid("ambiguous owned route gateway"));
+                }
+                gateway = Some(checked_gateway(family, kind, value)?);
+            }
+            RTA_OIF => {
+                if value.len() != 4 {
+                    return Err(invalid("invalid owned route interface attribute"));
+                }
+                interface = Some(checked_interface(
+                    i32::from_ne_bytes(value.try_into().unwrap()),
+                    lookup,
+                )?);
+            }
+            RTA_PRIORITY | RTA_TABLE => {
+                if value.len() != 4 {
+                    return Err(invalid("invalid owned route scalar attribute"));
+                }
+                let scalar = u32::from_ne_bytes(value.try_into().unwrap());
+                if kind == RTA_TABLE {
+                    table = scalar;
+                } else {
+                    metric = scalar;
+                }
+            }
+            RTA_MULTIPATH => {
+                multipath = Some(checked_multipath(family, value, lookup)?);
+            }
+            // Kernel informational attributes do not participate in our exact
+            // route deletion key: preferred source, cache statistics, IPv6
+            // preference and expiry. Unknown forwarding forms (encap, nh-id,
+            // source-specific routes, …) must not silently lose identity.
+            7 => {
+                checked_gateway(family, RTA_GATEWAY, value)?;
+            }
+            12 if value.len() == 32 => {}
+            20 if value.len() == 1 => {}
+            23 if value.len() == 4 => {}
+            _ => return Err(invalid("unsupported owned route attribute")),
+        }
+    }
+    let has_single = gateway.is_some() || interface.is_some();
+    if (message[17] != 0 && destination.is_none())
+        || (multipath.is_some() && has_single)
+        || (message[23] == RTN_BLACKHOLE && (multipath.is_some() || has_single))
+        || (message[23] == RTN_UNICAST && multipath.is_none() && !has_single)
+    {
+        return Err(invalid("incomplete or ambiguous owned route identity"));
+    }
+    let address = destination.unwrap_or_else(|| ip_from_octets(family, None).unwrap());
+    let prefix = Prefix::new(address, message[17])
+        .map_err(|_| invalid("invalid owned route prefix length"))?;
+    let hops = multipath.unwrap_or_else(|| {
+        if has_single {
+            vec![NextHop {
+                gateway,
+                iface: interface,
+                weight: 1,
+            }]
+        } else {
+            Vec::new()
+        }
+    });
+    let expected_scope =
+        if address.is_ipv6() || hops.is_empty() || hops.iter().any(|hop| hop.gateway.is_some()) {
+            RT_SCOPE_UNIVERSE
+        } else {
+            RT_SCOPE_LINK
+        };
+    if message[22] != expected_scope || table == 0 || prefix.addr() != address {
+        return Err(invalid(
+            "owned route scope/table/prefix cannot be represented exactly",
+        ));
+    }
+    Ok(Some(
+        Route::new(prefix, protocol, hops, metric).with_table(table),
+    ))
 }
 
 impl KernelFib {
-    /// Open a netlink route socket. Fails without `CAP_NET_ADMIN`.
+    /// Open a netlink route socket. Writes additionally require `CAP_NET_ADMIN`.
     pub fn new() -> Result<Self, FibError> {
         // SAFETY: a plain socket(2) call; the returned fd is checked.
         let fd = unsafe {
             libc::socket(
                 libc::AF_NETLINK,
-                libc::SOCK_RAW | libc::SOCK_CLOEXEC,
+                libc::SOCK_RAW | libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK,
                 libc::NETLINK_ROUTE,
             )
         };
@@ -678,33 +979,6 @@ impl KernelFib {
                 "opening netlink socket: {}",
                 io::Error::last_os_error()
             )));
-        }
-        // Bound the ACK read: this socket is driven synchronously from the
-        // router's async task, so a kernel that never replies (memory pressure,
-        // ENOBUFS storm) would otherwise hang the router loop indefinitely and
-        // silently stop route convergence. A receive timeout turns that into a
-        // recoverable per-request error instead of a deadlock. (Moving the whole
-        // netlink I/O off the async runtime is the larger follow-up; this closes
-        // the unbounded-hang failure mode.)
-        let tv = libc::timeval {
-            tv_sec: 5,
-            tv_usec: 0,
-        };
-        // SAFETY: setsockopt with a valid timeval for the fd we just opened.
-        let rc = unsafe {
-            libc::setsockopt(
-                fd,
-                libc::SOL_SOCKET,
-                libc::SO_RCVTIMEO,
-                &tv as *const _ as *const c_void,
-                mem::size_of::<libc::timeval>() as libc::socklen_t,
-            )
-        };
-        if rc < 0 {
-            let err = io::Error::last_os_error();
-            // SAFETY: closing the fd we just opened.
-            unsafe { libc::close(fd) };
-            return Err(FibError(format!("setting netlink recv timeout: {err}")));
         }
         // SAFETY: a zeroed sockaddr_nl with only the family set is a valid bind
         // address (the kernel auto-assigns the port id).
@@ -723,32 +997,182 @@ impl KernelFib {
             unsafe { libc::close(fd) };
             return Err(FibError(format!("binding netlink socket: {err}")));
         }
-        Ok(Self { fd, seq: 1 })
+        let mut length = mem::size_of_val(&sa) as libc::socklen_t;
+        // SAFETY: the sockaddr and its length are writable for this call.
+        let rc =
+            unsafe { libc::getsockname(fd, &mut sa as *mut _ as *mut libc::sockaddr, &mut length) };
+        if rc < 0 {
+            let error = io::Error::last_os_error();
+            // SAFETY: closing the socket owned by this constructor.
+            unsafe { libc::close(fd) };
+            return Err(FibError(format!("reading netlink local port: {error}")));
+        }
+        if length as usize != mem::size_of_val(&sa)
+            || sa.nl_family != libc::AF_NETLINK as u16
+            || sa.nl_pid == 0
+            || sa.nl_groups != 0
+        {
+            // SAFETY: closing the socket owned by this constructor.
+            unsafe { libc::close(fd) };
+            return Err(FibError("unexpected netlink local socket identity".into()));
+        }
+        let port = sa.nl_pid;
+        sa.nl_pid = 0;
+        // Connecting pins the peer to the kernel; recvmsg checks the sender too.
+        // SAFETY: sockaddr_nl remains valid across the nonblocking connect.
+        let rc = unsafe { libc::connect(fd, &sa as *const _ as *const libc::sockaddr, length) };
+        if rc < 0 {
+            let error = io::Error::last_os_error();
+            // SAFETY: closing the socket owned by this constructor.
+            unsafe { libc::close(fd) };
+            return Err(FibError(format!("connecting netlink kernel peer: {error}")));
+        }
+        Ok(Self { fd, seq: 1, port })
     }
 
-    /// Send one netlink message to the kernel (nl_pid 0).
-    fn send_to_kernel(&self, msg: &[u8]) -> Result<(), FibError> {
-        // SAFETY: a zeroed sockaddr_nl with the family set addresses the kernel.
-        let mut dst: libc::sockaddr_nl = unsafe { mem::zeroed() };
-        dst.nl_family = libc::AF_NETLINK as u16;
-        // SAFETY: `msg` is a valid byte slice; `dst` outlives the call.
-        let sent = unsafe {
-            libc::sendto(
-                self.fd,
-                msg.as_ptr() as *const c_void,
-                msg.len(),
-                0,
-                &dst as *const _ as *const libc::sockaddr,
-                mem::size_of::<libc::sockaddr_nl>() as libc::socklen_t,
-            )
-        };
-        if sent < 0 {
-            return Err(FibError(format!(
-                "sending netlink request: {}",
-                io::Error::last_os_error()
-            )));
+    fn fresh_exchange(&mut self) -> Result<(), NetlinkFailure> {
+        let mut fresh = Self::new().map_err(|fib| NetlinkFailure { fib, errno: None })?;
+        fresh.seq = self.seq;
+        // Drop closes the old socket: a late reply from an ambiguous earlier
+        // exchange can never be mistaken for the next request's ACK or dump.
+        std::mem::swap(self, &mut fresh);
+        Ok(())
+    }
+
+    fn io(
+        &self,
+        budget: &ExchangeBudget,
+        events: i16,
+        operation: impl FnMut() -> isize,
+    ) -> Result<usize, NetlinkFailure> {
+        self.io_checked(budget, events, || Ok(()), operation)
+    }
+
+    fn io_checked(
+        &self,
+        budget: &ExchangeBudget,
+        events: i16,
+        mut before_attempt: impl FnMut() -> Result<(), NetlinkFailure>,
+        mut operation: impl FnMut() -> isize,
+    ) -> Result<usize, NetlinkFailure> {
+        loop {
+            budget.remaining()?;
+            before_attempt()?;
+            budget.remaining()?;
+            let result = operation();
+            // Capture errno before any clock, allocation or logging work.
+            let error = (result < 0).then(io::Error::last_os_error);
+            if result >= 0 {
+                budget.remaining()?;
+                return Ok(result as usize);
+            }
+            let error = error.unwrap();
+            if error.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            if error.kind() != io::ErrorKind::WouldBlock {
+                return Err(syscall_error("netlink transport", error));
+            }
+            loop {
+                let remaining = budget.remaining()?;
+                let timeout = remaining
+                    .as_millis()
+                    .saturating_add(1)
+                    .min(i32::MAX as u128) as i32;
+                let mut poll = libc::pollfd {
+                    fd: self.fd,
+                    events,
+                    revents: 0,
+                };
+                // SAFETY: poll points to one valid descriptor and is bounded.
+                let result = unsafe { libc::poll(&mut poll, 1, timeout) };
+                let error = (result < 0).then(io::Error::last_os_error);
+                budget.remaining()?;
+                if let Some(error) = error {
+                    if error.kind() == io::ErrorKind::Interrupted {
+                        continue;
+                    }
+                    return Err(syscall_error("polling netlink", error));
+                }
+                if poll.revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0 {
+                    return Err(invalid("netlink socket poll failed"));
+                }
+                if result > 0 && poll.revents & events != 0 {
+                    break;
+                }
+            }
+        }
+    }
+
+    fn send_to_kernel(
+        &self,
+        msg: &[u8],
+        budget: &mut ExchangeBudget,
+    ) -> Result<(), NetlinkFailure> {
+        self.send_bound_to_kernel(msg, budget, &InterfaceBindings::default())
+    }
+
+    fn send_bound_to_kernel(
+        &self,
+        msg: &[u8],
+        budget: &mut ExchangeBudget,
+        interfaces: &InterfaceBindings,
+    ) -> Result<(), NetlinkFailure> {
+        budget.charge(msg.len())?;
+        let sent = self.io_checked(
+            budget,
+            libc::POLLOUT,
+            || {
+                // Check on every actual send attempt, including internal EINTR /
+                // EAGAIN retries, not merely once per logical ACK exchange. There
+                // is still no atomic compare-and-send against kernel link changes.
+                interfaces
+                    .validate(&mut if_index)
+                    .map_err(|fib| NetlinkFailure { fib, errno: None })
+            },
+            || {
+                // SAFETY: msg is readable; the connected peer is the kernel.
+                unsafe { libc::send(self.fd, msg.as_ptr().cast(), msg.len(), 0) }
+            },
+        )?;
+        if sent != msg.len() {
+            return Err(invalid("short netlink datagram send"));
         }
         Ok(())
+    }
+
+    fn receive(&self, budget: &mut ExchangeBudget) -> Result<Vec<u8>, NetlinkFailure> {
+        let mut byte = 0u8;
+        let length = self.io(budget, libc::POLLIN, || {
+            // SAFETY: one writable byte; PEEK|TRUNC returns full datagram length.
+            unsafe {
+                libc::recv(
+                    self.fd,
+                    (&mut byte as *mut u8).cast(),
+                    1,
+                    libc::MSG_PEEK | libc::MSG_TRUNC,
+                )
+            }
+        })?;
+        budget.charge(length)?;
+        let mut bytes = vec![0u8; length];
+        // SAFETY: sockaddr_nl/msghdr permit all-zero initialization.
+        let mut sender: libc::sockaddr_nl = unsafe { mem::zeroed() };
+        let mut vector = libc::iovec {
+            iov_base: bytes.as_mut_ptr().cast(),
+            iov_len: bytes.len(),
+        };
+        let mut message: libc::msghdr = unsafe { mem::zeroed() };
+        message.msg_name = (&mut sender as *mut libc::sockaddr_nl).cast();
+        message.msg_namelen = mem::size_of_val(&sender) as libc::socklen_t;
+        message.msg_iov = &mut vector;
+        message.msg_iovlen = 1;
+        let received = self.io(budget, libc::POLLIN, || {
+            // SAFETY: msghdr references live writable buffers of stated lengths.
+            unsafe { libc::recvmsg(self.fd, &mut message, 0) }
+        })?;
+        validate_datagram(received, length, &message, &sender)?;
+        Ok(bytes)
     }
 
     /// Send one route request and wait for its ACK, retrying a transient kernel
@@ -760,12 +1184,19 @@ impl KernelFib {
     /// after the retries is surfaced to the router, which queues it for its own
     /// periodic reconciliation.
     fn request(&mut self, msg: &[u8]) -> Result<(), FibError> {
-        self.request_guarded(msg, None)
+        self.request_guarded(msg, None, &InterfaceBindings::default())
     }
 
-    fn request_guarded(&mut self, msg: &[u8], expected: Option<&Route>) -> Result<(), FibError> {
+    fn request_guarded(
+        &mut self,
+        msg: &[u8],
+        expected: Option<&Route>,
+        interfaces: &InterfaceBindings,
+    ) -> Result<(), FibError> {
+        let mut budget = ExchangeBudget::new();
         let mut attempt = 0u32;
         loop {
+            interfaces.validate(&mut if_index)?;
             if let Some(expected) = expected {
                 // Linux IPv4 treats RTA_PRIORITY=0 as a wildcard even when
                 // the attribute is explicitly present. Check actual existence
@@ -773,15 +1204,20 @@ impl KernelFib {
                 // An absent zero-metric retry must not remove metric20 instead.
                 // This is not atomic exclusion against concurrent foreign FIB
                 // writers: rtnetlink provides no compare-and-delete for zero.
-                if !self
-                    .dump_owned()?
+                let observed = self
+                    .dump_owned_budget(&mut budget)
+                    .map_err(|error| error.fib)?;
+                // Even an apparent absence cannot be trusted as successful
+                // deletion if the selector's interface changed during the dump.
+                interfaces.validate(&mut if_index)?;
+                if !observed
                     .iter()
                     .any(|route| same_kernel_route(expected, route))
                 {
                     return Ok(());
                 }
             }
-            match self.request_once(msg) {
+            match self.request_once(msg, &mut budget, interfaces) {
                 Ok(()) => return Ok(()),
                 Err(e)
                     if e.errno == Some(libc::ESRCH)
@@ -793,139 +1229,90 @@ impl KernelFib {
                     attempt += 1;
                     // Linear backoff (20ms, 40ms, 60ms): brief, since these bursts
                     // clear fast, and bounded so the router loop is never stalled long.
-                    std::thread::sleep(std::time::Duration::from_millis(20 * attempt as u64));
+                    let remaining = budget.remaining().map_err(|error| error.fib)?;
+                    std::thread::sleep(Duration::from_millis(20 * attempt as u64).min(remaining));
                 }
                 Err(e) => return Err(e.fib),
             }
         }
     }
 
-    /// One send+recv round-trip. On failure, returns the [`FibError`] together with
-    /// the raw errno (when known) so [`request`] can decide whether to retry.
-    fn request_once(&mut self, msg: &[u8]) -> Result<(), NetlinkFailure> {
-        if let Err(fib) = self.send_to_kernel(msg) {
-            // send_to_kernel already stamped last_os_error into the message; recover
-            // the errno for the transient check.
-            let errno = io::Error::last_os_error().raw_os_error();
-            return Err(NetlinkFailure { fib, errno });
+    /// One isolated exchange. The shared caller budget also covers retries.
+    fn request_once(
+        &mut self,
+        msg: &[u8],
+        budget: &mut ExchangeBudget,
+        interfaces: &InterfaceBindings,
+    ) -> Result<(), NetlinkFailure> {
+        self.fresh_exchange()?;
+        self.send_bound_to_kernel(msg, budget, interfaces)?;
+        let bytes = self.receive(budget)?;
+        let sequence = u32::from_ne_bytes(msg[8..12].try_into().unwrap());
+        let messages = checked_messages(&bytes, sequence, self.port)?;
+        if messages.len() != 1 {
+            return Err(invalid("expected exactly one correlated netlink ACK"));
         }
-
-        // Read the ACK / error reply.
-        let mut buf = [0u8; 4096];
-        // SAFETY: `buf` is a valid, sufficiently-large mutable buffer.
-        let n = unsafe { libc::recv(self.fd, buf.as_mut_ptr() as *mut c_void, buf.len(), 0) };
-        if n < 0 {
-            let err = io::Error::last_os_error();
-            let errno = err.raw_os_error();
-            return Err(NetlinkFailure {
-                fib: FibError(format!("reading netlink reply: {err}")),
-                errno,
-            });
-        }
-        let n = n as usize;
-        if n < NLMSGHDR_LEN {
-            return Err(NetlinkFailure {
-                fib: FibError("truncated netlink reply".into()),
-                errno: None,
-            });
-        }
-        let nlmsg_type = u16::from_ne_bytes([buf[4], buf[5]]);
-        if nlmsg_type == NLMSG_ERROR {
-            // struct nlmsgerr { __s32 error; struct nlmsghdr msg; } — the error is
-            // the first field after the 16-byte header. 0 means a plain ACK.
-            if n < NLMSGHDR_LEN + 4 {
-                return Err(NetlinkFailure {
-                    fib: FibError("short netlink error reply".into()),
-                    errno: None,
-                });
-            }
-            let code = i32::from_ne_bytes([buf[16], buf[17], buf[18], buf[19]]);
-            if code != 0 {
-                // nlmsgerr carries the negative errno.
-                return Err(NetlinkFailure {
-                    fib: FibError(format!("netlink: {}", io::Error::from_raw_os_error(-code))),
-                    errno: Some(-code),
-                });
-            }
-        }
-        Ok(())
+        checked_ack(messages[0], msg)
     }
 
     fn next_seq(&mut self) -> u32 {
-        let s = self.seq;
+        let sequence = self.seq;
         self.seq = self.seq.wrapping_add(1);
-        s
+        sequence
     }
 
-    /// Dump every routing table and return the routes tagged with one of Wren's own
-    /// protocol ids (see [`owned_protocol`]) — the routes a previous Wren instance
-    /// installed, in the main table or any VRF table (each route carries its table).
-    /// Foreign routes (kernel, DHCP, …) are skipped.
     fn dump_owned(&mut self) -> Result<Vec<Route>, FibError> {
-        // An `RTM_GETROUTE` dump request: an rtmsg with `AF_UNSPEC` so the kernel
-        // walks both address families.
-        let seq = self.next_seq();
-        let mut req = vec![0u8; NLMSGHDR_LEN + RTMSG_LEN];
-        req[16] = libc::AF_UNSPEC as u8; // rtm_family
-        let total = req.len() as u32;
-        req[0..4].copy_from_slice(&total.to_ne_bytes());
-        req[4..6].copy_from_slice(&RTM_GETROUTE.to_ne_bytes());
-        req[6..8].copy_from_slice(&(NLM_F_REQUEST | NLM_F_DUMP).to_ne_bytes());
-        req[8..12].copy_from_slice(&seq.to_ne_bytes());
-        self.send_to_kernel(&req)?;
+        self.dump_owned_budget(&mut ExchangeBudget::new())
+            .map_err(|error| error.fib)
+    }
 
-        // Read the multipart reply until `NLMSG_DONE`. Netlink datagrams are
-        // message-aligned, so each `recv` yields whole messages.
+    fn dump_owned_budget(
+        &mut self,
+        budget: &mut ExchangeBudget,
+    ) -> Result<Vec<Route>, NetlinkFailure> {
+        self.fresh_exchange()?;
+        let sequence = self.next_seq();
+        let mut request = vec![0u8; NLMSGHDR_LEN + RTMSG_LEN];
+        request[16] = libc::AF_UNSPEC as u8;
+        let length = request.len() as u32;
+        request[0..4].copy_from_slice(&length.to_ne_bytes());
+        request[4..6].copy_from_slice(&RTM_GETROUTE.to_ne_bytes());
+        request[6..8].copy_from_slice(&(NLM_F_REQUEST | NLM_F_DUMP).to_ne_bytes());
+        request[8..12].copy_from_slice(&sequence.to_ne_bytes());
+        self.send_to_kernel(&request, budget)?;
         let mut routes = Vec::new();
-        let mut buf = [0u8; 16384];
-        'recv: loop {
-            // SAFETY: `buf` is a valid, sufficiently-large mutable buffer.
-            let n = unsafe { libc::recv(self.fd, buf.as_mut_ptr() as *mut c_void, buf.len(), 0) };
-            if n < 0 {
-                return Err(FibError(format!(
-                    "reading netlink dump: {}",
-                    io::Error::last_os_error()
-                )));
-            }
-            let n = n as usize;
-            let mut off = 0;
-            while off + NLMSGHDR_LEN <= n {
-                let len = u32::from_ne_bytes([buf[off], buf[off + 1], buf[off + 2], buf[off + 3]])
-                    as usize;
-                if len < NLMSGHDR_LEN || off + len > n {
-                    break;
-                }
-                let ty = u16::from_ne_bytes([buf[off + 4], buf[off + 5]]);
-                if ty == NLMSG_DONE {
-                    break 'recv;
-                }
-                if ty == NLMSG_ERROR {
-                    let code = if off + NLMSGHDR_LEN + 4 <= n {
-                        i32::from_ne_bytes([
-                            buf[off + 16],
-                            buf[off + 17],
-                            buf[off + 18],
-                            buf[off + 19],
-                        ])
-                    } else {
-                        0
-                    };
-                    if code != 0 {
-                        return Err(FibError(format!(
-                            "netlink dump: {}",
-                            io::Error::from_raw_os_error(-code)
-                        )));
+        loop {
+            let bytes = self.receive(budget)?;
+            let messages = checked_messages(&bytes, sequence, self.port)?;
+            for (index, message) in messages.iter().enumerate() {
+                budget.remaining()?;
+                let kind = u16::from_ne_bytes(message[4..6].try_into().unwrap());
+                match kind {
+                    NLMSG_DONE => {
+                        checked_done(message)?;
+                        if index + 1 != messages.len() {
+                            return Err(invalid("messages after netlink dump completion"));
+                        }
+                        return Ok(routes);
                     }
-                }
-                if ty == RTM_NEWROUTE {
-                    if let Some(route) = parse_route(&buf[off..off + len]) {
-                        routes.push(route);
+                    NLMSG_ERROR => {
+                        checked_ack(message, &request)?;
+                        return Err(invalid("unexpected success ACK instead of route dump"));
                     }
+                    RTM_NEWROUTE => {
+                        let flags = u16::from_ne_bytes(message[6..8].try_into().unwrap());
+                        if flags != NLM_F_MULTI {
+                            return Err(invalid("non-multipart route dump response"));
+                        }
+                        if let Some(route) = parse_owned_route(message)? {
+                            routes.push(route);
+                        }
+                        budget.remaining()?;
+                    }
+                    _ => return Err(invalid("unexpected netlink dump message type")),
                 }
-                off += align4(len);
             }
         }
-        Ok(routes)
     }
 }
 
@@ -942,9 +1329,9 @@ impl Fib for KernelFib {
             &route.prefix,
             route.table,
             Some(route),
-        );
+        )?;
         let guard = (route.metric == 0 && route.prefix.addr().is_ipv4()).then_some(route);
-        self.request_guarded(&msg, guard)
+        self.request_guarded(&msg.bytes, guard, &msg.interfaces)
     }
     fn apply(&mut self, change: &FibChange) -> Result<(), FibError> {
         let seq = self.next_seq();
@@ -965,8 +1352,8 @@ impl Fib for KernelFib {
                 *table,
                 None,
             ),
-        };
-        self.request(&msg)
+        }?;
+        self.request_guarded(&msg.bytes, None, &msg.interfaces)
     }
 
     fn owned_routes(&mut self) -> Result<Vec<Route>, FibError> {
@@ -988,6 +1375,772 @@ pub const CREATE_ONLY_FLAGS: u16 = NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NL
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Existing byte-level tests use the same fallible production encoder;
+    // these adapters only unwrap successful requests and expose their bytes.
+    fn build_route_msg(
+        kind: u16,
+        flags: u16,
+        seq: u32,
+        prefix: &Prefix,
+        table: u32,
+        route: Option<&Route>,
+    ) -> Vec<u8> {
+        super::build_route_msg(kind, flags, seq, prefix, table, route)
+            .unwrap()
+            .bytes
+    }
+
+    fn build_multipath(family: u8, hops: &[NextHop]) -> Vec<u8> {
+        let interfaces = InterfaceBindings::resolve(hops, &mut if_index).unwrap();
+        super::build_multipath(family, hops, &interfaces).unwrap()
+    }
+
+    #[test]
+    fn writes_require_every_explicit_interface_before_encoding() {
+        let gateway = Some("192.0.2.1".parse().unwrap());
+        for hops in [
+            vec![NextHop {
+                gateway,
+                iface: Some("no-such-wren-interface".into()),
+                weight: 1,
+            }],
+            vec![
+                NextHop::dev("lo"),
+                NextHop {
+                    gateway,
+                    iface: Some("no-such-wren-interface".into()),
+                    weight: 1,
+                },
+            ],
+            vec![NextHop::dev("")],
+            vec![NextHop::dev("bad\0name")],
+            vec![NextHop {
+                gateway: None,
+                iface: None,
+                weight: 1,
+            }],
+        ] {
+            let route = Route::new(p("198.18.1.0/24"), Protocol::Static, hops, 0);
+            for kind in [RTM_NEWROUTE, RTM_DELROUTE] {
+                assert!(super::build_route_msg(
+                    kind,
+                    NLM_F_REQUEST | NLM_F_ACK,
+                    7,
+                    &route.prefix,
+                    route.table,
+                    Some(&route)
+                )
+                .is_err());
+                // Even a caller incorrectly bypassing resolution cannot cause
+                // an explicit interface to vanish from either encoder shape.
+                if route.nexthops.iter().any(|hop| hop.iface.is_some()) {
+                    assert!(encode_route_msg(
+                        kind,
+                        0,
+                        7,
+                        &route.prefix,
+                        route.table,
+                        Some(&route),
+                        InterfaceBindings::default()
+                    )
+                    .is_err());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn writes_bind_repeated_interfaces_once_and_never_retarget_retries() {
+        let hops = vec![NextHop::dev("same"), NextHop::dev("same")];
+        let mut calls = 0;
+        let bindings = InterfaceBindings::resolve(&hops, &mut |name| {
+            assert_eq!(name, "same");
+            calls += 1;
+            Some(42 + calls - 1)
+        })
+        .unwrap();
+        assert_eq!(calls, 1);
+        let encoded = super::build_multipath(libc::AF_INET as u8, &hops, &bindings).unwrap();
+        assert_eq!(i32::from_ne_bytes(encoded[4..8].try_into().unwrap()), 42);
+        assert_eq!(i32::from_ne_bytes(encoded[12..16].try_into().unwrap()), 42);
+        let socket = KernelFib::new().unwrap();
+        for interrupted in [libc::EINTR, libc::EAGAIN] {
+            for changed in [None, Some(43), Some(0)] {
+                let mut checks = 0;
+                let mut sends = 0;
+                let retry = socket.io_checked(
+                    &ExchangeBudget::new(),
+                    libc::POLLOUT,
+                    || {
+                        checks += 1;
+                        bindings
+                            .validate(&mut |_| if checks == 1 { Some(42) } else { changed })
+                            .map_err(|fib| NetlinkFailure { fib, errno: None })
+                    },
+                    || {
+                        sends += 1;
+                        // SAFETY: fault injection only changes this test thread's errno.
+                        unsafe {
+                            *libc::__errno_location() = interrupted;
+                        }
+                        -1
+                    },
+                );
+                assert!(retry.unwrap_err().fib.0.contains("changed identity"));
+                assert_eq!(checks, 2);
+                assert_eq!(sends, 1, "stale interface reached a syscall retry");
+            }
+        }
+        let mut sends = 0;
+        let sent = socket
+            .io_checked(
+                &ExchangeBudget::new(),
+                libc::POLLOUT,
+                || {
+                    bindings
+                        .validate(&mut |_| Some(42))
+                        .map_err(|fib| NetlinkFailure { fib, errno: None })
+                },
+                || {
+                    sends += 1;
+                    if sends == 1 {
+                        // SAFETY: errno is local to this thread.
+                        unsafe {
+                            *libc::__errno_location() = libc::EINTR;
+                        }
+                        -1
+                    } else {
+                        20
+                    }
+                },
+            )
+            .unwrap();
+        assert_eq!(sent, 20);
+        assert_eq!(sends, 2);
+        for invalid in [None, Some(0), Some(u32::MAX)] {
+            assert!(InterfaceBindings::resolve(&hops, &mut |_| invalid).is_err());
+        }
+    }
+
+    fn reply(kind: u16, flags: u16, payload: &[u8]) -> Vec<u8> {
+        let mut bytes = vec![0u8; NLMSGHDR_LEN];
+        bytes.extend_from_slice(payload);
+        let length = bytes.len() as u32;
+        bytes[..4].copy_from_slice(&length.to_ne_bytes());
+        bytes[4..6].copy_from_slice(&kind.to_ne_bytes());
+        bytes[6..8].copy_from_slice(&flags.to_ne_bytes());
+        bytes[8..12].copy_from_slice(&7u32.to_ne_bytes());
+        bytes[12..16].copy_from_slice(&99u32.to_ne_bytes());
+        bytes
+    }
+
+    fn ack(request: &[u8], code: i32, capped: bool) -> Vec<u8> {
+        let mut payload = code.to_ne_bytes().to_vec();
+        payload.extend_from_slice(if code == 0 || capped {
+            &request[..16]
+        } else {
+            request
+        });
+        reply(NLMSG_ERROR, if capped { NLM_F_CAPPED } else { 0 }, &payload)
+    }
+
+    #[test]
+    fn replies_require_complete_correlated_frames() {
+        let good = reply(NLMSG_DONE, NLM_F_MULTI, &0i32.to_ne_bytes());
+        assert_eq!(checked_messages(&good, 7, 99).unwrap().len(), 1);
+        assert!(checked_messages(&good, 8, 99).is_err());
+        assert!(checked_messages(&good, 7, 100).is_err());
+        for length in 0..good.len() {
+            assert!(checked_messages(&good[..length], 7, 99).is_err());
+        }
+        for length in [0u32, 15, 21, u32::MAX] {
+            let mut malformed = good.clone();
+            malformed[..4].copy_from_slice(&length.to_ne_bytes());
+            assert!(checked_messages(&malformed, 7, 99).is_err());
+        }
+        let mut interrupted = good.clone();
+        interrupted[6..8].copy_from_slice(&(NLM_F_MULTI | NLM_F_DUMP_INTR).to_ne_bytes());
+        // Also fail when an otherwise good record preceded the interrupted one.
+        let bytes = [good.clone(), interrupted].concat();
+        assert!(checked_messages(&bytes, 7, 99).is_err());
+        let mut trailing = good.clone();
+        trailing.push(0);
+        assert!(checked_messages(&trailing, 7, 99).is_err());
+        assert_eq!(
+            checked_messages(&[good.clone(), good].concat(), 7, 99)
+                .unwrap()
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn ack_requires_exact_request_echo_and_checked_error_status() {
+        let request = build_route_msg(
+            RTM_DELROUTE,
+            NLM_F_REQUEST | NLM_F_ACK,
+            7,
+            &p("198.18.1.0/24"),
+            254,
+            None,
+        );
+        for capped in [false, true] {
+            let good = ack(&request, 0, capped);
+            checked_ack(&good, &request).unwrap();
+            for length in 0..good.len() {
+                assert!(checked_ack(&good[..length], &request).is_err());
+            }
+            for byte in 20..36 {
+                let mut wrong = good.clone();
+                wrong[byte] ^= 1;
+                assert!(checked_ack(&wrong, &request).is_err(), "echo offset {byte}");
+            }
+            let failure = ack(&request, -libc::EPERM, capped);
+            assert_eq!(
+                checked_ack(&failure, &request).unwrap_err().errno,
+                Some(libc::EPERM)
+            );
+        }
+        let mut wrong_payload = ack(&request, -libc::EBUSY, false);
+        wrong_payload[36] ^= 1;
+        assert_eq!(
+            checked_ack(&wrong_payload, &request).unwrap_err().errno,
+            None
+        );
+        let mut extack = ack(&request, 0, true);
+        extack[6..8].copy_from_slice(&(NLM_F_CAPPED | NLM_F_ACK_TLVS).to_ne_bytes());
+        push_attr(&mut extack, 1, b"diagnostic\0");
+        checked_ack(&extack, &request).unwrap();
+        extack.push(0);
+        assert!(checked_ack(&extack, &request).is_err());
+        for code in [1, i32::MIN] {
+            assert_eq!(
+                checked_ack(&ack(&request, code, true), &request)
+                    .unwrap_err()
+                    .errno,
+                None
+            );
+        }
+        assert!(checked_ack(&reply(NLMSG_DONE, 0, &[0; 20]), &request).is_err());
+        assert!(checked_ack(&ack(&request, 0, true), &[]).is_err());
+    }
+
+    #[test]
+    fn dump_completion_requires_status_and_valid_optional_attributes() {
+        let good = reply(NLMSG_DONE, NLM_F_MULTI, &0i32.to_ne_bytes());
+        checked_done(&good).unwrap();
+        assert!(checked_done(&good[..16]).is_err());
+        assert!(checked_done(&reply(NLMSG_DONE, 0, &0i32.to_ne_bytes())).is_err());
+        for code in [-libc::ENOBUFS, -libc::EINTR] {
+            let error =
+                checked_done(&reply(NLMSG_DONE, NLM_F_MULTI, &code.to_ne_bytes())).unwrap_err();
+            assert_eq!(error.errno, Some(-code));
+        }
+        let mut extack = reply(
+            NLMSG_DONE,
+            NLM_F_MULTI | NLM_F_ACK_TLVS,
+            &0i32.to_ne_bytes(),
+        );
+        push_attr(&mut extack, 1, b"diagnostic\0");
+        checked_done(&extack).unwrap();
+        extack.push(0);
+        assert!(checked_done(&extack).is_err());
+        let mut unannounced = good;
+        push_attr(&mut unannounced, 1, b"diagnostic\0");
+        assert!(checked_done(&unannounced).is_err());
+    }
+
+    #[test]
+    fn transport_rejects_truncation_and_non_kernel_senders() {
+        // SAFETY: both ABI structs permit zero initialization.
+        let mut message: libc::msghdr = unsafe { mem::zeroed() };
+        let mut sender: libc::sockaddr_nl = unsafe { mem::zeroed() };
+        message.msg_namelen = mem::size_of_val(&sender) as libc::socklen_t;
+        sender.nl_family = libc::AF_NETLINK as u16;
+        validate_datagram(20, 20, &message, &sender).unwrap();
+        for flags in [libc::MSG_TRUNC, libc::MSG_CTRUNC] {
+            message.msg_flags = flags;
+            assert!(validate_datagram(20, 20, &message, &sender).is_err());
+        }
+        message.msg_flags = 0;
+        for received in [0, 19, 21] {
+            assert!(validate_datagram(received, 20, &message, &sender).is_err());
+        }
+        sender.nl_pid = 42;
+        assert!(validate_datagram(20, 20, &message, &sender).is_err());
+        sender.nl_pid = 0;
+        sender.nl_groups = 1;
+        assert!(validate_datagram(20, 20, &message, &sender).is_err());
+        sender.nl_groups = 0;
+        message.msg_namelen -= 1;
+        assert!(validate_datagram(20, 20, &message, &sender).is_err());
+    }
+
+    #[test]
+    fn owned_route_malformed_attributes_never_become_apparent_absence() {
+        let route = Route::new(
+            p("198.18.1.0/24"),
+            Protocol::Static,
+            vec![NextHop::via("192.0.2.1".parse().unwrap())],
+            10,
+        );
+        let good = build_route_msg(
+            RTM_NEWROUTE,
+            NLM_F_MULTI,
+            7,
+            &route.prefix,
+            route.table,
+            Some(&route),
+        );
+        assert_eq!(parse_owned_route(&good).unwrap(), Some(route));
+        for (kind, value) in [
+            (RTA_OIF, vec![1]),
+            (RTA_OIF, i32::MAX.to_ne_bytes().to_vec()),
+            (RTA_PRIORITY, vec![0]),
+            (RTA_MULTIPATH, vec![0; 8]),
+            (RTA_VIA, vec![2, 1, 1, 2, 3, 4]),
+            (30, 1u32.to_ne_bytes().to_vec()),
+        ] {
+            let mut malformed = good.clone();
+            push_attr(&mut malformed, kind, &value);
+            assert!(parse_owned_route(&malformed).is_err(), "attribute {kind}");
+        }
+        for suffix in [vec![1], vec![3, 0, 2, 0], vec![8, 0, 2, 0]] {
+            let mut malformed = good.clone();
+            malformed.extend(suffix);
+            assert!(parse_owned_route(&malformed).is_err());
+            malformed[21] = RTPROT_KERNEL;
+            assert!(parse_owned_route(&malformed).unwrap().is_none());
+        }
+        for (offset, value) in [(16, 255), (17, 33), (18, 1), (19, 1), (23, 7)] {
+            let mut malformed = good.clone();
+            malformed[offset] = value;
+            assert!(parse_owned_route(&malformed).is_err());
+        }
+        // Missing destination must not silently turn a non-default route into /0.
+        let mut no_destination = good[..28].to_vec();
+        push_attr(&mut no_destination, RTA_GATEWAY, &[192, 0, 2, 1]);
+        assert!(parse_owned_route(&no_destination).is_err());
+    }
+
+    #[test]
+    fn owned_multipath_never_silently_drops_a_bad_hop() {
+        let paths = vec![
+            NextHop::via("192.0.2.1".parse().unwrap()),
+            NextHop::via("192.0.2.2".parse().unwrap()),
+        ];
+        let good = build_multipath(libc::AF_INET as u8, &paths);
+        checked_multipath(libc::AF_INET as u8, &good, &mut if_name).unwrap();
+        for length in 1..good.len() {
+            if length == good.len() / 2 {
+                continue;
+            }
+            assert!(checked_multipath(libc::AF_INET as u8, &good[..length], &mut if_name).is_err());
+        }
+        let mut invalid_hop = good.clone();
+        let second = good.len() / 2;
+        invalid_hop[second + 4..second + 8].copy_from_slice(&(-1i32).to_ne_bytes());
+        assert!(checked_multipath(libc::AF_INET as u8, &invalid_hop, &mut if_name).is_err());
+        let mut trailing = good;
+        trailing.extend([0, 0, 0, 0]);
+        assert!(checked_multipath(libc::AF_INET as u8, &trailing, &mut if_name).is_err());
+    }
+
+    #[test]
+    fn owned_interface_identity_is_resolved_once_and_missing_is_an_error() {
+        let route = Route::new(
+            p("198.18.1.0/24"),
+            Protocol::Static,
+            vec![NextHop::via("192.0.2.1".parse().unwrap())],
+            10,
+        );
+        let mut message =
+            build_route_msg(RTM_NEWROUTE, 0, 7, &route.prefix, route.table, Some(&route));
+        push_attr(&mut message, RTA_OIF, &42u32.to_ne_bytes());
+        let mut calls = 0;
+        let result = parse_owned_route_with(&message, &mut |index| {
+            assert_eq!(index, 42);
+            calls += 1;
+            (calls == 1).then(|| "original-name".into())
+        })
+        .unwrap()
+        .unwrap();
+        assert_eq!(calls, 1);
+        assert_eq!(result.nexthops[0].iface.as_deref(), Some("original-name"));
+        assert!(parse_owned_route_with(&message, &mut |_| None).is_err());
+        let mut hop = build_multipath(libc::AF_INET as u8, &route.nexthops);
+        hop[4..8].copy_from_slice(&42i32.to_ne_bytes());
+        calls = 0;
+        let hops = checked_multipath(libc::AF_INET as u8, &hop, &mut |_| {
+            calls += 1;
+            (calls == 1).then(|| "original-name".into())
+        })
+        .unwrap();
+        assert_eq!(calls, 1);
+        assert_eq!(hops[0].iface.as_deref(), Some("original-name"));
+        assert!(checked_multipath(libc::AF_INET as u8, &hop, &mut |_| None).is_err());
+    }
+
+    #[test]
+    fn owned_scope_and_forwarding_flags_cannot_silently_change() {
+        for route in [
+            Route::new(p("198.18.1.0/24"), Protocol::Static, vec![], 10),
+            Route::new(
+                p("198.18.1.0/24"),
+                Protocol::Static,
+                vec![NextHop::via("192.0.2.1".parse().unwrap())],
+                10,
+            ),
+        ] {
+            let good =
+                build_route_msg(RTM_NEWROUTE, 0, 7, &route.prefix, route.table, Some(&route));
+            parse_owned_route(&good).unwrap();
+            for scope in [RT_SCOPE_LINK, 254, 255] {
+                let mut unsupported = good.clone();
+                unsupported[22] = scope;
+                assert!(parse_owned_route(&unsupported).is_err());
+            }
+            for flags in [4u32, 0x200, u32::MAX] {
+                let mut unsupported = good.clone();
+                unsupported[24..28].copy_from_slice(&flags.to_ne_bytes());
+                assert!(parse_owned_route(&unsupported).is_err());
+            }
+        }
+        let mut hop = build_multipath(
+            libc::AF_INET as u8,
+            &[NextHop::via("192.0.2.1".parse().unwrap())],
+        );
+        hop[2] = 4; // ONLINK cannot be round-tripped by Route.
+        assert!(checked_multipath(libc::AF_INET as u8, &hop, &mut if_name).is_err());
+    }
+
+    #[test]
+    fn absolute_budget_bounds_eintr_idle_receive_and_wire_bytes() {
+        let socket = KernelFib::new().unwrap();
+        let mut budget = ExchangeBudget::new();
+        budget.deadline = Instant::now();
+        let mut calls = 0;
+        assert!(socket
+            .io(&budget, libc::POLLIN, || {
+                calls += 1;
+                0
+            })
+            .is_err());
+        assert_eq!(calls, 0);
+        budget.deadline = Instant::now() + Duration::from_millis(10);
+        assert!(socket
+            .io(&budget, libc::POLLIN, || {
+                calls += 1;
+                // SAFETY: errno is local to this thread.
+                unsafe {
+                    *libc::__errno_location() = libc::EINTR;
+                }
+                -1
+            })
+            .is_err());
+        assert!(calls > 0);
+        // Reset the deadline so this actually exercises ENOBUFS, not timeout.
+        budget.deadline = Instant::now() + Duration::from_secs(1);
+        calls = 0;
+        let failure = socket
+            .io(&budget, libc::POLLIN, || {
+                calls += 1;
+                // SAFETY: errno is local to this thread.
+                unsafe {
+                    *libc::__errno_location() = libc::ENOBUFS;
+                }
+                -1
+            })
+            .unwrap_err();
+        assert_eq!(calls, 1);
+        assert_eq!(failure.errno, Some(libc::ENOBUFS));
+        budget.deadline = Instant::now() + Duration::from_millis(10);
+        let start = Instant::now();
+        assert!(socket
+            .receive(&mut budget)
+            .unwrap_err()
+            .fib
+            .0
+            .contains("deadline"));
+        assert!(start.elapsed() < Duration::from_secs(1));
+        let mut budget = ExchangeBudget::new();
+        assert!(budget.charge(0).is_err());
+        budget.charge(EXCHANGE_BYTES - 1).unwrap();
+        assert!(budget.charge(2).is_err());
+        budget.charge(1).unwrap();
+        assert!(budget.charge(usize::MAX).is_err());
+    }
+
+    #[test]
+    #[ignore = "requires an isolated route inventory; run scripts/netlink-kernel-smoke.sh"]
+    fn actual_kernel_dump_has_correlated_port_and_explicit_done_status() {
+        let mut socket = KernelFib::new().unwrap();
+        // No mutation and no capabilities required. Actual kernel traffic tests
+        // the framing assumptions, rather than only our synthetic constructors.
+        socket.dump_owned().unwrap();
+        socket.dump_owned().unwrap();
+    }
+
+    #[test]
+    #[ignore = "needs disposable network namespaces; run scripts/netlink-kernel-smoke.sh"]
+    fn kernel_inventory_scope_multipart_and_error_regressions() {
+        const CHILD: &str = "WREN_NETLINK_INVENTORY_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            // A separate namespace prevents the intentionally unsupported owned
+            // route below from affecting concurrently running acceptance tests.
+            let status = std::process::Command::new("unshare")
+                .args(["-Urn", "--"])
+                .arg(std::env::current_exe().unwrap())
+                .args([
+                    "--ignored",
+                    "--exact",
+                    "tests::kernel_inventory_scope_multipart_and_error_regressions",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
+        let ip = |arguments: &[&str]| {
+            let output = std::process::Command::new("ip")
+                .args(arguments)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "ip {arguments:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        ip(&["link", "set", "lo", "up"]);
+        ip(&["link", "add", "d0", "type", "dummy"]);
+        ip(&["link", "set", "d0", "up"]);
+        let mut kernel = KernelFib::new().unwrap();
+        let interface = NextHop {
+            gateway: None,
+            iface: Some("d0".into()),
+            weight: 1,
+        };
+        for prefix in ["198.18.10.0/24", "2001:db8:10::/64"] {
+            let route = Route::new(p(prefix), Protocol::Static, vec![interface.clone()], 10)
+                .with_table(42700);
+            kernel.apply(&FibChange::Install(route.clone())).unwrap();
+            assert!(kernel
+                .dump_owned()
+                .unwrap()
+                .iter()
+                .any(|found| same_kernel_route(&route, found)));
+            kernel.remove_owned(&route).unwrap();
+            assert!(!kernel
+                .dump_owned()
+                .unwrap()
+                .iter()
+                .any(|found| same_kernel_route(&route, found)));
+        }
+        // Keep real FIB state while the originally selected name is renamed,
+        // then recreated at a different index. Neither an install nor an exact
+        // zero-metric delete may reuse/broaden that old encoded selector.
+        let zero = Route::new(
+            p("198.18.20.0/24"),
+            Protocol::Static,
+            vec![interface.clone()],
+            0,
+        )
+        .with_table(42700);
+        kernel.apply(&FibChange::Install(zero.clone())).unwrap();
+        let removal = super::build_route_msg(
+            RTM_DELROUTE,
+            NLM_F_REQUEST | NLM_F_ACK,
+            70,
+            &zero.prefix,
+            zero.table,
+            Some(&zero),
+        )
+        .unwrap();
+        let addition = Route::new(
+            p("198.18.21.0/24"),
+            Protocol::Static,
+            vec![interface.clone()],
+            10,
+        )
+        .with_table(42700);
+        let install = super::build_route_msg(
+            RTM_NEWROUTE,
+            NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_REPLACE,
+            71,
+            &addition.prefix,
+            addition.table,
+            Some(&addition),
+        )
+        .unwrap();
+        ip(&["link", "set", "d0", "down"]);
+        ip(&["link", "set", "d0", "name", "renamed0"]);
+        ip(&["link", "set", "renamed0", "up"]);
+        // Administrative down removed the route. Restore the same numeric
+        // interface's route under its actual new name before testing stale
+        // requests; otherwise an empty FIB would make preservation vacuous.
+        let mut renamed = zero.clone();
+        renamed.nexthops[0].iface = Some("renamed0".into());
+        kernel.apply(&FibChange::Install(renamed.clone())).unwrap();
+        assert!(kernel
+            .dump_owned()
+            .unwrap()
+            .iter()
+            .any(|route| same_kernel_route(&renamed, route)));
+        for recreated in [false, true] {
+            if recreated {
+                ip(&["link", "add", "d0", "type", "dummy"]);
+                ip(&["link", "set", "d0", "up"]);
+            }
+            assert!(kernel
+                .request_guarded(&removal.bytes, Some(&zero), &removal.interfaces)
+                .unwrap_err()
+                .0
+                .contains("changed identity"));
+            assert!(kernel
+                .request_guarded(&install.bytes, None, &install.interfaces)
+                .unwrap_err()
+                .0
+                .contains("changed identity"));
+            let remaining = kernel.dump_owned().unwrap();
+            let original = remaining
+                .iter()
+                .find(|route| route.prefix == zero.prefix && route.table == zero.table)
+                .unwrap();
+            assert_eq!(original.nexthops[0].iface.as_deref(), Some("renamed0"));
+            assert_eq!(original.metric, 0);
+            assert!(!remaining
+                .iter()
+                .any(|route| route.prefix == addition.prefix && route.table == addition.table));
+        }
+        kernel.remove_owned(&renamed).unwrap();
+        assert!(!kernel
+            .dump_owned()
+            .unwrap()
+            .iter()
+            .any(|route| route.prefix == zero.prefix && route.table == zero.table));
+        let mut expected = Vec::new();
+        for index in 0..=255 {
+            let route = Route::new(
+                p(&format!("198.19.{index}.0/24")),
+                Protocol::Static,
+                vec![],
+                10,
+            )
+            .with_table(42700);
+            kernel.apply(&FibChange::Install(route.clone())).unwrap();
+            expected.push(route);
+        }
+        let actual = kernel.dump_owned().unwrap();
+        let actual: Vec<_> = actual.iter().filter(|route| route.table == 42700).collect();
+        assert_eq!(actual.len(), expected.len());
+        assert!(expected
+            .iter()
+            .all(|route| actual.iter().any(|found| same_kernel_route(route, found))));
+        let invalid_route = Route::new(
+            p("198.18.11.0/24"),
+            Protocol::Static,
+            vec![NextHop::via("203.0.113.1".parse().unwrap())],
+            10,
+        )
+        .with_table(42700);
+        assert!(kernel.apply(&FibChange::Install(invalid_route)).is_err());
+        // A failed ACK exchange must not contaminate the next successful dump.
+        assert_eq!(
+            kernel
+                .dump_owned()
+                .unwrap()
+                .iter()
+                .filter(|route| route.table == 42700)
+                .count(),
+            256
+        );
+        ip(&[
+            "route",
+            "add",
+            "198.18.12.0/24",
+            "dev",
+            "d0",
+            "scope",
+            "host",
+            "proto",
+            "static",
+            "table",
+            "42700",
+        ]);
+        assert!(kernel.dump_owned().unwrap_err().0.contains("scope"));
+        ip(&[
+            "route",
+            "del",
+            "198.18.12.0/24",
+            "dev",
+            "d0",
+            "scope",
+            "host",
+            "proto",
+            "static",
+            "table",
+            "42700",
+        ]);
+        assert_eq!(
+            kernel
+                .dump_owned()
+                .unwrap()
+                .iter()
+                .filter(|route| route.table == 42700)
+                .count(),
+            256
+        );
+    }
+
+    #[test]
+    fn kernel_identity_accepts_only_the_ipv6_default_metric_normalization() {
+        for prefix in ["198.18.254.0/24", "2001:db8:99::/64"] {
+            for metric in [0, 1, 1024, 4096] {
+                let expected = Route::new(p(prefix), Protocol::Static, vec![], metric);
+                for observed_metric in [0, 1, 1024, 4096] {
+                    let mut observed = expected.clone();
+                    observed.metric = observed_metric;
+                    assert_eq!(
+                        same_kernel_route(&expected, &observed),
+                        metric == observed_metric
+                            || (expected.prefix.addr().is_ipv6()
+                                && metric == 0
+                                && observed_metric == 1024),
+                        "{prefix}: wanted {metric}, observed {observed_metric}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "needs CAP_NET_ADMIN + d0; run scripts/netlink-kernel-smoke.sh"]
+    fn ipv6_default_metric_readback_and_exact_removal() {
+        let mut fib = KernelFib::new().expect("open kernel fib");
+        for (index, metric) in [0, 1, 1024, 4096].into_iter().enumerate() {
+            let route = Route::new(
+                p(&format!("2001:db8:99:{index}::/64")),
+                Protocol::Static,
+                vec![NextHop::via("2001:db8::2".parse().unwrap())],
+                metric,
+            );
+            fib.apply(&FibChange::Install(route.clone())).unwrap();
+            let owned = fib.owned_routes().unwrap();
+            let observed = owned.iter().find(|r| r.prefix == route.prefix).unwrap();
+            assert_eq!(observed.metric, if metric == 0 { 1024 } else { metric });
+            assert!(same_kernel_route(&route, observed));
+            fib.remove_owned(observed).unwrap();
+            assert!(fib
+                .owned_routes()
+                .unwrap()
+                .iter()
+                .all(|r| r.prefix != route.prefix));
+        }
+    }
 
     #[test]
     fn kernel_identity_ignores_rib_annotations_but_not_owner_or_next_hop() {
@@ -1145,7 +2298,7 @@ mod tests {
     fn blackhole_routes_survive_owned_readback() {
         let route = Route::new(p("198.19.244.0/24"), Protocol::Static, vec![], 60);
         let msg = build_route_msg(RTM_NEWROUTE, 0, 1, &route.prefix, route.table, Some(&route));
-        assert_eq!(parse_route(&msg), Some(route));
+        assert_eq!(parse_owned_route(&msg).unwrap(), Some(route));
     }
 
     #[test]
@@ -1269,7 +2422,7 @@ mod tests {
         let onlink = Route::new(
             p("10.0.0.0/24"),
             Protocol::Connected,
-            vec![NextHop::dev("eth0")],
+            vec![NextHop::dev("lo")],
             0,
         );
         let msg = build_route_msg(
@@ -1307,14 +2460,14 @@ mod tests {
         let msg = build_route_msg(RTM_NEWROUTE, 0, 1, &r.prefix, r.table, Some(&r));
         assert_eq!(msg[20], 100);
         assert!(!has_attr(&msg, RTA_TABLE, &100u32.to_ne_bytes()));
-        assert_eq!(parse_route(&msg), Some(r));
+        assert_eq!(parse_owned_route(&msg).unwrap(), Some(r));
 
         // A large VRF table travels in RTA_TABLE with rtm_table = unspecified.
         let r = Route::new(p("10.0.0.0/24"), Protocol::Static, nh(), 0).with_table(100_000);
         let msg = build_route_msg(RTM_NEWROUTE, 0, 1, &r.prefix, r.table, Some(&r));
         assert_eq!(msg[20], RT_TABLE_UNSPEC);
         assert!(has_attr(&msg, RTA_TABLE, &100_000u32.to_ne_bytes()));
-        assert_eq!(parse_route(&msg), Some(r));
+        assert_eq!(parse_owned_route(&msg).unwrap(), Some(r));
     }
 
     #[test]
@@ -1328,7 +2481,7 @@ mod tests {
         let msg = build_route_msg(RTM_NEWROUTE, 0, 1, &route.prefix, route.table, Some(&route));
         // A built message parses straight back to the same route (proto, prefix,
         // gateway, metric all preserved).
-        assert_eq!(parse_route(&msg), Some(route));
+        assert_eq!(parse_owned_route(&msg).unwrap(), Some(route));
     }
 
     #[test]
@@ -1340,7 +2493,9 @@ mod tests {
             0,
         );
         let msg = build_route_msg(RTM_NEWROUTE, 0, 1, &def.prefix, def.table, Some(&def));
-        let got = parse_route(&msg).expect("default route parses");
+        let got = parse_owned_route(&msg)
+            .unwrap()
+            .expect("default route parses");
         assert!(got.prefix.is_default());
         assert_eq!(got.protocol, Protocol::Bgp);
     }
@@ -1354,7 +2509,7 @@ mod tests {
             3,
         );
         let msg = build_route_msg(RTM_NEWROUTE, 0, 1, &route.prefix, route.table, Some(&route));
-        assert_eq!(parse_route(&msg), Some(route));
+        assert_eq!(parse_owned_route(&msg).unwrap(), Some(route));
     }
 
     #[test]
@@ -1376,7 +2531,7 @@ mod tests {
         let mut via = (libc::AF_INET6 as u16).to_ne_bytes().to_vec();
         via.extend_from_slice(&[0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2]);
         assert!(has_attr(&msg, RTA_VIA, &via));
-        assert_eq!(parse_route(&msg), Some(route));
+        assert_eq!(parse_owned_route(&msg).unwrap(), Some(route));
     }
 
     /// Kernel-acceptance for the RFC 5549 case the round-trip test can't prove: that
@@ -1515,7 +2670,9 @@ mod tests {
         assert!(has_attr(&msg, RTA_MULTIPATH, &[]));
         assert!(!has_attr(&msg, RTA_GATEWAY, &[]));
         // …and round-trip back to both gateways.
-        let parsed = parse_route(&msg).expect("multipath route parses");
+        let parsed = parse_owned_route(&msg)
+            .unwrap()
+            .expect("multipath route parses");
         assert_eq!(parsed, route);
         assert_eq!(parsed.nexthops.len(), 2);
     }
@@ -1538,7 +2695,7 @@ mod tests {
             connected.table,
             Some(&connected),
         );
-        assert_eq!(parse_route(&msg), None);
+        assert_eq!(parse_owned_route(&msg).unwrap(), None);
     }
 
     /// Walk the rtattrs after the rtmsg looking for `(attr_type, payload)`.

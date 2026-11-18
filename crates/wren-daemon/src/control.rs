@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 use tracing::{info, warn};
 
 #[cfg(feature = "babel")]
@@ -46,6 +46,9 @@ use crate::vrrp::VrrpQueryRequest;
 /// that instead of hanging.
 #[derive(Clone)]
 pub struct Channels {
+    /// Reload admission is owned by main, independently of router FIB progress.
+    pub reload: mpsc::Sender<oneshot::Sender<crate::router::ReloadStatus>>,
+    pub reload_status: watch::Receiver<crate::router::ReloadStatus>,
     /// To the central router loop (`show routes`).
     pub router: mpsc::Sender<QueryRequest>,
     /// To the central router loop to open a route-export stream (`monitor
@@ -154,6 +157,16 @@ async fn handle_conn(stream: UnixStream, channels: Channels) -> Result<()> {
     }
     let line = String::from_utf8_lossy(&line_buf);
     let line = line.trim();
+
+    if line == "show reload" || line == "reload" {
+        let response = if line == "show reload" {
+            channels.reload_status.borrow().render()
+        } else {
+            reload_response(&channels.reload, channels.reload_status.clone()).await
+        };
+        reader.get_mut().write_all(response.as_bytes()).await?;
+        return Ok(());
+    }
 
     // A subscribe command opens a long-lived export stream rather than a one-shot
     // query/response, so handle it before the per-protocol parsers. `monitor evpn`
@@ -774,6 +787,79 @@ pub async fn run_client(path: &Path, command: &str) -> Result<()> {
     Ok(())
 }
 
+async fn reload_response(
+    requests: &mpsc::Sender<oneshot::Sender<crate::router::ReloadStatus>>,
+    mut status: watch::Receiver<crate::router::ReloadStatus>,
+) -> String {
+    use std::time::Duration;
+    let (reply, accepted) = oneshot::channel();
+    if requests.try_send(reply).is_err() {
+        let mut rejected = status.borrow().clone();
+        rejected.state = "rejected";
+        rejected.detail = Some("reload admission unavailable; running generation unchanged".into());
+        return rejected.render();
+    }
+    let admitted = match tokio::time::timeout(Duration::from_secs(5), accepted).await {
+        Ok(Ok(admitted)) => admitted,
+        _ => {
+            let mut pending = status.borrow().clone();
+            pending.state = "pending";
+            pending.detail = Some("admission outcome unknown; inspect show reload".into());
+            return pending.render();
+        }
+    };
+    if admitted.state == "rejected" {
+        return admitted.render();
+    }
+    let generation = admitted.generation;
+    let completion = async {
+        loop {
+            let current = status.borrow_and_update().clone();
+            if current.generation != generation {
+                let mut superseded = admitted.clone();
+                superseded.state = "superseded";
+                superseded.detail = Some("a newer routing generation was admitted".into());
+                return superseded;
+            }
+            if current.state != "pending" {
+                return current;
+            }
+            if status.changed().await.is_err() {
+                return current;
+            }
+        }
+    };
+    match tokio::time::timeout(Duration::from_secs(30), completion).await {
+        Ok(result) => result.render(),
+        Err(_) => {
+            let mut pending = admitted;
+            pending.detail = Some("completion timeout; generation continues asynchronously".into());
+            pending.render()
+        }
+    }
+}
+
+/// A bounded request/receipt, not cancellation of a queued routing transaction.
+pub async fn run_reload_client(path: &Path) -> Result<()> {
+    let response = tokio::time::timeout(std::time::Duration::from_secs(40), async {
+        let mut stream = UnixStream::connect(path).await?;
+        stream.write_all(b"reload\n").await?;
+        stream.shutdown().await?;
+        let mut response = String::new();
+        stream.take(4097).read_to_string(&mut response).await?;
+        anyhow::ensure!(response.len() <= 4096, "reload receipt too large");
+        Ok::<_, anyhow::Error>(response)
+    })
+    .await
+    .context("reload response timeout; outcome unknown; inspect wren show reload")??;
+    print!("{response}");
+    anyhow::ensure!(
+        response.lines().any(|line| line == "state converged"),
+        "routing reload did not report convergence; inspect wren show reload"
+    );
+    Ok(())
+}
+
 /// Serve a route-export subscription: register with the router, then stream each
 /// [`RouteEvent`] to the client as a line until the channel ends or the client
 /// disconnects. A closed peer is noticed even when the routing stream is quiet.
@@ -1218,6 +1304,159 @@ mod flowspec_monitor_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn reload_receipt_waits_for_actual_generation_completion_and_reports_supersession() {
+        for supersede in [false, true] {
+            let (requests, mut incoming) = mpsc::channel(1);
+            let (status, receiver) = watch::channel(crate::router::ReloadStatus::startup());
+            let client = tokio::spawn(async move { reload_response(&requests, receiver).await });
+            let reply = incoming.recv().await.unwrap();
+            let mut admitted = crate::router::ReloadStatus::startup();
+            admitted.generation = 1;
+            admitted.state = "pending";
+            admitted.in_flight = true;
+            status.send_replace(admitted.clone());
+            reply.send(admitted).unwrap();
+            tokio::task::yield_now().await;
+            assert!(
+                !client.is_finished(),
+                "enqueue is not successful convergence"
+            );
+            status.send_modify(|value| {
+                if supersede {
+                    value.generation = 2;
+                } else {
+                    value.state = "converged";
+                    value.in_flight = false;
+                }
+            });
+            let receipt = tokio::time::timeout(std::time::Duration::from_secs(1), client)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(receipt.contains("generation 1\n"));
+            assert!(receipt.contains(if supersede {
+                "state superseded\n"
+            } else {
+                "state converged\n"
+            }));
+        }
+    }
+
+    #[tokio::test]
+    async fn rejected_reload_receipt_preserves_running_generation() {
+        let (requests, incoming) = mpsc::channel(1);
+        let (_status, receiver) = watch::channel(crate::router::ReloadStatus::startup());
+        drop(incoming);
+        let receipt = reload_response(&requests, receiver).await;
+        assert!(receipt.contains("generation 0\nstate rejected\n"));
+    }
+
+    #[tokio::test]
+    async fn reload_admission_queue_saturation_is_bounded_and_never_reports_success() {
+        let (requests, mut incoming) = mpsc::channel(1);
+        let (_status, receiver) = watch::channel(crate::router::ReloadStatus::startup());
+        let first_requests = requests.clone();
+        let first_receiver = receiver.clone();
+        let first =
+            tokio::spawn(async move { reload_response(&first_requests, first_receiver).await });
+        while requests.capacity() != 0 {
+            tokio::task::yield_now().await;
+        }
+        let mut overflow = tokio::task::JoinSet::new();
+        for _ in 0..32 {
+            let requests = requests.clone();
+            let receiver = receiver.clone();
+            overflow.spawn(async move { reload_response(&requests, receiver).await });
+        }
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while let Some(result) = overflow.join_next().await {
+                assert!(result.unwrap().contains("state rejected\n"));
+            }
+        })
+        .await
+        .unwrap();
+        assert!(!first.is_finished());
+        incoming
+            .recv()
+            .await
+            .unwrap()
+            .send(crate::router::ReloadStatus::startup())
+            .unwrap();
+        assert!(first.await.unwrap().contains("state converged\n"));
+    }
+
+    #[tokio::test]
+    async fn admitted_caller_cancellation_does_not_cancel_actual_router_transaction() {
+        use crate::router::{ReloadStatus, RouterReload};
+        let (requests, mut incoming) = mpsc::channel(1);
+        let (status, receiver) = watch::channel(ReloadStatus::startup());
+        let mut progress = receiver.clone();
+        let client = tokio::spawn(async move { reload_response(&requests, receiver).await });
+        let acceptance = incoming.recv().await.unwrap();
+        let fib = crate::fib::spawn(Box::new(wren_core::MemoryFib::default()));
+        let route = wren_core::Route::new(
+            "198.51.100.0/24".parse().unwrap(),
+            wren_core::Protocol::Static,
+            vec![wren_core::NextHop::via("192.0.2.1".parse().unwrap())],
+            10,
+        );
+        let (updates, updates_rx) = mpsc::channel(1);
+        let (_queries, queries_rx) = mpsc::channel(1);
+        let (_subscribe, subscribe_rx) = mpsc::channel(1);
+        let (reloads, reload_rx) = mpsc::channel(1);
+        let mut admitted = ReloadStatus::startup();
+        admitted.generation = 1;
+        admitted.state = "pending";
+        admitted.in_flight = true;
+        reloads
+            .try_send(RouterReload {
+                generation: 1,
+                statics: vec![route.clone()],
+                imports: Default::default(),
+                fib_export: None,
+                vrf_exports: Default::default(),
+            })
+            .unwrap();
+        status.send_replace(admitted.clone());
+        acceptance.send(admitted).unwrap();
+        tokio::task::yield_now().await;
+        client.abort();
+        assert!(client.await.unwrap_err().is_cancelled());
+        let router = async {
+            crate::router::run(
+                &mut wren_core::Rib::new(),
+                &fib,
+                updates_rx,
+                &Default::default(),
+                None,
+                &[],
+                &[],
+                queries_rx,
+                subscribe_rx,
+                &[],
+                Default::default(),
+                reload_rx,
+                status,
+                &Default::default(),
+            )
+            .await;
+        };
+        let driver = async {
+            progress
+                .wait_for(|value| value.generation == 1 && value.state == "converged")
+                .await
+                .unwrap();
+            assert_eq!(fib.owned_routes().await.unwrap(), vec![route]);
+            drop(updates);
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            tokio::join!(router, driver);
+        })
+        .await
+        .unwrap();
+    }
     use wren_core::Protocol;
 
     #[test]

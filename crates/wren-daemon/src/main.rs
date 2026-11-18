@@ -58,7 +58,7 @@ use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
-use wren_core::{Fib, FibChange, MemoryFib, Protocol, Rib, RouteDistinguisher};
+use wren_core::{Fib, MemoryFib, Protocol, Rib, RouteDistinguisher};
 use wren_filter::{parse_action, Action, Decision, Filter, Match, Modify, PrefixList, Rule};
 use wren_netlink::KernelFib;
 
@@ -107,6 +107,8 @@ struct Args {
 /// Subcommands. Absent → run the daemon.
 #[derive(Subcommand, Debug)]
 enum Command {
+    /// Reload the daemon's configured file and await routing convergence.
+    Reload,
     /// Query a running wren daemon over its control socket, e.g. `wren show
     /// routes` or `wren show routes ospf`.
     Show {
@@ -188,6 +190,10 @@ const DEFAULT_CONTROL_SOCKET: &str = "/run/wren/wren.sock";
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
+
+    if matches!(args.command, Some(Command::Reload)) {
+        return control::run_reload_client(&args.socket).await;
+    }
 
     // Client mode: connect to a running daemon, print its answer, and exit —
     // without standing up the daemon or its logging.
@@ -302,8 +308,7 @@ async fn main() -> Result<()> {
     // Everything below talks to it through this async handle.
     let fib = fib::spawn(fib_backend);
 
-    // Resolve the static routes once: their prefixes are the set we keep when
-    // reconciling away a previous instance's leftover forwarding-plane routes.
+    // Resolve configured statics before reconciling previous owned FIB state.
     let statics = cfg.static_routes().context("resolving static routes")?;
 
     // Compile the configured filters and resolve the import (per-protocol, into the
@@ -316,18 +321,19 @@ async fn main() -> Result<()> {
         build_vrf_routemaps(&cfg, &by_name).context("resolving vrf route-maps")?;
     let vrfs = build_vrf_infos(&cfg).context("resolving vrfs")?;
     let statics = admit_static_routes(statics, &imports, &vrf_imports);
-    // Only admitted routes may preserve a previous process's FIB entries.
-    // Keeping every configured prefix would leave now-rejected statics behind.
-    let keep: HashSet<_> = statics.iter().map(|r| (r.table, r.prefix)).collect();
-    match fib.owned_routes().await {
-        Ok(owned) if !owned.is_empty() => {
-            let removed = router::reconcile_owned(&fib, owned, &keep).await;
-            if removed > 0 {
-                info!(removed, "reconciled stale routes from a previous instance");
-            }
-        }
-        Ok(_) => {}
-        Err(e) => warn!(error = %e, "reading existing routes for reconciliation failed"),
+    // Do not expose a healthy control socket while a previous instance's
+    // forwarding state is unknown or still installed. A restart is also the
+    // management plane's rollback boundary: warning and continuing here would
+    // falsely acknowledge restoration while candidate-only routes remain live.
+    // Conservatively remove every exact owned identity before reinstalling.
+    // Prefix-only preservation can retain an old metric/protocol sibling or
+    // an export-denied route. Unchanged owned routes briefly withdraw across
+    // restart; foreign/connected routes are never part of this cleanup.
+    let removed = router::reconcile_startup(&fib)
+        .await
+        .context("reconciling forwarding state before startup")?;
+    if removed > 0 {
+        info!(removed, "reconciled stale routes from a previous instance");
     }
     if !imports.is_empty() {
         info!(protocols = imports.len(), "import filters active");
@@ -339,31 +345,23 @@ async fn main() -> Result<()> {
         info!(vrfs = vrfs.len(), "VRFs configured");
     }
 
-    // Seed the RIB with the configured static routes, programming each best-path
-    // change into the forwarding plane as it happens. A static route in a VRF is run
-    // through that VRF's import route-map (entering the VRF) and, when programmed,
-    // its export route-map (VRF → kernel); either may drop or rewrite it.
+    // Resolve all RIB best paths before writing the FIB. Export boundaries apply
+    // VRF then global policy; retain actual successful post-export writes for the
+    // router's snapshots/repair instead of claiming every configured route exists.
     let mut rib = Rib::new();
-    let mut installed = 0usize;
     // The static routes actually admitted into the RIB (after each VRF import
     // route-map): the baseline the router diffs a SIGHUP reload against.
-    let mut seeded_statics: Vec<wren_core::Route> = Vec::new();
-    for route in statics {
-        seeded_statics.push(route.clone());
-        if let Some(change) = rib.update(route) {
-            if let FibChange::Install(best) = &change {
-                // The export route-map may drop it (kept in the RIB, off the FIB).
-                if let Some(best) = vrf_routemap(&vrf_exports, best.clone()) {
-                    fib.apply(FibChange::Install(best))
-                        .await
-                        .map_err(|e| anyhow::anyhow!(e))?;
-                    installed += 1;
-                }
-            } else {
-                fib.apply(change).await.map_err(|e| anyhow::anyhow!(e))?;
-            }
-        }
-    }
+    let seeded_statics = statics;
+    let startup_exported = router::seed_startup_routes(
+        &mut rib,
+        &fib,
+        &seeded_statics,
+        &vrf_exports,
+        fib_export.as_ref(),
+    )
+    .await
+    .context("programming startup routes")?;
+    let installed = startup_exported.len();
     for r in rib.iter_best() {
         info!(prefix = %r.prefix, table = r.table, protocol = r.protocol.name(), metric = r.metric, "best route");
     }
@@ -387,17 +385,13 @@ async fn main() -> Result<()> {
     // `_tx` end is held for the whole run so the router's subscribe select arm
     // never sees a closed channel.
     let (subscribe_tx, subscribe_rx) = mpsc::channel(QUERY_QUEUE);
-    // SIGHUP config hot-reload → the router loop. On SIGHUP a background task re-reads
-    // the config file, re-resolves its static routes, and sends them here; the router
-    // diffs against the running set and applies only the delta. The `_tx` end is held
-    // for the whole run so the router's reload select arm never sees a closed channel.
-    let (reload_tx, reload_rx) = mpsc::channel::<router::ReloadRoutes>(QUERY_QUEUE);
-    // SIGHUP route-filter hot-reload → the router loop. On SIGHUP the reload task
-    // re-compiles the filters and sends the new import + FIB-export set here; the
-    // router swaps its live filter set wholesale (re-evaluated on the next update each
-    // affects). The `_tx` end is held for the whole run so the router's filter-reload
-    // select arm never sees a closed channel.
-    let (filter_reload_tx, filter_reload_rx) = mpsc::channel::<router::FilterReload>(QUERY_QUEUE);
+    // Admit one coherent routing generation without awaiting the router which
+    // this task must continue polling. Completion remains separately readable.
+    let (reload_tx, reload_rx) = mpsc::channel::<router::RouterReload>(1);
+    let (reload_requests_tx, mut reload_requests_rx) =
+        mpsc::channel::<tokio::sync::oneshot::Sender<router::ReloadStatus>>(1);
+    let (reload_status, mut reload_progress) =
+        tokio::sync::watch::channel(router::ReloadStatus::startup());
     // SIGHUP BGP neighbour hot-reload → the BGP task. On SIGHUP the reload task diffs the
     // re-read neighbour set against the running one and sends the add/remove delta here;
     // the BGP engine starts the added peers and tears the removed ones down, leaving
@@ -615,6 +609,8 @@ async fn main() -> Result<()> {
     {
         let socket = args.socket.clone();
         let channels = control::Channels {
+            reload: reload_requests_tx.clone(),
+            reload_status: reload_progress.clone(),
             router: queries_tx.clone(),
             subscribe: subscribe_tx.clone(),
             evpn_subscribe: bgp_enabled.then(|| evpn_subscribe_tx.clone()),
@@ -1448,6 +1444,8 @@ async fn main() -> Result<()> {
     // by the `supervisor`. A reload that fails to parse (or names a bad filter) is logged
     // and ignored so the running configuration is kept rather than a broken one applied.
     let config_path = args.config.clone();
+    let reload_baseline = ReloadBaseline::new(&cfg, &imports, &vrf_imports);
+    let mut deferred_reload: Option<(u64, ReloadedConfig)> = None;
     // Only diff BGP neighbours when BGP is running: the engine is spawned only when it was
     // enabled at startup, so an added neighbour has an engine to bring it up.
     let bgp_reconfig_enabled = bgp_enabled;
@@ -1501,8 +1499,10 @@ async fn main() -> Result<()> {
         queries_rx,
         subscribe_rx,
         &seeded_statics,
+        startup_exported,
         reload_rx,
-        filter_reload_rx,
+        reload_status.clone(),
+        &vrf_exports,
     );
     tokio::pin!(router_fut);
     loop {
@@ -1523,16 +1523,29 @@ async fn main() -> Result<()> {
             }
             _ = hup_wait => {
                 info!("SIGHUP received; reloading configuration");
-                apply_reload(
-                    &config_path,
-                    &reload_tx,
-                    &filter_reload_tx,
-                    &bgp_reload_tx,
-                    bgp_reconfig_enabled,
-                    &mut known_bgp_peers,
-                    &mut supervisor,
-                )
-                .await;
+                let (receipt, accepted) = begin_reload(&config_path, &reload_baseline, &reload_tx, &reload_status);
+                if receipt.state == "rejected" {
+                    warn!(generation = receipt.generation, reason = ?receipt.detail,
+                        "SIGHUP routing reload rejected; running generation unchanged");
+                }
+                if let Some(accepted) = accepted { deferred_reload = Some(accepted); }
+            }
+            Some(reply) = reload_requests_rx.recv() => {
+                // A timed-out admission which was never accepted cannot mutate.
+                if !reply.is_closed() {
+                    let (receipt, accepted) = begin_reload(&config_path, &reload_baseline, &reload_tx, &reload_status);
+                    if let Some(accepted) = accepted { deferred_reload = Some(accepted); }
+                    let _ = reply.send(receipt);
+                }
+            }
+            Ok(()) = reload_progress.changed() => {
+                let progress = reload_progress.borrow_and_update().clone();
+                if progress.state == "converged"
+                    && deferred_reload.as_ref().is_some_and(|(generation, _)| *generation == progress.generation) {
+                    let (_, reloaded) = deferred_reload.take().expect("checked pending generation");
+                    apply_protocol_reload(reloaded, &bgp_reload_tx, bgp_reconfig_enabled,
+                        &mut known_bgp_peers, &mut supervisor);
+                }
             }
             r = async {
                 // Shut down on either SIGINT (Ctrl-C) or SIGTERM (systemd `stop`).
@@ -2069,6 +2082,8 @@ struct ReloadedConfig {
     /// The configured BGP peers, or `None` when BGP is disabled/absent (the reload then
     /// carries no neighbour delta).
     bgp_peers: Option<Vec<bgp::BgpPeerCfg>>,
+    vrf_imports: std::collections::HashMap<u32, Filter>,
+    vrf_exports: std::collections::HashMap<u32, Filter>,
 }
 
 /// Re-read the configuration file for a SIGHUP hot-reload: resolve its static routes
@@ -2084,7 +2099,7 @@ fn reload_config(path: &std::path::Path) -> Result<ReloadedConfig> {
     let by_name = compile_named_filters(&cfg).context("compiling filters")?;
     let imports = resolve_import_filters(&cfg, &by_name).context("resolving import filters")?;
     let fib_export = resolve_fib_export(&cfg, &by_name).context("resolving export filters")?;
-    let (vrf_imports, _vrf_exports) =
+    let (vrf_imports, vrf_exports) =
         build_vrf_routemaps(&cfg, &by_name).context("resolving vrf route-maps")?;
     let statics = admit_static_routes(
         cfg.static_routes().context("resolving static routes")?,
@@ -2105,52 +2120,137 @@ fn reload_config(path: &std::path::Path) -> Result<ReloadedConfig> {
         imports,
         fib_export,
         bgp_peers,
+        vrf_imports,
+        vrf_exports,
     })
 }
 
-/// Apply one SIGHUP config hot-reload: re-read the file and reconcile the running
-/// daemon to it. Static routes and route filters reconcile live in the router; BGP
-/// neighbours (add/remove) reconcile live in the BGP engine; the dynamic protocol
-/// engines are started/stopped/restarted by the `supervisor`. A reload that fails to
-/// parse or resolve is logged and dropped, keeping the running configuration.
-#[allow(clippy::too_many_arguments)] // one reload step wires every hot-reloadable sink
-async fn apply_reload(
+/// Inputs whose already-admitted dynamic candidates cannot safely be replayed.
+struct ReloadBaseline {
+    dynamic_imports: router::ImportFilters,
+    vrf_imports: std::collections::HashMap<u32, Filter>,
+    vrfs: Vec<(String, u32, Option<String>, Vec<String>)>,
+}
+
+impl ReloadBaseline {
+    fn new(
+        cfg: &wren_config::Config,
+        imports: &router::ImportFilters,
+        vrf_imports: &std::collections::HashMap<u32, Filter>,
+    ) -> Self {
+        let mut vrfs: Vec<_> = cfg
+            .vrfs
+            .iter()
+            .map(|vrf| {
+                let mut interfaces = vrf.interfaces.clone();
+                interfaces.sort();
+                (vrf.name.clone(), vrf.table, vrf.rd.clone(), interfaces)
+            })
+            .collect();
+        vrfs.sort();
+        Self {
+            dynamic_imports: imports
+                .iter()
+                .filter(|(protocol, _)| **protocol != Protocol::Static)
+                .map(|(protocol, filter)| (*protocol, filter.clone()))
+                .collect(),
+            vrf_imports: vrf_imports.clone(),
+            vrfs,
+        }
+    }
+
+    fn admits(&self, next: &ReloadedConfig) -> bool {
+        let next = Self::new(&next.cfg, &next.imports, &next.vrf_imports);
+        let previous: std::collections::BTreeMap<_, _> = self
+            .dynamic_imports
+            .iter()
+            .map(|(protocol, filter)| (protocol.name(), filter))
+            .collect();
+        let candidate: std::collections::BTreeMap<_, _> = next
+            .dynamic_imports
+            .iter()
+            .map(|(protocol, filter)| (protocol.name(), filter))
+            .collect();
+        reload::diff_keyed(&previous, &candidate).is_empty()
+            && self.vrf_imports == next.vrf_imports
+            && self.vrfs == next.vrfs
+    }
+}
+
+/// Admission never waits for the router, which is polled by this same task.
+fn begin_reload(
     config_path: &std::path::Path,
-    reload_tx: &mpsc::Sender<router::ReloadRoutes>,
-    filter_reload_tx: &mpsc::Sender<router::FilterReload>,
+    baseline: &ReloadBaseline,
+    reload_tx: &mpsc::Sender<router::RouterReload>,
+    status: &tokio::sync::watch::Sender<router::ReloadStatus>,
+) -> (router::ReloadStatus, Option<(u64, ReloadedConfig)>) {
+    let mut receipt = status.borrow().clone();
+    let reject = |mut receipt: router::ReloadStatus, detail: &str| {
+        receipt.state = "rejected";
+        receipt.detail = Some(detail.into());
+        (receipt, None)
+    };
+    if receipt.in_flight {
+        return reject(
+            receipt,
+            "routing reconciliation busy; generation unchanged; retry later",
+        );
+    }
+    let reloaded = match reload_config(config_path) {
+        Ok(config) => config,
+        Err(_) => {
+            warn!("reload rejected before mutation: invalid configuration");
+            return reject(
+                receipt,
+                "invalid configuration; running generation unchanged",
+            );
+        }
+    };
+    if !baseline.admits(&reloaded) {
+        warn!("reload rejected before mutation: dynamic import or VRF binding change requires restart");
+        return reject(
+            receipt,
+            "dynamic import or VRF binding changes require restart; no mutation",
+        );
+    }
+    let Some(generation) = receipt.generation.checked_add(1) else {
+        return reject(receipt, "generation counter exhausted; restart required");
+    };
+    let transaction = router::RouterReload {
+        generation,
+        statics: reloaded.statics.clone(),
+        imports: reloaded.imports.clone(),
+        fib_export: reloaded.fib_export.clone(),
+        vrf_exports: reloaded.vrf_exports.clone(),
+    };
+    if reload_tx.try_send(transaction).is_err() {
+        return reject(
+            receipt,
+            "routing queue unavailable; running generation unchanged",
+        );
+    }
+    receipt.generation = generation;
+    receipt.state = "pending";
+    receipt.pending_prefixes = reloaded.statics.len();
+    receipt.detail = None;
+    receipt.in_flight = true;
+    status.send_replace(receipt.clone());
+    info!(
+        generation,
+        "routing generation admitted; convergence pending"
+    );
+    (receipt, Some((generation, reloaded)))
+}
+
+/// Existing protocol reload consumers run only after routing reconciliation.
+/// Their adjacency convergence is deliberately outside the routing receipt.
+fn apply_protocol_reload(
+    reloaded: ReloadedConfig,
     bgp_reload_tx: &mpsc::Sender<bgp::BgpReconfig>,
     bgp_reconfig_enabled: bool,
     known_bgp_peers: &mut std::collections::HashSet<std::net::IpAddr>,
     supervisor: &mut reload::Supervisor,
 ) {
-    let reloaded = match reload_config(config_path) {
-        Ok(r) => r,
-        Err(e) => {
-            error!(error = %e, "config reload failed; keeping the running configuration");
-            return;
-        }
-    };
-    let static_count = reloaded.statics.len();
-    if reload_tx
-        .send(router::ReloadRoutes {
-            statics: reloaded.statics,
-        })
-        .await
-        .is_err()
-    {
-        warn!("router loop gone; static hot-reload skipped");
-    }
-    if filter_reload_tx
-        .send(router::FilterReload {
-            imports: reloaded.imports,
-            fib_export: reloaded.fib_export,
-        })
-        .await
-        .is_err()
-    {
-        warn!("router loop gone; filter hot-reload skipped");
-    }
-    info!(statics = static_count, "configuration reloaded");
     // BGP neighbour hot-reload: diff the re-read neighbour set against the running one
     // and send the add/remove delta to the BGP engine.
     if bgp_reconfig_enabled {
@@ -2171,8 +2271,7 @@ async fn apply_reload(
             } else {
                 let (added, removed) = (add.len(), remove.len());
                 if bgp_reload_tx
-                    .send(bgp::BgpReconfig { add, remove })
-                    .await
+                    .try_send(bgp::BgpReconfig { add, remove })
                     .is_err()
                 {
                     warn!("BGP engine gone; neighbour hot-reload skipped");
@@ -3619,6 +3718,201 @@ fn build_vrrp_instances(cfg: &wren_config::Config) -> Result<Vec<vrrp::InstanceC
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn busy_reload_rejects_before_reading_candidate_or_queueing_a_new_generation() {
+        let baseline = ReloadBaseline::new(
+            &wren_config::Config::default(),
+            &router::ImportFilters::new(),
+            &std::collections::HashMap::new(),
+        );
+        let mut current = router::ReloadStatus::startup();
+        current.generation = 7;
+        current.state = "pending";
+        current.in_flight = true;
+        let (status, _) = tokio::sync::watch::channel(current.clone());
+        let (tx, mut rx) = mpsc::channel(1);
+        let (reply, accepted) = begin_reload(
+            std::path::Path::new("/not/a/config"),
+            &baseline,
+            &tx,
+            &status,
+        );
+        assert_eq!(reply.generation, 7);
+        assert_eq!(reply.state, "rejected");
+        assert!(reply.detail.unwrap().contains("busy"));
+        assert!(accepted.is_none() && rx.try_recv().is_err());
+        assert_eq!(*status.borrow(), current);
+    }
+
+    #[test]
+    fn reload_admission_requires_restart_for_dynamic_import_and_structural_vrf_changes() {
+        let cfg = wren_config::Config::default();
+        let baseline = ReloadBaseline::new(
+            &cfg,
+            &router::ImportFilters::new(),
+            &std::collections::HashMap::new(),
+        );
+        let mut candidate = ReloadedConfig {
+            cfg,
+            statics: vec![],
+            imports: Default::default(),
+            fib_export: None,
+            bgp_peers: None,
+            vrf_imports: Default::default(),
+            vrf_exports: Default::default(),
+        };
+        assert!(baseline.admits(&candidate));
+        candidate
+            .imports
+            .insert(Protocol::Static, Filter::reject_all());
+        candidate.fib_export = Some(Filter::reject_all());
+        candidate.vrf_exports.insert(100, Filter::reject_all());
+        assert!(
+            baseline.admits(&candidate),
+            "static admission/export changes are replayable"
+        );
+        candidate
+            .imports
+            .insert(Protocol::Bgp, Filter::reject_all());
+        assert!(!baseline.admits(&candidate));
+        candidate.imports.remove(&Protocol::Bgp);
+        candidate.vrf_imports.insert(100, Filter::reject_all());
+        assert!(!baseline.admits(&candidate));
+        candidate.vrf_imports.clear();
+        candidate.cfg.vrfs.push(wren_config::VrfDef {
+            name: "blue".into(),
+            table: 100,
+            rd: None,
+            interfaces: vec!["eth1".into()],
+            import: None,
+            export: None,
+        });
+        assert!(!baseline.admits(&candidate));
+    }
+
+    #[tokio::test]
+    async fn real_slow_fib_attempt_blocks_new_restrictive_admission_until_first_round_finishes() {
+        use wren_core::{Fib, FibChange, FibError, MemoryFib, NextHop, Route};
+        struct HeldInstall {
+            inner: MemoryFib,
+            entered: Option<tokio::sync::oneshot::Sender<()>>,
+            release: std::sync::mpsc::Receiver<()>,
+        }
+        impl Fib for HeldInstall {
+            fn apply(&mut self, change: &FibChange) -> std::result::Result<(), FibError> {
+                if let Some(entered) = self.entered.take() {
+                    let _ = entered.send(());
+                    self.release
+                        .recv_timeout(std::time::Duration::from_secs(2))
+                        .map_err(|_| FibError("test release deadline exceeded".into()))?;
+                }
+                self.inner.apply(change)
+            }
+            fn owned_routes(&mut self) -> std::result::Result<Vec<Route>, FibError> {
+                self.inner.owned_routes()
+            }
+            fn remove_owned(&mut self, route: &Route) -> std::result::Result<(), FibError> {
+                self.inner.remove_owned(route)
+            }
+        }
+        let (entered, wait_entered) = tokio::sync::oneshot::channel();
+        let (release, wait_release) = std::sync::mpsc::channel();
+        let fib = crate::fib::spawn(Box::new(HeldInstall {
+            inner: MemoryFib::default(),
+            entered: Some(entered),
+            release: wait_release,
+        }));
+        let (updates, updates_rx) = mpsc::channel(1);
+        let (_queries, queries_rx) = mpsc::channel(1);
+        let (_subscribe, subscribe_rx) = mpsc::channel(1);
+        let (reloads, reload_rx) = mpsc::channel(1);
+        let (status, mut progress) = tokio::sync::watch::channel(router::ReloadStatus::startup());
+        let baseline = ReloadBaseline::new(
+            &wren_config::Config::default(),
+            &Default::default(),
+            &Default::default(),
+        );
+        let router = async {
+            router::run(
+                &mut wren_core::Rib::new(),
+                &fib,
+                updates_rx,
+                &Default::default(),
+                None,
+                &[],
+                &[],
+                queries_rx,
+                subscribe_rx,
+                &[],
+                Default::default(),
+                reload_rx,
+                status.clone(),
+                &Default::default(),
+            )
+            .await;
+        };
+        let driver = async {
+            let route = Route::new(
+                "198.51.100.0/24".parse().unwrap(),
+                Protocol::Static,
+                vec![NextHop::via("192.0.2.1".parse().unwrap())],
+                10,
+            );
+            reloads
+                .try_send(router::RouterReload {
+                    generation: 1,
+                    statics: vec![route.clone()],
+                    imports: Default::default(),
+                    fib_export: None,
+                    vrf_exports: Default::default(),
+                })
+                .unwrap();
+            status.send_modify(|value| {
+                value.generation = 1;
+                value.state = "pending";
+                value.in_flight = true;
+            });
+            wait_entered.await.unwrap();
+            // /dev/null is a valid empty configuration: accepting it would
+            // withdraw the old route, not fail parsing. No arbitrary path comes
+            // from the wire; this test supplies the daemon-owned config path.
+            let (rejected, accepted) = begin_reload(
+                std::path::Path::new("/dev/null"),
+                &baseline,
+                &reloads,
+                &status,
+            );
+            assert_eq!(rejected.state, "rejected");
+            assert_eq!(rejected.generation, 1);
+            assert!(rejected.detail.unwrap().contains("busy") && accepted.is_none());
+            release.send(()).unwrap();
+            progress
+                .wait_for(|value| value.generation == 1 && value.state == "converged")
+                .await
+                .unwrap();
+            assert_eq!(fib.owned_routes().await.unwrap(), vec![route]);
+            let (admitted, accepted) = begin_reload(
+                std::path::Path::new("/dev/null"),
+                &baseline,
+                &reloads,
+                &status,
+            );
+            assert_eq!(admitted.generation, 2);
+            assert!(accepted.is_some());
+            progress
+                .wait_for(|value| value.generation == 2 && value.state == "converged")
+                .await
+                .unwrap();
+            assert!(fib.owned_routes().await.unwrap().is_empty());
+            drop(updates);
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(4), async {
+            tokio::join!(router, driver);
+        })
+        .await
+        .unwrap();
+    }
     use std::net::Ipv6Addr;
 
     #[test]
