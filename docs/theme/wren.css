@@ -1,20 +1,50 @@
-/* Small cosmetic tweaks for the Wren handbook. */
-
-/* Give wide reference tables room to breathe. */
+/* Keep mdBook's theme-aware contrast, navigation and syntax highlighting. */
+.content main {
+    line-height: 1.58;
+}
+.content h1,
+.content h2,
+.content h3 {
+    line-height: 1.22;
+    text-wrap: balance;
+}
+.content h1 {
+    padding-bottom: .4em;
+    border-bottom: 2px solid var(--table-border-color);
+}
+.content h2 {
+    margin-top: 1.85em;
+}
 .content table {
-    margin: 1rem 0;
+    margin: 1.3rem 0 1.8rem;
+    width: 100%;
 }
 .content table td,
 .content table th {
-    padding: 0.4rem 0.7rem;
+    padding: .48rem .75rem;
+    vertical-align: top;
+    text-align: left;
 }
-
-/* Status ticks in the introduction table read better centred. */
-.content table td:last-child {
-    white-space: nowrap;
+.content th {
+    font-weight: 650;
 }
-
-/* A touch more separation around the ASCII architecture diagrams. */
 .content pre > code {
-    line-height: 1.45;
+    line-height: 1.5;
+    padding: .95em 1.1em;
+}
+.content :target {
+    scroll-margin-top: 5rem;
+}
+@media (max-width: 700px) {
+    .content table {
+        display: block;
+        overflow-x: auto;
+    }
+    .content table td,
+    .content table th {
+        white-space: normal;
+    }
+    .content table code {
+        overflow-wrap: anywhere;
+    }
 }

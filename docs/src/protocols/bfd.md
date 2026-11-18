@@ -1,217 +1,51 @@
-# BFD
+# Detect a failed routing peer with BFD {#bfd}
 
-Wren implements **Bidirectional Forwarding Detection**
-([RFC 5880](https://www.rfc-editor.org/rfc/rfc5880), single-hop encapsulation
-[RFC 5881](https://www.rfc-editor.org/rfc/rfc5881)) — a lightweight,
-protocol-independent hello mechanism that detects a forwarding-path failure in
-**well under a second**, far faster than a routing protocol's own hold timer.
+BFD can tell a routing protocol that its neighbor has failed before the protocol’s own hold timer expires. Check BFD and protocol state separately.
 
-> A BGP session with a 180-second hold time would take up to three minutes to
-> notice a silently blackholed path (one where no TCP reset is ever delivered).
-> A BFD session over the same path notices in a few hundred milliseconds and tells
-> BGP to tear the session down at once.
+<a id="what-is-implemented"></a>
 
-Two systems exchange small UDP Control packets at a sub-second rate. When a system
-stops hearing its neighbour for `detect-mult` receive intervals it declares the
-session **Down**, and the protocols riding that path drop their adjacency
-immediately rather than waiting for the hold / dead timer. **BGP**, **OSPFv2**,
-**OSPFv3** and **IS-IS** all use it.
+## Configure the first router {#configuration}
 
-Scope: **single-hop asynchronous mode**, **IPv4 and IPv6**, with **authentication**
-(§6.7) and the **Echo function** (§6.4, IPv4). Demand mode is a future extension.
-
-## What is implemented
-
-**The Control-packet codec** (RFC 5880 §4.1) — the 24-octet mandatory section:
-Version, Diagnostic, State, the P/F/C/A/D/M flags, Detect Mult, the My/Your
-Discriminators and the three microsecond interval fields. The reception checks that
-can be made on a packet alone are enforced on decode (version 1, a sane Length, a
-non-zero Detect Mult and My Discriminator, the Multipoint bit clear, and a Your
-Discriminator that may only be zero while the sender is Down/AdminDown). The
-**Authentication Section** (§6.7) — Simple Password and Keyed/Meticulous MD5 & SHA-1,
-with the MD5 and SHA-1 hashes implemented from scratch so the crate stays dependency
-free — is appended on transmit and verified on receive, including the replay window.
-This all lives in the dependency-free `wren-bfd` crate and is unit-tested with no I/O.
-
-**The session state machine** (§6.8.6) — the `Down → Init → Up` handshake, with a
-neighbour signalling Down or a detection timeout taking an Up session back to Down
-(diagnostics Neighbor Signaled Session Down and Control Detection Time Expired). A
-received Poll is answered with the Final bit (§6.8.7). The Desired Min TX Interval
-is floored to one second while the session is not Up (§6.8.3), so forming or failed
-sessions are cheap, and drops to the configured rate once Up. The transmit interval
-carries the §6.8.7 jitter; the Detection Time is `detect-mult ×` the negotiated
-receive interval (§6.8.4).
-
-**The UDP runner** (in `wren-daemon`) ties them together — shared receive sockets on
-UDP port **3784** for **both IPv4 and IPv6** (the latter bound `IPV6_V6ONLY` so the
-two coexist), a connected transmit socket per peer sending with **TTL / hop limit
-255** (the GTSM check single-hop BFD relies on, RFC 5881 §5), per-session transmit
-and detection timers, and demultiplexing received packets to a session by
-`(source address, scope)`. The **scope** is the receiving interface index, which is
-what keeps IPv6 **link-local** peers distinct — exactly how OSPFv3 identifies its
-neighbours. Sessions are **dynamic and multi-consumer**: a protocol registers a peer
-(BGP statically at startup, the OSPF IGPs as a neighbour reaches Full), and the
-runner creates the session on first registration and tears it down when the last
-subscriber deregisters. A peer shared by two protocols has one session. When a
-session that had come up goes down, every subscribed protocol is notified and tears
-its adjacency to that peer down at once.
-
-## Configuration
-
-The timing is shared by every session and comes from a global `[bfd]` block (all
-optional); BFD is then enabled per protocol.
+Router A enables BFD on a particular BGP neighbor. The lab uses permissive eBGP policy only inside its disposable namespaces. The BFD intervals are milliseconds; the BGP hold time is seconds.
 
 ```toml
+router-id = "10.0.0.1"
 [bfd]
-min-tx      = 300   # Desired Min TX Interval, milliseconds (default 300)
-min-rx      = 300   # Required Min RX Interval, milliseconds (default 300)
-detect-mult = 3     # session fails after this many missed intervals (default 3)
-```
-
-At the defaults the Detection Time is `300 ms × 3 = 900 ms`. The peer must also be
-configured to run BFD.
-
-### Authentication (RFC 5880 §6.7)
-
-A session can authenticate every Control packet so a forged or replayed packet can
-not drive a neighbour down. Authentication is configured once in `[bfd]` and applies
-to every session; **both ends must use the same type and key**.
-
-```toml
-[bfd]
-auth-type   = "meticulous-sha1"  # simple | keyed-md5 | meticulous-md5 |
-                                 # keyed-sha1 | meticulous-sha1
-auth-key-id = 1                  # the key id sent on the wire (default 1)
-auth-key    = "a shared secret"  # the password / keying material
-```
-
-* **`simple`** — Simple Password (§4.2): the key is sent in the clear (at most 16
-  bytes). Use only where the link itself is trusted.
-* **`keyed-md5` / `keyed-sha1`** (§4.3/§4.4) — an MD5 or SHA-1 digest over the whole
-  packet keyed by the shared secret, with a sequence number that advances
-  occasionally.
-* **`meticulous-md5` / `meticulous-sha1`** — the same, but the sequence number
-  advances on **every** packet, which is the strongest replay resistance and the
-  recommended choice. (The hashes are for BFD's keyed integrity check, not
-  confidentiality.)
-
-A packet that arrives without a valid Authentication Section for the configured key —
-wrong type, wrong key, a tampered digest, or a replayed sequence number — is silently
-discarded, so a session whose ends disagree on the key never comes up.
-
-#### Per-neighbour keys
-
-The `[bfd]` block is the default for every session, but a **BGP neighbour can override
-it with its own key**, so different peers authenticate with different passwords (and
-even different algorithms):
-
-```toml
-[bfd]
-auth-type = "meticulous-sha1"      # the default for sessions without an override
-auth-key  = "the shared default"
-
-[[bgp.neighbor]]
-address       = "10.0.1.2"
-remote-as     = 65002
-bfd           = true
-bfd-auth-type = "meticulous-sha1"  # this peer's own key …
-bfd-auth-key  = "key-for-this-peer"
-[[bgp.neighbor]]
-address       = "10.0.2.2"
-remote-as     = 65003
-bfd           = true
-bfd-auth-type = "keyed-md5"        # … another peer, a different type and key
-bfd-auth-key  = "key-for-that-peer"
-```
-
-A neighbour without a `bfd-auth-*` block inherits the global `[bfd]` key. (The IGP
-sessions — OSPFv2/OSPFv3/IS-IS — currently all use the global key.)
-
-**BGP** — enable it per neighbour. A BFD-down tears the BGP session down (rather
-than waiting for the Hold Timer); the connector re-establishes when the path
-recovers:
-
-```toml
+min-tx      = 200
+min-rx      = 200
+detect-mult = 3
+[bgp]
+enabled             = true
+local-as            = 65001
+hold-time           = 180
+ebgp-require-policy = false
 [[bgp.neighbor]]
 address   = "10.0.0.2"
 remote-as = 65002
 bfd       = true
 ```
 
-**OSPFv2** — enable it for the instance with `[ospf] bfd = true`. A session is
-brought up to each neighbour that reaches **Full**, and a BFD-down tears that
-adjacency down at once (RFC 5882 §4.4) instead of waiting for the dead interval:
 
-```toml
-[ospf]
-enabled    = true
-interfaces = ["eth1"]
-bfd        = true
-```
-
-**OSPFv3** — the same, with `[ospf3] bfd = true`. OSPFv3 neighbours are IPv6
-link-local addresses, so each session runs over IPv6 (the engine binds an IPv6
-control socket and keys the session by the neighbour's link-local address and the
-interface scope); nothing else differs:
-
-```toml
-[ospf3]
-enabled    = true
-interfaces = ["eth1"]
-bfd        = true
-```
-
-**IS-IS** — the same, with `[isis] bfd = true`. IS-IS adjacencies run over the
-link-layer (SNPA/MAC), not IP, so the neighbour's IP for the BFD session is taken
-from the IP Interface Address TLV in its Hellos (IPv4 if present, otherwise IPv6); a
-session is brought up to each neighbour with an up adjacency that advertises one:
-
-```toml
-[isis]
-enabled    = true
-interfaces = ["eth1"]
-bfd        = true
-```
-
-### Echo (RFC 5880 §6.4)
-
-The **Echo function** adds a second, faster liveness check that exercises the
-neighbour's *forwarding plane* directly, without involving its BFD software. Each
-side sends Echo packets addressed to **its own** IP but out to the neighbour's MAC, so
-the neighbour's data plane loops them straight back. When the looped packets stop
-returning the session fails with the diagnostic **Echo Function Failed** — typically
-well before the Control detection time, since Echo can run at a much faster interval.
-
-```toml
-[bfd]
-echo          = true   # run Echo on every IPv4 session (default false)
-echo-interval = 100    # milliseconds between Echo packets (default 100)
-# Echo detection ≈ echo-interval × detect-mult, e.g. 100 ms × 3 = 300 ms
-```
-
-Echo runs alongside the Control session (it does not replace it) and only while the
-session is **Up**. It is **IPv4, single-hop** only. Because the looped packet carries
-the local system's own address as both source and destination, the kernel's
-martian-source filtering would drop it on the way in, so Wren transmits and receives
-Echo over a raw `AF_PACKET` socket (needing `CAP_NET_RAW`) — the payload format is a
-local matter, here a magic plus the session's discriminator and a sequence number.
-**The neighbour must have IP forwarding enabled** for the loopback to occur; if it
-never returns an Echo, detection simply never arms and the Control session is
-unaffected. `wren show bfd` shows whether Echo is running for a session and the last
-diagnostic.
-
-## Operational view
-
-`wren show bfd` lists the sessions and their state, straight from the task that
-owns them:
+## Observe the result {#operational-view}
 
 ```sh
-$ wren show bfd
-peer               state      local-discr remote-discr       tx   detect
-10.0.0.2           Up                   1            1    270ms    900ms
+bash scripts/bgp-bfd-smoke.sh
 ```
 
-When the path fails, the session goes `Down` (and `remote-discr` clears) within the
-Detection Time, and the BGP session to that peer is torn down — visible as the
-neighbour leaving `Established` in `wren show bgp neighbors` far sooner than the
-hold timer would allow.
+On a separate running instance, inspect the same state:
+
+```sh
+wren show bfd
+wren show bgp neighbors
+```
+
+The fixture waits for BFD `Up` and BGP `Established`, then checks that loss of BFD tears down BGP before its 180-second hold timer. Detection depends on the negotiated intervals and multiplier.
+
+[Lab source](https://github.com/Velstra/wren/blob/main/scripts/bgp-bfd-smoke.sh).
+
+<a id="per-neighbour-keys"></a>
+<a id="echo-rfc-5880-64"></a>
+
+## Authentication and echo {#authentication-rfc-5880-67}
+
+The [per-session authentication test](https://github.com/Velstra/wren/blob/main/scripts/bfd-auth-per-session-smoke.sh) configures peers independently. To check packet return on the data path, start with the [IPv4 echo](https://github.com/Velstra/wren/blob/main/scripts/bfd-echo-smoke.sh) or [IPv6 echo](https://github.com/Velstra/wren/blob/main/scripts/bfd-echo-v6-smoke.sh) example.

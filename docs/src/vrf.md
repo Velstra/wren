@@ -1,174 +1,52 @@
-# VRFs & Route Distinguishers
+# Separate tenant routes with VRFs {#vrfs--route-distinguishers}
 
-A **VRF** (Virtual Routing and Forwarding instance) is a named, isolated routing
-table. Routes and interfaces placed in a VRF use its own kernel routing table, so the
-same IP prefix can exist in several VRFs at once without colliding — the basis of
-multi-tenant routing and L3VPNs.
+A named VRF directs selected routes into a dedicated Linux table. A BGP instance bound to it uses the VRF’s routing domain for its session as well.
 
-Wren models a VRF as a `(table, prefix)` key throughout the RIB and the forwarding
-plane: every [`Route`](core.md) carries the kernel table it belongs to (the default
-VRF is the main table, `254`), best-path selection runs per `(table, prefix)`, and the
-kernel backend programs each route into its table via the rtnetlink `RTA_TABLE`
-attribute. Overlapping address space therefore stays separate end to end.
 
-> **Scope.** **Static** routes and **every routing protocol** — **RIP**, **OSPF**,
-> **IS-IS**, **Babel** and **BGP** — can be placed in a VRF today: a static with `vrf =
-> "…"`, or an instance with `[rip] vrf = "…"`, `[ospf] vrf = "…"`, `[isis] vrf = "…"`,
-> `[babel] vrf = "…"` or `[bgp] vrf = "…"` installs its routes into the VRF's kernel
-> table, with the VRF's Route Distinguisher and route-maps. BGP additionally binds its
-> session sockets to the VRF (so the TCP peerings use the VRF's routing table); this is
-> a **plain VRF**, not an MPLS L3VPN (VPNv4/RD-on-the-wire/route targets) — that
-> remains future work.
+## Configure the first router {#configuration}
 
-## Configuration
-
-A `[[vrf]]` block names a VRF and the kernel routing table it programs into:
+This fixture uses a Linux VRF master named blue and table 100. The test script creates the Linux devices. The Wren TOML binds BGP and a static prefix to that domain; its permissive eBGP policy is limited to the isolated lab.
 
 ```toml
+router-id = "10.0.0.1"
 [[vrf]]
-name       = "blue"
-table      = 100             # the kernel routing table id
-rd         = "65000:1"       # the Route Distinguisher (RFC 4364) — the VRF's identity
-interfaces = ["eth1"]        # interfaces bound to this VRF (informational here)
-import     = "blue-in"       # a route-map applied to routes entering the VRF
-export     = "blue-out"      # a route-map applied to routes leaving the VRF to the kernel
-```
-
-A static route joins a VRF by naming it:
-
-```toml
+name  = "blue"
+table = 100
 [[static]]
 prefix = "10.99.0.0/24"
-via    = "10.9.0.2"
-vrf    = "blue"              # installs into table 100, not the main table
-```
-
-A **dynamic protocol** joins a VRF the same way. A RIP instance bound to a VRF runs
-its sockets over the VRF's (enslaved) interfaces and installs every route it learns —
-and its connected routes — into the VRF's table:
-
-```toml
-[rip]
-enabled    = true
-interfaces = ["eth1"]
-vrf        = "blue"          # learned + connected routes go into table 100
-```
-
-OSPF joins a VRF identically — every route its SPF computes (intra-area, inter-area
-and AS-external) is installed into the VRF's table:
-
-```toml
-[ospf]
-enabled      = true
-interfaces   = ["eth1"]
-network-type = "point-to-point"
-vrf          = "blue"        # SPF results go into table 100
-```
-
-IS-IS joins a VRF the same way — its connected reachability and every SPF result, in
-both address families, go into the VRF's table:
-
-```toml
-[isis]
-enabled      = true
-interfaces   = ["eth1"]
-network-type = "point-to-point"
-vrf          = "blue"        # SPF results go into table 100
-```
-
-Babel joins a VRF identically — its connected reachability and every route it selects,
-in both address families, go into the VRF's table:
-
-```toml
-[babel]
-enabled    = true
-interfaces = ["eth1"]
-vrf        = "blue"          # selected routes go into table 100
-```
-
-BGP joins a VRF the same way, with one addition: besides stamping the VRF's table on
-every route it installs, it binds its session sockets to the VRF's L3 master device
-(`SO_BINDTODEVICE`), so the TCP peerings are established over the VRF's routing table.
-The peers must therefore be reachable within the VRF (their addresses on the enslaved
-interfaces). This is a plain per-VRF BGP, not an MPLS L3VPN.
-
-```toml
+via    = "10.9.0.100"
+vrf    = "blue"
 [bgp]
-enabled  = true
-local-as = 65001
-vrf      = "blue"            # sessions + learned routes use table 100
-
+enabled             = true
+local-as            = 65001
+vrf                 = "blue"
+redistribute        = ["static"]
+ebgp-require-policy = false
 [[bgp.neighbor]]
-address        = "10.9.0.2"  # reachable on an interface enslaved to blue
-remote-as      = 65002
-require-policy = false       # or give it an import/export policy — see below
+address   = "10.9.0.2"
+remote-as = 65002
 ```
 
-A VRF does not change the edge: this is still an eBGP session, so RFC 8212
-default-deny applies to it and a policy-less peer exchanges nothing. Either attach
-an `import`/`export` filter as usual or, as here, opt the neighbour out — see
-[Default-deny without policy](protocols/bgp.md#default-deny-without-policy-rfc-8212).
 
-For the VRF to be a real forwarding context, create the Linux VRF device and enslave
-its interfaces with `ip` (or networkd) — Wren installs into the table, it does not
-create the device:
+## Observe the result {#operational-view}
 
 ```sh
-ip link add blue type vrf table 100
-ip link set blue up
-ip link set eth1 master blue
+bash scripts/vrf-bgp-smoke.sh
 ```
 
-### Route Distinguishers
-
-The `rd` is a [RFC 4364](https://www.rfc-editor.org/rfc/rfc4364) §4.2 Route
-Distinguisher — an 8-octet value that makes a VRF's routes globally unique. Wren
-accepts all three text encodings and validates them at startup:
-
-| Form | Type | Example |
-|---|---|---|
-| `<2-octet AS>:<number>` | 0 | `65000:1` |
-| `<IPv4>:<number>` | 1 | `192.0.2.1:1` |
-| `<4-octet AS>:<number>` | 2 | `4200000000:1` |
-
-It is the VRF's identity (shown by `show vrf`); it is the same wire shape as a BGP
-Route Target extended community but a distinct field.
-
-### Route-maps
-
-A VRF's `import` route-map is applied to every route as it enters the VRF (a rejected
-route is dropped, an accepted one may be rewritten — metric, preference, …); the
-`export` route-map gates routes on their way from the VRF's RIB to the kernel. Both
-reference a named `[[filter]]`, the same engine used for protocol import/export
-policy:
-
-```toml
-[[filter]]
-name    = "blue-in"
-default = "accept"
-[[filter.rule]]
-prefix = ["10.77.0.0/24"]    # keep this prefix out of the VRF
-action = "reject"
-```
-
-## Operational view
-
-`wren show vrf` lists the configured VRFs with their table, Route Distinguisher and the
-number of best routes currently in each:
+On a separate running instance, inspect the same state:
 
 ```sh
-$ wren show vrf
-vrf                 table rd                   routes
-blue                  100 65000:1                   2
+ip route show table 100
+wren show routes
 ```
 
-`wren show routes` tags a route with its table when it is not in the default VRF:
+The receiving router learns `10.99.0.0/24 via 10.9.0.1` in table 100. The same prefix is absent from the main table.
 
-```sh
-$ wren show routes
-10.99.0.0/24 via 10.9.0.2 table 100 proto static metric 0
-10.88.0.0/24 via 10.8.0.2 proto static metric 0
-```
+[Lab source](https://github.com/Velstra/wren/blob/main/scripts/vrf-bgp-smoke.sh).
 
-At startup Wren also reconciles stale routes **per table**, so a route a previous
-instance left in a VRF table is cleaned up just like a main-table one.
+<a id="route-maps"></a>
+
+## Distinguish table selection from route policy {#route-distinguishers}
+
+The Linux table number selects a forwarding domain. A route distinguisher identifies a route in VPN-related contexts. VRF import and export route-maps decide what enters the VRF RIB or reaches the FIB. [Static table isolation and route-map example](https://github.com/Velstra/wren/blob/main/scripts/vrf-smoke.sh).

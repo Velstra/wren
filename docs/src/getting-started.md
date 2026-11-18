@@ -1,157 +1,75 @@
-# Getting Started
+# Build and check Wren {#getting-started}
 
-## Requirements
+## Build the daemon {#build--test}
 
-- A recent **stable** Rust toolchain (the workspace pins stable via
-  `rust-toolchain.toml`). Wren's control plane uses no nightly features.
-- Linux, for the kernel FIB backend (it talks rtnetlink over a raw netlink
-  socket). The library crates and their tests build and run on any platform.
+<a id="requirements"></a>
 
-## Build & test
+Install Git, a C linker, and stable Rust with Cargo. Use Linux for the kernel backend. All commands below run from the checkout root.
 
 ```sh
-cargo build --release          # builds the `wren` binary into target/release/
-cargo test                     # the library crates need no network
-cargo clippy --all-targets     # lint
+git clone https://github.com/Velstra/wren.git
+cd wren
+cargo build --locked -p wren-daemon --bin wren
+export PATH="$PWD/target/debug:$PATH"
+wren --version
 ```
 
-The release binary lands at `target/release/wren`.
+The build produces `target/debug/wren`. To evaluate a release, check out its tag before building and use its copy of the example scripts.
 
-## Building a subset (cargo features)
-
-By default the daemon includes every routing protocol. Each one is behind a cargo
-feature, so an embedder (e.g. [Sentinel](core.md)) that only needs a couple can
-compile the rest out entirely — smaller binary, faster builds, fewer dependencies:
-
-| Feature | Protocol(s) |
-|---|---|
-| `ospf`  | OSPFv2 |
-| `ospf3` | OSPFv3 |
-| `rip`   | RIPv2 + RIPng |
-| `babel` | Babel |
-| `isis`  | IS-IS |
-
-`default = ["ospf", "ospf3", "rip", "babel", "isis"]`. **BGP and the core** (the RIB,
-FIB, filters, config and netlink) are always built in — they are the floor.
+## Validate an example {#checking-a-configuration}
 
 ```sh
-# Only BGP + core — no OSPF/RIP/Babel/IS-IS compiled at all:
-cargo build --release -p wren-daemon --no-default-features
-
-# BGP + core + just OSPFv2 and IS-IS:
-cargo build --release -p wren-daemon --no-default-features --features "ospf,isis"
+wren check -c examples/wren.toml
 ```
 
-A disabled protocol's `[section]` in the config is simply inert, and its `show`
-command returns the unknown-command help — the daemon still runs everything you did
-build in.
+Look for `examples/wren.toml is valid`, router ID `10.0.0.1` and two resolved static routes. An invalid file exits nonzero. This check reads the configuration without opening protocol sockets or changing routes.
 
-## Running
+## Inspect a running instance {#running}
 
-Wren reads a single TOML file (see the [Configuration](configuration.md)
-reference) and drives one of two forwarding-plane **backends**:
-
-| Backend | Flag | Effect |
-|---|---|---|
-| In-memory (default) | `--backend memory` or `--dry-run` | Computes routes and logs them; never touches the kernel. Safe anywhere. |
-| Kernel | `--backend kernel` | Installs and withdraws real routes over netlink. Needs `CAP_NET_ADMIN`. |
+Use a fresh working directory and a dedicated socket. This complete configuration has only a static route. Keep terminal A open.
 
 ```sh
-# Dry run — compute routes in memory, never touch the kernel:
-./target/release/wren --config ./examples/wren.toml --dry-run
-
-# Real install — program the kernel routing table:
-sudo ./target/release/wren --config ./examples/wren.toml --backend kernel
+work=$(mktemp -d)
+cd "$work"
+cat >router.toml <<'TOML'
+router-id = "192.0.2.10"
+[[static]]
+prefix = "198.51.100.0/24"
+via = "192.0.2.1"
+TOML
+printf 'Lab directory: %s\n' "$PWD"
+wren --config router.toml --backend memory --socket "$PWD/wren.sock"
 ```
 
-The default config path is `/etc/wren/wren.toml`; override it with `--config`.
-
-### Checking a configuration
-
-`wren check` reads a file, resolves everything that can be resolved without a
-network, and exits — parse, compile the filters, resolve the import/export
-attachments and the VRF route-maps, build the static routes and the BGP
-neighbour set. That is the same work a `SIGHUP` reload does before it commits, so
-a file that passes here is one the running daemon would accept.
-
-Nothing is started, no socket is opened and the kernel is not touched, which
-means it is safe on a box that is already routing. The alternative is finding
-out by restarting.
+In terminal B, add the checkout’s absolute `target/debug` path to `PATH` and enter the printed lab directory:
 
 ```sh
-$ wren check -c ./examples/wren.toml
-./examples/wren.toml is valid
-  router-id       10.0.0.1
-  static routes   2
-  vrfs            0
-  filters         0
-  import filters  0
-  bgp             disabled
-  vrrp            0
+wren --socket "$PWD/wren.sock" show routes
 ```
 
-The counts are what was *resolved*, not what was written. They happen to agree
-here, but a static route that a VRF's import route-map rejects is written and not
-counted — and that difference is the one worth seeing before a restart rather
-than after.
+Look for `198.51.100.0/24` with next hop `192.0.2.1` and protocol `static`. The memory backend keeps the forwarding decision in process. Stop the daemon with Ctrl-C.
 
-A file that does not pass says what is wrong with it and exits non-zero, which is
-what makes this usable from a script or a deployment pipeline:
+## Run a two-router lab {#try-it-without-root}
+
+<a id="two-router-tests"></a>
+
+On Linux, install iproute2 and util-linux. The scripts use unprivileged user/network namespaces and create their own interfaces. Run these from the checkout root:
 
 ```sh
-$ wren check -c broken.toml
-Error: reading broken.toml
-
-Caused by:
-    invalid config: static route 198.51.100.0/24 is a blackhole and cannot also have a next-hop
+bash scripts/bgp-unnumbered-smoke.sh
+bash scripts/bgp-hot-reload-smoke.sh
 ```
 
-### Logging
+The first lab checks an IPv4 route with an IPv6 next hop in the actual kernel table. The second checks which sessions and routes survive adding and removing a peer.
 
-Wren logs through [`tracing`](https://docs.rs/tracing). Set `RUST_LOG` to choose
-the verbosity — for example `RUST_LOG=info` (the default), `RUST_LOG=debug`, or a
-per-module filter like `RUST_LOG=wren::bgp=debug,info`.
-
-## Try it without root
-
-Most of Wren can be exercised unprivileged inside a throwaway **user + network
-namespace** (`unshare -Urn`), which grants `CAP_NET_RAW`/`CAP_NET_ADMIN` *inside
-the namespace* without real root:
+## Build a smaller binary {#building-a-subset-cargo-features}
 
 ```sh
-unshare -Urn sh -c '
-  ip link add dummy0 type dummy
-  ip addr add 10.9.9.1/24 dev dummy0
-  ip link set dummy0 up
-  ./target/debug/wren --config ./examples/wren.toml --backend kernel &
-  sleep 1
-  ip route'
+cargo build --release --locked -p wren-daemon --bin wren --no-default-features
 ```
 
-### Two-router tests
+Add features such as `--features ospf,isis` when those protocols are required. The [daemon manifest](https://github.com/Velstra/wren/blob/main/crates/wren-daemon/Cargo.toml) lists the default set.
 
-Protocols that exchange packets with a neighbour need **two** network namespaces
-joined by a virtual link — a single namespace short-circuits delivery in the
-kernel before a bound socket ever sees the packet. The pattern used throughout
-Wren's development (no real root required):
+## Logging
 
-```sh
-unshare -Urn bash -c '
-  ip link set lo up
-  # A holder process in its own netns becomes "router B".
-  setsid unshare -n -- sleep 300 & BPID=$!
-  sleep 0.3
-  # A veth pair: one end stays here (router A), the other moves to B by PID.
-  ip link add veth0 type veth peer name veth1
-  ip link set veth1 netns $BPID
-  ip addr add 10.0.0.1/24 dev veth0; ip link set veth0 up
-  nsenter -t $BPID -n ip addr add 10.0.0.2/24 dev veth1
-  nsenter -t $BPID -n ip link set veth1 up
-  nsenter -t $BPID -n ip link set lo up
-  # Run a wren in each namespace, then inspect "ip route" on both sides.
-'
-```
-
-Each protocol chapter gives a concrete two-router smoke test built on this
-harness. Rootless `ip netns add` cannot write `/run/netns`, so the holder-PID +
-`nsenter` approach above is used instead of named namespaces.
+Set `RUST_LOG=debug` when starting the daemon to inspect protocol startup. The [monitoring guide](monitoring.md) covers state queries, metrics, and reloads.
