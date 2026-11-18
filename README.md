@@ -1,5 +1,10 @@
 # Wren
 
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset=".github/brand/logo-on-dark.svg">
+  <img src=".github/brand/logo.svg" alt="Velstra Wren" height="72">
+</picture>
+
 Rust routing daemon for BGP, OSPFv2/v3, IS-IS, RIP/RIPng and Babel, with BFD,
 VRRP, VRFs and Linux kernel route installation.
 
