@@ -64,15 +64,30 @@ struct HaDecisionObservation {
 }
 
 /// The exchange can outlive the Agent sample or a tracked link. Revalidate the
-/// SAME sample used in the request, never a new file/policy generation. Read the
-/// clock after the second health probe, so that probe's latency cannot hide age.
+/// SAME generation used in the request, never a new file/policy generation.
+///
+/// The exchange alone may use the whole I/O budget, and the requested sample is
+/// already up to one Agent poll old, so judging the freshness bound on that
+/// sample withdrew a healthy owner whenever an exchange was slow. `reread` is a
+/// read of the Agent's file taken after the exchange: it is used, and judged by
+/// the same bound, only when it is the same generation as the request (see
+/// `same_agent_generation`). Otherwise the requested sample is judged as
+/// before. A request without an accepted sample never acquires one. Read the
+/// file after the second health probe and the clock after both, so neither
+/// latency can hide age.
 fn revalidate_after_exchange(
     agent: Option<wren_ha::Agent>,
     healthy_before: bool,
     health: impl FnOnce() -> bool,
+    reread: impl FnOnce() -> Option<wren_ha::Agent>,
     clock: impl FnOnce() -> u64,
 ) -> HaDecisionObservation {
     let healthy_after = health();
+    let agent = agent.map(|requested| {
+        reread()
+            .filter(|current| same_agent_generation(&requested, current))
+            .unwrap_or(requested)
+    });
     let now = clock();
     HaDecisionObservation {
         agent: agent.filter(|agent| agent.eligible && wren_ha::fresh(agent.updated_ns, now)),
@@ -80,6 +95,19 @@ fn revalidate_after_exchange(
         healthy_after,
         now,
     }
+}
+
+/// The identity and claim a request carried: a later report with these fields
+/// equal describes the same Agent incarnation, policy and replica generation.
+/// `forwarding_term` may advance (the Agent acknowledging this term) and
+/// `eligible`/`updated_ns` are what the post-exchange check judges.
+fn same_agent_generation(requested: &wren_ha::Agent, current: &wren_ha::Agent) -> bool {
+    current.cluster == requested.cluster
+        && current.node == requested.node
+        && current.coordinator_boot == requested.coordinator_boot
+        && current.agent_boot == requested.agent_boot
+        && current.policy == requested.policy
+        && current.ready_term == requested.ready_term
 }
 
 /// Diagnostic-only snapshots. No value here participates in authority, freshness
@@ -873,7 +901,8 @@ pub async fn run_ha(
                     Err(error) => { debug!(error = format_args!("{error:#}"), "HA authority renewal unavailable; existing deadline cannot be extended"); }
                 }
                 let decision = revalidate_after_exchange(agent, healthy_before,
-                    || ha_interfaces_healthy(&binding.configs, &config.wireguard), wren_ha::now_ns);
+                    || ha_interfaces_healthy(&binding.configs, &config.wireguard),
+                    || wren_ha::read_private::<Agent>(Path::new(AGENT_PATH)).ok(), wren_ha::now_ns);
                 let agent = decision.agent;
                 let healthy = decision.healthy;
                 let now = decision.now;
@@ -1851,7 +1880,7 @@ mod tests {
             (updated_ns + wren_ha::FRESH_NS + 1, false),
             (updated_ns - 1, false),
         ] {
-            let decision = revalidate_after_exchange(Some(accepted.clone()), true, || true, || now);
+            let decision = revalidate_after_exchange(Some(accepted.clone()), true, || true, || None, || now);
             assert_eq!(decision.agent.is_some(), expected);
             if let Some(agent) = decision.agent {
                 assert_eq!(agent.updated_ns, updated_ns);
@@ -1864,10 +1893,107 @@ mod tests {
         // No file read is accepted by this boundary: a missing/rejected request
         // cannot acquire another generation just because the exchange completed.
         assert!(
-            revalidate_after_exchange(None, true, || true, || updated_ns)
+            revalidate_after_exchange(None, true, || true, || Some(accepted.clone()), || updated_ns)
                 .agent
                 .is_none()
         );
+    }
+
+    /// HA-flap (audit 8b6181): the exchange alone may take the whole I/O
+    /// budget (80 ms) and the requested sample is already up to one Agent poll
+    /// old, so measuring the 100 ms bound on that sample alone withdrew a
+    /// healthy owner's VIPs whenever an exchange was slow. Freshness is now
+    /// measured on a read taken after the exchange, but only of the SAME Agent
+    /// generation the request carried; anything else keeps the old verdict.
+    #[test]
+    fn post_exchange_freshness_uses_a_new_read_of_the_same_generation_only() {
+        let requested_ns = 1_000_000_000;
+        let now = requested_ns + wren_ha::FRESH_NS + 50_000_000;
+        let requested = wren_ha::Agent {
+            eligible: true,
+            updated_ns: requested_ns,
+            agent_boot: [9; 16],
+            policy: [3; 32],
+            ready_term: 7,
+            forwarding_term: 7,
+            ..Default::default()
+        };
+        let reread = |change: fn(&mut wren_ha::Agent)| {
+            let mut agent = requested.clone();
+            agent.updated_ns = now - 10_000_000;
+            change(&mut agent);
+            agent
+        };
+        // A slow exchange with a live Agent of the same generation stays active.
+        let decision = revalidate_after_exchange(
+            Some(requested.clone()),
+            true,
+            || true,
+            || Some(reread(|_| {})),
+            || now,
+        );
+        assert_eq!(
+            decision.agent.map(|a| a.updated_ns),
+            Some(now - 10_000_000)
+        );
+        // The Agent died during the exchange: its last write is stale.
+        let decision = revalidate_after_exchange(
+            Some(requested.clone()),
+            true,
+            || true,
+            || Some(reread(|a| a.updated_ns = 1_000_000_000)),
+            || now,
+        );
+        assert!(decision.agent.is_none());
+        // It became ineligible during the exchange: stricter than before.
+        let decision = revalidate_after_exchange(
+            Some(requested.clone()),
+            true,
+            || true,
+            || Some(reread(|a| a.eligible = false)),
+            || now,
+        );
+        assert!(decision.agent.is_none());
+        // Another generation never substitutes for the requested sample.
+        for change in [
+            (|a: &mut wren_ha::Agent| a.policy = [4; 32]) as fn(&mut wren_ha::Agent),
+            |a| a.agent_boot = [8; 16],
+            |a| a.ready_term = 8,
+            |a| a.coordinator_boot = [1; 16],
+            |a| a.node = 2,
+        ] {
+            let decision = revalidate_after_exchange(
+                Some(requested.clone()),
+                true,
+                || true,
+                || Some(reread(change)),
+                || now,
+            );
+            assert!(decision.agent.is_none(), "another generation was accepted");
+        }
+        // An unreadable file keeps the requested sample's own verdict.
+        let decision =
+            revalidate_after_exchange(Some(requested.clone()), true, || true, || None, || now);
+        assert!(decision.agent.is_none());
+        // The re-read is taken after the health probe, before the clock.
+        let order = std::cell::RefCell::new(Vec::new());
+        revalidate_after_exchange(
+            Some(requested.clone()),
+            true,
+            || {
+                order.borrow_mut().push("health");
+                true
+            },
+            || {
+                order.borrow_mut().push("read");
+                None
+            },
+            || {
+                order.borrow_mut().push("clock");
+                now
+            },
+        );
+        assert_eq!(*order.borrow(), ["health", "read", "clock"]);
     }
 
     #[test]
@@ -1887,6 +2013,7 @@ mod tests {
                 health_finished.set(true);
                 true
             },
+            || None,
             || {
                 assert!(
                     health_finished.get(),
@@ -1913,6 +2040,7 @@ mod tests {
                 }),
                 before,
                 || after,
+                || None,
                 || 1,
             );
             assert_eq!(decision.healthy, before && after);
