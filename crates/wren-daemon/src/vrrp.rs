@@ -1880,7 +1880,8 @@ mod tests {
             (updated_ns + wren_ha::FRESH_NS + 1, false),
             (updated_ns - 1, false),
         ] {
-            let decision = revalidate_after_exchange(Some(accepted.clone()), true, || true, || None, || now);
+            let decision =
+                revalidate_after_exchange(Some(accepted.clone()), true, || true, || None, || now);
             assert_eq!(decision.agent.is_some(), expected);
             if let Some(agent) = decision.agent {
                 assert_eq!(agent.updated_ns, updated_ns);
@@ -1892,11 +1893,15 @@ mod tests {
         }
         // No file read is accepted by this boundary: a missing/rejected request
         // cannot acquire another generation just because the exchange completed.
-        assert!(
-            revalidate_after_exchange(None, true, || true, || Some(accepted.clone()), || updated_ns)
-                .agent
-                .is_none()
-        );
+        assert!(revalidate_after_exchange(
+            None,
+            true,
+            || true,
+            || Some(accepted.clone()),
+            || updated_ns
+        )
+        .agent
+        .is_none());
     }
 
     /// HA-flap (audit 8b6181): the exchange alone may take the whole I/O
@@ -1932,10 +1937,7 @@ mod tests {
             || Some(reread(|_| {})),
             || now,
         );
-        assert_eq!(
-            decision.agent.map(|a| a.updated_ns),
-            Some(now - 10_000_000)
-        );
+        assert_eq!(decision.agent.map(|a| a.updated_ns), Some(now - 10_000_000));
         // The Agent died during the exchange: its last write is stale.
         let decision = revalidate_after_exchange(
             Some(requested.clone()),
