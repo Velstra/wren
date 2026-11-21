@@ -62,7 +62,7 @@ use wren_ospfv3::{
     OPT_E, OPT_R, OPT_V6,
 };
 
-use crate::router::RouteUpdate;
+use crate::router::{Redistribution, RouteUpdate};
 use crate::sockopt::{setsockopt_int, setsockopt_struct};
 
 /// How often (seconds) the housekeeping timer advances dead/wait timers.
@@ -105,8 +105,14 @@ pub struct Ospf3Config {
     /// Interfaces OSPFv3 runs on, each with the area it belongs to.
     pub interfaces: Vec<Ospf3IfaceCfg>,
     /// External destinations to redistribute as AS-external LSAs. A non-empty list
-    /// makes this router an AS boundary router (ASBR).
+    /// makes this router an AS boundary router (ASBR). The configured static routes
+    /// at start; kept current by the central router's redistribution feed
+    /// ([`apply_redistribution`](Ospf::apply_redistribution)) as a reload adds or
+    /// removes them.
     pub redistribute: Vec<RedistRoute>,
+    /// The type-2 metric a route the redistribution feed announces is advertised
+    /// at (`[ospf3] redistribute_metric`, default 20).
+    pub redistribute_metric: u32,
     /// Run BFD (RFC 5880) to each Full neighbour and tear the adjacency down at once
     /// when BFD reports the path failed (RFC 5882), instead of waiting for the dead
     /// interval. `[ospf3] bfd = true`.
@@ -398,9 +404,11 @@ pub fn render_ospf3_interfaces(ifaces: &[Ospf3IfaceInfo]) -> String {
     out
 }
 
+#[allow(clippy::too_many_arguments)] // one channel per cross-cutting input, as OSPFv2
 pub async fn run(
     cfg: Ospf3Config,
     updates: mpsc::Sender<RouteUpdate>,
+    mut redist: mpsc::Receiver<Redistribution>,
     mut queries: mpsc::Receiver<Ospf3QueryRequest>,
     bfd_register: mpsc::Sender<crate::bfd::BfdCommand>,
     bfd_notify: mpsc::Sender<IpAddr>,
@@ -559,6 +567,9 @@ pub async fn run(
             }
             _ = rxmt.tick() => {
                 ospf.retransmit_pending().await;
+            }
+            Some(r) = redist.recv() => {
+                ospf.apply_redistribution(r).await;
             }
             Some(req) = queries.recv() => {
                 let resp = match req.query {
@@ -1470,12 +1481,12 @@ impl Ospf {
         !self.cfg.redistribute.is_empty()
     }
 
-    /// Build and install this ASBR's AS-external LSAs into the AS-wide database.
-    fn originate_externals(&mut self) {
-        if self.cfg.redistribute.is_empty() {
-            return;
-        }
+    /// Build and install this ASBR's AS-external LSAs into the AS-wide database,
+    /// and flush (MaxAge) the ones it no longer redistributes. Returns every LSA
+    /// installed, fresh or flushed, for a caller that floods them.
+    fn originate_externals(&mut self) -> Vec<Lsa> {
         let mut want = HashSet::new();
+        let mut changed = Vec::new();
         for r in 0..self.cfg.redistribute.len() {
             let prefix = self.cfg.redistribute[r].prefix;
             let metric = self.cfg.redistribute[r].metric;
@@ -1497,11 +1508,49 @@ impl Ospf {
             };
             let key = lsa.key();
             lsa.header.ls_seq = self.next_seq(AS_SCOPE, key);
-            self.external_lsdb.install(lsa);
+            self.external_lsdb.install(lsa.clone());
             want.insert(key);
+            changed.push(lsa);
             info!(prefix = %prefix, metric, "OSPFv3 redistributing external route");
         }
+        // Age out what we no longer originate, AS-wide, so neighbours drop it now
+        // rather than at MaxAge.
+        for key in retired_externals(&self.originated_externals, &want) {
+            if let Some(mut lsa) = self.external_lsdb.get(&key).cloned() {
+                lsa.header.ls_age = MAX_AGE;
+                lsa.header.ls_seq = self.next_seq(AS_SCOPE, key);
+                self.external_lsdb.install(lsa.clone());
+                changed.push(lsa);
+            }
+        }
         self.originated_externals = want;
+        changed
+    }
+
+    /// Fold a redistribution change from the central router into the external
+    /// set, then re-originate and flood. Until this existed OSPFv3 redistributed
+    /// only the static routes configured when the engine started: a reload that
+    /// removed one left its AS-external LSA in every neighbour's database, and one
+    /// that added a static was not advertised. When the ASBR status flips (first
+    /// external added / last removed) the Router-LSA's E-bit changes, so it is
+    /// re-originated too.
+    async fn apply_redistribution(&mut self, r: Redistribution) {
+        let was_asbr = self.is_asbr();
+        let metric = self.cfg.redistribute_metric;
+        if !fold_redistribution(&mut self.cfg.redistribute, r, metric) {
+            return;
+        }
+        for lsa in self.originate_externals() {
+            if lsa.header.ls_age == MAX_AGE {
+                info!(lsid = %lsa.header.link_state_id, "OSPFv3 withdrawing redistributed external route");
+            }
+            self.flood_external_except(&lsa, Ipv6Addr::UNSPECIFIED)
+                .await;
+        }
+        if self.is_asbr() != was_asbr {
+            self.reoriginate_and_flood().await;
+        }
+        self.run_spf_and_announce().await;
     }
 
     /// A header for an LSA we originate (sequence/checksum/length filled later).
@@ -2508,6 +2557,44 @@ fn shutdown_lsas<'a>(router_id: Ipv4Addr, lsas: impl Iterator<Item = &'a Lsa>) -
         .collect()
 }
 
+/// Apply one redistribution message to the external set; whether it changed.
+/// OSPFv3 carries IPv6 only, so an IPv4 announcement is ignored, and a withdraw
+/// for a prefix this router does not redistribute is a no-op (the router sends
+/// one for every best-path change a target does not redistribute).
+fn fold_redistribution(set: &mut Vec<RedistRoute>, r: Redistribution, metric: u32) -> bool {
+    match r {
+        Redistribution::Announce(route) => {
+            if route.prefix.is_ipv4() {
+                return false;
+            }
+            match set.iter_mut().find(|e| e.prefix == route.prefix) {
+                Some(e) if e.metric == metric => false,
+                Some(e) => {
+                    e.metric = metric;
+                    true
+                }
+                None => {
+                    set.push(RedistRoute {
+                        prefix: route.prefix,
+                        metric,
+                    });
+                    true
+                }
+            }
+        }
+        Redistribution::Withdraw(prefix) => {
+            let before = set.len();
+            set.retain(|e| e.prefix != prefix);
+            set.len() != before
+        }
+    }
+}
+
+/// The external LSAs originated before that are no longer wanted.
+fn retired_externals(before: &HashSet<LsaKey>, want: &HashSet<LsaKey>) -> Vec<LsaKey> {
+    before.difference(want).copied().collect()
+}
+
 fn retired_self_external(router_id: Ipv4Addr, originated: bool, lsa: &Lsa) -> Option<Lsa> {
     if originated
         || lsa.header.advertising_router != router_id
@@ -2523,6 +2610,61 @@ fn retired_self_external(router_id: Ipv4Addr, originated: bool, lsa: &Lsa) -> Op
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn v6_static(prefix: &str) -> wren_core::Route {
+        wren_core::Route::new(
+            prefix.parse().unwrap(),
+            wren_core::Protocol::Static,
+            vec![wren_core::NextHop::via("2001:db8::9".parse().unwrap())],
+            0,
+        )
+    }
+
+    /// The external set follows the router's feed: a static removed by a reload
+    /// leaves it, one added joins it at the configured metric, and what OSPFv3
+    /// cannot carry or never redistributed changes nothing.
+    #[test]
+    fn redistribution_feed_adds_and_withdraws_externals() {
+        let mut set = vec![RedistRoute {
+            prefix: "2001:db8:11::/64".parse().unwrap(),
+            metric: 20,
+        }];
+        let withdraw = |p: &str| Redistribution::Withdraw(p.parse().unwrap());
+        assert!(fold_redistribution(
+            &mut set,
+            withdraw("2001:db8:11::/64"),
+            20
+        ));
+        assert!(set.is_empty());
+        assert!(!fold_redistribution(
+            &mut set,
+            withdraw("2001:db8:11::/64"),
+            20
+        ));
+        let announce = Redistribution::Announce(v6_static("2001:db8:11::/64"));
+        assert!(fold_redistribution(&mut set, announce.clone(), 20));
+        assert!(!fold_redistribution(&mut set, announce.clone(), 20));
+        assert!(fold_redistribution(&mut set, announce, 30));
+        assert_eq!(set.len(), 1);
+        assert_eq!(set[0].metric, 30);
+        let v4 = Redistribution::Announce(wren_core::Route::new(
+            "198.51.100.0/24".parse().unwrap(),
+            wren_core::Protocol::Static,
+            vec![wren_core::NextHop::via("192.0.2.1".parse().unwrap())],
+            0,
+        ));
+        assert!(!fold_redistribution(&mut set, v4, 20));
+        assert_eq!(set.len(), 1);
+    }
+
+    #[test]
+    fn externals_no_longer_wanted_are_retired() {
+        let key = |id: [u8; 4]| router_lsa(id, [1; 4], 1).key();
+        let before = HashSet::from([key([1; 4]), key([2; 4])]);
+        let want = HashSet::from([key([2; 4])]);
+        assert_eq!(retired_externals(&before, &want), vec![key([1; 4])]);
+        assert!(retired_externals(&want, &want).is_empty());
+    }
 
     #[test]
     fn only_retired_self_externals_are_purged_after_restart() {

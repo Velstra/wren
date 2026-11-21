@@ -8,6 +8,14 @@ follows [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **OSPFv3 redistribution follows a reload.** `[ospf3] redistribute_static`
+  advertised the static routes configured when the engine started and nothing
+  else: a reload that removed one left its AS-external LSA in every
+  neighbour's database (and the route in their FIBs), and one that added a
+  static was never advertised. OSPFv3 now takes the central router's
+  redistribution feed, as OSPFv2 and the other IGPs do, and originates or
+  flushes (MaxAge) the external LSA as the static comes and goes, without
+  restarting the engine or its adjacencies.
 - **OSPFv3 no longer installs routes for directly attached prefixes.** A
   prefix on a link the router sits on (two routers on one shared /64, or the
   router's own) came out of the SPF with no next hop and was handed to the
