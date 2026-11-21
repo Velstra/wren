@@ -1540,7 +1540,7 @@ async fn main() -> Result<()> {
             }
             Ok(()) = reload_progress.changed() => {
                 let progress = reload_progress.borrow_and_update().clone();
-                if progress.state == "converged"
+                if progress.is_complete()
                     && deferred_reload.as_ref().is_some_and(|(generation, _)| *generation == progress.generation) {
                     let (_, reloaded) = deferred_reload.take().expect("checked pending generation");
                     apply_protocol_reload(reloaded, &bgp_reload_tx, bgp_reconfig_enabled,

@@ -18,6 +18,18 @@ follows [Semantic Versioning](https://semver.org/).
   them — and a link-local next hop whose interface cannot be named is dropped
   rather than installed unpinned. `wren_ospfv3::spf::SpfRoute::to_route` now
   returns `Option<Route>`.
+- **A route the kernel refuses no longer holds every routing reload open.** A
+  reload completed only when every prefix was in the kernel, so one refused
+  learned route (any protocol) kept each new generation `pending`: `wren
+  reload` timed out after 30 s, deferred protocol reconfiguration never ran,
+  and every Sentinel commit failed while it lasted. A reconciliation pass that
+  completes with only learned routes refused now settles as `degraded` — the
+  configuration is applied, the refused routes are retried every reconcile
+  tick — and `wren reload` succeeds. A refused configured static route still
+  keeps the generation `pending`, as the operator's own change is not in the
+  kernel. Receipts and `show reload` name each refused route on a
+  `failed-route <table> <prefix> <protocol>` line (at most 16, the rest
+  counted), including the receipt a timed-out reload prints.
 - **OSPFv2/v3 withdraw their own LSAs on a normal shutdown.** Configuration
   restarts now flood MaxAge instances at the original link, area and AS scopes,
   then accept acknowledgments and retry within a bounded shutdown window.
