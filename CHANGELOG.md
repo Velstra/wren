@@ -8,6 +8,16 @@ follows [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **OSPFv3 no longer installs routes for directly attached prefixes.** A
+  prefix on a link the router sits on (two routers on one shared /64, or the
+  router's own) came out of the SPF with no next hop and was handed to the
+  kernel as a route with neither a gateway nor an interface. Netlink refused
+  it ("route nexthop has neither gateway nor interface"), the router retried it
+  forever, and every routing reload stayed pending. Such prefixes are now left
+  out, as OSPFv2 and IS-IS already did — the kernel's connected route covers
+  them — and a link-local next hop whose interface cannot be named is dropped
+  rather than installed unpinned. `wren_ospfv3::spf::SpfRoute::to_route` now
+  returns `Option<Route>`.
 - **OSPFv2/v3 withdraw their own LSAs on a normal shutdown.** Configuration
   restarts now flood MaxAge instances at the original link, area and AS scopes,
   then accept acknowledgments and retry within a bounded shutdown window.

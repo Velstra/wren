@@ -1874,7 +1874,6 @@ impl Ospf {
             chosen.entry(r.prefix).or_insert(r);
         }
 
-        let new_prefixes: HashSet<Prefix> = chosen.keys().copied().collect();
         // Map each SPF-computed Interface ID (the ifindex) to its interface name,
         // so `to_route` can pin every link-local next hop to an outgoing device —
         // a v6 route with a fe80:: gateway and no RTA_OIF is rejected by netlink.
@@ -1883,8 +1882,24 @@ impl Ospf {
             .iter()
             .map(|i| (i.interface_id, i.name.clone()))
             .collect();
-        for r in chosen.values() {
-            let route = r.to_route(|id| iface_name.get(&id).cloned());
+        // A directly attached prefix (a link this router sits on, or its own)
+        // has no next hop and yields no route: the kernel's connected route
+        // covers it, and the FIB refuses a route with neither a gateway nor an
+        // interface — which used to keep every routing reload pending. It is
+        // also left out of the announced set, so one that was reachable through
+        // a neighbour before is withdrawn.
+        let routes: Vec<_> = chosen
+            .values()
+            .filter_map(|r| {
+                let route = r.to_route(|id| iface_name.get(&id).cloned());
+                if route.is_none() {
+                    debug!(prefix = %r.prefix, cost = r.cost, "OSPFv3 route has no installable next hop (directly attached or unresolved); not installed");
+                }
+                route
+            })
+            .collect();
+        let new_prefixes: HashSet<Prefix> = routes.iter().map(|r| r.prefix).collect();
+        for route in routes {
             let _ = self.updates.send(RouteUpdate::Announce(route)).await;
         }
         let gone: Vec<Prefix> = self.announced.difference(&new_prefixes).copied().collect();
