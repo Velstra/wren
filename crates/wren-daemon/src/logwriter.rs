@@ -24,8 +24,22 @@ use std::time::{Duration, Instant};
 
 use tracing_subscriber::fmt::MakeWriter;
 
-/// Lines held while the output is blocked before new ones are dropped.
+/// Lines held while the output is blocked before new ones are dropped,
+/// unless `WREN_LOG_QUEUE_LINES` says otherwise.
 pub const QUEUE_LINES: usize = 4096;
+
+/// The accepted range of `WREN_LOG_QUEUE_LINES`.
+const QUEUE_LINES_RANGE: std::ops::RangeInclusive<usize> = 1..=65_536;
+
+/// The queue size from `WREN_LOG_QUEUE_LINES`, clamped; the default when
+/// unset or unparsable.
+pub fn queue_lines(setting: Option<&str>) -> usize {
+    setting
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .map_or(QUEUE_LINES, |lines| {
+            lines.clamp(*QUEUE_LINES_RANGE.start(), *QUEUE_LINES_RANGE.end())
+        })
+}
 
 /// Log lines dropped because the output was blocked, since start.
 static DROPPED: AtomicU64 = AtomicU64::new(0);
@@ -50,9 +64,10 @@ pub struct LossyStdout {
 }
 
 impl LossyStdout {
-    /// A writer for the process's stdout.
+    /// A writer for the process's stdout, sized by `WREN_LOG_QUEUE_LINES`.
     pub fn stdout() -> Self {
-        Self::new(io::stdout(), QUEUE_LINES)
+        let lines = queue_lines(std::env::var("WREN_LOG_QUEUE_LINES").ok().as_deref());
+        Self::new(io::stdout(), lines)
     }
 
     /// A writer that drains into `out` on its own thread, holding at most
@@ -262,6 +277,16 @@ mod tests {
         assert!(text
             .lines()
             .all(|l| l.starts_with("line ") || l.starts_with("wren: ") || l == "after the stall"));
+    }
+
+    #[test]
+    fn the_queue_size_setting_is_clamped_and_defaults() {
+        assert_eq!(queue_lines(None), QUEUE_LINES);
+        assert_eq!(queue_lines(Some("nonsense")), QUEUE_LINES);
+        assert_eq!(queue_lines(Some("0")), 1);
+        assert_eq!(queue_lines(Some("1")), 1);
+        assert_eq!(queue_lines(Some(" 100 ")), 100);
+        assert_eq!(queue_lines(Some("10000000")), 65_536);
     }
 
     /// An event written in several pieces reaches the output as one line.

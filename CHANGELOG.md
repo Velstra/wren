@@ -17,7 +17,8 @@ follows [Semantic Versioning](https://semver.org/).
   drained by a dedicated writer thread; while the output is blocked new lines
   are dropped instead of waited for, counted in the new metric
   `wren_log_lines_dropped_total`, and reported on the log as soon as it
-  drains. A daemon exit waits up to 500 ms for the queued lines.
+  drains. A daemon exit waits up to 500 ms for the queued lines. The queue
+  size can be set with `WREN_LOG_QUEUE_LINES` (1–65536).
 - **OSPFv3 redistribution follows a reload.** `[ospf3] redistribute_static`
   advertised the static routes configured when the engine started and nothing
   else: a reload that removed one left its AS-external LSA in every
