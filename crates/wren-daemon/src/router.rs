@@ -1055,6 +1055,18 @@ pub fn render_router_metrics(rib: &Rib) -> String {
     for (proto, n) in &counts {
         crate::metrics::sample(&mut out, "wren_rib_routes", &[("protocol", proto)], n);
     }
+    crate::metrics::family(
+        &mut out,
+        "wren_log_lines_dropped_total",
+        "Log lines dropped because the log output (journald) was not reading.",
+        "counter",
+    );
+    crate::metrics::sample(
+        &mut out,
+        "wren_log_lines_dropped_total",
+        &[],
+        crate::logwriter::dropped(),
+    );
     out
 }
 
@@ -1951,6 +1963,7 @@ mod tests {
         let out = render_router_metrics(&h.rib);
         assert!(out.contains("# TYPE wren_rib_routes gauge"));
         assert!(out.contains("wren_rib_routes{protocol=\"bgp\"} 2"));
+        assert!(out.contains("# TYPE wren_log_lines_dropped_total counter"));
         assert!(out.contains("wren_rib_routes{protocol=\"static\"} 1"));
         // An empty RIB still emits the family header, with no samples.
         let empty = render_router_metrics(&Rib::new());

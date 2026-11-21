@@ -23,6 +23,7 @@ mod fib;
 mod igmp;
 #[cfg(feature = "isis")]
 mod isis;
+mod logwriter;
 mod metrics;
 #[cfg(feature = "igmp")]
 mod mld;
@@ -263,11 +264,17 @@ async fn main() -> Result<()> {
         return igmp::mcast_join_blocking(g, iface);
     }
 
+    // Logging must never block the daemon: a journal that stops reading would
+    // otherwise stall every task that logs, the HA lease renewals included
+    // (see `logwriter`).
+    let log = logwriter::LossyStdout::stdout();
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
         )
+        .with_writer(log.clone())
         .init();
+    let _flush_log = logwriter::FlushOnExit(log);
 
     // Supervision: each routing protocol runs in its own spawned task. With
     // unwinding (no panic=abort, see the workspace Cargo.toml), a panic in one

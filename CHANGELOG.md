@@ -8,6 +8,16 @@ follows [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **Logging no longer blocks the daemon.** Log lines were written straight to
+  stdout, a pipe to journald under systemd. When journald stopped reading
+  (synchronous console forwarding, disk pressure, rate limiting) every task
+  that logged blocked on the stdout lock — the HA lease coordinator included,
+  so its 25 ms renewals stalled past the 250 ms witness lease and the pair
+  failed over with no fault. Lines now go through a bounded queue (4096 lines)
+  drained by a dedicated writer thread; while the output is blocked new lines
+  are dropped instead of waited for, counted in the new metric
+  `wren_log_lines_dropped_total`, and reported on the log as soon as it
+  drains. A daemon exit waits up to 500 ms for the queued lines.
 - **OSPFv3 redistribution follows a reload.** `[ospf3] redistribute_static`
   advertised the static routes configured when the engine started and nothing
   else: a reload that removed one left its AS-external LSA in every
