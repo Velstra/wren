@@ -29,6 +29,10 @@ struct Cache {
     policy: String,
     authority: Authority,
     endpoints: Vec<Endpoint>,
+    /// The previous owner's wall clock (see [`crate::clock`]); absent from a
+    /// cold baseline and from agents that do not replicate it.
+    #[serde(default)]
+    peer_clock: Option<crate::clock::PeerClock>,
 }
 impl Cache {
     fn validate(&self, config: &Config, role: &Role) -> Result<()> {
@@ -169,6 +173,7 @@ pub async fn promote(config: Config, role: Role) -> Result<()> {
             None
         }
     };
+    align_clock(cache.as_ref().and_then(|c| c.peer_clock));
     for interface in &config.wireguard {
         ensure!(
             !interface.is_empty()
@@ -219,6 +224,68 @@ pub async fn promote(config: Config, role: Role) -> Result<()> {
     }
     Ok(())
 }
+/// Where the last clock decision is recorded for `sentinel show ha` and health.
+const CLOCK_STATUS: &str = "/run/velstra/ha/clock.json";
+
+#[derive(Serialize)]
+struct ClockStatus {
+    #[serde(flatten)]
+    decision: crate::clock::Decision,
+    /// CLOCK_REALTIME before and after a step, in ns.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stepped: Option<(u64, u64)>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
+/// Bring this member's wall clock up to the previous owner's before it
+/// initiates WireGuard handshakes (see [`crate::clock`]). Never fails the
+/// promotion: a clock it cannot or must not step is reported, not fatal.
+fn align_clock(peer: Option<crate::clock::PeerClock>) {
+    use crate::clock::{decide, step_forward, synchronised, wall_ns, Decision};
+    let decision = match wall_ns() {
+        Ok(wall) => decide(peer, wall, crate::now_ns(), synchronised()),
+        Err(_) => Decision::Unknown {
+            reason: "the wall clock cannot be read",
+        },
+    };
+    let mut status = ClockStatus {
+        decision,
+        stepped: None,
+        error: None,
+    };
+    match decision {
+        Decision::Step { behind_ns } => match step_forward(behind_ns) {
+            Ok((old, new)) => {
+                tracing::warn!(
+                    old_ns = old,
+                    new_ns = new,
+                    behind_ms = behind_ns / 1_000_000,
+                    "HA promotion: stepped the wall clock forward to the previous owner's so WireGuard handshakes are not rejected as replays"
+                );
+                status.stepped = Some((old, new));
+            }
+            Err(error) => {
+                tracing::warn!(
+                    behind_ms = behind_ns / 1_000_000,
+                    error = format_args!("{error:#}"),
+                    "clock behind HA peer; stepping it failed, WireGuard tunnels may stall until NTP corrects it"
+                );
+                status.error = Some(format!("{error:#}"));
+            }
+        },
+        Decision::Refuse { behind_ns, reason } => tracing::warn!(
+            behind_ms = behind_ns / 1_000_000,
+            reason,
+            "clock behind HA peer, not stepped; WireGuard tunnels may stall until NTP corrects it"
+        ),
+        Decision::InStep | Decision::Unknown { .. } => {}
+    }
+    if let Err(error) = write_private(Path::new(CLOCK_STATUS), &status, false) {
+        tracing::warn!(error = format_args!("{error:#}"), "recording the HA clock decision failed");
+    }
+}
+
 fn restore_keepalive(original: &str, promoted: &str) -> Result<String> {
     let originals: Vec<_> = original.split("[Peer]").skip(1).collect();
     let mut sections = promoted.split("[Peer]");
@@ -283,6 +350,7 @@ mod tests {
                 ..Authority::default()
             },
             endpoints: vec![],
+            peer_clock: None,
         };
         cache.validate(&config, &role).unwrap();
         config.wireguard_policy = "changed-identity".into();
@@ -296,6 +364,22 @@ mod tests {
         cache.node = 1;
         cache.cluster = "another-cluster".into();
         assert!(cache.validate(&config, &role).is_err());
+    }
+    #[test]
+    fn the_agents_snapshot_with_its_peer_clock_parses() {
+        // The exact shape velstra's ha::wireguard::publish writes.
+        let cache: Cache = serde_json::from_str(
+            r#"{"cluster":"c","node":1,"policy":"p","authority":{"term":1,"owner":1,"boot":[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],"policy":[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]},"endpoints":[],"peer_clock":{"wall_ns":5,"synchronised":true,"observed_ns":7}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            cache.peer_clock,
+            Some(crate::clock::PeerClock {
+                wall_ns: 5,
+                synchronised: true,
+                observed_ns: 7
+            })
+        );
     }
     #[test]
     fn promotion_reuses_identity_updates_only_known_peer_and_restores_keepalive() {
@@ -326,6 +410,7 @@ mod tests {
                     family: 4,
                 },
             ],
+            peer_clock: None,
         };
         let promoted = promotion_config(&original, "wg0", Some(&cache)).unwrap();
         assert!(promoted.contains("PrivateKey = private"));

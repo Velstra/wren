@@ -14,3 +14,4 @@ serde_json = "1"
 tokio = { workspace = true, features = ["process"] }
 ring = "0.17.14"
 libc = "0.2"
+tracing.workspace = true
