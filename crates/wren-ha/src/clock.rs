@@ -28,19 +28,29 @@
 //! The step itself is not taken by Wren. Wren parses untrusted routing
 //! protocols and must not hold CAP_SYS_TIME. It connects to [`SOCKET`], and
 //! the `wren-ha-clock-step` helper, which holds that capability and nothing
-//! else, reads the replicated clock itself and runs [`align`]. Wren sends
-//! nothing, so the most a compromised Wren can trigger is a step these rules
-//! allow.
+//! else, runs [`align`]. What Wren can and cannot do through it:
+//! - Wren sends nothing. The helper reads the predecessor's clock from
+//!   [`PEER`], which the agent publishes in a directory Wren's unit cannot
+//!   see, so Wren can neither choose nor forge the reading.
+//! - Wren can only trigger a decision on the agent's reading. Requests run
+//!   one at a time under a lock, and each re-reads the wall clock under the
+//!   lock, so two requests never add the same lag twice.
+//! - All steps of a boot together never exceed [`MAX_BOOT_STEP_NS`]. The
+//!   helper keeps that budget in [`STATE_DIR`], which Wren also cannot see.
 use anyhow::{ensure, Context, Result};
 use serde::{Deserialize, Serialize};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
-/// The helper's socket (systemd socket activation, one instance per request).
+/// The helper's socket (systemd socket activation, one request at a time).
 pub const SOCKET: &str = "/run/velstra-ha-clock.sock";
-/// The agent's replicated WireGuard snapshot, with `peer_clock`.
-pub const SNAPSHOT: &str = "/run/velstra/ha/wireguard.json";
-/// The last decision, for `sentinel show health`.
-pub const STATUS: &str = "/run/velstra/ha/clock.json";
+/// The predecessor's clock as the agent publishes it (velstra
+/// `ha::wireguard::publish_clock`), outside Wren's view.
+pub const PEER: &str = "/run/velstra/ha-clock/peer.json";
+/// The helper's own state: the lock, the per-boot budget and the last
+/// decision (read by `sentinel show health`). Outside Wren's view.
+pub const STATE_DIR: &str = "/run/velstra-ha-clock-step";
+/// All forward steps of one boot together (10 min). /run is per boot.
+pub const MAX_BOOT_STEP_NS: u64 = 600_000_000_000;
 
 /// A lag below this is left alone: it is within handshake timing noise.
 pub const STEP_THRESHOLD_NS: u64 = 100_000_000;
@@ -135,7 +145,7 @@ pub fn decide(
     Decision::Step { behind_ns }
 }
 
-/// One decision as recorded in [`STATUS`] and returned to Wren.
+/// One decision as recorded in the helper's status file and returned to Wren.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Status {
     /// `step`, `in-step`, `refuse` or `unknown`.
@@ -152,6 +162,11 @@ pub struct Status {
     pub error: Option<String>,
     /// Whether this member's clock was NTP-synchronised when it decided.
     pub local_synchronised: bool,
+    /// The latest refusal or failed step that nothing has settled since. A
+    /// later unknown decision keeps it; only a step, or an in-step decision on
+    /// a fresh reading, clears it. This is what `sentinel show health` reports.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unresolved: Option<Box<Status>>,
 }
 
 impl Status {
@@ -169,7 +184,28 @@ impl Status {
             stepped: None,
             error: None,
             local_synchronised,
+            unresolved: None,
         }
+    }
+
+    /// Whether this decision left a lag standing (a refusal or a failed step).
+    fn leaves_lag(&self) -> bool {
+        self.action == "refuse" || (self.action == "step" && self.stepped.is_none())
+    }
+
+    /// Carry the outstanding lag forward from the `previous` record.
+    fn settle(mut self, previous: Option<Status>) -> Self {
+        self.unresolved = if self.leaves_lag() {
+            Some(Box::new(Status {
+                unresolved: None,
+                ..self.clone()
+            }))
+        } else if self.action == "unknown" {
+            previous.and_then(|p| p.unresolved)
+        } else {
+            None
+        };
+        self
     }
 
     /// The helper's reply and record, as JSON.
@@ -202,24 +238,125 @@ impl Status {
     }
 }
 
-/// The replicated peer clock in the agent's snapshot. Only `peer_clock` is
-/// read; the rest of the snapshot is Wren's business.
-pub fn read_peer_clock(path: &Path) -> Result<Option<PeerClock>> {
-    #[derive(Deserialize)]
-    struct Snapshot {
-        #[serde(default)]
-        peer_clock: Option<PeerClock>,
-    }
-    Ok(crate::read_private::<Snapshot>(path)?.peer_clock)
+fn not_found(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<std::io::Error>()
+        .is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound)
 }
 
-/// Decide from the replicated clock at `snapshot` and act: step when the rules
-/// allow it, and record the decision at `status`. Never fails: whatever goes
+/// The predecessor's clock as the agent published it; `None` when there is
+/// none (the agent removes the file when it has no predecessor's reading).
+pub fn read_peer_clock(path: &Path) -> Result<Option<PeerClock>> {
+    match crate::read_private::<PeerClock>(path) {
+        Ok(clock) => Ok(Some(clock)),
+        Err(error) if not_found(&error) => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+/// The clocks [`align`] reads and steps; a trait so tests can run it without
+/// CAP_SYS_TIME.
+pub trait Clocks {
+    fn wall_ns(&self) -> Result<u64>;
+    fn boot_ns(&self) -> u64;
+    fn synchronised(&self) -> bool;
+    fn step_forward(&self, behind_ns: u64) -> Result<(u64, u64)>;
+}
+
+/// This machine's clocks.
+pub struct SystemClocks;
+impl Clocks for SystemClocks {
+    fn wall_ns(&self) -> Result<u64> {
+        wall_ns()
+    }
+    fn boot_ns(&self) -> u64 {
+        crate::now_ns()
+    }
+    fn synchronised(&self) -> bool {
+        synchronised()
+    }
+    fn step_forward(&self, behind_ns: u64) -> Result<(u64, u64)> {
+        step_forward(behind_ns)
+    }
+}
+
+/// Where [`align`] reads and keeps its state.
+pub struct Paths {
+    pub peer: PathBuf,
+    pub state: PathBuf,
+}
+impl Default for Paths {
+    fn default() -> Self {
+        Self {
+            peer: PEER.into(),
+            state: STATE_DIR.into(),
+        }
+    }
+}
+impl Paths {
+    pub fn status(&self) -> PathBuf {
+        self.state.join("status.json")
+    }
+    fn budget(&self) -> PathBuf {
+        self.state.join("budget.json")
+    }
+    fn lock(&self) -> PathBuf {
+        self.state.join("lock")
+    }
+}
+
+#[derive(Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct Budget {
+    /// Forward steps taken this boot, in ns.
+    spent_ns: u64,
+}
+
+/// Hold the helper's lock (flock on a file in its own directory).
+fn lock(path: &Path) -> Result<std::fs::File> {
+    use std::os::{fd::AsRawFd, unix::fs::OpenOptionsExt};
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)?;
+    // SAFETY: flock on a descriptor this function owns.
+    ensure!(
+        unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } == 0,
+        "locking the clock-step state failed: {}",
+        std::io::Error::last_os_error()
+    );
+    Ok(file)
+}
+
+/// Decide from the agent's published reading and act: step when the rules and
+/// the per-boot budget allow it, and record the decision. One request at a
+/// time: the decision is taken under the lock, on a wall clock read under it,
+/// so a second request sees the first one's step. Never fails: whatever goes
 /// wrong is part of the returned status.
-pub fn align(snapshot: &Path, status: &Path) -> Status {
-    let local_synchronised = synchronised();
-    let decision = match (read_peer_clock(snapshot), wall_ns()) {
-        (Ok(peer), Ok(wall)) => decide(peer, wall, crate::now_ns(), local_synchronised),
+pub fn align(paths: &Paths, clocks: &dyn Clocks) -> Status {
+    let held = std::fs::create_dir_all(&paths.state)
+        .map_err(anyhow::Error::from)
+        .and_then(|()| lock(&paths.lock()));
+    let _guard = match held {
+        Ok(file) => file,
+        Err(error) => {
+            return Status {
+                error: Some(format!("{error:#}")),
+                ..Status::of(
+                    Decision::Unknown {
+                        reason: "the clock-step state is unavailable",
+                    },
+                    clocks.synchronised(),
+                )
+            }
+        }
+    };
+    let local_synchronised = clocks.synchronised();
+    let decision = match (read_peer_clock(&paths.peer), clocks.wall_ns()) {
+        (Ok(peer), Ok(wall)) => decide(peer, wall, clocks.boot_ns(), local_synchronised),
         (Err(_), _) => Decision::Unknown {
             reason: "the replicated peer clock cannot be read",
         },
@@ -227,21 +364,48 @@ pub fn align(snapshot: &Path, status: &Path) -> Status {
             reason: "the wall clock cannot be read",
         },
     };
+    // A budget that exists but cannot be read counts as spent.
+    let budget = match crate::read_private::<Budget>(&paths.budget()) {
+        Ok(budget) => Some(budget),
+        Err(error) if not_found(&error) => Some(Budget::default()),
+        Err(_) => None,
+    };
+    let decision = match (decision, &budget) {
+        (Decision::Step { behind_ns }, Some(b))
+            if b.spent_ns.saturating_add(behind_ns) <= MAX_BOOT_STEP_NS =>
+        {
+            decision
+        }
+        (Decision::Step { behind_ns }, _) => Decision::Refuse {
+            behind_ns,
+            reason: "the per-boot step budget (10 min) is spent",
+        },
+        (other, _) => other,
+    };
     let mut result = Status::of(decision, local_synchronised);
     if let Decision::Step { behind_ns } = decision {
-        match step_forward(behind_ns) {
-            Ok(times) => result.stepped = Some(times),
+        match clocks.step_forward(behind_ns) {
+            Ok(times) => {
+                result.stepped = Some(times);
+                let spent = Budget {
+                    spent_ns: budget.map_or(0, |b| b.spent_ns).saturating_add(behind_ns),
+                };
+                if let Err(error) = crate::write_private(&paths.budget(), &spent, false) {
+                    result.error = Some(format!("recording the step budget failed: {error:#}"));
+                }
+            }
             Err(error) => result.error = Some(format!("{error:#}")),
         }
     }
-    if let Err(error) = crate::write_private(status, &result, false) {
+    let previous = crate::read_private::<Status>(&paths.status()).ok();
+    let mut result = result.settle(previous);
+    if let Err(error) = crate::write_private(&paths.status(), &result, false) {
         result
             .error
             .get_or_insert(format!("recording the decision failed: {error:#}"));
     }
     result
 }
-
 /// This member's CLOCK_REALTIME in ns.
 pub fn wall_ns() -> Result<u64> {
     let mut time = libc::timespec {
@@ -493,32 +657,187 @@ mod tests {
         );
     }
 
+    /// A clock under test control: the wall clock moves only by its steps
+    /// (each read waits `lag`, to widen any race), and every step is counted.
+    struct FakeClocks {
+        wall: std::sync::Mutex<u64>,
+        steps: std::sync::atomic::AtomicUsize,
+        boot: u64,
+        lag: std::time::Duration,
+    }
+    impl Clocks for FakeClocks {
+        fn wall_ns(&self) -> Result<u64> {
+            let wall = *self.wall.lock().unwrap();
+            std::thread::sleep(self.lag);
+            Ok(wall)
+        }
+        fn boot_ns(&self) -> u64 {
+            self.boot
+        }
+        fn synchronised(&self) -> bool {
+            false
+        }
+        fn step_forward(&self, behind_ns: u64) -> Result<(u64, u64)> {
+            let mut wall = self.wall.lock().unwrap();
+            let old = *wall;
+            *wall += behind_ns;
+            self.steps.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok((old, *wall))
+        }
+    }
+
+    fn fake(wall: u64) -> FakeClocks {
+        FakeClocks {
+            wall: std::sync::Mutex::new(wall),
+            steps: std::sync::atomic::AtomicUsize::new(0),
+            boot: 100 * S,
+            lag: std::time::Duration::ZERO,
+        }
+    }
+
+    fn steps(clocks: &FakeClocks) -> usize {
+        clocks.steps.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// A private directory for one test, holding the agent's reading and the
+    /// helper's state the way write_private and read_private require them.
+    struct Scratch {
+        root: PathBuf,
+        paths: Paths,
+    }
+    impl Scratch {
+        fn new(name: &str) -> Self {
+            use std::os::unix::fs::PermissionsExt;
+            let root =
+                std::env::temp_dir().join(format!("wren-clock-{name}-{}", std::process::id()));
+            for dir in [root.clone(), root.join("agent"), root.join("state")] {
+                std::fs::create_dir_all(&dir).unwrap();
+                std::fs::set_permissions(&dir, PermissionsExt::from_mode(0o700)).unwrap();
+            }
+            let paths = Paths {
+                peer: root.join("agent/peer.json"),
+                state: root.join("state"),
+            };
+            Self { root, paths }
+        }
+        fn publish(&self, wall_ns: u64, observed_ns: u64) {
+            let clock = PeerClock {
+                wall_ns,
+                synchronised: false,
+                observed_ns,
+            };
+            crate::write_private(&self.paths.peer, &clock, false).unwrap();
+        }
+    }
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
     #[test]
-    fn align_reads_the_agents_snapshot_and_records_unknown_when_it_is_missing() {
-        let dir = std::env::temp_dir().join(format!("wren-clock-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        // write_private refuses a group- or world-writable directory.
-        std::fs::set_permissions(&dir, std::os::unix::fs::PermissionsExt::from_mode(0o700))
-            .unwrap();
-        let status_path = dir.join("clock.json");
-        let status = align(&dir.join("absent.json"), &status_path);
-        assert_eq!(status.action, "unknown");
-        assert_eq!(
-            status.reason.as_deref(),
-            Some("the replicated peer clock cannot be read")
-        );
-        let recorded: Status = crate::read_private(&status_path).unwrap();
-        assert_eq!(recorded, status);
-        // A snapshot without a peer clock (a cold baseline) is also unknown.
-        let snapshot = dir.join("wireguard.json");
+    fn align_steps_on_the_agents_reading_and_ignores_a_snapshot_wren_can_write() {
+        let scratch = Scratch::new("source");
+        let clocks = fake(1_000 * S);
+        // A peer_clock in Wren's writable /run/velstra/ha/wireguard.json is
+        // never read: only the agent's own file counts, and there is none yet.
         crate::write_private(
-            &snapshot,
-            &serde_json::json!({"cluster": "c", "endpoints": []}),
+            &scratch.root.join("wireguard.json"),
+            &serde_json::json!({"peer_clock": {"wall_ns": 1_600 * S, "synchronised": true, "observed_ns": 100 * S}}),
             false,
         )
         .unwrap();
-        assert_eq!(read_peer_clock(&snapshot).unwrap(), None);
-        let _ = std::fs::remove_dir_all(dir);
+        let status = align(&scratch.paths, &clocks);
+        assert_eq!(status.action, "unknown", "{status:?}");
+        assert_eq!(steps(&clocks), 0);
+        // The agent's reading: 9 s ahead, received 0.5 s ago.
+        scratch.publish(1_009 * S, 100 * S - S / 2);
+        let status = align(&scratch.paths, &clocks);
+        assert_eq!(status.action, "step", "{status:?}");
+        assert_eq!(status.behind_ns, Some(9 * S + S / 2));
+        assert_eq!(*clocks.wall.lock().unwrap(), 1_009 * S + S / 2);
+        let recorded: Status = crate::read_private(&scratch.paths.status()).unwrap();
+        assert_eq!(recorded, status);
+    }
+
+    #[test]
+    fn two_concurrent_requests_step_once() {
+        let scratch = Scratch::new("concurrent");
+        scratch.publish(1_009 * S, 100 * S);
+        let clocks = FakeClocks {
+            lag: std::time::Duration::from_millis(100),
+            ..fake(1_000 * S)
+        };
+        let statuses: Vec<Status> = std::thread::scope(|scope| {
+            let a = scope.spawn(|| align(&scratch.paths, &clocks));
+            let b = scope.spawn(|| align(&scratch.paths, &clocks));
+            vec![a.join().unwrap(), b.join().unwrap()]
+        });
+        assert_eq!(steps(&clocks), 1, "{statuses:?}");
+        assert_eq!(*clocks.wall.lock().unwrap(), 1_009 * S);
+        let mut actions: Vec<_> = statuses.iter().map(|s| s.action.as_str()).collect();
+        actions.sort();
+        assert_eq!(actions, ["in-step", "step"]);
+    }
+
+    #[test]
+    fn the_per_boot_budget_refuses_steps_beyond_ten_minutes_in_total() {
+        let scratch = Scratch::new("budget");
+        let clocks = fake(1_000 * S);
+        for round in 0..2u64 {
+            let wall = *clocks.wall.lock().unwrap();
+            scratch.publish(wall + 5 * 60 * S, 100 * S);
+            let status = align(&scratch.paths, &clocks);
+            assert_eq!(status.action, "step", "round {round}: {status:?}");
+        }
+        // 10 min spent: one more second is refused and the clock stays.
+        let wall = *clocks.wall.lock().unwrap();
+        scratch.publish(wall + S, 100 * S);
+        let status = align(&scratch.paths, &clocks);
+        assert_eq!(status.action, "refuse", "{status:?}");
+        assert_eq!(
+            status.reason.as_deref(),
+            Some("the per-boot step budget (10 min) is spent")
+        );
+        assert_eq!(*clocks.wall.lock().unwrap(), wall);
+        assert!(status.unresolved.is_some());
+        // A budget file that cannot be trusted counts as spent.
+        let corrupt = Scratch::new("budget-corrupt");
+        crate::write_private(
+            &corrupt.paths.state.join("budget.json"),
+            &serde_json::json!({"spent": "garbage"}),
+            false,
+        )
+        .unwrap();
+        corrupt.publish(1_000 * S + S, 100 * S);
+        assert_eq!(align(&corrupt.paths, &fake(1_000 * S)).action, "refuse");
+    }
+
+    #[test]
+    fn an_unknown_decision_keeps_an_unresolved_refusal_a_fresh_one_clears_it() {
+        let scratch = Scratch::new("unresolved");
+        let clocks = fake(1_000 * S);
+        // 11 min ahead: refused, and left unresolved.
+        scratch.publish(1_000 * S + 11 * 60 * S, 100 * S);
+        let refused = align(&scratch.paths, &clocks);
+        assert_eq!(refused.action, "refuse");
+        let outstanding = refused.unresolved.clone().unwrap();
+        assert_eq!(
+            outstanding.reason.as_deref(),
+            Some("the lag exceeds the 10 min step limit")
+        );
+        // No reading any more: unknown, and the refusal stays recorded.
+        std::fs::remove_file(&scratch.paths.peer).unwrap();
+        let unknown = align(&scratch.paths, &clocks);
+        assert_eq!(unknown.action, "unknown");
+        assert_eq!(unknown.unresolved, Some(outstanding));
+        let recorded: Status = crate::read_private(&scratch.paths.status()).unwrap();
+        assert!(recorded.unresolved.is_some());
+        // A fresh reading in step settles it.
+        scratch.publish(1_000 * S, 100 * S);
+        let settled = align(&scratch.paths, &clocks);
+        assert_eq!(settled.action, "in-step");
+        assert_eq!(settled.unresolved, None);
     }
 
     #[test]

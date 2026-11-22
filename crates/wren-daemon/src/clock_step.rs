@@ -2,18 +2,19 @@
 //! clock for an HA WireGuard takeover (see `wren_ha::clock`).
 //!
 //! systemd starts one instance per connection to `wren_ha::clock::SOCKET`
-//! (`Accept=yes`), with the connection as stdin and stdout. The request
-//! carries nothing: the helper reads the agent's replicated peer clock itself,
-//! applies `wren_ha::clock::decide`, steps when the rules allow it, records the
-//! decision, answers with it as one JSON document and exits. A caller can
-//! therefore trigger at most a step the rules allow, never choose one.
+//! (`Accept=yes`, one connection at a time), with the connection as stdin and
+//! stdout. The request carries nothing. The helper reads the predecessor's
+//! clock that the agent published outside the caller's view, then applies
+//! `wren_ha::clock::decide` and the per-boot budget under its lock. It steps
+//! when both allow it, records the decision, answers with it as one JSON
+//! document and exits. A caller can trigger a decision on the agent's
+//! reading; it can neither supply the reading nor exceed the budget.
 use std::io::Write;
-use std::path::Path;
 
 fn main() -> std::process::ExitCode {
     let status = wren_ha::clock::align(
-        Path::new(wren_ha::clock::SNAPSHOT),
-        Path::new(wren_ha::clock::STATUS),
+        &wren_ha::clock::Paths::default(),
+        &wren_ha::clock::SystemClocks,
     );
     if let Some(message) = status.message() {
         // stderr is this unit's journal.
