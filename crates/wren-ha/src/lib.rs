@@ -13,6 +13,7 @@
 //! lease`. The defaults (250 ms lease, 80 ms I/O) therefore need a witness
 //! round trip below roughly 25 ms; a distant witness needs a longer lease and
 //! I/O budget, configured identically on both members and the witness.
+pub mod clock;
 pub mod two_node;
 pub mod wireguard;
 use anyhow::{ensure, Context, Result};
