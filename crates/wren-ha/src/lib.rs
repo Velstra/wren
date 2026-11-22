@@ -1005,6 +1005,31 @@ mod tests {
         );
     }
     #[test]
+    fn the_preemption_hold_never_delays_a_failover() {
+        // The hold only refuses to displace a live owner. An owner that stops
+        // renewing inside its hold is replaced as soon as its lease runs
+        // out, by the member that was waiting to preempt it.
+        let mut engine = Engine::new("ha-test-cluster-01".into(), Authority::default(), 0);
+        let now = 1_000_000_000;
+        assert!(engine.request(&request(1, 0), now).unwrap().granted);
+        let takeover = now + TTL_MS * 1_000_000;
+        assert!(engine.request(&request(2, 1), takeover).unwrap().granted);
+        // The new owner renews for a second of its 10 s hold, then dies.
+        let mut last = takeover;
+        while last < takeover + 1_000_000_000 {
+            last += POLL_MS * 1_000_000;
+            assert!(engine.request(&request(2, 2), last).unwrap().granted);
+        }
+        let mut returning = request(1, 2);
+        returning.boot = [9; 16];
+        assert!(!engine.request(&returning, last + 1).unwrap().granted);
+        let failover = engine
+            .request(&returning, last + TTL_MS * 1_000_000)
+            .unwrap();
+        assert!(failover.granted, "the hold delayed a failover");
+        assert_eq!((failover.authority.owner, failover.authority.term), (1, 3));
+    }
+    #[test]
     fn lost_cold_grant_ack_can_retry_only_until_the_same_agent_reports_warm_state() {
         let mut engine = Engine::new("ha-test-cluster-01".into(), Authority::default(), 0);
         let now = 1_000_000_000;
