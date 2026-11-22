@@ -8,6 +8,16 @@ follows [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **A preemption no longer interrupts the takeover it follows.** In witness
+  mode a higher-priority member could preempt a new owner as soon as it held
+  that owner's snapshot. After the owner's Wren crashed, its restarted
+  coordinator took the pair back 3 to 4 s after the fault, as soon as its
+  agent held the successor's snapshot. A WireGuard takeover still waiting for
+  a handshake retry then lost the pair before it forwarded: two handovers
+  for one fault (3.95 s of outage). The witness
+  now honours a preemption only once the owner has held its authority for
+  10 s (`PREEMPT_HOLD_MS`). Failover is unchanged; only the return of a
+  preempting member waits.
 - **Logging no longer blocks the daemon.** Log lines were written straight to
   stdout, a pipe to journald under systemd. When journald stopped reading
   (synchronous console forwarding, disk pressure, rate limiting) every task

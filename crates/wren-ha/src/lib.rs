@@ -56,6 +56,14 @@ pub const MAX_LEASE_MS: u64 = 10_000;
 /// How long the witness must have heard nothing from one member before it
 /// lets the other, cold member open a new empty epoch alone.
 pub const PEER_SILENCE_MS: u64 = 10_000;
+/// How long a new owner keeps authority against a preempting member. A
+/// takeover is not finished when the witness grants it: the new owner still
+/// opens its data plane, announces the VIPs and, through WireGuard, may need
+/// one handshake retry (REKEY_TIMEOUT 5 s plus up to 1/3 s jitter) before
+/// traffic flows. A preemption inside that window starts a second handover
+/// on top of an unfinished one, so one fault costs two outages. Preemption
+/// is a preference, never needed for forwarding; waiting costs nothing.
+pub const PREEMPT_HOLD_MS: u64 = 10_000;
 /// Concurrent sessions each configured member may hold. The coordinator runs
 /// one exchange at a time; the rest absorbs exchanges it abandoned that the
 /// witness has not yet timed out.
@@ -397,6 +405,9 @@ struct Engine {
     claim: Claim,
     lease_ns: u64,
     silence_ns: u64,
+    /// When the current owner was granted its authority (or this witness
+    /// started): the start of its preemption hold.
+    owner_since: u64,
     /// The last authenticated request from each member, or this witness's own
     /// start: silence it did not observe is never presumed.
     heard: [u64; 2],
@@ -426,6 +437,7 @@ impl Engine {
             claim: Claim::default(),
             lease_ns: lease_ms * 1_000_000,
             silence_ns: silence_ms * 1_000_000,
+            owner_since: now,
             heard: [now, now],
         }
     }
@@ -496,9 +508,12 @@ impl Engine {
             && now.saturating_sub(self.heard[1 - slot]) >= self.silence_ns;
         let eligible = request.eligible
             && (ready || initial || retry || cold_quorum && request.node == 1 || lone);
+        // A preemption waits out the owner's hold (see PREEMPT_HOLD_MS).
+        let held = now.saturating_sub(self.owner_since) >= PREEMPT_HOLD_MS * 1_000_000;
         if current
             && !ours
             && exact
+            && held
             && request.eligible
             && request.preempt
             && (request.priority, 3 - request.node)
@@ -547,6 +562,7 @@ impl Engine {
                 };
                 self.expiry = now.saturating_add(self.lease_ns);
                 self.owner_priority = request.priority;
+                self.owner_since = now;
                 self.preferred = None;
                 self.cold = [None, None];
                 granted = true;
@@ -877,6 +893,16 @@ mod tests {
             eligible: true,
         }
     }
+    /// Renews `owner` every poll from its grant at `granted` until its
+    /// preemption hold is over, and returns the last renewal.
+    fn renew_through_hold(engine: &mut Engine, owner: &Request, granted: u64) -> u64 {
+        let mut at = granted;
+        while at < granted + PREEMPT_HOLD_MS * 1_000_000 {
+            at += POLL_MS * 1_000_000;
+            assert!(engine.request(owner, at).unwrap().granted);
+        }
+        at
+    }
     #[test]
     fn witness_never_overlaps_leases_and_rejects_cold_stale_or_replayed_owners() {
         let mut engine = Engine::new("ha-test-cluster-01".into(), Authority::default(), 0);
@@ -913,7 +939,7 @@ mod tests {
             .request(&request(2, 1), now + TTL_MS * 1_000_000)
             .unwrap();
         assert!(b.granted);
-        let active = now + TTL_MS * 1_000_000;
+        let active = renew_through_hold(&mut engine, &request(2, 2), now + TTL_MS * 1_000_000);
         assert!(!engine.request(&request(1, 1), active + 1).unwrap().granted);
         assert!(!engine.request(&request(1, 2), active + 2).unwrap().granted);
         assert!(
@@ -931,6 +957,51 @@ mod tests {
                 .request(&request(1, 2), active + TTL_MS * 1_000_000)
                 .unwrap()
                 .granted
+        );
+    }
+    #[test]
+    fn a_new_owner_keeps_authority_through_its_preemption_hold() {
+        // Node 1's coordinator dies; node 2 takes over. Node 1's restarted
+        // coordinator (a new boot) imports node 2's snapshot within a second
+        // and asks to preempt. Granting that at once handed the pair over a
+        // second time before the first takeover was forwarding: one fault,
+        // two outages (ha-wireguard-failover, 3.95 s instead of 1.3 s).
+        let mut engine = Engine::new("ha-test-cluster-01".into(), Authority::default(), 0);
+        let now = 1_000_000_000;
+        assert!(engine.request(&request(1, 0), now).unwrap().granted);
+        let takeover = now + TTL_MS * 1_000_000;
+        let grant = engine.request(&request(2, 1), takeover).unwrap();
+        assert!(grant.granted);
+        assert_eq!(grant.authority.term, 2);
+        let mut restarted = request(1, 2);
+        restarted.boot = [9; 16];
+        let hold_ends = takeover + PREEMPT_HOLD_MS * 1_000_000;
+        let mut at = takeover;
+        while at + POLL_MS * 1_000_000 < hold_ends {
+            at += POLL_MS * 1_000_000;
+            assert!(!engine.request(&restarted, at).unwrap().granted);
+            assert!(
+                engine.request(&request(2, 2), at + 1).unwrap().granted,
+                "the new owner lost authority {} ms into its hold",
+                (at - takeover) / 1_000_000
+            );
+        }
+        // The hold is over: the preemption proceeds as before, once the
+        // owner's last lease has run out.
+        assert!(!engine.request(&restarted, hold_ends).unwrap().granted);
+        assert!(
+            !engine
+                .request(&request(2, 2), hold_ends + 1)
+                .unwrap()
+                .granted,
+            "the owner renewed past its hold against a preempting member"
+        );
+        let expired = at + 1 + TTL_MS * 1_000_000;
+        let preempted = engine.request(&restarted, expired).unwrap();
+        assert!(preempted.granted);
+        assert_eq!(
+            (preempted.authority.owner, preempted.authority.term),
+            (1, 3)
         );
     }
     #[test]
