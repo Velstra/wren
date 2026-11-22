@@ -27,10 +27,12 @@ fn main() -> std::process::ExitCode {
             return std::process::ExitCode::FAILURE;
         }
     };
+    // The decision is taken and recorded either way. A caller that went away
+    // first (a takeover cancelled by a newer one) is not a failure of this
+    // unit; reporting it as one would list a failed unit in health.
     let mut stdout = std::io::stdout().lock();
     if let Err(error) = stdout.write_all(&reply).and_then(|()| stdout.flush()) {
-        eprintln!("answering the clock-step request failed: {error}");
-        return std::process::ExitCode::FAILURE;
+        eprintln!("the clock-step caller left before the answer: {error}");
     }
     std::process::ExitCode::SUCCESS
 }
