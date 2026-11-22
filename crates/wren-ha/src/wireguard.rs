@@ -30,8 +30,10 @@ struct Cache {
     authority: Authority,
     endpoints: Vec<Endpoint>,
     /// The previous owner's wall clock (see [`crate::clock`]); absent from a
-    /// cold baseline and from agents that do not replicate it.
+    /// cold baseline and from agents that do not replicate it. Parsed so the
+    /// agent's snapshot is accepted; the clock-step helper acts on it.
     #[serde(default)]
+    #[allow(dead_code)]
     peer_clock: Option<crate::clock::PeerClock>,
 }
 impl Cache {
@@ -173,7 +175,7 @@ pub async fn promote(config: Config, role: Role) -> Result<()> {
             None
         }
     };
-    align_clock(cache.as_ref().and_then(|c| c.peer_clock));
+    request_clock_step().await;
     for interface in &config.wireguard {
         ensure!(
             !interface.is_empty()
@@ -224,65 +226,34 @@ pub async fn promote(config: Config, role: Role) -> Result<()> {
     }
     Ok(())
 }
-/// Where the last clock decision is recorded for `sentinel show ha` and health.
-const CLOCK_STATUS: &str = "/run/velstra/ha/clock.json";
+/// How long a takeover waits for the clock-step helper before it goes ahead.
+const CLOCK_STEP_WAIT: Duration = Duration::from_secs(2);
 
-#[derive(Serialize)]
-struct ClockStatus {
-    #[serde(flatten)]
-    decision: crate::clock::Decision,
-    /// CLOCK_REALTIME before and after a step, in ns.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    stepped: Option<(u64, u64)>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    error: Option<String>,
-}
-
-/// Bring this member's wall clock up to the previous owner's before it
-/// initiates WireGuard handshakes (see [`crate::clock`]). Never fails the
-/// promotion: a clock it cannot or must not step is reported, not fatal.
-fn align_clock(peer: Option<crate::clock::PeerClock>) {
-    use crate::clock::{decide, step_forward, synchronised, wall_ns, Decision};
-    let decision = match wall_ns() {
-        Ok(wall) => decide(peer, wall, crate::now_ns(), synchronised()),
-        Err(_) => Decision::Unknown {
-            reason: "the wall clock cannot be read",
-        },
+/// Ask the privileged helper to align this member's wall clock with its
+/// predecessor's before WireGuard initiates (see [`crate::clock`]). Sends
+/// nothing: the helper reads the replicated clock and applies the rules
+/// itself. Never fails the promotion; every outcome is logged.
+async fn request_clock_step() {
+    use tokio::io::AsyncReadExt;
+    let exchange = async {
+        let mut stream = tokio::net::UnixStream::connect(crate::clock::SOCKET).await?;
+        let mut reply = Vec::new();
+        (&mut stream).take(4096).read_to_end(&mut reply).await?;
+        anyhow::Ok(serde_json::from_slice::<crate::clock::Status>(&reply)?)
     };
-    let mut status = ClockStatus {
-        decision,
-        stepped: None,
-        error: None,
-    };
-    match decision {
-        Decision::Step { behind_ns } => match step_forward(behind_ns) {
-            Ok((old, new)) => {
-                tracing::warn!(
-                    old_ns = old,
-                    new_ns = new,
-                    behind_ms = behind_ns / 1_000_000,
-                    "HA promotion: stepped the wall clock forward to the previous owner's so WireGuard handshakes are not rejected as replays"
-                );
-                status.stepped = Some((old, new));
+    match timeout(CLOCK_STEP_WAIT, exchange).await {
+        Ok(Ok(status)) => {
+            if let Some(message) = status.message() {
+                tracing::warn!("{message}");
             }
-            Err(error) => {
-                tracing::warn!(
-                    behind_ms = behind_ns / 1_000_000,
-                    error = format_args!("{error:#}"),
-                    "clock behind HA peer; stepping it failed, WireGuard tunnels may stall until NTP corrects it"
-                );
-                status.error = Some(format!("{error:#}"));
-            }
-        },
-        Decision::Refuse { behind_ns, reason } => tracing::warn!(
-            behind_ms = behind_ns / 1_000_000,
-            reason,
-            "clock behind HA peer, not stepped; WireGuard tunnels may stall until NTP corrects it"
+        }
+        Ok(Err(error)) => tracing::warn!(
+            error = format_args!("{error:#}"),
+            "HA takeover: the clock-step helper failed; a lagging clock here would stall WireGuard tunnels"
         ),
-        Decision::InStep | Decision::Unknown { .. } => {}
-    }
-    if let Err(error) = write_private(Path::new(CLOCK_STATUS), &status, false) {
-        tracing::warn!(error = format_args!("{error:#}"), "recording the HA clock decision failed");
+        Err(_) => tracing::warn!(
+            "HA takeover: the clock-step helper did not answer within 2 s; a lagging clock here would stall WireGuard tunnels"
+        ),
     }
 }
 
