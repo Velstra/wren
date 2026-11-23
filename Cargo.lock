@@ -711,25 +711,25 @@ checksum = "0592e1c9d151f854e6fd382574c3a0855250e1d9b2f99d9281c6e6391af352f1"
 
 [[package]]
 name = "wren-babel"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "wren-core",
 ]
 
 [[package]]
 name = "wren-bfd"
-version = "0.4.0"
+version = "0.5.0"
 
 [[package]]
 name = "wren-bgp"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "wren-core",
 ]
 
 [[package]]
 name = "wren-config"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "serde",
  "toml",
@@ -739,11 +739,11 @@ dependencies = [
 
 [[package]]
 name = "wren-core"
-version = "0.4.0"
+version = "0.5.0"
 
 [[package]]
 name = "wren-daemon"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -770,14 +770,14 @@ dependencies = [
 
 [[package]]
 name = "wren-filter"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "wren-core",
 ]
 
 [[package]]
 name = "wren-ha"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "base64",
@@ -791,18 +791,18 @@ dependencies = [
 
 [[package]]
 name = "wren-igmp"
-version = "0.4.0"
+version = "0.5.0"
 
 [[package]]
 name = "wren-isis"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "wren-core",
 ]
 
 [[package]]
 name = "wren-netlink"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "libc",
  "wren-core",
@@ -810,32 +810,32 @@ dependencies = [
 
 [[package]]
 name = "wren-ospf"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "wren-core",
 ]
 
 [[package]]
 name = "wren-ospfv3"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "wren-core",
 ]
 
 [[package]]
 name = "wren-pim"
-version = "0.4.0"
+version = "0.5.0"
 
 [[package]]
 name = "wren-rip"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "wren-core",
 ]
 
 [[package]]
 name = "wren-vrrp"
-version = "0.4.0"
+version = "0.5.0"
 
 [[package]]
 name = "zmij"
