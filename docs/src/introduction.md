@@ -2,6 +2,16 @@
 
 Wren exchanges routes with adjacent routers and can install selected paths in the Linux forwarding table. Use this handbook to evaluate a peering change in a disposable lab, inspect what reached the kernel, and decide which protocols fit your deployment.
 
+## How the parts fit {#how-the-parts-fit}
+
+```mermaid
+flowchart LR
+  peers[Adjacent routers] <-->|BGP, OSPF, IS-IS, RIP, Babel| wren[wren daemon]
+  conf[wren.toml] -->|start, SIGHUP| wren
+  wren -->|netlink| kernel[Linux routing tables]
+  op[wren show, monitor] <-->|control socket| wren
+```
+
 ## Choose a task {#how-to-read-this-handbook}
 
 | Task | Start here |

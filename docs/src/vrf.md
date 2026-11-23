@@ -2,6 +2,14 @@
 
 A named VRF directs selected routes into a dedicated Linux table. A BGP instance bound to it uses the VRF’s routing domain for its session as well.
 
+```mermaid
+flowchart LR
+  st["[[static]] vrf = blue"] --> rib[VRF blue RIB]
+  bgp["[bgp] vrf = blue"] <--> rib
+  rib --> t100[Linux table 100]
+  other[Routes without vrf] --> main[Linux main table]
+```
+
 
 ## Configure the first router {#configuration}
 

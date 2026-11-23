@@ -13,7 +13,23 @@ For a nondefault control socket, specify its path before the subcommand, for exa
 
 ## Add or remove a BGP peer on reload {#configuration-hot-reload--sighup}
 
-Wren compares the new neighbor set with the running one. A new peer connects, a removed peer’s routes are withdrawn, and an unchanged peer keeps its session and learned routes. Use this procedure for **adding or removing** peers. A change to an existing peer’s policy, timers, or other settings requires separate validation.
+Wren compares the new neighbor set with the running one. Use this procedure for **adding or removing** peers. A change to an existing peer’s policy, timers, or other settings requires separate validation.
+
+```mermaid
+sequenceDiagram
+  participant Op as Operator
+  participant W as wren
+  participant P as BGP peers
+  Op->>W: SIGHUP
+  W->>W: parse and resolve (same as wren check)
+  alt rejected
+    W-->>Op: log error, keep running config
+  else accepted
+    W->>P: connect new peers
+    W->>P: drop removed peers, withdraw their routes
+    Note over W,P: unchanged peers keep session and routes
+  end
+```
 
 Run the complete three-router lab from a Linux checkout:
 
@@ -27,7 +43,7 @@ bash scripts/bgp-hot-reload-smoke.sh
 | Add C and reload | Still Established; route retained | Established; `10.30.0.0/24` learned |
 | Remove C and reload | Still Established; route retained | Session removed; its route withdrawn |
 
-On a managed host, check the edited file and send `SIGHUP` to the specific daemon that loaded it. Substitute its known process ID for `WREN_PID` and inspect the same socket before and after the reload.
+On a managed host, check the edited file, then send `SIGHUP` to the daemon that loaded it (its process ID as `WREN_PID`). Inspect the same socket before and after.
 
 ```sh
 wren check --config /etc/wren/wren.toml
@@ -67,4 +83,9 @@ The Unix socket returns Prometheus exposition text. Inspect `wren_bgp_neighbor_u
 
 ## Stream BGP events to a collector {#bmp--streaming-bgp-state-to-a-monitoring-station}
 
-Add `[bgp.bmp]` with `station = "192.0.2.50:11019"` to your BGP configuration. Wren connects to that BMP collector and emits peer-up, route-monitoring and peer-down messages. Reconnection resumes live observations; it does not replay the missed interval. [Collector test](https://github.com/Velstra/wren/blob/main/scripts/bgp-bmp-smoke.sh).
+```toml
+[bgp.bmp]
+station = "192.0.2.50:11019"
+```
+
+Add this table to your BGP configuration. Wren connects to that BMP collector and emits peer-up, route-monitoring and peer-down messages. Reconnection resumes live observations; it does not replay the missed interval. [Collector test](https://github.com/Velstra/wren/blob/main/scripts/bgp-bmp-smoke.sh).

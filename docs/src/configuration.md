@@ -13,17 +13,23 @@ prefix = "198.51.100.0/24"
 via = "192.0.2.1"
 ```
 
-Save this as `router.toml`. Check it before starting the daemon:
+Save it as `router.toml` and check it:
 
 ```sh
 wren check --config router.toml
 ```
 
-The result should report one static route. A successful check validates the file; use a peer and a kernel route lookup to verify reachability.
+The result reports one static route. A check validates the file only; verify reachability with a peer and a kernel route lookup.
 
 ## Apply an explicit eBGP policy {#route-filters--filter-and-import}
 
 This complete example permits a single peer prefix in and a single local prefix out. Both filters reject everything else.
+
+```mermaid
+flowchart LR
+  peer[Peer 192.0.2.20<br/>AS 65002] -->|"import: from-peer<br/>203.0.113.0/24 only"| rib[Wren RIB]
+  rib -->|"export: to-peer<br/>198.51.100.0/24 only"| peer
+```
 
 ```toml
 router-id = "192.0.2.10"

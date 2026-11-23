@@ -11,6 +11,7 @@ preferred-dark-theme = "navy"
 git-repository-url = "https://github.com/velstra/wren"
 edit-url-template = "https://github.com/velstra/wren/edit/main/docs/{path}"
 additional-css = ["theme/wren.css"]
+additional-js = ["mermaid/mermaid.min.js", "mermaid/mermaid-init.js"]
 
 [output.html.fold]
 enable = true
