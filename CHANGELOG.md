@@ -19,6 +19,13 @@ follows [Semantic Versioning](https://semver.org/).
   the election refuses an ineligible request and zeroes the deadline, so the
   VIPs go on the next tick there; the second agent check after the exchange
   is gone in both modes.
+- **The first announcement after a takeover no longer waits for the next
+  witness exchange.** The new owner sends its gratuitous ARP and neighbour
+  advertisements as soon as its agent acknowledges forwarding the new term,
+  while its lease for that term is still running. The exchange it used to
+  wait for is the slowest of a takeover (the witness records the
+  acknowledgement durably), so a takeover reaches clients 50 to 70 ms sooner
+  in witness mode. Holding and releasing the VIPs are decided as before.
 
 ### Fixed
 
