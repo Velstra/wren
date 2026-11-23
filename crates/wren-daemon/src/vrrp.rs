@@ -70,6 +70,39 @@ fn request_agent(reported: Option<wren_ha::Agent>, observed_ns: u64) -> Option<w
     reported.filter(|agent| agent.eligible && wren_ha::fresh(agent.updated_ns, observed_ns))
 }
 
+/// Neither the VPN nor the VIP cooldown is running at `now`.
+fn cooldowns_clear(now: u64, vpn_failed_until: u64, vip_failed_until: u64) -> bool {
+    now >= vpn_failed_until && now >= vip_failed_until
+}
+
+/// Whether this member asks for (or to keep) authority: its links healthy, a
+/// request Agent (`request_agent`: fresh and eligible), and no cooldown.
+fn request_eligible(
+    healthy_before: bool,
+    agent: Option<&wren_ha::Agent>,
+    cooldowns_clear: bool,
+) -> bool {
+    healthy_before && agent.is_some() && cooldowns_clear
+}
+
+/// The lease deadline after a reply. A witness reply moves it only when it
+/// granted or the authority changed: a refused renewal leaves the running
+/// lease to end on its own. A two-node reply always sets it, and a refusal
+/// sets it to zero.
+fn deadline_after_reply(
+    mode: wren_ha::Mode,
+    granted: bool,
+    same_authority: bool,
+    current: u64,
+    offered: u64,
+) -> u64 {
+    if mode == wren_ha::Mode::TwoNode || granted || !same_authority {
+        offered
+    } else {
+        current
+    }
+}
+
 /// The exchange can outlive a tracked link: probe the links again, then read
 /// the clock, so the probe's latency counts against the lease.
 ///
@@ -877,7 +910,7 @@ pub async fn run_ha(
                     boot, agent_boot: agent.as_ref().map_or([0;16],|a|a.agent_boot), priority: config.priority, preempt: config.preempt,
                     ready_term: agent.as_ref().map_or(0, |a| a.ready_term),
                     policy: agent.as_ref().map_or(role.authority.policy, |a| a.policy),
-                    eligible: healthy_before && agent.is_some() && now>=vpn_failed_until && now>=vip_failed_until };
+                    eligible: request_eligible(healthy_before, agent.as_ref(), cooldowns_clear(now, vpn_failed_until, vip_failed_until)) };
                 let asked = Instant::now();
                 let answer = if let Some(peers) = &mut peer_control {
                     peers.step(&request, role.deadline_ns, role.vips_ready).await
@@ -893,7 +926,7 @@ pub async fn run_ha(
                     Ok((reply, deadline)) => {
                         let same = role.authority == reply.authority;
                         role.authority = reply.authority;
-                        if config.mode == wren_ha::Mode::TwoNode || reply.granted || !same { role.deadline_ns = deadline; }
+                        role.deadline_ns = deadline_after_reply(config.mode, reply.granted, same, role.deadline_ns, deadline);
                         if !same {debug!(authority=?role.authority,ready_term=request.ready_term,granted=reply.granted,"HA authority generation changed");role.vpn_ready=false;rekey.cancel();rekey_term=0;}
                         role.claimed_ready_term=reply.claim.ready_term;role.claimed_agent_boot=reply.claim.agent_boot;
                     }
@@ -902,7 +935,7 @@ pub async fn run_ha(
                 let decision = observe_after_exchange(healthy_before,
                     || ha_interfaces_healthy(&binding.configs, &config.wireguard), wren_ha::now_ns);
                 let active = holds_vips(&decision,
-                    decision.now>=vpn_failed_until && decision.now>=vip_failed_until, &role, config.node, boot);
+                    cooldowns_clear(decision.now, vpn_failed_until, vip_failed_until), &role, config.node, boot);
                 let healthy = decision.healthy;
                 let now = decision.now;
                 let withdrawal = withdrawal_diagnostics::Report {
@@ -1941,12 +1974,14 @@ mod tests {
         assert!(!holds_vips(&slow, true, &holding(deadline), 2, [6; 16]));
     }
 
-    /// A stale Agent cannot renew: its request carries no Agent, so it is
-    /// ineligible and the lease is not extended. The member then stops holding
-    /// the VIPs when that lease ends, at the latest one lease after the last
-    /// fresh report.
+    /// A stale Agent cannot renew: its request carries no Agent and is
+    /// ineligible. The witness then refuses the renewal (wren-ha
+    /// `an_ineligible_owner_request_is_not_renewed`) and the running lease is
+    /// left to end; the two-node election refuses and zeroes the deadline
+    /// (`an_ineligible_owner_loses_its_deadline_at_once`), which this member
+    /// adopts at once.
     #[test]
-    fn a_stale_agent_stops_renewal_and_the_lease_then_ends_holding() {
+    fn a_stale_agent_makes_the_request_ineligible_and_stops_renewal() {
         let updated_ns = 1_000_000_000;
         let last_fresh = wren_ha::Agent {
             eligible: true,
@@ -1954,28 +1989,53 @@ mod tests {
             ..Default::default()
         };
         let stale_at = updated_ns + wren_ha::FRESH_NS + 1;
-        assert!(request_agent(Some(last_fresh.clone()), stale_at).is_none());
-        // The last renewal it could carry was read at `updated + FRESH`.
-        let deadline = updated_ns + wren_ha::FRESH_NS + wren_ha::TTL_MS * 1_000_000;
-        let decision = |now: u64| HaDecisionObservation {
-            healthy: true,
-            healthy_after: true,
-            now,
+        let agent = request_agent(Some(last_fresh), stale_at);
+        assert!(!request_eligible(true, agent.as_ref(), true));
+        let running = 2_000_000_000;
+        assert_eq!(
+            deadline_after_reply(wren_ha::Mode::Witness, false, true, running, 0),
+            running,
+            "a refused witness renewal moved the running lease"
+        );
+        assert_eq!(
+            deadline_after_reply(wren_ha::Mode::TwoNode, false, true, running, 0),
+            0,
+            "a refused two-node step kept the deadline"
+        );
+        // A grant or a new authority generation takes the offered deadline.
+        assert_eq!(
+            deadline_after_reply(wren_ha::Mode::Witness, true, true, running, 7),
+            7
+        );
+        assert_eq!(
+            deadline_after_reply(wren_ha::Mode::Witness, false, false, running, 7),
+            7
+        );
+    }
+
+    #[test]
+    fn a_request_needs_an_agent_healthy_links_and_no_cooldown() {
+        let agent = wren_ha::Agent {
+            eligible: true,
+            ..Default::default()
         };
-        assert!(holds_vips(
-            &decision(stale_at),
-            true,
-            &holding(deadline),
-            2,
-            [5; 16]
-        ));
-        assert!(!holds_vips(
-            &decision(deadline),
-            true,
-            &holding(deadline),
-            2,
-            [5; 16]
-        ));
+        assert!(request_eligible(true, Some(&agent), true));
+        assert!(
+            !request_eligible(true, None, true),
+            "a request without an Agent was eligible"
+        );
+        assert!(!request_eligible(false, Some(&agent), true));
+        assert!(!request_eligible(true, Some(&agent), false));
+        let now = 1_000;
+        assert!(cooldowns_clear(now, now, now));
+        assert!(
+            !cooldowns_clear(now, now + 1, 0),
+            "a running VPN cooldown was clear"
+        );
+        assert!(
+            !cooldowns_clear(now, 0, now + 1),
+            "a running VIP cooldown was clear"
+        );
     }
 
     #[test]

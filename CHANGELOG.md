@@ -15,7 +15,10 @@ follows [Semantic Versioning](https://semver.org/).
   it last renewed ends: at most the 100 ms freshness bound plus one 250 ms
   lease. Its stale or ineligible reports stop the renewals, and its data
   plane is already fenced: by process exit, by ineligibility, or (for a
-  wedged agent) by the kernel deadline it no longer extends.
+  wedged agent) by the kernel deadline it no longer extends. In two-node mode
+  the election refuses an ineligible request and zeroes the deadline, so the
+  VIPs go on the next tick there; the second agent check after the exchange
+  is gone in both modes.
 
 ### Fixed
 
