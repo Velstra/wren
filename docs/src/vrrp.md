@@ -4,6 +4,19 @@ VRRP peers share a virtual router ID and virtual IP. During failover, verify the
 
 <a id="how-it-works"></a>
 
+```mermaid
+stateDiagram-v2
+  [*] --> Initialize
+  Initialize --> Master: startup, priority 255
+  Initialize --> Backup: startup
+  Backup --> Master: master-down timer
+  Master --> Backup: advert from higher priority, or equal with higher address
+  Master --> Initialize: shutdown
+  Backup --> Initialize: shutdown
+```
+
+A new master assumes the virtual address and announces it (gratuitous ARP for IPv4, unsolicited neighbor advertisement for IPv6). `wren show vrrp` prints the state.
+
 ## Configure the first router {#configuration}
 
 The lab configures priority 200 on router A. Router B uses the same VRID and virtual address with a lower priority.

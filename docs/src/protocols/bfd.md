@@ -39,6 +39,18 @@ wren show bfd
 wren show bgp neighbors
 ```
 
+```mermaid
+sequenceDiagram
+  participant A as Router A
+  participant B as Router B
+  A->>B: BGP Established
+  A->>B: BFD Up
+  Note over B: B stops answering
+  A->>A: no BFD packet for detect-mult × interval
+  A->>A: BFD Down, BGP session torn down
+  Note over A: hold timer (180 s) not needed
+```
+
 The fixture waits for BFD `Up` and BGP `Established`, then checks that loss of BFD tears down BGP before its 180-second hold timer. Detection depends on the negotiated intervals and multiplier.
 
 [Lab source](https://github.com/Velstra/wren/blob/main/scripts/bgp-bfd-smoke.sh).

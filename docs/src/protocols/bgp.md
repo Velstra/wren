@@ -11,6 +11,12 @@ Wren can carry an IPv4 prefix across a peering link with only IPv6 addresses. Us
 
 The lab connects AS 65001 to AS 65002 over `2001:db8::/64`. Router B originates `10.99.0.0/24`. A and B negotiate extended next-hop encoding; the 32-bit router IDs do not need to be assigned to the peering interfaces.
 
+```mermaid
+flowchart LR
+  A["Router A · AS 65001<br/>2001:db8::1"] <-->|"eBGP, extended next hop"| B["Router B · AS 65002<br/>2001:db8::2"]
+  B -.->|"10.99.0.0/24 via 2001:db8::2"| A
+```
+
 **Router A · receiving peer**
 
 ```toml
@@ -72,6 +78,25 @@ For a directly connected peer the next hop may be link-local. Check the egress i
 
 The default eBGP policy requires explicit filters for each direction. The [configuration example](../configuration.md#route-filters--filter-and-import) admits one prefix per direction. Run `bash scripts/bgp-default-deny-smoke.sh` to compare the four cases: neither filter, import only, export only, and both. A peer can remain Established throughout while its usable route set changes.
 
+
+## Session states {#session-states}
+
+`wren show bgp neighbors` prints each peer's RFC 4271 state:
+
+```mermaid
+stateDiagram-v2
+  [*] --> Idle
+  Idle --> Connect: start
+  Connect --> OpenSent: TCP up
+  Connect --> Active: TCP failed
+  Active --> OpenSent: TCP up
+  Active --> Connect: ConnectRetry
+  OpenSent --> OpenConfirm: OPEN received
+  OpenConfirm --> Established: KEEPALIVE received
+  Established --> Idle: hold timer, NOTIFICATION or TCP failure
+```
+
+A manual stop or a received NOTIFICATION returns any state to Idle. An UPDATE in OpenSent or OpenConfirm, a KEEPALIVE in OpenSent, or a second OPEN is an FSM error: Wren sends NOTIFICATION code 5, drops the connection and returns to Idle.
 
 ## Change and observe sessions {#what-is-implemented}
 
