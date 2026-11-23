@@ -305,6 +305,8 @@ RFC 8212 deny.
 
 ### CI and release tooling
 
+- crates.io release workflow: opt-in single-operator approval mode
+  (`RELEASE_SINGLE_OPERATOR`); the two-person rule stays the default.
 - CI enforces workspace formatting, runs the kernel route tests in isolation,
   and loads (and if needed installs) the `veth`, `dummy` and `vrf` modules the
   rootless smokes create; `actions/checkout` moved to v7.
