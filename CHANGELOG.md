@@ -6,6 +6,17 @@ follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed
+
+- **The lease, not a second look at the agent, decides whether a member holds
+  its VIPs.** A new owner no longer drops its VIPs for up to one lease right
+  after a takeover because one agent report arrived late during a witness
+  exchange. A wedged or ineligible agent now keeps the VIPs until the lease
+  it last renewed ends: at most the 100 ms freshness bound plus one 250 ms
+  lease. Its stale or ineligible reports stop the renewals, and its data
+  plane is already fenced: by process exit, by ineligibility, or (for a
+  wedged agent) by the kernel deadline it no longer extends.
+
 ### Fixed
 
 - **A preemption no longer interrupts the takeover it follows.** In witness
