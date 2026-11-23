@@ -2,6 +2,12 @@
 
 Use a MAC-VRF to exchange tenant MAC addresses and an IP-VRF to exchange tenant prefixes. Each imports its own route targets. A route reflector can relay these advertisements without being a tenant VTEP.
 
+```mermaid
+flowchart LR
+  a["Leaf 10.0.0.1<br/>VNI 10100, L3 VNI 50100"] <-->|iBGP, evpn| rr[Route reflector<br/>10.0.0.254]
+  rr <-->|iBGP, evpn| b[Other leaf]
+```
+
 <a id="two-entities-not-one"></a>
 
 ## Configure the first router {#configuration}

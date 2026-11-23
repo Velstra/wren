@@ -87,36 +87,39 @@ pub struct SpfRoute {
     /// The total OSPF cost from the root.
     pub cost: u32,
     /// The link-local next hops (gateway + local interface). Empty means the
-    /// destination is directly attached to the root (a connected/on-link route
-    /// whose outgoing interface the runner resolves).
+    /// destination is directly attached to the root (a connected route, which
+    /// [`SpfRoute::to_route`] does not turn into a FIB entry).
     pub gateways: Vec<SpfNextHop>,
 }
 
 impl SpfRoute {
     /// Convert into a [`wren_core::Route`] tagged [`Protocol::Ospf`], with the
-    /// cost as the metric. Each next-hop gateway is pinned to its outgoing
-    /// interface, whose name `resolve_iface` maps from the SPF-computed Interface
-    /// ID (a link-local gateway without an outgoing interface is unroutable). An
-    /// empty next-hop set becomes a single on-link next hop (gateway and
-    /// interface unset — the runner fills the interface in). If a next hop's
-    /// interface cannot be named it falls back to an unpinned gateway.
-    pub fn to_route(&self, resolve_iface: impl Fn(u32) -> Option<String>) -> Route {
-        let nexthops: Vec<NextHop> = if self.gateways.is_empty() {
-            vec![NextHop {
-                gateway: None,
-                iface: None,
-                weight: 1,
-            }]
-        } else {
-            self.gateways
-                .iter()
-                .map(|nh| match resolve_iface(nh.iface_id) {
-                    Some(name) => NextHop::via_dev(IpAddr::V6(nh.gateway), name),
-                    None => NextHop::via(IpAddr::V6(nh.gateway)),
-                })
-                .collect()
-        };
-        Route::new(self.prefix, Protocol::Ospf, nexthops, self.cost)
+    /// cost as the metric, or `None` when there is nothing to install.
+    ///
+    /// Each next hop is a link-local gateway pinned to its outgoing interface,
+    /// whose name `resolve_iface` maps from the SPF-computed Interface ID; a
+    /// link-local gateway without an interface is unroutable, so a next hop
+    /// whose interface cannot be named is left out. Two cases yield `None`:
+    ///
+    /// - an empty next-hop set — the destination is directly attached (a
+    ///   prefix of this router's own, or of a link it sits on). The kernel's
+    ///   connected route already covers it, and a route with neither a gateway
+    ///   nor an interface is refused by netlink. OSPFv2 and IS-IS leave such
+    ///   prefixes out for the same reason.
+    /// - no next hop whose interface resolves.
+    pub fn to_route(&self, resolve_iface: impl Fn(u32) -> Option<String>) -> Option<Route> {
+        let nexthops: Vec<NextHop> = self
+            .gateways
+            .iter()
+            .filter_map(|nh| {
+                resolve_iface(nh.iface_id)
+                    .map(|name| NextHop::via_dev(IpAddr::V6(nh.gateway), name))
+            })
+            .collect();
+        if nexthops.is_empty() {
+            return None;
+        }
+        Some(Route::new(self.prefix, Protocol::Ospf, nexthops, self.cost))
     }
 }
 
@@ -153,7 +156,7 @@ pub fn routes(
     compute(area, links, root)
         .routes
         .iter()
-        .map(|r| r.to_route(resolve_iface))
+        .filter_map(|r| r.to_route(resolve_iface))
         .collect()
 }
 
@@ -1049,19 +1052,109 @@ mod tests {
             vec![NextHop::via_dev(IpAddr::V6(ll(2)), "if1")]
         );
 
-        // The connected prefix maps to a single on-link next hop.
-        let local = rts
-            .iter()
-            .find(|r| r.prefix == p("2001:db8:1::/64"))
-            .unwrap();
+        // The root's own prefix is connected: the kernel already routes it,
+        // and a gateway-less, interface-less route is not installable.
+        assert!(rts.iter().all(|r| r.prefix != p("2001:db8:1::/64")));
+    }
+
+    /// Two routers on one shared /64 (a broadcast LAN). The LAN prefix is
+    /// directly attached to the root, so no FIB route comes out of it; every
+    /// route that does names both a gateway and an outgoing interface — what
+    /// netlink requires. This is the case that wedged the kernel FIB: the
+    /// on-link route with neither was refused, retried forever, and kept
+    /// every routing reload pending.
+    #[test]
+    fn a_shared_link_prefix_yields_no_route_and_every_route_is_installable() {
+        let mut area = Lsdb::new();
+        let mut links = Lsdb::new();
+        area.install(router_lsa(
+            [1, 1, 1, 1],
+            0,
+            vec![transit([1, 1, 1, 1], 1, 1, 1)],
+            1,
+        ));
+        area.install(router_lsa(
+            [2, 2, 2, 2],
+            0,
+            vec![transit([1, 1, 1, 1], 1, 2, 1)],
+            1,
+        ));
+        area.install(network_lsa(
+            [1, 1, 1, 1],
+            1,
+            vec![[1, 1, 1, 1], [2, 2, 2, 2]],
+        ));
+        area.install(intra_network(
+            [1, 1, 1, 1],
+            1,
+            vec![prefix(
+                Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0),
+                64,
+                0,
+            )],
+        ));
+        // Both routers also advertise the shared /64 as their own.
+        area.install(intra_router(
+            [1, 1, 1, 1],
+            vec![prefix(
+                Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0),
+                64,
+                0,
+            )],
+        ));
+        // R2's own /64 behind it: the one route that must come out.
+        area.install(intra_router(
+            [2, 2, 2, 2],
+            vec![
+                prefix(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0), 64, 0),
+                prefix(Ipv6Addr::new(0x2001, 0xdb8, 2, 0, 0, 0, 0, 0), 64, 0),
+            ],
+        ));
+        links.install(link_lsa([2, 2, 2, 2], 2, ll(2)));
+
+        let res = compute(&area, &links, rid([1, 1, 1, 1]));
+        assert!(find(&res, "2001:db8::/64").gateways.is_empty());
+        assert_eq!(gws(&find(&res, "2001:db8:2::/64").gateways), vec![ll(2)]);
+
+        let rts = routes(&area, &links, rid([1, 1, 1, 1]), |_| Some("eth1".into()));
+        assert!(rts.iter().all(|r| r.prefix != p("2001:db8::/64")));
+        assert!(rts.iter().any(|r| r.prefix == p("2001:db8:2::/64")));
+        for r in &rts {
+            assert!(!r.nexthops.is_empty(), "{}", r.prefix);
+            for nh in &r.nexthops {
+                assert!(
+                    nh.gateway.is_some() && nh.iface.is_some(),
+                    "{} {nh:?}",
+                    r.prefix
+                );
+            }
+        }
+    }
+
+    /// A link-local gateway whose outgoing interface is unknown is unroutable;
+    /// the route is left out rather than handed to the kernel unpinned.
+    #[test]
+    fn a_next_hop_without_a_named_interface_is_left_out() {
+        let route = SpfRoute {
+            prefix: p("2001:db8:2::/64"),
+            cost: 10,
+            gateways: vec![
+                SpfNextHop {
+                    gateway: ll(2),
+                    iface_id: 7,
+                },
+                SpfNextHop {
+                    gateway: ll(3),
+                    iface_id: 8,
+                },
+            ],
+        };
+        let only_7 = |id: u32| (id == 7).then(|| "eth7".to_string());
         assert_eq!(
-            local.nexthops,
-            vec![NextHop {
-                gateway: None,
-                iface: None,
-                weight: 1
-            }]
+            route.to_route(only_7).unwrap().nexthops,
+            vec![NextHop::via_dev(IpAddr::V6(ll(2)), "eth7")]
         );
+        assert!(route.to_route(|_| None).is_none());
     }
 
     /// A two-router area where R2 is an ABR injecting an inter-area prefix.

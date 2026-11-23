@@ -51,9 +51,28 @@ pub struct ReloadStatus {
     pub state: &'static str,
     pub pending_prefixes: usize,
     pub detail: Option<String>,
+    /// The routes the kernel refused in the last completed reconciliation
+    /// pass (retried on every reconcile tick). Empty when converged.
+    pub failed_routes: Vec<FailedRoute>,
     /// Internal admission barrier; not part of the public receipt grammar.
     pub in_flight: bool,
 }
+
+/// A prefix the kernel FIB did not take in a completed reconciliation pass:
+/// its install (or the removal of what replaced it) was refused, and the
+/// readback confirmed the prefix is not in its desired state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FailedRoute {
+    pub table: u32,
+    pub prefix: Prefix,
+    /// Who the route belongs to: a refused `static` is the operator's own
+    /// configuration not reaching the kernel; anything else was learned.
+    pub protocol: Protocol,
+}
+
+/// How many refused routes a receipt names; the rest are counted. Keeps a
+/// receipt well inside the control client's 4 KiB bound.
+const MAX_REPORTED_FAILURES: usize = 16;
 
 impl ReloadStatus {
     pub fn startup() -> Self {
@@ -62,8 +81,19 @@ impl ReloadStatus {
             state: "converged",
             pending_prefixes: 0,
             detail: None,
+            failed_routes: Vec::new(),
             in_flight: false,
         }
+    }
+
+    /// Whether this generation's reconciliation has finished: `converged`, or
+    /// `degraded` — every configured route is in the kernel and only learned
+    /// routes were refused (they stay queued for retry and are named in the
+    /// receipt). A refused learned route must not hold a reload open: it is
+    /// not the operator's change, and a peer could otherwise keep every
+    /// commit from completing.
+    pub fn is_complete(&self) -> bool {
+        matches!(self.state, "converged" | "degraded")
     }
 
     pub fn render(&self) -> String {
@@ -74,6 +104,22 @@ impl ReloadStatus {
         if let Some(detail) = &self.detail {
             // Details are fixed diagnostics, never configuration contents.
             let _ = writeln!(text, "detail {}", detail.replace(['\n', '\r'], " "));
+        }
+        for failed in self.failed_routes.iter().take(MAX_REPORTED_FAILURES) {
+            let _ = writeln!(
+                text,
+                "failed-route {} {} {}",
+                failed.table,
+                failed.prefix,
+                failed.protocol.name()
+            );
+        }
+        let omitted = self
+            .failed_routes
+            .len()
+            .saturating_sub(MAX_REPORTED_FAILURES);
+        if omitted > 0 {
+            let _ = writeln!(text, "failed-routes-omitted {omitted}");
         }
         text
     }
@@ -365,12 +411,12 @@ pub async fn run(
                             .and_then(|route| export_route(&route, fib_export.as_ref()))
                             .map(|route| ((route.table, route.prefix), route))
                     }).collect();
-                    let converged = reconcile_selected(&desired, fib,
+                    let pass = reconcile_selected(&desired, fib,
                         &mut exported, &mut subscribers, &mut failed, &changed, &mut monitor_valid).await;
                     for change in coalesced.values() {
                         redistribute(redist, &redist_event(change)).await;
                     }
-                    publish_completion(&status, generation, &failed, converged);
+                    publish_completion(&status, generation, &failed, &pass);
                     managed.retain(|key| failed.contains(key) || exported.contains_key(key));
                 }
                 None => break, // every protocol sender dropped — shut the router down
@@ -415,22 +461,42 @@ pub async fn run(
                 fib_export = reload.fib_export;
                 vrf_exports = reload.vrf_exports;
                 generation = reload.generation;
-                let converged = reconcile_desired_checked(rib, fib, &vrf_exports, fib_export.as_ref(),
+                let pass = reconcile_desired_checked(rib, fib, &vrf_exports, fib_export.as_ref(),
                     &mut exported, &mut subscribers, &mut failed, &managed, &mut monitor_valid).await;
                 for change in changes.values() {
                     redistribute(redist, &redist_event(change)).await;
                 }
-                publish_completion(&status, generation, &failed, converged);
+                publish_completion(&status, generation, &failed, &pass);
                 managed.retain(|key| failed.contains(key) || exported.contains_key(key));
             }
             _ = reconcile.tick(), if status.borrow().generation == generation => {
                 begin_attempt(&status, generation);
-                let converged = reconcile_desired_checked(rib, fib, &vrf_exports, fib_export.as_ref(),
+                let pass = reconcile_desired_checked(rib, fib, &vrf_exports, fib_export.as_ref(),
                     &mut exported, &mut subscribers, &mut failed, &managed, &mut monitor_valid).await;
-                publish_completion(&status, generation, &failed, converged);
+                publish_completion(&status, generation, &failed, &pass);
                 managed.retain(|key| failed.contains(key) || exported.contains_key(key));
             }
         }
+    }
+}
+
+/// What one reconciliation pass established about the forwarding plane.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Pass {
+    /// Every selected prefix is in its desired state.
+    Converged,
+    /// The pass completed — every write was followed by a readback — and the
+    /// kernel did not take these routes. They stay in the failed set.
+    Refused(Vec<FailedRoute>),
+    /// An inventory or readback failed, or a write failed in a way the
+    /// readback did not settle: the state of the selected prefixes is unknown.
+    Unknown,
+}
+
+#[cfg(test)]
+impl Pass {
+    fn converged(&self) -> bool {
+        *self == Pass::Converged
     }
 }
 
@@ -442,20 +508,43 @@ fn begin_attempt(status: &watch::Sender<ReloadStatus>, generation: u64) {
     });
 }
 
+/// Publish what a pass established. A pass that completed with only learned
+/// routes refused is `degraded`, which ends the reload; a refused static
+/// route is the generation's own configuration missing from the kernel and
+/// keeps it `pending` (retried on the reconcile tick, as an unknown pass is).
+/// Either way the receipt names the refused routes.
 fn publish_completion(
     status: &watch::Sender<ReloadStatus>,
     generation: u64,
     failed: &BTreeSet<(u32, Prefix)>,
-    converged: bool,
+    pass: &Pass,
 ) {
+    let (state, detail, failed_routes): (_, Option<&str>, _) = match pass {
+        Pass::Converged => ("converged", None, Vec::new()),
+        Pass::Unknown => (
+            "pending",
+            Some("forwarding-plane reconciliation incomplete; retry scheduled"),
+            Vec::new(),
+        ),
+        Pass::Refused(routes) if routes.iter().any(|r| r.protocol == Protocol::Static) => (
+            "pending",
+            Some("the kernel refused a configured route; retry scheduled"),
+            routes.clone(),
+        ),
+        Pass::Refused(routes) => (
+            "degraded",
+            Some("the kernel refused learned routes; retry scheduled"),
+            routes.clone(),
+        ),
+    };
     status.send_modify(|current| {
         // An older in-flight generation must not overwrite a newer admission.
         if current.generation == generation && current.state != "rejected" {
             current.in_flight = false;
-            current.state = if converged { "converged" } else { "pending" };
+            current.state = state;
             current.pending_prefixes = failed.len();
-            current.detail = (!converged)
-                .then(|| "forwarding-plane reconciliation incomplete; retry scheduled".into());
+            current.detail = detail.map(Into::into);
+            current.failed_routes = failed_routes;
         }
     });
 }
@@ -543,7 +632,7 @@ async fn reconcile_desired_checked(
     failed: &mut BTreeSet<(u32, Prefix)>,
     managed: &BTreeSet<(u32, Prefix)>,
     monitor_valid: &mut bool,
-) -> bool {
+) -> Pass {
     let desired: ExportedRoutes = rib
         .iter_best()
         .filter_map(|route| {
@@ -580,7 +669,7 @@ async fn reconcile_selected(
     failed: &mut BTreeSet<(u32, Prefix)>,
     keys: &BTreeSet<(u32, Prefix)>,
     monitor_valid: &mut bool,
-) -> bool {
+) -> Pass {
     *monitor_valid = false;
     failed.extend(keys.iter().copied());
     let obsolete = |have: &Route| {
@@ -595,7 +684,7 @@ async fn reconcile_selected(
         Err(error) => {
             subscribers.clear();
             warn!(%error, "routing reconciliation inventory failed");
-            return false;
+            return Pass::Unknown;
         }
     };
     let mut writes_ok = true;
@@ -613,7 +702,7 @@ async fn reconcile_selected(
             Err(error) => {
                 subscribers.clear();
                 warn!(%error, "route withdrawal readback failed");
-                return false;
+                return Pass::Unknown;
             }
         }
     } else {
@@ -621,7 +710,7 @@ async fn reconcile_selected(
     };
     *monitor_valid = observed_exports(desired, &after_removals, keys, exported, subscribers);
     if !writes_ok || after_removals.iter().any(obsolete) {
-        return false;
+        return Pass::Unknown;
     }
     let index = inventory_index(&after_removals);
     let mut installed = false;
@@ -644,7 +733,7 @@ async fn reconcile_selected(
                 *monitor_valid = false;
                 subscribers.clear();
                 warn!(%error, "route installation readback failed");
-                return false;
+                return Pass::Unknown;
             }
         }
     } else {
@@ -652,17 +741,38 @@ async fn reconcile_selected(
     };
     *monitor_valid = observed_exports(desired, &final_routes, keys, exported, subscribers);
     let index = inventory_index(&final_routes);
+    let mut refused = Vec::new();
     failed.retain(|key| {
         if !keys.contains(key) {
             return true;
         }
         let actual = index.get(key).map_or(&[][..], Vec::as_slice);
-        match desired.get(key) {
-            Some(want) => actual.len() != 1 || !same_forwarding(want, actual[0]),
-            None => !actual.is_empty(),
+        // The protocol of the route that is not where it should be: the one
+        // wanted, or — for a withdrawal — the one still installed.
+        let stuck = match desired.get(key) {
+            Some(want) => {
+                (actual.len() != 1 || !same_forwarding(want, actual[0])).then_some(want.protocol)
+            }
+            None => actual.first().map(|have| have.protocol),
+        };
+        if let Some(protocol) = stuck {
+            refused.push(FailedRoute {
+                table: key.0,
+                prefix: key.1,
+                protocol,
+            });
         }
+        stuck.is_some()
     });
-    writes_ok && failed.is_empty() && *monitor_valid
+    if writes_ok && failed.is_empty() && *monitor_valid {
+        Pass::Converged
+    } else if refused.is_empty() {
+        // A write errored but the readback shows nothing out of place (a lost
+        // ACK), or the only failures predate this pass: settle on the next tick.
+        Pass::Unknown
+    } else {
+        Pass::Refused(refused)
+    }
 }
 
 #[cfg(test)]
@@ -689,6 +799,7 @@ async fn reconcile_desired(
         &mut true,
     )
     .await
+    .converged()
 }
 
 /// A successful install is not permanent: Linux removes gateway routes when a
@@ -944,6 +1055,18 @@ pub fn render_router_metrics(rib: &Rib) -> String {
     for (proto, n) in &counts {
         crate::metrics::sample(&mut out, "wren_rib_routes", &[("protocol", proto)], n);
     }
+    crate::metrics::family(
+        &mut out,
+        "wren_log_lines_dropped_total",
+        "Log lines dropped because the log output (journald) was not reading.",
+        "counter",
+    );
+    crate::metrics::sample(
+        &mut out,
+        "wren_log_lines_dropped_total",
+        &[],
+        crate::logwriter::dropped(),
+    );
     out
 }
 
@@ -1840,6 +1963,7 @@ mod tests {
         let out = render_router_metrics(&h.rib);
         assert!(out.contains("# TYPE wren_rib_routes gauge"));
         assert!(out.contains("wren_rib_routes{protocol=\"bgp\"} 2"));
+        assert!(out.contains("# TYPE wren_log_lines_dropped_total counter"));
         assert!(out.contains("wren_rib_routes{protocol=\"static\"} 1"));
         // An empty RIB still emits the family header, with no samples.
         let empty = render_router_metrics(&Rib::new());
@@ -2495,53 +2619,50 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(10);
         let mut subs = vec![tx];
         let mut valid = true;
-        assert!(
-            !reconcile_selected(
-                &desired,
-                &fib,
-                &mut exported,
-                &mut subs,
-                &mut failed,
-                &keys,
-                &mut valid
-            )
-            .await
-        );
+        assert!(!reconcile_selected(
+            &desired,
+            &fib,
+            &mut exported,
+            &mut subs,
+            &mut failed,
+            &keys,
+            &mut valid
+        )
+        .await
+        .converged());
         assert!(!valid && exported.is_empty());
         assert!(
             rx.recv().await.is_none(),
             "unknown inventory closes rather than fabricating an empty dump"
         );
         assert_eq!(fib.owned_routes().await.unwrap(), vec![route.clone()]);
-        assert!(
-            !reconcile_selected(
-                &BTreeMap::new(),
-                &fib,
-                &mut exported,
-                &mut subs,
-                &mut failed,
-                &keys,
-                &mut valid
-            )
-            .await
-        );
+        assert!(!reconcile_selected(
+            &BTreeMap::new(),
+            &fib,
+            &mut exported,
+            &mut subs,
+            &mut failed,
+            &keys,
+            &mut valid
+        )
+        .await
+        .converged());
         assert!(
             valid,
             "sole observed old route is representable even when never cached"
         );
         assert_eq!(exported.get(&key), Some(&route));
-        assert!(
-            reconcile_selected(
-                &BTreeMap::new(),
-                &fib,
-                &mut exported,
-                &mut subs,
-                &mut failed,
-                &keys,
-                &mut valid
-            )
-            .await
-        );
+        assert!(reconcile_selected(
+            &BTreeMap::new(),
+            &fib,
+            &mut exported,
+            &mut subs,
+            &mut failed,
+            &keys,
+            &mut valid
+        )
+        .await
+        .converged());
         assert!(valid && exported.is_empty());
     }
 
@@ -2563,32 +2684,30 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(10);
         let mut subs = vec![tx];
         let mut valid = true;
-        assert!(
-            !reconcile_selected(
-                &desired,
-                &fib,
-                &mut exported,
-                &mut subs,
-                &mut failed,
-                &keys,
-                &mut valid
-            )
-            .await
-        );
+        assert!(!reconcile_selected(
+            &desired,
+            &fib,
+            &mut exported,
+            &mut subs,
+            &mut failed,
+            &keys,
+            &mut valid
+        )
+        .await
+        .converged());
         assert!(!valid);
         assert!(rx.recv().await.is_none());
-        assert!(
-            reconcile_selected(
-                &desired,
-                &fib,
-                &mut exported,
-                &mut subs,
-                &mut failed,
-                &keys,
-                &mut valid
-            )
-            .await
-        );
+        assert!(reconcile_selected(
+            &desired,
+            &fib,
+            &mut exported,
+            &mut subs,
+            &mut failed,
+            &keys,
+            &mut valid
+        )
+        .await
+        .converged());
         assert!(valid);
         assert_eq!(exported, desired);
     }
@@ -2715,13 +2834,14 @@ mod tests {
             state: "pending",
             pending_prefixes: 0,
             detail: None,
+            failed_routes: Vec::new(),
             in_flight: false,
         });
-        publish_completion(&status, 1, &BTreeSet::new(), true);
+        publish_completion(&status, 1, &BTreeSet::new(), &Pass::Converged);
         assert_eq!(status.borrow().state, "pending");
-        publish_completion(&status, 2, &BTreeSet::new(), false);
+        publish_completion(&status, 2, &BTreeSet::new(), &Pass::Unknown);
         assert_eq!(status.borrow().state, "pending");
-        publish_completion(&status, 2, &BTreeSet::new(), true);
+        publish_completion(&status, 2, &BTreeSet::new(), &Pass::Converged);
         assert_eq!(status.borrow().state, "converged");
         assert_eq!(
             ReloadStatus::startup().render(),
@@ -2847,6 +2967,186 @@ mod tests {
         })
         .await
         .unwrap();
+    }
+
+    /// A [`Fib`] that refuses every install of the prefixes in `refuse`, with
+    /// the error netlink gives a route it cannot express — what OSPFv3's
+    /// on-link route for a shared /64 met on a real kernel.
+    struct RefusingFib {
+        inner: MemoryFib,
+        refuse: Vec<Prefix>,
+    }
+
+    impl Fib for RefusingFib {
+        fn apply(&mut self, change: &FibChange) -> Result<(), wren_core::FibError> {
+            if let FibChange::Install(route) = change {
+                if self.refuse.contains(&route.prefix) {
+                    return Err(wren_core::FibError(
+                        "route nexthop has neither gateway nor interface".into(),
+                    ));
+                }
+            }
+            self.inner.apply(change)
+        }
+        fn remove_owned(&mut self, route: &Route) -> Result<(), wren_core::FibError> {
+            self.inner.remove_owned(route)
+        }
+        fn owned_routes(&mut self) -> Result<Vec<Route>, wren_core::FibError> {
+            self.inner.owned_routes()
+        }
+    }
+
+    fn on_link_ospf_route(prefix: &str) -> Route {
+        Route::new(
+            prefix.parse().unwrap(),
+            Protocol::Ospf,
+            vec![NextHop {
+                gateway: None,
+                iface: None,
+                weight: 1,
+            }],
+            1,
+        )
+    }
+
+    /// Drive the real router loop over `fib`: announce `learned`, then admit
+    /// routing generation 1 carrying `statics`, and return the status the
+    /// generation settles on (or the still-pending one after two seconds,
+    /// well inside the 15 s retry tick).
+    async fn reload_outcome(
+        fib: RefusingFib,
+        learned: Vec<Route>,
+        statics: Vec<Route>,
+    ) -> (ReloadStatus, Vec<Route>) {
+        let fib = crate::fib::spawn(Box::new(fib));
+        let (updates, updates_rx) = mpsc::channel(16);
+        let (_queries, queries_rx) = mpsc::channel(4);
+        let (_subscribe, subscribe_rx) = mpsc::channel(4);
+        let (reloads, reload_rx) = mpsc::channel(1);
+        let (status, mut progress) = watch::channel(ReloadStatus::startup());
+        let mut rib = Rib::new();
+        let (imports, vrf_exports) = (ImportFilters::new(), HashMap::new());
+        let router = run(
+            &mut rib,
+            &fib,
+            updates_rx,
+            &imports,
+            None,
+            &[],
+            &[],
+            queries_rx,
+            subscribe_rx,
+            &[],
+            ExportedRoutes::new(),
+            reload_rx,
+            status.clone(),
+            &vrf_exports,
+        );
+        let driver = async {
+            for route in learned {
+                updates.send(RouteUpdate::Announce(route)).await.unwrap();
+            }
+            while updates.capacity() != 16 || status.borrow().in_flight {
+                tokio::task::yield_now().await;
+            }
+            let mut receipt = status.borrow().clone();
+            receipt.generation = 1;
+            receipt.state = "pending";
+            receipt.in_flight = true;
+            reloads
+                .try_send(RouterReload {
+                    generation: 1,
+                    statics,
+                    imports: ImportFilters::new(),
+                    fib_export: None,
+                    vrf_exports: HashMap::new(),
+                })
+                .unwrap();
+            status.send_replace(receipt);
+            let _ = tokio::time::timeout(
+                Duration::from_secs(2),
+                progress.wait_for(|v| v.generation == 1 && !v.in_flight && v.state != "pending"),
+            )
+            .await;
+            let outcome = status.borrow().clone();
+            drop(updates);
+            outcome
+        };
+        let (_, outcome) = tokio::join!(router, driver);
+        let installed = fib.owned_routes().await.unwrap();
+        (outcome, installed)
+    }
+
+    /// One learned route the kernel refuses must not hold a routing reload
+    /// open: the generation's own static is installed, the reload completes as
+    /// `degraded`, and the receipt names the refused route. Before, the
+    /// refused route stayed in the failed set, the generation stayed `pending`
+    /// for good, `wren reload` timed out after 30 s and every Sentinel commit
+    /// failed while OSPFv3 ran on a shared /64.
+    #[tokio::test]
+    async fn a_refused_learned_route_completes_the_reload_as_degraded_and_names_it() {
+        let shared = on_link_ospf_route("2001:db8::/64");
+        let configured = static_route("198.51.100.0/24");
+        let fib = RefusingFib {
+            inner: MemoryFib::default(),
+            refuse: vec![shared.prefix],
+        };
+        let (outcome, installed) =
+            reload_outcome(fib, vec![shared], vec![configured.clone()]).await;
+        assert_eq!(outcome.state, "degraded", "{}", outcome.render());
+        assert!(outcome.is_complete());
+        assert_eq!(installed, vec![configured]);
+        assert_eq!(
+            outcome.failed_routes,
+            vec![FailedRoute {
+                table: wren_core::RT_TABLE_MAIN,
+                prefix: "2001:db8::/64".parse().unwrap(),
+                protocol: Protocol::Ospf,
+            }]
+        );
+        assert!(outcome
+            .render()
+            .contains("failed-route 254 2001:db8::/64 ospf\n"));
+    }
+
+    /// A refused static route is the operator's own change missing from the
+    /// kernel: the generation stays `pending` (retried each tick) — a reload
+    /// that reports success here would hide it — but the receipt names it.
+    #[tokio::test]
+    async fn a_refused_static_route_keeps_the_reload_pending_and_names_it() {
+        let configured = static_route("198.51.100.0/24");
+        let fib = RefusingFib {
+            inner: MemoryFib::default(),
+            refuse: vec![configured.prefix],
+        };
+        let (outcome, installed) = reload_outcome(fib, vec![], vec![configured]).await;
+        assert_eq!(outcome.state, "pending", "{}", outcome.render());
+        assert!(!outcome.is_complete());
+        assert!(installed.is_empty());
+        assert!(outcome
+            .render()
+            .contains("failed-route 254 198.51.100.0/24 static\n"));
+    }
+
+    #[test]
+    fn a_receipt_names_at_most_sixteen_refused_routes_and_counts_the_rest() {
+        let mut status = ReloadStatus::startup();
+        status.state = "degraded";
+        status.failed_routes = (0..20u8)
+            .map(|i| FailedRoute {
+                table: 254,
+                prefix: format!("10.{i}.0.0/16").parse().unwrap(),
+                protocol: Protocol::Bgp,
+            })
+            .collect();
+        let text = status.render();
+        assert_eq!(
+            text.lines()
+                .filter(|l| l.starts_with("failed-route "))
+                .count(),
+            16
+        );
+        assert!(text.ends_with("failed-routes-omitted 4\n"), "{text}");
     }
 
     /// A [`Fib`] that counts install writes — to prove a coalesced burst hits the

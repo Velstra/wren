@@ -23,6 +23,7 @@ mod fib;
 mod igmp;
 #[cfg(feature = "isis")]
 mod isis;
+mod logwriter;
 mod metrics;
 #[cfg(feature = "igmp")]
 mod mld;
@@ -263,11 +264,17 @@ async fn main() -> Result<()> {
         return igmp::mcast_join_blocking(g, iface);
     }
 
+    // Logging must never block the daemon: a journal that stops reading would
+    // otherwise stall every task that logs, the HA lease renewals included
+    // (see `logwriter`).
+    let log = logwriter::LossyStdout::stdout();
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
         )
+        .with_writer(log.clone())
         .init();
+    let _flush_log = logwriter::FlushOnExit(log);
 
     // Supervision: each routing protocol runs in its own spawned task. With
     // unwinding (no panic=abort, see the workspace Cargo.toml), a panic in one
@@ -829,6 +836,19 @@ async fn main() -> Result<()> {
                 if backend == Backend::Memory {
                     warn!("OSPFv3 is enabled but the backend is in-memory — learned routes will not be installed in the kernel");
                 }
+                // Wire redistribution: `redistribute_static` makes OSPFv3 follow the
+                // router's best static routes, so a reload that adds or removes one
+                // is advertised or withdrawn without restarting the engine.
+                let (redist_tx, redist_rx) = mpsc::channel(REDIST_QUEUE);
+                if ospf3cfg.redistribute_static {
+                    redist_targets.push(router::RedistTarget {
+                        protocol: Protocol::Ospf,
+                        sources: HashSet::from([Protocol::Static]),
+                        filter: None,
+                        tx: redist_tx,
+                    });
+                    info!("OSPFv3 redistribution of static routes active");
+                }
                 let tx = updates_tx.clone();
                 let qrx = ospf3_queries_rx
                     .take()
@@ -841,7 +861,9 @@ async fn main() -> Result<()> {
                 let bdrx = ospf3_bfd_rx.take().expect("ospf3 bfd rx taken once");
                 let sd = supervisor.mark_started("ospf3", ospf3_sig(&cfg));
                 proto_handles.push(tokio::spawn(async move {
-                    if let Err(e) = ospf3::run(run_cfg, tx, qrx, breg, bnotify, bdrx, sd).await {
+                    if let Err(e) =
+                        ospf3::run(run_cfg, tx, redist_rx, qrx, breg, bnotify, bdrx, sd).await
+                    {
                         error!(error = %e, "OSPFv3 engine stopped");
                     }
                 }));
@@ -1236,19 +1258,22 @@ async fn main() -> Result<()> {
                         return None;
                     }
                 };
+                let (rtx, redist_rx) = mpsc::channel(REDIST_QUEUE);
                 let (qtx, qrx) = mpsc::channel(QUERY_QUEUE);
                 let (bdtx, bdrx) = mpsc::channel(QUERY_QUEUE);
                 let tx = updates_tx.clone();
                 let breg = breg.clone();
                 let bnotify = bnotify.clone();
                 let join = tokio::spawn(async move {
-                    if let Err(e) = ospf3::run(run_cfg, tx, qrx, breg, bnotify, bdrx, stop).await {
+                    if let Err(e) =
+                        ospf3::run(run_cfg, tx, redist_rx, qrx, breg, bnotify, bdrx, stop).await
+                    {
                         error!(error = %e, "OSPFv3 engine stopped");
                     }
                 });
                 Some(reload::SpawnOut {
                     join,
-                    parked: vec![Box::new(qtx), Box::new(bdtx)],
+                    parked: vec![Box::new(rtx), Box::new(qtx), Box::new(bdtx)],
                 })
             }),
         );
@@ -1540,7 +1565,7 @@ async fn main() -> Result<()> {
             }
             Ok(()) = reload_progress.changed() => {
                 let progress = reload_progress.borrow_and_update().clone();
-                if progress.state == "converged"
+                if progress.is_complete()
                     && deferred_reload.as_ref().is_some_and(|(generation, _)| *generation == progress.generation) {
                     let (_, reloaded) = deferred_reload.take().expect("checked pending generation");
                     apply_protocol_reload(reloaded, &bgp_reload_tx, bgp_reconfig_enabled,
@@ -1810,8 +1835,9 @@ fn build_ospf3_config(
         });
     }
     // Redistribute the configured static routes; the runner keeps only the IPv6.
+    let redistribute_metric = ospf3.redistribute_metric.unwrap_or(20);
     let redistribute = if ospf3.redistribute_static {
-        let metric = ospf3.redistribute_metric.unwrap_or(20);
+        let metric = redistribute_metric;
         cfg.static_routes()
             .context("resolving static routes for OSPFv3 redistribution")?
             .into_iter()
@@ -1833,6 +1859,7 @@ fn build_ospf3_config(
         instance_id: ospf3.instance_id.unwrap_or(0),
         interfaces,
         redistribute,
+        redistribute_metric,
         bfd: ospf3.bfd,
         auth: build_ospf3_auth(ospf3)?,
         auth_replay_protection: ospf3.auth_replay_protection.unwrap_or(true),

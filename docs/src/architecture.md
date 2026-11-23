@@ -2,11 +2,23 @@
 
 ## Follow a prefix {#the-central-router-loop}
 
+```mermaid
+flowchart LR
+  proto[Protocol task] -->|import filter| upd[Route update]
+  upd --> rib[Router loop<br/>RIB per table and prefix]
+  rib -->|winner changed| chg[Install or removal]
+  chg -->|FIB export policy| be{Backend}
+  be --> k[kernel: netlink]
+  be --> m[memory: in process]
+  rib -->|redistribution| proto
+  rib --> mon[wren monitor routes]
+```
+
 1. A protocol accepts an advertisement and submits a candidate to the route manager.
 2. The RIB compares candidates for that table and prefix. When the winner changes, the RIB produces an install or a removal.
 3. The selected backend applies the forwarding update. Import and FIB export policy can affect what is retained or installed. Connected networks stay under kernel ownership.
 
-To distinguish a learned path from an installed one, inspect all three views:
+Learned, selected and installed are three views:
 
 ```sh
 wren show bgp routes

@@ -6,8 +6,81 @@ follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed
+
+- **The lease, not a second look at the agent, decides whether a member holds
+  its VIPs.** A new owner no longer drops its VIPs for up to one lease right
+  after a takeover because one agent report arrived late during a witness
+  exchange. A wedged or ineligible agent now keeps the VIPs until the lease
+  it last renewed ends: at most the 100 ms freshness bound plus one 250 ms
+  lease, and the release follows on the next poll after the exchange in
+  flight (about 0.45 s after the agent stops). Its stale or ineligible reports stop the renewals, and its data
+  plane is already fenced: by process exit, by ineligibility, or (for a
+  wedged agent) by the kernel deadline it no longer extends. In two-node mode
+  the election refuses an ineligible request and zeroes the deadline, so the
+  VIPs go on the next tick there; the second agent check after the exchange
+  is gone in both modes.
+- **The first announcement after a takeover no longer waits for the next
+  witness exchange.** The new owner sends its gratuitous ARP and neighbour
+  advertisements as soon as its agent acknowledges forwarding the new term,
+  while its lease for that term is still running. The exchange it used to
+  wait for is the slowest of a takeover (the witness records the
+  acknowledgement durably), so a takeover reaches clients 50 to 70 ms sooner
+  in witness mode. Holding and releasing the VIPs are decided as before.
+
 ### Fixed
 
+- **A preemption no longer interrupts the takeover it follows.** In witness
+  mode a higher-priority member could preempt a new owner as soon as it held
+  that owner's snapshot. After the owner's Wren crashed, its restarted
+  coordinator took the pair back 3 to 4 s after the fault, as soon as its
+  agent held the successor's snapshot. A WireGuard takeover still waiting for
+  a handshake retry then lost the pair before it forwarded: two handovers
+  for one fault (3.95 s of outage). The witness
+  now honours a preemption only once the owner has held its authority for
+  10 s (`PREEMPT_HOLD_MS`). Failover is unchanged; only the return of a
+  preempting member waits.
+- **Logging no longer blocks the daemon.** Log lines were written straight to
+  stdout, a pipe to journald under systemd. When journald stopped reading
+  (synchronous console forwarding, disk pressure, rate limiting) every task
+  that logged blocked on the stdout lock — the HA lease coordinator included,
+  so its 25 ms renewals stalled past the 250 ms witness lease and the pair
+  failed over with no fault. Lines now go through a bounded queue (4096 lines)
+  drained by a dedicated writer thread; while the output is blocked new lines
+  are dropped instead of waited for, counted in the new metric
+  `wren_log_lines_dropped_total`, and reported on the log as soon as it
+  drains. A daemon exit waits up to 500 ms for the queued lines. The queue
+  size can be set with `WREN_LOG_QUEUE_LINES` (1–65536).
+- **OSPFv3 redistribution follows a reload.** `[ospf3] redistribute_static`
+  advertised the static routes configured when the engine started and nothing
+  else: a reload that removed one left its AS-external LSA in every
+  neighbour's database (and the route in their FIBs), and one that added a
+  static was never advertised. OSPFv3 now takes the central router's
+  redistribution feed, as OSPFv2 and the other IGPs do, and originates or
+  flushes (MaxAge) the external LSA as the static comes and goes, without
+  restarting the engine or its adjacencies.
+- **OSPFv3 no longer installs routes for directly attached prefixes.** A
+  prefix on a link the router sits on (two routers on one shared /64, or the
+  router's own) came out of the SPF with no next hop and was handed to the
+  kernel as a route with neither a gateway nor an interface. Netlink refused
+  it ("route nexthop has neither gateway nor interface"), the router retried it
+  forever, and every routing reload stayed pending. Such prefixes are now left
+  out, as OSPFv2 and IS-IS already did — the kernel's connected route covers
+  them — and a link-local next hop whose interface cannot be named is dropped
+  rather than installed unpinned. `wren_ospfv3::spf::SpfRoute::to_route` now
+  returns `Option<Route>`.
+- **A route the kernel refuses no longer holds every routing reload open.** A
+  reload completed only when every prefix was in the kernel, so one refused
+  learned route (any protocol) kept each new generation `pending`: `wren
+  reload` timed out after 30 s, deferred protocol reconfiguration never ran,
+  and every Sentinel commit failed while it lasted. A reconciliation pass that
+  completes with only learned routes refused now settles as `degraded` — the
+  configuration is applied, the refused routes are retried every reconcile
+  tick — and `wren reload` succeeds. A refused configured static route still
+  keeps the generation `pending`, as the operator's own change is not in the
+  kernel. Receipts and `show reload` name each refused route on a
+  `failed-route <table> <prefix> <protocol>` line (at most 16, the rest
+  counted), including the receipt a timed-out reload prints.
 - **OSPFv2/v3 withdraw their own LSAs on a normal shutdown.** Configuration
   restarts now flood MaxAge instances at the original link, area and AS scopes,
   then accept acknowledgments and retry within a bounded shutdown window.

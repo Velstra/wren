@@ -32,7 +32,20 @@ wren show ospf interfaces
 wren show ospf database
 ```
 
-Run the `show` commands on your running instance. The lab runs its own queries before cleanup and checks for the neighbor in `Full` state and the interface in `PtP` state.
+The lab runs its own queries before cleanup and checks for the neighbor in `Full` state and the interface in `PtP` state. `wren show ospf neighbors` steps through the RFC 2328 states on the way:
+
+```mermaid
+stateDiagram-v2
+  direction LR
+  [*] --> Down
+  Down --> Init: Hello seen
+  Init --> TwoWay: our ID in its Hello
+  TwoWay --> ExStart: form adjacency
+  ExStart --> Exchange
+  Exchange --> Loading: database described
+  Loading --> Full: LSAs received
+  Exchange --> Full: nothing to request
+```
 
 [Lab source](https://github.com/Velstra/wren/blob/main/scripts/ospf-show-smoke.sh).
 

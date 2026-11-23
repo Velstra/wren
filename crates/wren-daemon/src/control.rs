@@ -832,7 +832,14 @@ async fn reload_response(
     match tokio::time::timeout(Duration::from_secs(30), completion).await {
         Ok(result) => result.render(),
         Err(_) => {
-            let mut pending = admitted;
+            // The latest view of this generation, so the receipt names the
+            // routes still refused rather than repeating the admission.
+            let current = status.borrow().clone();
+            let mut pending = if current.generation == generation {
+                current
+            } else {
+                admitted
+            };
             pending.detail = Some("completion timeout; generation continues asynchronously".into());
             pending.render()
         }
@@ -854,10 +861,19 @@ pub async fn run_reload_client(path: &Path) -> Result<()> {
     .context("reload response timeout; outcome unknown; inspect wren show reload")??;
     print!("{response}");
     anyhow::ensure!(
-        response.lines().any(|line| line == "state converged"),
+        receipt_reports_completion(&response),
         "routing reload did not report convergence; inspect wren show reload"
     );
     Ok(())
+}
+
+/// Whether a reload receipt reports a finished generation: `converged`, or
+/// `degraded` (configuration applied; only learned routes were refused by the
+/// kernel, named on `failed-route` lines and retried in the background).
+fn receipt_reports_completion(receipt: &str) -> bool {
+    receipt
+        .lines()
+        .any(|line| line == "state converged" || line == "state degraded")
 }
 
 /// Serve a route-export subscription: register with the router, then stream each
@@ -1304,6 +1320,64 @@ mod flowspec_monitor_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The client accepts what ends a reload — `converged`, or `degraded` with
+    /// the refused learned routes listed — and nothing that is still open or
+    /// refused outright.
+    #[test]
+    fn the_reload_client_accepts_converged_and_degraded_receipts_only() {
+        let mut status = crate::router::ReloadStatus::startup();
+        assert!(receipt_reports_completion(&status.render()));
+        status.state = "degraded";
+        status.failed_routes = vec![crate::router::FailedRoute {
+            table: 254,
+            prefix: "2001:db8::/64".parse().unwrap(),
+            protocol: wren_core::Protocol::Ospf,
+        }];
+        let degraded = status.render();
+        assert!(degraded.contains("failed-route 254 2001:db8::/64 ospf\n"));
+        assert!(receipt_reports_completion(&degraded));
+        for open in ["pending", "rejected", "superseded"] {
+            status.state = open;
+            assert!(!receipt_reports_completion(&status.render()), "{open}");
+        }
+        // A detail line that merely mentions a state is not the state line.
+        assert!(!receipt_reports_completion(
+            "state pending\ndetail state converged\n"
+        ));
+    }
+
+    /// A generation that settles as `degraded` ends the waiting client at once
+    /// with the refused routes in its receipt, rather than after the timeout.
+    #[tokio::test]
+    async fn a_degraded_generation_completes_the_reload_receipt() {
+        let (requests, mut incoming) = mpsc::channel(1);
+        let (status, receiver) = watch::channel(crate::router::ReloadStatus::startup());
+        let client = tokio::spawn(async move { reload_response(&requests, receiver).await });
+        let reply = incoming.recv().await.unwrap();
+        let mut admitted = crate::router::ReloadStatus::startup();
+        admitted.generation = 1;
+        admitted.state = "pending";
+        admitted.in_flight = true;
+        status.send_replace(admitted.clone());
+        reply.send(admitted).unwrap();
+        status.send_modify(|value| {
+            value.state = "degraded";
+            value.in_flight = false;
+            value.failed_routes = vec![crate::router::FailedRoute {
+                table: 254,
+                prefix: "2001:db8::/64".parse().unwrap(),
+                protocol: wren_core::Protocol::Ospf,
+            }];
+        });
+        let receipt = tokio::time::timeout(std::time::Duration::from_secs(1), client)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(receipt.contains("state degraded\n"), "{receipt}");
+        assert!(receipt.contains("failed-route 254 2001:db8::/64 ospf\n"));
+        assert!(receipt_reports_completion(&receipt));
+    }
 
     #[tokio::test]
     async fn reload_receipt_waits_for_actual_generation_completion_and_reports_supersession() {
