@@ -945,6 +945,9 @@ pub async fn run_ha(
                 if announce_before_exchange(&AnnounceView { role: &role, node: config.node, boot, now,
                     healthy: healthy_before, cooldowns_clear: cooldowns_clear(now, vpn_failed_until, vip_failed_until),
                     owns_vips: binding.owns, agent: agent.as_ref(), announced_term }) {
+                    // The tunnels first, as after the exchange: neighbours must
+                    // not move here before WireGuard is being brought up.
+                    start_vpn_promote(&config, &mut role, &mut rekey, &mut rekey_term);
                     info!(term=role.authority.term, node=config.node, "HA promoted; announcing all VIPs");
                     binding.announce(); announcements.arm(Instant::now()); announced_term = role.authority.term;
                 }
@@ -1009,10 +1012,8 @@ pub async fn run_ha(
                     if binding.owns {binding.release(); withdrawal_reporter.after_release(withdrawal);} announcements.cancel(); announced_term = 0;
                     rekey.cancel();rekey_term=0;role.vpn_ready=false;
                 }
-                if active && role.vips_ready && agent.as_ref().is_some_and(|a| a.forwarding_term==role.authority.term) && rekey_term!=role.authority.term {
-                    rekey.cancel();rekey_term=role.authority.term;
-                    if config.wireguard.is_empty() {role.vpn_ready=true;}
-                    else {let config=config.clone();let role=role.clone();rekey.0=Some(tokio::spawn(wren_ha::wireguard::promote(config,role)));}
+                if active && role.vips_ready && agent.as_ref().is_some_and(|a| a.forwarding_term==role.authority.term) {
+                    start_vpn_promote(&config, &mut role, &mut rekey, &mut rekey_term);
                 }
                 role.updated_ns = now;
                 wren_ha::write_private(Path::new(ROLE_PATH), &role, false)?;
@@ -1105,6 +1106,29 @@ fn standby_unready(
         return Some("fresh data-plane agent has no state snapshot yet");
     }
     None
+}
+
+/// Start bringing this member's HA WireGuard interfaces up for its term, once
+/// per term (`rekey_term`). Without HA WireGuard the VPN is ready at once.
+fn start_vpn_promote(
+    config: &wren_ha::Config,
+    role: &mut wren_ha::Role,
+    rekey: &mut RekeyTask,
+    rekey_term: &mut u64,
+) {
+    if *rekey_term == role.authority.term {
+        return;
+    }
+    rekey.cancel();
+    *rekey_term = role.authority.term;
+    if config.wireguard.is_empty() {
+        role.vpn_ready = true;
+    } else {
+        rekey.0 = Some(tokio::spawn(wren_ha::wireguard::promote(
+            config.clone(),
+            role.clone(),
+        )));
+    }
 }
 
 #[derive(Default)]
@@ -2076,6 +2100,33 @@ mod tests {
             announce_view(&not_ready, Some(&acknowledged)),
             "the VIPs not ready",
         );
+    }
+
+    /// The VPN promote starts once per term, whichever path reaches it first
+    /// (before the exchange with the early announcement, or after it).
+    #[test]
+    fn the_vpn_promote_starts_once_per_term() {
+        let config = wren_ha::Config {
+            cluster: "test".into(),
+            node: 2,
+            mode: wren_ha::Mode::Witness,
+            witness: None,
+            two_node: None,
+            secret: "test".into(),
+            priority: 100,
+            preempt: false,
+            wireguard: Vec::new(),
+            wireguard_policy: String::new(),
+            lease_ms: 250,
+            io_ms: 80,
+        };
+        let mut role = holding(2_100_000_000);
+        let (mut rekey, mut rekey_term) = (RekeyTask::default(), 0);
+        start_vpn_promote(&config, &mut role, &mut rekey, &mut rekey_term);
+        assert!(role.vpn_ready && rekey_term == 8);
+        role.vpn_ready = false;
+        start_vpn_promote(&config, &mut role, &mut rekey, &mut rekey_term);
+        assert!(!role.vpn_ready, "the promote ran twice for one term");
     }
 
     /// An early announcement does not keep the VIPs: the decision after the
