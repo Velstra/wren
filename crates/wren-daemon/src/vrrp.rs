@@ -70,6 +70,42 @@ fn request_agent(reported: Option<wren_ha::Agent>, observed_ns: u64) -> Option<w
     reported.filter(|agent| agent.eligible && wren_ha::fresh(agent.updated_ns, observed_ns))
 }
 
+/// What decides the first announcement of a term before a tick's exchange.
+struct AnnounceView<'a> {
+    role: &'a wren_ha::Role,
+    node: u8,
+    boot: [u8; 16],
+    now: u64,
+    healthy: bool,
+    cooldowns_clear: bool,
+    owns_vips: bool,
+    /// The request Agent (`request_agent`: fresh and eligible).
+    agent: Option<&'a wren_ha::Agent>,
+    announced_term: u64,
+}
+
+/// Announce a term's VIPs before this tick's exchange rather than after it.
+/// The Agent acknowledged forwarding this term, and this member owns the VIPs
+/// under an unexpired lease for it on its own clock: the state the announce
+/// after the exchange would see. The exchange that follows an acknowledgement
+/// records the new claim durably at the witness, so it is the slowest of a
+/// takeover. Only the first announcement of a term moves; holding and release
+/// stay with the decision after the exchange.
+fn announce_before_exchange(view: &AnnounceView) -> bool {
+    let role = view.role;
+    view.owns_vips
+        && role.vips_ready
+        && role.authority.owner == view.node
+        && role.authority.boot == view.boot
+        && role.deadline_ns > view.now
+        && view.healthy
+        && view.cooldowns_clear
+        && view
+            .agent
+            .is_some_and(|a| a.forwarding_term == role.authority.term)
+        && view.announced_term != role.authority.term
+}
+
 /// Neither the VPN nor the VIP cooldown is running at `now`.
 fn cooldowns_clear(now: u64, vpn_failed_until: u64, vip_failed_until: u64) -> bool {
     now >= vpn_failed_until && now >= vip_failed_until
@@ -906,6 +942,15 @@ pub async fn run_ha(
                 agent_seen = reported;
                 let healthy_before = ha_interfaces_healthy(&binding.configs, &config.wireguard);
                 let agent_request_accepted = agent.is_some();
+                if announce_before_exchange(&AnnounceView { role: &role, node: config.node, boot, now,
+                    healthy: healthy_before, cooldowns_clear: cooldowns_clear(now, vpn_failed_until, vip_failed_until),
+                    owns_vips: binding.owns, agent: agent.as_ref(), announced_term }) {
+                    // The tunnels first, as after the exchange: neighbours must
+                    // not move here before WireGuard is being brought up.
+                    start_vpn_promote(&config, &mut role, &mut rekey, &mut rekey_term);
+                    info!(term=role.authority.term, node=config.node, "HA promoted; announcing all VIPs");
+                    binding.announce(); announcements.arm(Instant::now()); announced_term = role.authority.term;
+                }
                 let request = Request { cluster: config.cluster.clone(), node: config.node,
                     boot, agent_boot: agent.as_ref().map_or([0;16],|a|a.agent_boot), priority: config.priority, preempt: config.preempt,
                     ready_term: agent.as_ref().map_or(0, |a| a.ready_term),
@@ -967,10 +1012,8 @@ pub async fn run_ha(
                     if binding.owns {binding.release(); withdrawal_reporter.after_release(withdrawal);} announcements.cancel(); announced_term = 0;
                     rekey.cancel();rekey_term=0;role.vpn_ready=false;
                 }
-                if active && role.vips_ready && agent.as_ref().is_some_and(|a| a.forwarding_term==role.authority.term) && rekey_term!=role.authority.term {
-                    rekey.cancel();rekey_term=role.authority.term;
-                    if config.wireguard.is_empty() {role.vpn_ready=true;}
-                    else {let config=config.clone();let role=role.clone();rekey.0=Some(tokio::spawn(wren_ha::wireguard::promote(config,role)));}
+                if active && role.vips_ready && agent.as_ref().is_some_and(|a| a.forwarding_term==role.authority.term) {
+                    start_vpn_promote(&config, &mut role, &mut rekey, &mut rekey_term);
                 }
                 role.updated_ns = now;
                 wren_ha::write_private(Path::new(ROLE_PATH), &role, false)?;
@@ -1063,6 +1106,29 @@ fn standby_unready(
         return Some("fresh data-plane agent has no state snapshot yet");
     }
     None
+}
+
+/// Start bringing this member's HA WireGuard interfaces up for its term, once
+/// per term (`rekey_term`). Without HA WireGuard the VPN is ready at once.
+fn start_vpn_promote(
+    config: &wren_ha::Config,
+    role: &mut wren_ha::Role,
+    rekey: &mut RekeyTask,
+    rekey_term: &mut u64,
+) {
+    if *rekey_term == role.authority.term {
+        return;
+    }
+    rekey.cancel();
+    *rekey_term = role.authority.term;
+    if config.wireguard.is_empty() {
+        role.vpn_ready = true;
+    } else {
+        rekey.0 = Some(tokio::spawn(wren_ha::wireguard::promote(
+            config.clone(),
+            role.clone(),
+        )));
+    }
 }
 
 #[derive(Default)]
@@ -1933,6 +1999,170 @@ mod tests {
             deadline_ns,
             ..Default::default()
         }
+    }
+
+    fn announce_view<'a>(
+        role: &'a wren_ha::Role,
+        agent: Option<&'a wren_ha::Agent>,
+    ) -> AnnounceView<'a> {
+        AnnounceView {
+            role,
+            node: 2,
+            boot: [5; 16],
+            now: 2_000_000_000,
+            healthy: true,
+            cooldowns_clear: true,
+            owns_vips: true,
+            agent,
+            announced_term: 7,
+        }
+    }
+
+    /// The first announcement of a term goes out before the tick's exchange
+    /// once the Agent acknowledges the term, and only while this member holds
+    /// an unexpired lease for it, owns the VIPs and is healthy.
+    #[test]
+    fn a_term_is_announced_once_its_agent_acknowledges_it_under_a_live_lease() {
+        let mut role = holding(2_100_000_000);
+        role.vips_ready = true;
+        let acknowledged = wren_ha::Agent {
+            forwarding_term: 8,
+            ..Default::default()
+        };
+        assert!(announce_before_exchange(&announce_view(
+            &role,
+            Some(&acknowledged)
+        )));
+        let refused = |view: AnnounceView, why: &str| {
+            assert!(!announce_before_exchange(&view), "announced with {why}");
+        };
+        refused(
+            AnnounceView {
+                owns_vips: false,
+                ..announce_view(&role, Some(&acknowledged))
+            },
+            "no VIPs owned",
+        );
+        refused(
+            AnnounceView {
+                node: 1,
+                ..announce_view(&role, Some(&acknowledged))
+            },
+            "another owner",
+        );
+        refused(
+            AnnounceView {
+                boot: [6; 16],
+                ..announce_view(&role, Some(&acknowledged))
+            },
+            "an older boot",
+        );
+        refused(
+            AnnounceView {
+                now: 2_100_000_000,
+                ..announce_view(&role, Some(&acknowledged))
+            },
+            "the lease ending now",
+        );
+        refused(
+            AnnounceView {
+                healthy: false,
+                ..announce_view(&role, Some(&acknowledged))
+            },
+            "unhealthy links",
+        );
+        refused(
+            AnnounceView {
+                cooldowns_clear: false,
+                ..announce_view(&role, Some(&acknowledged))
+            },
+            "a cooldown",
+        );
+        refused(announce_view(&role, None), "no fresh Agent");
+        let previous = wren_ha::Agent {
+            forwarding_term: 7,
+            ..Default::default()
+        };
+        refused(
+            announce_view(&role, Some(&previous)),
+            "the Agent on the previous term",
+        );
+        refused(
+            AnnounceView {
+                announced_term: 8,
+                ..announce_view(&role, Some(&acknowledged))
+            },
+            "the term already announced",
+        );
+        let mut not_ready = role.clone();
+        not_ready.vips_ready = false;
+        refused(
+            announce_view(&not_ready, Some(&acknowledged)),
+            "the VIPs not ready",
+        );
+    }
+
+    /// The VPN promote starts once per term, whichever path reaches it first
+    /// (before the exchange with the early announcement, or after it).
+    #[test]
+    fn the_vpn_promote_starts_once_per_term() {
+        let config = wren_ha::Config {
+            cluster: "test".into(),
+            node: 2,
+            mode: wren_ha::Mode::Witness,
+            witness: None,
+            two_node: None,
+            secret: "test".into(),
+            priority: 100,
+            preempt: false,
+            wireguard: Vec::new(),
+            wireguard_policy: String::new(),
+            lease_ms: 250,
+            io_ms: 80,
+        };
+        let mut role = holding(2_100_000_000);
+        let (mut rekey, mut rekey_term) = (RekeyTask::default(), 0);
+        start_vpn_promote(&config, &mut role, &mut rekey, &mut rekey_term);
+        assert!(role.vpn_ready && rekey_term == 8);
+        role.vpn_ready = false;
+        start_vpn_promote(&config, &mut role, &mut rekey, &mut rekey_term);
+        assert!(!role.vpn_ready, "the promote ran twice for one term");
+    }
+
+    /// An early announcement does not keep the VIPs: the decision after the
+    /// exchange still releases them when that exchange lost the authority or
+    /// the lease ran out.
+    #[test]
+    fn an_early_announcement_still_releases_when_the_exchange_loses_authority() {
+        let mut role = holding(2_100_000_000);
+        role.vips_ready = true;
+        let acknowledged = wren_ha::Agent {
+            forwarding_term: 8,
+            ..Default::default()
+        };
+        assert!(announce_before_exchange(&announce_view(
+            &role,
+            Some(&acknowledged)
+        )));
+        let decision = HaDecisionObservation {
+            healthy: true,
+            healthy_after: true,
+            now: 2_050_000_000,
+        };
+        let mut lost = role.clone();
+        lost.authority.owner = 1;
+        assert!(
+            !holds_vips(&decision, true, &lost, 2, [5; 16]),
+            "kept the VIPs of a lost term"
+        );
+        let expired = HaDecisionObservation {
+            now: 2_100_000_000,
+            ..decision
+        };
+        assert!(
+            !holds_vips(&expired, true, &role, 2, [5; 16]),
+            "kept the VIPs past the lease"
+        );
     }
 
     /// The lease, not a second look at the Agent, decides whether this member
