@@ -686,16 +686,23 @@ pub async fn exchange(config: &Config, request: &Request) -> Result<(Reply, u64)
             reply.remaining_ms <= MAX_LEASE_MS,
             "invalid witness duration"
         );
-        let deadline = if reply.granted {
-            let valid = reply.remaining_ms.min(config.lease_ms);
-            start.saturating_add(valid.saturating_sub(MARGIN_MS) * 1_000_000)
-        } else {
-            0
-        };
+        let deadline = lease_deadline(start, &reply, config.lease_ms);
         Ok((reply, deadline))
     })
     .await
     .context("witness request deadline")?
+}
+
+/// The local deadline a witness reply grants: counted from when this member
+/// started connecting, cut to its own lease, minus the margin. No grant, or a
+/// start clock that could not be read (`now_ns` fails closed to `u64::MAX`),
+/// grants nothing: a failed clock must never become a lease without end.
+fn lease_deadline(start: u64, reply: &Reply, lease_ms: u64) -> u64 {
+    if !reply.granted || start == u64::MAX {
+        return 0;
+    }
+    let valid = reply.remaining_ms.min(lease_ms);
+    start.saturating_add(valid.saturating_sub(MARGIN_MS) * 1_000_000)
 }
 
 /// An IPv4 member reaching a dual-stack listener arrives v4-mapped.
@@ -902,6 +909,49 @@ mod tests {
             assert!(engine.request(owner, at).unwrap().granted);
         }
         at
+    }
+    #[test]
+    fn a_failed_start_clock_grants_no_lease() {
+        let reply = Reply {
+            authority: Authority::default(),
+            claim: Claim::default(),
+            remaining_ms: TTL_MS,
+            granted: true,
+        };
+        let start = 1_000_000_000;
+        assert_eq!(
+            lease_deadline(start, &reply, TTL_MS),
+            start + (TTL_MS - MARGIN_MS) * 1_000_000
+        );
+        assert_eq!(
+            lease_deadline(u64::MAX, &reply, TTL_MS),
+            0,
+            "a failed clock granted a lease"
+        );
+        let refused = Reply {
+            granted: false,
+            ..reply
+        };
+        assert_eq!(lease_deadline(start, &refused, TTL_MS), 0);
+    }
+    /// An owner whose Agent went stale asks with an ineligible request: the
+    /// witness does not renew it, so its lease runs out.
+    #[test]
+    fn an_ineligible_owner_request_is_not_renewed() {
+        let mut engine = Engine::new("ha-test-cluster-01".into(), Authority::default(), 0);
+        let now = (TTL_MS + MARGIN_MS) * 1_000_000;
+        let grant = engine.request(&request(1, 0), now).unwrap();
+        assert!(grant.granted);
+        let mut stale = request(1, 0);
+        stale.eligible = false;
+        let later = now + 100_000_000;
+        let reply = engine.request(&stale, later).unwrap();
+        assert!(!reply.granted, "an ineligible request was renewed");
+        assert_eq!(
+            reply.remaining_ms,
+            TTL_MS - 100,
+            "the refused renewal extended the lease"
+        );
     }
     #[test]
     fn witness_never_overlaps_leases_and_rejects_cold_stale_or_replayed_owners() {

@@ -57,57 +57,91 @@ fn read_then_timestamp_agent(
 }
 
 struct HaDecisionObservation {
-    agent: Option<wren_ha::Agent>,
     healthy: bool,
     healthy_after: bool,
     now: u64,
 }
 
-/// The exchange can outlive the Agent sample or a tracked link. Revalidate the
-/// SAME generation used in the request, never a new file/policy generation.
-///
-/// The exchange alone may use the whole I/O budget, and the requested sample is
-/// already up to one Agent poll old, so judging the freshness bound on that
-/// sample withdrew a healthy owner whenever an exchange was slow. `reread` is a
-/// read of the Agent's file taken after the exchange: it is used, and judged by
-/// the same bound, only when it is the same generation as the request (see
-/// `same_agent_generation`). Otherwise the requested sample is judged as
-/// before. A request without an accepted sample never acquires one. Read the
-/// file after the second health probe and the clock after both, so neither
-/// latency can hide age.
-fn revalidate_after_exchange(
-    agent: Option<wren_ha::Agent>,
+/// The Agent sample a request may carry: this coordinator's Agent, eligible,
+/// and fresh when it was read. A stale or ineligible Agent makes the request
+/// ineligible, so the witness (or the two-node election) does not renew this
+/// member's authority and its lease runs out.
+fn request_agent(reported: Option<wren_ha::Agent>, observed_ns: u64) -> Option<wren_ha::Agent> {
+    reported.filter(|agent| agent.eligible && wren_ha::fresh(agent.updated_ns, observed_ns))
+}
+
+/// Neither the VPN nor the VIP cooldown is running at `now`.
+fn cooldowns_clear(now: u64, vpn_failed_until: u64, vip_failed_until: u64) -> bool {
+    now >= vpn_failed_until && now >= vip_failed_until
+}
+
+/// Whether this member asks for (or to keep) authority: its links healthy, a
+/// request Agent (`request_agent`: fresh and eligible), and no cooldown.
+fn request_eligible(
     healthy_before: bool,
-    health: impl FnOnce() -> bool,
-    reread: impl FnOnce() -> Option<wren_ha::Agent>,
-    clock: impl FnOnce() -> u64,
-) -> HaDecisionObservation {
-    let healthy_after = health();
-    let agent = agent.map(|requested| {
-        reread()
-            .filter(|current| same_agent_generation(&requested, current))
-            .unwrap_or(requested)
-    });
-    let now = clock();
-    HaDecisionObservation {
-        agent: agent.filter(|agent| agent.eligible && wren_ha::fresh(agent.updated_ns, now)),
-        healthy: healthy_before && healthy_after,
-        healthy_after,
-        now,
+    agent: Option<&wren_ha::Agent>,
+    cooldowns_clear: bool,
+) -> bool {
+    healthy_before && agent.is_some() && cooldowns_clear
+}
+
+/// The lease deadline after a reply. A witness reply moves it only when it
+/// granted or the authority changed: a refused renewal leaves the running
+/// lease to end on its own. A two-node reply always sets it, and a refusal
+/// sets it to zero.
+fn deadline_after_reply(
+    mode: wren_ha::Mode,
+    granted: bool,
+    same_authority: bool,
+    current: u64,
+    offered: u64,
+) -> u64 {
+    if mode == wren_ha::Mode::TwoNode || granted || !same_authority {
+        offered
+    } else {
+        current
     }
 }
 
-/// The identity and claim a request carried: a later report with these fields
-/// equal describes the same Agent incarnation, policy and replica generation.
-/// `forwarding_term` may advance (the Agent acknowledging this term) and
-/// `eligible`/`updated_ns` are what the post-exchange check judges.
-fn same_agent_generation(requested: &wren_ha::Agent, current: &wren_ha::Agent) -> bool {
-    current.cluster == requested.cluster
-        && current.node == requested.node
-        && current.coordinator_boot == requested.coordinator_boot
-        && current.agent_boot == requested.agent_boot
-        && current.policy == requested.policy
-        && current.ready_term == requested.ready_term
+/// The exchange can outlive a tracked link: probe the links again, then read
+/// the clock, so the probe's latency counts against the lease.
+///
+/// The Agent is not judged again here. Its freshness gates the request
+/// (`request_agent`), and the lease deadline gates holding the VIPs
+/// (`holds_vips`). Re-judging a 100 ms heartbeat after an exchange that may
+/// itself take the 80 ms I/O budget left no margin and withdrew healthy owners.
+fn observe_after_exchange(
+    healthy_before: bool,
+    health: impl FnOnce() -> bool,
+    clock: impl FnOnce() -> u64,
+) -> HaDecisionObservation {
+    let healthy_after = health();
+    HaDecisionObservation {
+        healthy: healthy_before && healthy_after,
+        healthy_after,
+        now: clock(),
+    }
+}
+
+/// Whether this member holds its VIPs after an exchange: healthy links, no
+/// cooldown, and this node's own authority with its lease still running at
+/// the decision instant. An Agent that went stale or ineligible stops the
+/// renewals (`request_agent`), so the lease ends and this turns false within
+/// one lease; its data plane is fenced on its own (process exit revokes the
+/// pinned owner word, ineligibility closes the kernel deadline, a wedged Agent
+/// stops extending it).
+fn holds_vips(
+    decision: &HaDecisionObservation,
+    cooldowns_clear: bool,
+    role: &wren_ha::Role,
+    node: u8,
+    boot: [u8; 16],
+) -> bool {
+    decision.healthy
+        && cooldowns_clear
+        && role.authority.owner == node
+        && role.authority.boot == boot
+        && role.deadline_ns > decision.now
 }
 
 /// Diagnostic-only snapshots. No value here participates in authority, freshness
@@ -196,7 +230,6 @@ mod withdrawal_diagnostics {
         pub(super) healthy_before: bool,
         pub(super) healthy_after: bool,
         pub(super) agent_request_accepted: bool,
-        pub(super) agent_accepted: bool,
         pub(super) vpn_cooldown: bool,
         pub(super) vip_cooldown: bool,
         pub(super) owner_matches: bool,
@@ -271,7 +304,6 @@ mod withdrawal_diagnostics {
                             agent_status = ?observed.map(|o| o.status),
                             agent_eligible = ?observed.and_then(|o| o.eligible),
                             agent_identity_matches = ?observed.map(|o| o.identity_matches),
-                            agent_gate_accepted = ?condition.map(|c| c.agent_accepted),
                             agent_request_accepted = ?condition.map(|c| c.agent_request_accepted),
                             healthy = ?condition.map(|c| c.healthy),
                             healthy_before = ?condition.map(|c| c.healthy_before),
@@ -870,7 +902,7 @@ pub async fn run_ha(
                 let reported = raw_reported
                     .filter(|a| a.cluster == config.cluster && a.node == config.node
                         && a.coordinator_boot == boot);
-                let agent = reported.clone().filter(|a| a.eligible && wren_ha::fresh(a.updated_ns, observed_ns));
+                let agent = request_agent(reported.clone(), observed_ns);
                 agent_seen = reported;
                 let healthy_before = ha_interfaces_healthy(&binding.configs, &config.wireguard);
                 let agent_request_accepted = agent.is_some();
@@ -878,7 +910,7 @@ pub async fn run_ha(
                     boot, agent_boot: agent.as_ref().map_or([0;16],|a|a.agent_boot), priority: config.priority, preempt: config.preempt,
                     ready_term: agent.as_ref().map_or(0, |a| a.ready_term),
                     policy: agent.as_ref().map_or(role.authority.policy, |a| a.policy),
-                    eligible: healthy_before && agent.is_some() && now>=vpn_failed_until && now>=vip_failed_until };
+                    eligible: request_eligible(healthy_before, agent.as_ref(), cooldowns_clear(now, vpn_failed_until, vip_failed_until)) };
                 let asked = Instant::now();
                 let answer = if let Some(peers) = &mut peer_control {
                     peers.step(&request, role.deadline_ns, role.vips_ready).await
@@ -894,20 +926,18 @@ pub async fn run_ha(
                     Ok((reply, deadline)) => {
                         let same = role.authority == reply.authority;
                         role.authority = reply.authority;
-                        if config.mode == wren_ha::Mode::TwoNode || reply.granted || !same { role.deadline_ns = deadline; }
+                        role.deadline_ns = deadline_after_reply(config.mode, reply.granted, same, role.deadline_ns, deadline);
                         if !same {debug!(authority=?role.authority,ready_term=request.ready_term,granted=reply.granted,"HA authority generation changed");role.vpn_ready=false;rekey.cancel();rekey_term=0;}
                         role.claimed_ready_term=reply.claim.ready_term;role.claimed_agent_boot=reply.claim.agent_boot;
                     }
                     Err(error) => { debug!(error = format_args!("{error:#}"), "HA authority renewal unavailable; existing deadline cannot be extended"); }
                 }
-                let decision = revalidate_after_exchange(agent, healthy_before,
-                    || ha_interfaces_healthy(&binding.configs, &config.wireguard),
-                    || wren_ha::read_private::<Agent>(Path::new(AGENT_PATH)).ok(), wren_ha::now_ns);
-                let agent = decision.agent;
+                let decision = observe_after_exchange(healthy_before,
+                    || ha_interfaces_healthy(&binding.configs, &config.wireguard), wren_ha::now_ns);
+                let active = holds_vips(&decision,
+                    cooldowns_clear(decision.now, vpn_failed_until, vip_failed_until), &role, config.node, boot);
                 let healthy = decision.healthy;
                 let now = decision.now;
-                let active = healthy && agent.is_some() && now>=vpn_failed_until && now>=vip_failed_until && role.authority.owner == config.node
-                    && role.authority.boot == boot && role.deadline_ns > now;
                 let withdrawal = withdrawal_diagnostics::Report {
                     event: withdrawal_diagnostics::Event::Inactive,
                     node: config.node, decision_ns: now, observation: last_observation,
@@ -915,7 +945,7 @@ pub async fn run_ha(
                     authority_term: role.authority.term, authority_owner: role.authority.owner,
                     conditions: Some(withdrawal_diagnostics::Conditions {
                         healthy, healthy_before, healthy_after: decision.healthy_after,
-                        agent_request_accepted, agent_accepted: agent.is_some(),
+                        agent_request_accepted,
                         vpn_cooldown: now < vpn_failed_until, vip_cooldown: now < vip_failed_until,
                         owner_matches: role.authority.owner == config.node,
                         authority_boot_matches: role.authority.boot == boot,
@@ -1864,190 +1894,177 @@ pub fn parse_vrrp_query(line: &str) -> Option<VrrpQuery> {
 #[cfg(test)]
 mod tests {
     #[test]
-    fn post_exchange_reuses_same_agent_and_enforces_exact_freshness_boundary() {
+    fn a_request_carries_only_a_fresh_eligible_agent() {
         let updated_ns = 1_000_000_000;
-        let accepted = wren_ha::Agent {
+        let agent = wren_ha::Agent {
             eligible: true,
             updated_ns,
             agent_boot: [9; 16],
-            policy: [3; 32],
             ready_term: 7,
-            forwarding_term: 7,
             ..Default::default()
         };
-        for (now, expected) in [
+        for (observed, expected) in [
             (updated_ns + wren_ha::FRESH_NS, true),
             (updated_ns + wren_ha::FRESH_NS + 1, false),
             (updated_ns - 1, false),
         ] {
-            let decision =
-                revalidate_after_exchange(Some(accepted.clone()), true, || true, || None, || now);
-            assert_eq!(decision.agent.is_some(), expected);
-            if let Some(agent) = decision.agent {
-                assert_eq!(agent.updated_ns, updated_ns);
-                assert_eq!(agent.policy, accepted.policy);
-                assert_eq!(agent.agent_boot, accepted.agent_boot);
-                assert_eq!(agent.ready_term, 7);
-                assert_eq!(agent.forwarding_term, 7);
-            }
+            assert_eq!(
+                request_agent(Some(agent.clone()), observed).is_some(),
+                expected,
+                "observed at {observed}"
+            );
         }
-        // No file read is accepted by this boundary: a missing/rejected request
-        // cannot acquire another generation just because the exchange completed.
-        assert!(revalidate_after_exchange(
-            None,
-            true,
-            || true,
-            || Some(accepted.clone()),
-            || updated_ns
-        )
-        .agent
-        .is_none());
+        let mut ineligible = agent.clone();
+        ineligible.eligible = false;
+        assert!(request_agent(Some(ineligible), updated_ns).is_none());
+        assert!(request_agent(None, updated_ns).is_none());
     }
 
-    /// HA-flap (audit 8b6181): the exchange alone may take the whole I/O
-    /// budget (80 ms) and the requested sample is already up to one Agent poll
-    /// old, so measuring the 100 ms bound on that sample alone withdrew a
-    /// healthy owner's VIPs whenever an exchange was slow. Freshness is now
-    /// measured on a read taken after the exchange, but only of the SAME Agent
-    /// generation the request carried; anything else keeps the old verdict.
+    fn holding(deadline_ns: u64) -> wren_ha::Role {
+        wren_ha::Role {
+            node: 2,
+            coordinator_boot: [5; 16],
+            authority: wren_ha::Authority {
+                term: 8,
+                owner: 2,
+                boot: [5; 16],
+                policy: [3; 32],
+            },
+            deadline_ns,
+            ..Default::default()
+        }
+    }
+
+    /// The lease, not a second look at the Agent, decides whether this member
+    /// holds its VIPs. Before, an Agent report judged after the exchange (a
+    /// 100 ms heartbeat against an exchange of up to 80 ms) withdrew healthy
+    /// owners right after promotion; a fresh request, a slow exchange and a
+    /// late report now keep the VIPs for as long as the lease runs.
     #[test]
-    fn post_exchange_freshness_uses_a_new_read_of_the_same_generation_only() {
-        let requested_ns = 1_000_000_000;
-        let now = requested_ns + wren_ha::FRESH_NS + 50_000_000;
-        let requested = wren_ha::Agent {
+    fn holding_the_vips_follows_the_lease() {
+        let boot = [5; 16];
+        // The request went out with a fresh report at `asked`; the exchange
+        // took 80 ms; the Agent's next report is late. Nothing here reads it.
+        let asked = 2_000_000_000;
+        let deadline = asked + 230_000_000;
+        let decision = |now: u64, healthy: bool| HaDecisionObservation {
+            healthy,
+            healthy_after: healthy,
+            now,
+        };
+        let slow = decision(asked + 80_000_000 + wren_ha::FRESH_NS, true);
+        assert!(holds_vips(&slow, true, &holding(deadline), 2, boot));
+        // The lease ends the holding: at the deadline and after it.
+        for now in [deadline, deadline + 1] {
+            assert!(
+                !holds_vips(&decision(now, true), true, &holding(deadline), 2, boot),
+                "held the VIPs at {now} with the lease ending at {deadline}"
+            );
+        }
+        // Unhealthy links, a cooldown, another owner or an older boot.
+        assert!(!holds_vips(
+            &decision(asked, false),
+            true,
+            &holding(deadline),
+            2,
+            boot
+        ));
+        assert!(!holds_vips(&slow, false, &holding(deadline), 2, boot));
+        assert!(!holds_vips(&slow, true, &holding(deadline), 1, boot));
+        assert!(!holds_vips(&slow, true, &holding(deadline), 2, [6; 16]));
+    }
+
+    /// A stale Agent cannot renew: its request carries no Agent and is
+    /// ineligible. The witness then refuses the renewal (wren-ha
+    /// `an_ineligible_owner_request_is_not_renewed`) and the running lease is
+    /// left to end; the two-node election refuses and zeroes the deadline
+    /// (`an_ineligible_owner_loses_its_deadline_at_once`), which this member
+    /// adopts at once.
+    #[test]
+    fn a_stale_agent_makes_the_request_ineligible_and_stops_renewal() {
+        let updated_ns = 1_000_000_000;
+        let last_fresh = wren_ha::Agent {
             eligible: true,
-            updated_ns: requested_ns,
-            agent_boot: [9; 16],
-            policy: [3; 32],
-            ready_term: 7,
-            forwarding_term: 7,
+            updated_ns,
             ..Default::default()
         };
-        let reread = |change: fn(&mut wren_ha::Agent)| {
-            let mut agent = requested.clone();
-            agent.updated_ns = now - 10_000_000;
-            change(&mut agent);
-            agent
-        };
-        // A slow exchange with a live Agent of the same generation stays active.
-        let decision = revalidate_after_exchange(
-            Some(requested.clone()),
-            true,
-            || true,
-            || Some(reread(|_| {})),
-            || now,
+        let stale_at = updated_ns + wren_ha::FRESH_NS + 1;
+        let agent = request_agent(Some(last_fresh), stale_at);
+        assert!(!request_eligible(true, agent.as_ref(), true));
+        let running = 2_000_000_000;
+        assert_eq!(
+            deadline_after_reply(wren_ha::Mode::Witness, false, true, running, 0),
+            running,
+            "a refused witness renewal moved the running lease"
         );
-        assert_eq!(decision.agent.map(|a| a.updated_ns), Some(now - 10_000_000));
-        // The Agent died during the exchange: its last write is stale.
-        let decision = revalidate_after_exchange(
-            Some(requested.clone()),
-            true,
-            || true,
-            || Some(reread(|a| a.updated_ns = 1_000_000_000)),
-            || now,
+        assert_eq!(
+            deadline_after_reply(wren_ha::Mode::TwoNode, false, true, running, 0),
+            0,
+            "a refused two-node step kept the deadline"
         );
-        assert!(decision.agent.is_none());
-        // It became ineligible during the exchange: stricter than before.
-        let decision = revalidate_after_exchange(
-            Some(requested.clone()),
-            true,
-            || true,
-            || Some(reread(|a| a.eligible = false)),
-            || now,
+        // A grant or a new authority generation takes the offered deadline.
+        assert_eq!(
+            deadline_after_reply(wren_ha::Mode::Witness, true, true, running, 7),
+            7
         );
-        assert!(decision.agent.is_none());
-        // Another generation never substitutes for the requested sample.
-        for change in [
-            (|a: &mut wren_ha::Agent| a.policy = [4; 32]) as fn(&mut wren_ha::Agent),
-            |a| a.agent_boot = [8; 16],
-            |a| a.ready_term = 8,
-            |a| a.coordinator_boot = [1; 16],
-            |a| a.node = 2,
-        ] {
-            let decision = revalidate_after_exchange(
-                Some(requested.clone()),
-                true,
-                || true,
-                || Some(reread(change)),
-                || now,
-            );
-            assert!(decision.agent.is_none(), "another generation was accepted");
-        }
-        // An unreadable file keeps the requested sample's own verdict.
-        let decision =
-            revalidate_after_exchange(Some(requested.clone()), true, || true, || None, || now);
-        assert!(decision.agent.is_none());
-        // The re-read is taken after the health probe, before the clock.
-        let order = std::cell::RefCell::new(Vec::new());
-        revalidate_after_exchange(
-            Some(requested.clone()),
-            true,
-            || {
-                order.borrow_mut().push("health");
-                true
-            },
-            || {
-                order.borrow_mut().push("read");
-                None
-            },
-            || {
-                order.borrow_mut().push("clock");
-                now
-            },
+        assert_eq!(
+            deadline_after_reply(wren_ha::Mode::Witness, false, false, running, 7),
+            7
         );
-        assert_eq!(*order.borrow(), ["health", "read", "clock"]);
     }
 
     #[test]
-    fn post_exchange_health_delay_counts_towards_agent_age() {
-        let updated_ns = 1_000_000_000;
-        let clock = std::cell::Cell::new(updated_ns);
+    fn a_request_needs_an_agent_healthy_links_and_no_cooldown() {
+        let agent = wren_ha::Agent {
+            eligible: true,
+            ..Default::default()
+        };
+        assert!(request_eligible(true, Some(&agent), true));
+        assert!(
+            !request_eligible(true, None, true),
+            "a request without an Agent was eligible"
+        );
+        assert!(!request_eligible(false, Some(&agent), true));
+        assert!(!request_eligible(true, Some(&agent), false));
+        let now = 1_000;
+        assert!(cooldowns_clear(now, now, now));
+        assert!(
+            !cooldowns_clear(now, now + 1, 0),
+            "a running VPN cooldown was clear"
+        );
+        assert!(
+            !cooldowns_clear(now, 0, now + 1),
+            "a running VIP cooldown was clear"
+        );
+    }
+
+    #[test]
+    fn the_post_exchange_clock_follows_the_health_probe() {
         let health_finished = std::cell::Cell::new(false);
-        let decision = revalidate_after_exchange(
-            Some(wren_ha::Agent {
-                eligible: true,
-                updated_ns,
-                ..Default::default()
-            }),
+        let decision = observe_after_exchange(
             true,
             || {
-                clock.set(updated_ns + wren_ha::FRESH_NS + 1);
                 health_finished.set(true);
                 true
             },
-            || None,
             || {
                 assert!(
                     health_finished.get(),
                     "clock sampled before the health probe finished"
                 );
-                clock.get()
+                7
             },
         );
+        assert_eq!(decision.now, 7);
         assert!(decision.healthy);
-        assert!(
-            decision.agent.is_none(),
-            "slow health observation hid an expired Agent"
-        );
     }
 
     #[test]
     fn post_exchange_requires_health_both_before_and_after() {
         for (before, after) in [(true, true), (true, false), (false, true), (false, false)] {
-            let decision = revalidate_after_exchange(
-                Some(wren_ha::Agent {
-                    eligible: true,
-                    updated_ns: 1,
-                    ..Default::default()
-                }),
-                before,
-                || after,
-                || None,
-                || 1,
-            );
+            let decision = observe_after_exchange(before, || after, || 1);
             assert_eq!(decision.healthy, before && after);
             assert_eq!(decision.healthy_after, after);
-            assert!(decision.agent.is_some());
         }
     }
 

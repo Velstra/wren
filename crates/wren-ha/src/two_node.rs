@@ -859,6 +859,25 @@ mod tests {
         assert_eq!(reply.claim.ready_term, 7);
         assert_eq!(reply.claim.agent_boot, [4; 16]);
     }
+    /// An owner whose Agent went stale asks with an ineligible request: the
+    /// two-node election grants nothing and zeroes its deadline at once.
+    #[test]
+    fn an_ineligible_owner_loses_its_deadline_at_once() {
+        let cfg = config(2);
+        let mut engine = Election::new(0);
+        let (reply, deadline) = engine
+            .step(&cfg, &request(&cfg, 0), None, 2_000 * MS)
+            .unwrap();
+        assert!(reply.granted && deadline > 2_000 * MS);
+        let mut stale = request(&cfg, 0);
+        stale.eligible = false;
+        let (reply, deadline) = engine.step(&cfg, &stale, None, 2_025 * MS).unwrap();
+        assert!(!reply.granted);
+        assert_eq!(
+            deadline, 0,
+            "an ineligible owner kept its two-node deadline"
+        );
+    }
     #[test]
     fn healthy_incumbent_is_not_displaced_without_preemption() {
         let cfg = config(2);
