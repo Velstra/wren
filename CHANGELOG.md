@@ -6,8 +6,48 @@ follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
-### Changed
+## [0.5.0] — 2026-11-24
 
+This is the state shipped in Sentinel 1.0.0: the tag `sentinel-v1.0.0` names
+the same commit. It is a minor release because HA behaviour changed — the
+lease alone decides who holds the VIPs, a takeover announces sooner, a
+preemption waits for the takeover it follows, and a WireGuard successor's
+clock is stepped by a separate helper — and because eBGP now defaults to
+RFC 8212 deny.
+
+### Breaking and behaviour changes
+
+- **BREAKING: an eBGP peer with no policy now exchanges nothing, by default.**
+  RFC 8212's default-deny has been in Wren since 0.4.0, but as `[bgp]
+  ebgp-require-policy = true` — off unless asked for, which is the one setting
+  everybody who needs it has never heard of. It is now the default, as the RFC
+  has required since 2017: an eBGP neighbour with no `import` policy accepts no
+  routes, and one with no `export` policy advertises none. iBGP and
+  confederation sessions are untouched — the RFC is about external peers.
+
+  Two things follow that will surprise an existing configuration. **Upgrading a
+  policy-less eBGP config silences it**: the session still establishes, and no
+  routes cross it. And **a locally-originated route is no longer exempt** — the
+  `network` statements, redistribution, aggregates and `default-originate` of a
+  speaker with no export policy stay home too. The old implementation gated
+  transit routes and let a speaker's own out, which is precisely the leak the
+  RFC exists to stop: "Routes SHALL NOT be added to an Adj-RIB-Out associated
+  with an EBGP peer if no explicit Export Policy has been applied" draws no such
+  line.
+
+  Nothing is silent about it. The session logs, once, at establishment, which
+  directions are denied and how to change it; `show bgp neighbors` grows a
+  `policy-denied <n>` count of what was discarded on receipt, and the same
+  number is exported as `wren_bgp_policy_denied_received_total`. An
+  Established-but-empty peer now says why in three places, rather than looking
+  identical to a broken one.
+
+  To keep permit-all where you mean it: `require-policy = false` on a single
+  `[[bgp.neighbor]]` — the route server or lab peer that really is meant to
+  exchange everything — or `[bgp] ebgp-require-policy = false` for a whole
+  speaker at once. The per-neighbour key wins over the global one, so one
+  session can opt out while the rest of the router keeps the protection, and one
+  can be re-armed on a speaker that has opted out globally.
 - **The lease, not a second look at the agent, decides whether a member holds
   its VIPs.** A new owner no longer drops its VIPs for up to one lease right
   after a takeover because one agent report arrived late during a witness
@@ -20,16 +60,6 @@ follows [Semantic Versioning](https://semver.org/).
   the election refuses an ineligible request and zeroes the deadline, so the
   VIPs go on the next tick there; the second agent check after the exchange
   is gone in both modes.
-- **The first announcement after a takeover no longer waits for the next
-  witness exchange.** The new owner sends its gratuitous ARP and neighbour
-  advertisements as soon as its agent acknowledges forwarding the new term,
-  while its lease for that term is still running. The exchange it used to
-  wait for is the slowest of a takeover (the witness records the
-  acknowledgement durably), so a takeover reaches clients 50 to 70 ms sooner
-  in witness mode. Holding and releasing the VIPs are decided as before.
-
-### Fixed
-
 - **A preemption no longer interrupts the takeover it follows.** In witness
   mode a higher-priority member could preempt a new owner as soon as it held
   that owner's snapshot. After the owner's Wren crashed, its restarted
@@ -40,6 +70,47 @@ follows [Semantic Versioning](https://semver.org/).
   now honours a preemption only once the owner has held its authority for
   10 s (`PREEMPT_HOLD_MS`). Failover is unchanged; only the return of a
   preempting member waits.
+- **The first announcement after a takeover no longer waits for the next
+  witness exchange.** The new owner sends its gratuitous ARP and neighbour
+  advertisements as soon as its agent acknowledges forwarding the new term,
+  while its lease for that term is still running. The exchange it used to
+  wait for is the slowest of a takeover (the witness records the
+  acknowledgement durably), so a takeover reaches clients 50 to 70 ms sooner
+  in witness mode. Holding and releasing the VIPs are decided as before. The
+  WireGuard promote still starts before that first announcement.
+- **A WireGuard successor's wall clock is stepped up to its predecessor's by a
+  new helper, `wren-ha-clock-step`.** Both members share one WireGuard
+  identity, and a member whose clock lagged (a resumed VM, 8.9 s behind in the
+  measured case) had its promotion handshake dropped as a replay. The helper
+  is a separate `wren-daemon` binary, socket-activated on
+  `/run/velstra-ha-clock.sock` and long-running; Wren holds no clock
+  privilege, connects at promotion, waits at most 2 s and promotes whatever
+  the answer. The helper reads the agent's replicated reading from
+  `/run/velstra/ha-clock/peer.json` and steps only forward, not for a lag
+  under 100 ms, at most 60 s when both clocks claim NTP synchronisation and
+  10 min otherwise, never on a reading older than 5 s, and at most 10 min in
+  total per boot. Each decision is recorded in `/run/velstra/ha/clock.json`.
+- **The lease witness is stricter.** A lone survivor may claim the lease after
+  peer silence only within an established cluster (authority term above 0),
+  never open a new one; the witness serves only its configured members; and it
+  authenticates with a derived key instead of the admin secret.
+- **A reload completes when only learned routes are refused, and is
+  acknowledged only once converged.** See *Routing* below; the reload states
+  are now `converged`, `degraded` and `pending`.
+- **`wren_ospfv3::spf::SpfRoute::to_route` returns `Option<Route>`** (see the
+  OSPFv3 fix below), a source change for code embedding the crate.
+
+### HA
+
+- **Witnessless two-node HA coordination**, alongside the witness mode, with VRRP
+  guard tests.
+- **HA coordinates with durable witness leases**: exact warm and cold grant
+  claims are persisted before ownership is acknowledged, the lease and
+  I/O-timeout budget are recorded in the witness state, data VPNs are
+  reconstructed, reloads and bootstrap retries stay bound to the correct actor
+  and agent, and a failed start clock no longer yields a lease without end.
+- `show vrrp` reports standby readiness. Bounded WireGuard promotion failures
+  are reported without exposing private configuration.
 - **Logging no longer blocks the daemon.** Log lines were written straight to
   stdout, a pipe to journald under systemd. When journald stopped reading
   (synchronous console forwarding, disk pressure, rate limiting) every task
@@ -51,6 +122,50 @@ follows [Semantic Versioning](https://semver.org/).
   `wren_log_lines_dropped_total`, and reported on the log as soon as it
   drains. A daemon exit waits up to 500 ms for the queued lines. The queue
   size can be set with `WREN_LOG_QUEUE_LINES` (1–65536).
+- **VRRP:** elections recover when interface addresses change, a master
+  refreshes its VIP neighbour announcements, and virtual addresses stay on
+  usable declared links.
+- **VRRP can hold the virtual address on a link other than the one it elects
+  on.** `address-interface` on a `[[vrrp]]` separates the two: advertisements
+  stay on the link that is guaranteed to be up between the pair, while the
+  address is installed on the link that serves it. The gratuitous ARP and the
+  unsolicited neighbour advertisement go out there too, with *that* link's MAC —
+  a host on the served segment has to learn the address against a MAC it can
+  actually send to. Without this, a firewall with a dozen tagged segments needed
+  a virtual router and a VRID per segment to answer one question, "who is
+  master", that has the same answer on all of them. An `address-interface` that
+  does not exist at start-up warns and falls back to the advertisement link
+  rather than refusing to start.
+
+### Routing
+
+- **A route the kernel refuses no longer holds every routing reload open.** A
+  reload completed only when every prefix was in the kernel, so one refused
+  learned route (any protocol) kept each new generation `pending`: `wren
+  reload` timed out after 30 s, deferred protocol reconfiguration never ran,
+  and every Sentinel commit failed while it lasted. A reconciliation pass that
+  completes with only learned routes refused now settles as `degraded` — the
+  configuration is applied, the refused routes are retried every reconcile
+  tick — and `wren reload` succeeds. A refused configured static route still
+  keeps the generation `pending`, as the operator's own change is not in the
+  kernel. Receipts and `show reload` name each refused route on a
+  `failed-route <table> <prefix> <protocol>` line (at most 16, the rest
+  counted), including the receipt a timed-out reload prints.
+- **Owned FIB state is reconciled** with exact route identities, failed kernel
+  updates are recovered, a reload is acknowledged only once it has converged,
+  static imports are enforced and exactly the owned routes are withdrawn, and
+  the kernel's IPv6 default metric (0 read back as 1024) is recognised on
+  readback.
+- **OSPF's Router-LSA flags are in the byte RFC 2328 A.4.2 names.** The V/E/B
+  bits were written to byte 1, and read back from it, so wren agreed with
+  itself while telling every other implementation it was neither an ABR nor an
+  ASBR — FRR kept its AS-external LSAs and installed none of them. The
+  Router-LSA is re-originated when the ASBR status changes, and `show ip ospf
+  database` prints the flags by name. OSPFv3 was already correct.
+- **Three OSPF faults only another implementation found:** an LSA was flooded
+  without its length and checksum stamped, a neighbour was identified by the
+  wrong field for the interface type (RFC 2328 §10), and removing a route
+  deleted the link's own connected route with it.
 - **OSPFv3 redistribution follows a reload.** `[ospf3] redistribute_static`
   advertised the static routes configured when the engine started and nothing
   else: a reload that removed one left its AS-external LSA in every
@@ -69,18 +184,6 @@ follows [Semantic Versioning](https://semver.org/).
   them — and a link-local next hop whose interface cannot be named is dropped
   rather than installed unpinned. `wren_ospfv3::spf::SpfRoute::to_route` now
   returns `Option<Route>`.
-- **A route the kernel refuses no longer holds every routing reload open.** A
-  reload completed only when every prefix was in the kernel, so one refused
-  learned route (any protocol) kept each new generation `pending`: `wren
-  reload` timed out after 30 s, deferred protocol reconfiguration never ran,
-  and every Sentinel commit failed while it lasted. A reconciliation pass that
-  completes with only learned routes refused now settles as `degraded` — the
-  configuration is applied, the refused routes are retried every reconcile
-  tick — and `wren reload` succeeds. A refused configured static route still
-  keeps the generation `pending`, as the operator's own change is not in the
-  kernel. Receipts and `show reload` name each refused route on a
-  `failed-route <table> <prefix> <protocol>` line (at most 16, the rest
-  counted), including the receipt a timed-out reload prints.
 - **OSPFv2/v3 withdraw their own LSAs on a normal shutdown.** Configuration
   restarts now flood MaxAge instances at the original link, area and AS scopes,
   then accept acknowledgments and retry within a bounded shutdown window.
@@ -116,11 +219,14 @@ follows [Semantic Versioning](https://semver.org/).
   is not a route. Each SPF run now also logs, at info, how many routers the
   tree reached and how many routes came out of it; the routes themselves are
   at debug.
-- **`scripts/bgp-aggregate-smoke.sh` tested nothing in two of its three
-  phases.** The aggregate block was written above `ebgp-require-policy`, and a
-  `[[bgp.aggregate]]` header swallows every key after it — the daemon refused
-  the file (`unknown field`) and both aggregate phases failed against an empty
-  table. The key now precedes the block; the test is green and means it.
+- **BGP:** the IPv4-unicast multiprotocol capability is advertised (the IPv6
+  entry alone made a peer find no IPv4 in the set), and a configured network
+  list too large for one UPDATE (about 815 IPv4 /32s) is split across as few
+  UPDATEs with identical attributes as the 4096-octet limit allows instead of
+  resetting the session.
+- **IS-IS:** the LSP IS Type has its own codec; it used the Hello Circuit Type
+  numbering, so every Level-2 LSP carried an unused value and a neighbour's 3
+  decoded as L1L2.
 - **A type-3 IMET route's SRv6 SID reaches the EVPN monitor stream.** The flood
   lines were `+ evpn vni <vni> flood <vtep>` with no room for a service SID, so a
   consumer on an SRv6 data plane learned *who* to flood to and had nothing to
@@ -138,30 +244,6 @@ follows [Semantic Versioning](https://semver.org/).
   did not before — membership alone decided — so a peer that moved its locator, or
   moved between SRv6 and VXLAN, kept being flooded to a SID it no longer
   terminates.
-
-### Added
-
-- **`wren check` — resolve a configuration without starting anything.** Parse,
-  compile the filters, resolve the import/export attachments and the VRF
-  route-maps, build the static routes and the BGP neighbour set, print a summary,
-  exit. It is the same work a `SIGHUP` reload does before it commits, so a file
-  that passes is one the running daemon would accept — and because nothing is
-  started, no socket is opened and the kernel is not touched, it is safe to run
-  on a box that is already routing. A file that fails names what is wrong and
-  exits non-zero. `--config` became a global argument so `wren check -c f.toml`
-  works as well as `wren -c f.toml check`.
-
-- **VRRP can hold the virtual address on a link other than the one it elects
-  on.** `address-interface` on a `[[vrrp]]` separates the two: advertisements
-  stay on the link that is guaranteed to be up between the pair, while the
-  address is installed on the link that serves it. The gratuitous ARP and the
-  unsolicited neighbour advertisement go out there too, with *that* link's MAC —
-  a host on the served segment has to learn the address against a MAC it can
-  actually send to. Without this, a firewall with a dozen tagged segments needed
-  a virtual router and a VRID per segment to answer one question, "who is
-  master", that has the same answer on all of them. An `address-interface` that
-  does not exist at start-up warns and falls back to the advertisement link
-  rather than refusing to start.
 - **Blackhole static routes and administrative distance.** `blackhole = true` on
   a `[[static]]` discards what matches instead of forwarding it — the standard
   way to null-route a prefix, and what makes a BGP summary stick without also
@@ -178,40 +260,62 @@ follows [Semantic Versioning](https://semver.org/).
   route's whole next-hop set: a multipath route sent via one named gateway has
   one next hop by definition. Giving a next hop to a route that had none stops
   it discarding, which is documented rather than refused.
+- **`wren check` — resolve a configuration without starting anything.** Parse,
+  compile the filters, resolve the import/export attachments and the VRF
+  route-maps, build the static routes and the BGP neighbour set, print a summary,
+  exit. It is the same work a `SIGHUP` reload does before it commits, so a file
+  that passes is one the running daemon would accept — and because nothing is
+  started, no socket is opened and the kernel is not touched, it is safe to run
+  on a box that is already routing. A file that fails names what is wrong and
+  exits non-zero. `--config` became a global argument so `wren check -c f.toml`
+  works as well as `wren -c f.toml check`.
+- Export writes are bounded, monitor and reload lifecycles are cleaned up, and
+  raw socket registration follows the updated Tokio safety contract.
 
-### Changed
+### Security fixes
 
-- **BREAKING: an eBGP peer with no policy now exchanges nothing, by default.**
-  RFC 8212's default-deny has been in Wren since 0.4.0, but as `[bgp]
-  ebgp-require-policy = true` — off unless asked for, which is the one setting
-  everybody who needs it has never heard of. It is now the default, as the RFC
-  has required since 2017: an eBGP neighbour with no `import` policy accepts no
-  routes, and one with no `export` policy advertises none. iBGP and
-  confederation sessions are untouched — the RFC is about external peers.
+- **BGP receive-side validation.** ORIGIN and AS_PATH are required on an
+  UPDATE carrying only MP_REACH (the check never ran for IPv6, EVPN, FlowSpec,
+  SR-Policy or Link-State); an unrecognised (AFI, SAFI) is refused instead of
+  decoded as IPv4; the MP_REACH next-hop length is checked per family; AS 0
+  and a zero BGP Identifier in OPEN are rejected; the 4096-octet message
+  ceiling is imposed. An UPDATE whose AS path already holds our own AS is
+  dropped (RFC 4271 §9.1.2).
+- **BFD's authentication replay window survives the sequence wrap.** After one
+  wrap every authenticated packet was rejected for ever, tearing the session
+  down; serial-number arithmetic is used now, and the A-bit length floor of
+  RFC 5880 §6.8.6 is enforced.
+- Encoders clamp an out-of-range prefix length from decoded input instead of
+  slicing out of bounds.
+- The lease witness admits only its configured members and no longer
+  authenticates with the admin secret (see above). The clock-step helper keeps
+  the clock privilege out of Wren, which parses untrusted BGP, OSPF and IS-IS:
+  a compromised Wren can trigger a decision on the agent's reading, but can
+  neither supply the reading nor exceed the per-boot budget.
 
-  Two things follow that will surprise an existing configuration. **Upgrading a
-  policy-less eBGP config silences it**: the session still establishes, and no
-  routes cross it. And **a locally-originated route is no longer exempt** — the
-  `network` statements, redistribution, aggregates and `default-originate` of a
-  speaker with no export policy stay home too. The old implementation gated
-  transit routes and let a speaker's own out, which is precisely the leak the
-  RFC exists to stop: "Routes SHALL NOT be added to an Adj-RIB-Out associated
-  with an EBGP peer if no explicit Export Policy has been applied" draws no such
-  line.
+### Documentation
 
-  Nothing is silent about it. The session logs, once, at establishment, which
-  directions are denied and how to change it; `show bgp neighbors` grows a
-  `policy-denied <n>` count of what was discarded on receipt, and the same
-  number is exported as `wren_bgp_policy_denied_received_total`. An
-  Established-but-empty peer now says why in three places, rather than looking
-  identical to a broken one.
+- The operator handbook is rewritten around tested routing scenarios, with
+  Mermaid diagrams of how Wren fits, route selection, the import and export
+  filters, and protocol state machines and sequences; the README gained an
+  architecture diagram and a tighter quickstart and was shortened to link
+  focused setup guides; Wren branding.
+- The reference documents `blackhole` and `distance`, `set-next-hop` and
+  VRRP's `address-interface`; the roadmap and README say what shipped.
 
-  To keep permit-all where you mean it: `require-policy = false` on a single
-  `[[bgp.neighbor]]` — the route server or lab peer that really is meant to
-  exchange everything — or `[bgp] ebgp-require-policy = false` for a whole
-  speaker at once. The per-neighbour key wins over the global one, so one
-  session can opt out while the rest of the router keeps the protection, and one
-  can be re-armed on a speaker that has opted out globally.
+### CI and release tooling
+
+- CI enforces workspace formatting, runs the kernel route tests in isolation,
+  and loads (and if needed installs) the `veth`, `dummy` and `vrf` modules the
+  rootless smokes create; `actions/checkout` moved to v7.
+- `scripts/bgp-aggregate-smoke.sh` tested nothing in two of its three phases:
+  the aggregate block was written above `ebgp-require-policy`, and a
+  `[[bgp.aggregate]]` header swallows every key after it. The key now precedes
+  the block.
+- `crates-release.yml` qualifies the standalone `wren-core` crate and publishes
+  it only on an independently approved manual dispatch.
+- Dependency updates: anyhow, clap, libc, serde, Tokio (1.54.1), toml (1.2)
+  and base64 (0.23.1).
 
 ## [0.4.0] — 2026-08-01
 
