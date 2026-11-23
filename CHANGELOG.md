@@ -141,6 +141,8 @@ follows [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- crates.io release workflow: opt-in single-operator approval mode
+  (`RELEASE_SINGLE_OPERATOR`).
 - **`wren check` — resolve a configuration without starting anything.** Parse,
   compile the filters, resolve the import/export attachments and the VRF
   route-maps, build the static routes and the BGP neighbour set, print a summary,
