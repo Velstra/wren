@@ -2207,9 +2207,10 @@ mod tests {
     /// A stale Agent cannot renew: its request carries no Agent and is
     /// ineligible. The witness then refuses the renewal (wren-ha
     /// `an_ineligible_owner_request_is_not_renewed`) and the running lease is
-    /// left to end; the two-node election refuses and zeroes the deadline
-    /// (`an_ineligible_owner_loses_its_deadline_at_once`), which this member
-    /// adopts at once.
+    /// left to end. The two-node election refuses too and offers the running
+    /// lease back (`an_ineligible_owner_keeps_its_lease_until_it_ends`); this
+    /// member adopts whatever a two-node step offers, which is 0 only when
+    /// the election fences it.
     #[test]
     fn a_stale_agent_makes_the_request_ineligible_and_stops_renewal() {
         let updated_ns = 1_000_000_000;
@@ -2230,7 +2231,12 @@ mod tests {
         assert_eq!(
             deadline_after_reply(wren_ha::Mode::TwoNode, false, true, running, 0),
             0,
-            "a refused two-node step kept the deadline"
+            "a fenced two-node step kept the deadline"
+        );
+        assert_eq!(
+            deadline_after_reply(wren_ha::Mode::TwoNode, false, true, running, running),
+            running,
+            "a refused two-node step did not keep the lease the election offered back"
         );
         // A grant or a new authority generation takes the offered deadline.
         assert_eq!(
