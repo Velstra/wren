@@ -290,9 +290,16 @@ impl Election {
             self.deadline_ns =
                 now.saturating_add(cfg.lease_ms.saturating_sub(MARGIN_MS) * 1_000_000);
             self.last_owner_ns = now;
-        } else {
+        } else if local.eligible || !owner_is_us || remote_wins {
             self.deadline_ns = 0;
         }
+        // Otherwise this owner's own request is ineligible (a stale or not
+        // ready Agent): it is not renewed, and the lease already granted runs
+        // out as granted, as in witness mode. One late Agent report must not
+        // drop the VIPs on the next tick. No takeover can overlap it: the peer
+        // counts its peer timeout (at least four leases) from this owner's last
+        // active heartbeat, and an ineligible request is never published as
+        // active.
         Ok((
             Reply {
                 authority: self.authority.clone(),
@@ -860,22 +867,127 @@ mod tests {
         assert_eq!(reply.claim.agent_boot, [4; 16]);
     }
     /// An owner whose Agent went stale asks with an ineligible request: the
-    /// two-node election grants nothing and zeroes its deadline at once.
+    /// two-node election renews nothing, and the lease it last granted runs
+    /// out as granted, as in witness mode. One late Agent report must not drop
+    /// the VIPs on the next tick; a stall that outlasts the lease still does.
     #[test]
-    fn an_ineligible_owner_loses_its_deadline_at_once() {
+    fn an_ineligible_owner_keeps_its_lease_until_it_ends() {
         let cfg = config(2);
         let mut engine = Election::new(0);
-        let (reply, deadline) = engine
+        let (reply, granted) = engine
             .step(&cfg, &request(&cfg, 0), None, 2_000 * MS)
             .unwrap();
-        assert!(reply.granted && deadline > 2_000 * MS);
+        assert!(reply.granted && granted > 2_025 * MS);
         let mut stale = request(&cfg, 0);
         stale.eligible = false;
         let (reply, deadline) = engine.step(&cfg, &stale, None, 2_025 * MS).unwrap();
+        assert!(!reply.granted, "an ineligible request was renewed");
+        assert_eq!(
+            deadline, granted,
+            "an ineligible owner lost the lease it was granted, or had it extended"
+        );
+        assert_eq!(reply.remaining_ms, (granted - 2_025 * MS) / MS);
+        // The Agent is back before the lease ends: the same term is renewed.
+        let (reply, renewed) = engine
+            .step(&cfg, &request(&cfg, 0), None, 2_050 * MS)
+            .unwrap();
+        assert!(reply.granted && renewed > granted);
+        assert_eq!(
+            reply.authority,
+            authority(2, 1),
+            "a short stall started a new term"
+        );
+        // A stall that outlasts the lease ends it: never extended past it.
+        let mut last = renewed;
+        for tick in 1..=12 {
+            let now = 2_050 * MS + tick * 25 * MS;
+            let (reply, deadline) = engine.step(&cfg, &stale, None, now).unwrap();
+            assert!(!reply.granted);
+            assert_eq!(deadline, last, "an ineligible step moved the deadline");
+            last = deadline;
+        }
+        assert!(
+            last <= 2_050 * MS + cfg.lease_ms * MS,
+            "the lease outlived its grant"
+        );
+    }
+    /// Keeping its own lease never lets an ineligible owner hold on through a
+    /// collision: a peer that wins still fences it at once.
+    #[test]
+    fn an_ineligible_owner_still_yields_at_once_to_a_winning_peer() {
+        let cfg = config(2);
+        let mut engine = Election::new(0);
+        let (reply, _) = engine
+            .step(&cfg, &request(&cfg, 0), None, 2_000 * MS)
+            .unwrap();
+        assert!(reply.granted);
+        let peer_cfg = config(1);
+        let winner = observation(&peer_cfg, 0, 2, true, 2_020 * MS);
+        let mut stale = request(&cfg, 0);
+        stale.eligible = false;
+        let (reply, deadline) = engine
+            .step(&cfg, &stale, Some(&winner), 2_025 * MS)
+            .unwrap();
         assert!(!reply.granted);
         assert_eq!(
             deadline, 0,
-            "an ineligible owner kept its two-node deadline"
+            "an ineligible owner kept its lease against an active winner"
+        );
+    }
+    /// The kept lease cannot overlap a takeover: the standby counts its peer
+    /// timeout from the owner's last active heartbeat, and every valid
+    /// configuration's lease ends well inside that timeout.
+    #[test]
+    fn a_kept_lease_ends_before_the_standby_may_take_over() {
+        let owner_cfg = config(1);
+        let standby_cfg = config(2);
+        let mut owner = Election::new(0);
+        let (reply, owner_deadline) = owner
+            .step(&owner_cfg, &request(&owner_cfg, 0), None, 2_000 * MS)
+            .unwrap();
+        assert!(reply.granted);
+        let mut standby = Election::new(0);
+        // The standby last hears the owner active at its grant; then the
+        // owner's Agent stalls, and its heartbeats stop saying active.
+        let mut last_active = observation(&owner_cfg, 0, reply.authority.term, true, 2_000 * MS);
+        last_active.heartbeat.authority = reply.authority.clone();
+        standby
+            .step(
+                &standby_cfg,
+                &request(&standby_cfg, 0),
+                Some(&last_active),
+                2_001 * MS,
+            )
+            .unwrap();
+        let mut stale = request(&owner_cfg, 0);
+        stale.eligible = false;
+        let mut first_grant = None;
+        for tick in 1..=80 {
+            let now = 2_000 * MS + tick * 25 * MS;
+            let (_, kept) = owner.step(&owner_cfg, &stale, None, now).unwrap();
+            assert!(kept == owner_deadline);
+            let mut silent = last_active.clone();
+            silent.heartbeat.active = false;
+            silent.heartbeat.request.eligible = false;
+            silent.heartbeat.remaining_ms = kept.saturating_sub(now) / MS;
+            silent.heartbeat.sequence = tick + 1;
+            silent.heard_ns = now;
+            let (reply, _) = standby
+                .step(&standby_cfg, &request(&standby_cfg, 0), Some(&silent), now)
+                .unwrap();
+            if reply.granted && first_grant.is_none() {
+                first_grant = Some(now);
+            }
+        }
+        let first_grant = first_grant.expect("the standby never took over from a stalled owner");
+        let timeout = standby_cfg.two_node.as_ref().unwrap().peer_timeout_ms * MS;
+        assert!(
+            first_grant >= 2_000 * MS + timeout,
+            "the standby took over before its peer timeout"
+        );
+        assert!(
+            owner_deadline < first_grant,
+            "the stalled owner's kept lease overlapped the standby's takeover"
         );
     }
     #[test]

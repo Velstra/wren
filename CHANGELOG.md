@@ -6,6 +6,24 @@ follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **A two-node member no longer drops its VIPs for one late agent report.**
+  This corrects the 0.5.0 entry below that says that in two-node mode "the
+  election refuses an ineligible request and zeroes the deadline, so the VIPs
+  go on the next tick there". That behaviour turned one agent report over
+  100 ms old into a VIP withdrawal on the next 25 ms poll, and the next fresh
+  report took the VIPs back: a short VIP outage each time. A member whose
+  agent tick runs late under CPU load did this every few seconds. Measured on a
+  CPU-saturated 1-vCPU member: 35 withdrawals and 3 needless takeovers in
+  5 minutes idle; none with 2 vCPUs. An ineligible request is still not
+  renewed, but the lease already granted now runs out as granted, at most
+  230 ms, as in witness mode. A stall that outlasts the lease still releases
+  the VIPs, and a peer that wins a collision still fences the owner at once.
+  The standby's takeover is unchanged: it still waits its peer timeout, at
+  least four leases, from the owner's last active heartbeat, so the kept lease
+  always ends before the standby may take over.
+
 ## [0.5.0] — 2026-11-24
 
 This is the state shipped in Sentinel 1.0.0: the tag `sentinel-v1.0.0` names
